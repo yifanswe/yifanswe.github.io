@@ -1,0 +1,917 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Load Balancer — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/backend-fundamentals/">← Back to Backend Fundamental Components</a>
+        <h1 class="article-title">Load Balancer</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Backend Fundamental Components
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p>Load balancing is a class of infrastructure that distributes incoming work across a pool of backends with health awareness, traffic policy, and failure isolation. It is the layer that turns "a fleet of servers" into "a service." Its variants are radically different — a Layer 4 (L4) packet forwarder doing 10 million packets per second (Mpps) per box in the kernel looks almost nothing like a Layer 7 (L7) HTTP proxy doing 100 thousand requests per second (RPS) of TLS-terminated routing in user space. They share a name and a purpose; they share little code. This doc treats load balancing as a technology class, walks the design space, and uses examples from public web, internal microservices, database pools, video streaming, real-time gaming, and read-replica routing.</p>
+<hr>
+<h2 id="1-what-load-balancers-are-and-are-not">§1. What load balancers ARE — and are NOT</h2>
+<p>A load balancer (LB) is a traffic distributor: given an incoming unit of work (TCP packet, HTTP request, UDP datagram, DB query), it picks a backend from a pool and forwards. It keeps the pool clean — backends that fail health checks are evicted, new ones added smoothly, traffic reshuffled on membership change without resetting every live connection.</p>
+<p>Two big axes split the design space.</p>
+<p><strong>L4 vs L7.</strong> L4 LBs operate on the transport layer — they see source/destination IP, source/destination port, and protocol (the 5-tuple). They do not parse HTTP, do not terminate TLS, do not understand routes. They are fast (sub-microsecond per packet on modern XDP — eXpress Data Path — paths), nearly stateless (a connection table mapping 5-tuples to backends), and protocol-agnostic (TCP, UDP, QUIC). Google Maglev, Facebook Katran, Cloudflare Unimog, AWS NLB (Network Load Balancer), and Linux IPVS are L4. L7 LBs terminate the transport (typically TCP+TLS) and operate on the application protocol — HTTP, gRPC, Kafka wire protocol, Redis protocol. They route by path, header, body, JWT (JSON Web Token) claim; rewrite headers; retry; do canary; run a WAF (Web Application Firewall). NGINX, HAProxy, Envoy, Traefik, AWS ALB (Application Load Balancer), GCP HTTP(S) LB are L7. Slower per request (milliseconds, not microseconds), enormously more capable.</p>
+<p><strong>Hardware vs software.</strong> The legacy lineage is hardware appliances — F5 Big-IP, Citrix NetScaler, A10 — boxes with ASIC packet engines and proprietary OSes. The modern lineage is software on commodity x86/ARM — NGINX, HAProxy, Envoy in user space; IPVS, Katran, Unimog in the kernel via XDP/eBPF (extended Berkeley Packet Filter). Hardware wins on watts-per-bit; software wins on iteration speed and cost. By 2018 the industry's verdict was clear: hyperscalers all built software L4 LBs in eBPF or DPDK (Data Plane Development Kit). Hardware appliances still ship to enterprises that want one vendor's throat to choke.</p>
+<p>What load balancers are <strong>NOT</strong>:</p>
+<ul>
+<li><strong>Not a database.</strong> No persistent state. Lose the LB and connections reset, but no business data is lost.</li>
+<li><strong>Not a service mesh.</strong> A mesh is an architecture (sidecar proxies + control plane + mTLS — mutual Transport Layer Security — everywhere); it <em>uses</em> an LB (typically Envoy) as a building block.</li>
+<li><strong>Not a CDN (Content Delivery Network).</strong> A CDN caches; an LB routes. A CDN has an LB inside (Cloudflare runs Unimog), but the CDN's value is the cache hierarchy.</li>
+<li><strong>Not DNS.</strong> DNS-based load balancing (multiple A records) is a poor substitute — see §9.</li>
+<li><strong>Not a retry framework.</strong> End-to-end retry semantics (idempotency keys, saga compensation, exponential backoff) belong in the client and the application.</li>
+</ul>
+<p>The category matters because engineers reach for LBs to solve problems LBs don't solve (durability, exactly-once delivery, cross-region consistency) and ignore them for problems they do solve cleanly (slow-start protection, hot-route shedding, blue/green deploy gating).</p>
+<hr>
+<h2 id="2-inherent-guarantees">§2. Inherent guarantees</h2>
+<p>Load balancers provide by design:</p>
+<ul>
+<li><strong>Traffic distribution</strong> across the pool, approximately even by some weighting policy (round-robin, least-connections, P2C — Power of Two Choices — random, consistent hash).</li>
+<li><strong>Health awareness</strong> within the check window (2–10s active, sub-second passive).</li>
+<li><strong>Failover within the pool</strong> — backends that die stop receiving new traffic; some idempotent requests can be retried.</li>
+<li><strong>Flow stickiness for live connections</strong> — once a TCP flow is pinned to backend B, it stays on B even as the pool churns.</li>
+<li><strong>Single coherent VIP (Virtual IP) identity to clients</strong> — membership churn is invisible.</li>
+</ul>
+<p>What they do <strong>NOT</strong> provide:</p>
+<ul>
+<li><strong>Durability.</strong> In-flight requests on a crashed backend are lost. The LB does not buffer or persist.</li>
+<li><strong>Exactly-once.</strong> Retries to a new backend may double-execute; idempotency is the application's job.</li>
+<li><strong>End-to-end correctness.</strong> LB sees "backend returned 200"; it does not know the DB write committed.</li>
+<li><strong>Ordering across flows.</strong> Two requests from the same client may land on different backends in any order.</li>
+<li><strong>Strongly-consistent routing.</strong> Two LB boxes may briefly disagree on which backend is healthy. Routing tolerates this — either by being deterministic from a shared table (Maglev) or by the application surviving either choice.</li>
+<li><strong>Transactional drain.</strong> Draining is best-effort; no two-phase commit on connection migration.</li>
+</ul>
+<p>Same pattern as TCP: the layer below delivers bytes, the application above builds the correctness story. Anyone treating an LB as a durability layer will be surprised.</p>
+<hr>
+<h2 id="3-design-space">§3. Design space</h2>
+<table>
+<thead>
+<tr>
+<th>Variant</th>
+<th>Layer</th>
+<th>Throughput per box</th>
+<th>Latency added</th>
+<th>Strengths</th>
+<th>Examples</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Hardware appliance</strong></td>
+<td>L4+L7</td>
+<td>10–40 Gbps line rate</td>
+<td>µs</td>
+<td>Predictable, vendor-supported</td>
+<td>F5 Big-IP, Citrix NetScaler</td>
+</tr>
+<tr>
+<td><strong>Kernel L4 (IPVS, LVS)</strong></td>
+<td>L4</td>
+<td>1–2 Mpps</td>
+<td>5–20 µs</td>
+<td>Native to Linux, simple</td>
+<td>IPVS, LVS-DR (Direct Routing)</td>
+</tr>
+<tr>
+<td><strong>Kernel-bypass L4 (DPDK)</strong></td>
+<td>L4</td>
+<td>10–14 Mpps line rate</td>
+<td>~100 ns</td>
+<td>Max performance</td>
+<td>Google Maglev (DPDK)</td>
+</tr>
+<tr>
+<td><strong>XDP/eBPF L4</strong></td>
+<td>L4</td>
+<td>5–10 Mpps per core</td>
+<td>~50–200 ns</td>
+<td>Kernel-resident, programmable</td>
+<td>Katran, Unimog, Cilium</td>
+</tr>
+<tr>
+<td><strong>User-space L7</strong></td>
+<td>L7</td>
+<td>50–200k RPS HTTPS</td>
+<td>0.5–2 ms</td>
+<td>Battle-tested, rich config</td>
+<td>NGINX, HAProxy</td>
+</tr>
+<tr>
+<td><strong>Modern L7 sidecar</strong></td>
+<td>L7</td>
+<td>50–150k RPS HTTPS</td>
+<td>1–3 ms</td>
+<td>Dynamic xDS, observability</td>
+<td>Envoy at Lyft, Stripe</td>
+</tr>
+<tr>
+<td><strong>Cloud managed</strong></td>
+<td>L7 (mostly)</td>
+<td>Cloud-scaled</td>
+<td>1–10 ms</td>
+<td>Zero ops</td>
+<td>AWS ALB/NLB, GCP HTTP LB</td>
+</tr>
+<tr>
+<td><strong>API gateway</strong></td>
+<td>L7+</td>
+<td>1–50k RPS</td>
+<td>5–50 ms</td>
+<td>Auth, transformation built-in</td>
+<td>Kong, AWS API Gateway</td>
+</tr>
+<tr>
+<td><strong>DB proxy</strong></td>
+<td>L7 protocol-specific</td>
+<td>50k+ QPS</td>
+<td>0.5–2 ms</td>
+<td>Connection pooling, query routing</td>
+<td>PgBouncer, ProxySQL, vtgate</td>
+</tr>
+</tbody>
+</table>
+<p>The crucial split is <strong>L4 (fast, dumb)</strong> vs <strong>L7 (slow, smart)</strong>. Most real stacks <strong>chain</strong> them: L4 absorbs packet-per-second budget, then forwards into L7 for TLS termination, path routing, policy. Cloudflare: Unimog → NGINX-variant. Google: Maglev → GFE (Google Front-End). AWS: NLB + ALB chained.</p>
+<p>The other crucial dimension is <strong>kernel-bypass vs kernel-resident</strong>. DPDK gives the floor on latency and the ceiling on PPS (packets per second) at the cost of losing every kernel networking facility (iptables, tcpdump, eBPF tracing). XDP/eBPF is the modern compromise: stay in the kernel, run a verified bytecode program ahead of the rest of the stack, get ~10x the speed of user space, keep all the kernel tooling. By 2026, new L4 LB projects almost universally pick XDP/eBPF over DPDK unless they need absolute line-rate determinism.</p>
+<hr>
+<h2 id="4-byte-level-mechanics">§4. Byte-level mechanics</h2>
+<p>This is where the technology becomes concrete: load-distribution algorithms, data structures, kernel-bypass paths, and one packet end-to-end.</p>
+<h3 id="4a-consistent-hashing-variants">4a. Consistent hashing variants</h3>
+<p>The naive <code>backend_id = hash(5-tuple) mod N</code> works when N is fixed and fails catastrophically when N changes: adding one backend re-maps <code>(N-1)/N</code> of all flows, so almost every live TCP connection RESETs. Consistent hashing solves this. Three variants ship in production.</p>
+<p><strong>Ring-based (DynamoDB-style, Cassandra-style).</strong> Each backend hashes to K positions on a 2^32 ring (virtual nodes, K=100–500 to flatten variance). For key X: hash to H(X), walk clockwise to the first vnode, return that backend. Lookup is O(log(K·N)) via binary search on a sorted vnode array. K=200, N=1000 = 200k entries, fits in L2 cache, ~100 ns lookups. Adding a backend places K new vnodes; ~1/N of the key space moves. Variance K^(-1/2): K=100 with N=100 gives ~10% load standard deviation. Used by databases (Cassandra, DynamoDB, Riak) where the LB layer is co-designed with storage placement.</p>
+<p><strong>Rendezvous (HRW — Highest Random Weight).</strong> For key X and N backends: compute H(X, B_i) for every backend, pick the highest. O(N) per lookup — too slow for data plane at large N. But exactly 1/N of keys move on add, no vnode tuning, naturally tight distribution. Right pick when N is small (&lt;1000). Used by some CDNs and HDFS for chunk placement.</p>
+<p><strong>Maglev (Google's lookup-table variant).</strong> Used by Maglev, Katran, Unimog, and most modern XDP LBs. Precompute a fixed-size lookup table M of size T (a prime, typically 65537), where <code>M[i]</code> = backend assigned to slot i. To pick: <code>slot = hash mod T</code>, return <code>M[slot]</code>. A single array indexing — <strong>~10 ns, no branches</strong>, fits in L1 cache.</p>
+<p>The slot-assignment algorithm (NSDI 2016 §3.4):</p>
+<ol>
+<li>For each backend B_i, precompute permutation P_i of [0, T) using two hashes:
+   - <code>offset = H1(B_i) mod T</code>
+   - <code>skip = H2(B_i) mod (T-1) + 1</code> (T prime → gcd(skip, T) = 1 → permutation covers [0, T))
+   - <code>P_i[j] = (offset + j * skip) mod T</code></li>
+<li>Fill M in rounds. In round j each backend tries to claim slot <code>P_i[j]</code>. If taken, advance its cursor and try the next slot in its preference order on the next round.</li>
+</ol>
+<p>Worked example, T=7, backends {B1, B2, B3}:</p>
+<pre><code>P_1 = [3, 0, 4, 1, 5, 2, 6]    // B1's preferred slot order
+P_2 = [0, 2, 4, 6, 1, 3, 5]
+P_3 = [3, 4, 5, 6, 0, 1, 2]
+
+Round 0: B1 claims 3 → M[3]=B1; B2 claims 0 → M[0]=B2;
+         B3 tries 3, taken, cursor advances
+Round 1: B1 tries 0, taken; B2 claims 2 → M[2]=B2;
+         B3 claims 4 → M[4]=B3
+Round 2: B1 tries 4, taken; B2 tries 4, taken;
+         B3 claims 5 → M[5]=B3
+Round 3: B1 claims 1 → M[1]=B1; B2 claims 6 → M[6]=B2;
+         B3 done (has T/N ≈ 2 slots)
+
+Final: M = [B2, B1, B2, B1, B3, B3, B2]
+
+Lookup for a 5-tuple hashing to 1234567:
+  slot = 1234567 mod 7 = 4 → backend = M[4] = B3
+</code></pre>
+<p>When B2 dies and we rebuild with {B1, B3}, B2's slots (0, 2, 6) get reassigned per the remaining preference orders, while slots that didn't contain B2 (1, 3, 4, 5) very likely stay put. With T=65537 and a real backend count, ~T/N slots change per backend change — exactly the flows that <em>had</em> to move (the ones on the dying backend), with only a tiny fraction of surviving flows perturbed.</p>
+<p><strong>Why Maglev wins</strong>: O(1) lookup vs O(log N), provably even distribution by construction, single-array data structure. Rebuild is O(T) per backend change, done once on the control plane, pushed to every data-plane node as a ~64KB blob.</p>
+<h3 id="4b-weighted-round-robin-internals">4b. Weighted round-robin internals</h3>
+<p>When backends have different capacities, the LB uses a weight scheduler. Canonical NGINX/IPVS/HAProxy implementation:</p>
+<pre><code>On each request:
+  for each backend i:
+    b[i].current_weight += b[i].effective_weight
+  pick k = argmax(b[i].current_weight)
+  b[k].current_weight -= sum(b[i].effective_weight)
+  return k
+</code></pre>
+<p>Weights 5:1:1 produce the interleaved sequence <code>A A B A A C A A A B A A C ...</code> rather than <code>A A A A A B C A A A A A B C ...</code> — better latency distribution. O(N) per request, fine for N &lt; 10,000.</p>
+<h3 id="4c-least-connections-min-heap">4c. Least-connections (min-heap)</h3>
+<p>Naive O(N) scan is too slow at 5M decisions/sec. Real implementation: <strong>min-heap keyed by <code>active_connections</code></strong> + inverted index <code>backend_id → heap_index</code>. On new flow: peek top, increment, sift O(log N). On flow end: decrement, sift O(log N). For N=1000, log N = 10 ops per decision.</p>
+<p>Production refinement: <strong>P2C (Power of Two Choices).</strong> Pick two random backends, send to the less-loaded. O(1) per request, variance of max load drops from O(log N / log log N) for pure random to O(log log N / log d), and avoids the "thundering herd" pathology where every LB box independently picks the same "least-loaded" backend at the same instant. Envoy's default for LEAST_REQUEST.</p>
+<h3 id="4d-connection-tracking-table-5-tuple-backend">4d. Connection tracking table (5-tuple → backend)</h3>
+<p>The L4 LB does NOT rely on the consistent hash alone. It also keeps a flow table that maps live 5-tuples to backends, so mid-stream packets always hit the same backend even if the consistent-hash table just changed:</p>
+<pre><code class="language-c">struct flow_entry {
+    uint128_t five_tuple_hash;
+    uint32_t  backend_id;
+    uint64_t  last_seen_ns;
+    uint32_t  packets, bytes;
+};
+flow_entry table[16M];  // open-addressed, 2x expected concurrent flow count
+</code></pre>
+<p>On packet arrival: compute 5-tuple hash, probe at <code>hash mod table_size</code>, if found+fresh use cached backend, otherwise fall through to Maglev. Stale entries (idle &gt;60s) reclaimed.</p>
+<p>The flow table is the <strong>stickiness</strong> layer. The Maglev table is the <strong>correctness</strong> layer (new flows + flows after churn). Together: stable mid-flow stickiness + bounded reshuffle on churn + O(1) lookup in the hot path.</p>
+<h3 id="4e-kernel-bypass-paths">4e. Kernel-bypass paths</h3>
+<p>Three options, increasing in performance and decreasing in operational simplicity:</p>
+<p><strong>Option 1: kernel networking stack.</strong> NIC → kernel ring buffer → softirq → IP layer → netfilter → user-space socket → LB → socket → IP → NIC. <strong>~10 µs per packet</strong>, ~500k pps per core, ~6 syscall/context-switch boundaries. Stock NGINX, HAProxy, IPVS path. Fine for L7 where ms of parsing dominate µs of socket I/O. Inadequate for L4 at scale.</p>
+<p><strong>Option 2: DPDK kernel-bypass.</strong> DPDK takes the NIC away from the kernel entirely. A user-space process polls the NIC ring buffer directly via PMD (Poll Mode Driver). Packets never touch the kernel. Hugepages (2 MB or 1 GB) avoid TLB (Translation Lookaside Buffer) misses. Each LB thread pinned to a CPU core; each NIC queue mapped to one core (RSS — Receive Side Scaling — distributes packets by 5-tuple hash on the NIC ASIC). <strong>~100 ns per packet, 10 Mpps per core, line rate at 100 Gbps.</strong> Operational cost: no tcpdump, no iptables; the LB must reimplement ARP (Address Resolution Protocol), ICMP, fragmentation.</p>
+<p><strong>Option 3: XDP/eBPF.</strong> A kernel hook <strong>before</strong> the rest of the network stack. The eBPF program inspects the packet and returns <code>XDP_PASS</code> (continue up the stack), <code>XDP_DROP</code> (discard — DDoS shedding), <code>XDP_TX</code> (re-send out the same NIC after rewrite), or <code>XDP_REDIRECT</code> (different NIC). <strong>~50–200 ns per packet, 5–10 Mpps per core.</strong> eBPF is verified-safe bytecode (no unbounded loops, kernel verifier rejects anything it can't prove terminates within ~1M instructions). The Maglev table lives in a <strong>BPF map</strong> (kernel-resident hash/array map); user space updates via syscall, the eBPF program reads it during packet processing. Operational win: still the kernel — tcpdump, perf, ftrace work on traffic the XDP program PASSes. The 2026 default for new L4 LB projects.</p>
+<h3 id="4f-one-packet-end-to-end">4f. One packet end-to-end</h3>
+<p>A TCP SYN arrives at an XDP-based L4 LB:</p>
+<pre><code>T=0    ns   Packet hits NIC. Ethernet header parsed by NIC ASIC.
+            RSS: NIC hashes the 5-tuple via Toeplitz hash, picks
+            NIC queue 7 of 16. Queue 7 IRQ-bound to CPU core 7.
+
+T=50   ns   Core 7 NAPI poll reads packet descriptor from queue 7's
+            RX ring buffer.
+
+T=80   ns   XDP eBPF program invoked. Walks headers:
+            - bytes [0..14): Ethernet. Read ethertype at offset 12;
+              0x0800 (IPv4) or 0x86DD (IPv6), else XDP_PASS.
+            - bytes [14..34): IPv4. Read proto at +23 (TCP=6),
+              dst_ip at +30. If dst_ip != VIP, XDP_PASS.
+            - bytes [34..54): TCP. Read src_port, dst_port, flags.
+
+T=90   ns   Compute 5-tuple hash: CRC32C with SSE4.2 instruction
+            over (src_ip, src_port, dst_ip, dst_port, proto). ~5 ns.
+
+T=100  ns   Flow table lookup (BPF map). Probe at hash mod tbl_size.
+            Compare full 5-tuple. Hit: use cached backend_id, jump
+            to step 6. Miss (new SYN): continue.
+
+T=130  ns   Maglev lookup:
+              slot = hash mod 65537
+              backend_id = maglev_tbl[slot]  // single mem access
+            Write flow table entry (5-tuple_hash, backend_id, now()).
+
+T=150  ns   Backend info lookup (BPF map): dest_mac, dest_ip.
+
+T=170  ns   Rewrite packet:
+            - DSR (Direct Server Return): rewrite dest_mac to
+              backend_mac, leave IP unchanged. Backend has VIP bound
+              on loopback, accepts the packet, sends response
+              directly to client. Huge return-bandwidth savings.
+            - IPIP / GUE (Generic UDP Encapsulation) / GENEVE tunnel:
+              prepend outer IP with dest = backend_ip. More flexible
+              (crosses L3 boundaries), more overhead.
+
+T=180  ns   Return XDP_TX. NIC transmits out the same port.
+
+T=200  ns   Packet on wire to backend. Total LB hop ~200 ns, no
+            user-space copy, no syscall, no context switch.
+</code></pre>
+<p>At this rate, a 16-core box with 16 NIC queues saturates the 100 Gbps NIC long before saturating CPU. The L4 LB tier in modern hyperscale systems is <strong>bandwidth-bound, not CPU-bound</strong>.</p>
+<h3 id="4g-trade-offs-vs-structures-we-did-not-pick">4g. Trade-offs vs structures we did not pick</h3>
+<ul>
+<li><strong>Maglev vs ring-based</strong>: Maglev wins on lookup speed (O(1) vs O(log N)) and provably-even distribution. Ring wins when LB and storage are co-designed (Cassandra). Pick Maglev for the data plane, ring for storage placement.</li>
+<li><strong>Maglev vs Rendezvous</strong>: Maglev's O(1) is 1000x faster than Rendezvous's O(N) at N=1000. Rendezvous is fine for control-plane decisions made once per minute; Maglev is required for data-plane decisions made once per microsecond.</li>
+<li><strong>Maglev vs hash-mod-N</strong>: hash-mod-N is O(1) and simple but reshuffles (N-1)/N of all flows on backend change. Never use for stateful LB.</li>
+<li><strong>L4 vs L7 forwarding</strong>: L4 is faster (1 memory access vs HTTP parse) and protocol-agnostic. L7 can route on path/header. We chain them.</li>
+</ul>
+<h3 id="4h-soft-state-durability">4h. Soft-state durability</h3>
+<p>The L4 LB has <strong>no persistent state in the request path</strong>. The Maglev table is reconstructed deterministically from the backend list (which lives in a strongly-consistent control plane — etcd, Consul, Zookeeper). The flow table is <strong>soft state</strong>: if an LB box dies, surviving LBs (which get those flows via ECMP — Equal-Cost Multi-Path — rehash) compute the <strong>same Maglev table</strong> and route to the <strong>same backend</strong>. Flows keep working with a handful of packets dropped during the ~100 ms ECMP rehash window. This is the architectural trick that makes the LB tier stateless from a durability perspective: no replication, no failover dance.</p>
+<p>L7 LB is approximately stateless too — TLS session state, HTTP/2 connection state in process memory. If an L7 box dies, in-flight requests RESET; clients retry; traffic shifts via ECMP from below. Worst case: 5–10 seconds of client-visible degradation for the in-flight requests on the dead box.</p>
+<hr>
+<h2 id="5-capacity-envelope">§5. Capacity envelope</h2>
+<p>The numbers span six orders of magnitude. Real deployments anchored to the envelope:</p>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Example</th>
+<th>Reported scale</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hobby / small shop</td>
+<td>Single NGINX</td>
+<td>~10k RPS</td>
+</tr>
+<tr>
+<td>Mid-size SaaS</td>
+<td>HAProxy at Stack Overflow (2016)</td>
+<td>~30k RPS sustained, 70k peak</td>
+</tr>
+<tr>
+<td>GitHub</td>
+<td>HAProxy + GLB (GitHub LB)</td>
+<td>~1M RPS peak</td>
+</tr>
+<tr>
+<td>Stripe / Lyft</td>
+<td>Envoy fleet (mesh + edge)</td>
+<td>~250k RPS per Envoy, fleet-wide millions</td>
+</tr>
+<tr>
+<td>Netflix Open Connect</td>
+<td>NGINX CDN appliances</td>
+<td>100+ Gbps per appliance, multi-Tbps fleet</td>
+</tr>
+<tr>
+<td>Facebook Katran</td>
+<td>XDP/eBPF L4 LB</td>
+<td>~5 Mpps per server, tens of Mpps per cluster</td>
+</tr>
+<tr>
+<td>Google Maglev</td>
+<td>DPDK L4 LB (2016)</td>
+<td>~1 Mpps per box in DPDK, &gt;1 Tbps per cluster</td>
+</tr>
+<tr>
+<td>Cloudflare edge</td>
+<td>Unimog (XDP) + modified NGINX</td>
+<td>&gt;1B req/day, 60M RPS peak; mitigates &gt;100 Tbps DDoS</td>
+</tr>
+<tr>
+<td>AWS Hyperplane (NLB)</td>
+<td>Internal AWS L4 fleet</td>
+<td>Millions of RPS per NLB, 20M+ concurrent conns per AZ, &lt;100µs added</td>
+</tr>
+</tbody>
+</table>
+<p>The envelope spans <strong>10k RPS (single nginx) to 60M RPS (Cloudflare edge during DDoS)</strong>, packet rates from ~50k pps to 100+ Mpps per box. Architecture changes at inflection points: single nginx works until ~100k RPS, then ECMP'd cluster; ~1M RPS needs L4+L7 split with kernel-bypass at L4; ~10M RPS needs multi-region anycast; ~100M RPS needs partitioned Maglev tables across regions. Per-layer latency: L4 adds ~0.1 ms median, ~1 ms p99; L7 with TLS adds ~1 ms median, ~10 ms p99 (TLS handshake dominates); geographic anycast adds ~5–30 ms RTT depending on PoP density.</p>
+<hr>
+<h2 id="6-architecture-in-context">§6. Architecture in context</h2>
+<p>The canonical multi-tier topology, generalized across hyperscalers:</p>
+<pre><code>              Client (browser, mobile, IoT, gRPC client)
+                              │
+                              │ DNS query
+                              ▼
+                   ┌──────────────────────┐
+                   │  GeoDNS / Anycast DNS │  returns anycast VIP
+                   └──────────┬───────────┘
+                              │ TCP SYN / UDP / QUIC to anycast IP
+                              ▼
+              BGP advertises same VIP from N PoPs
+                  Internet routes to NEAREST PoP
+                              ▼
+        ┌────────────────────────────────────────┐
+        │   PoP Edge Router (ECMP, 5-tuple hash) │
+        └─────┬─────────────┬─────────────┬──────┘
+              ▼             ▼             ▼
+        ┌─────────┐   ┌─────────┐   ┌─────────┐
+        │ L4 LB#1 │   │ L4 LB#2 │   │ L4 LB#M │
+        │ XDP/eBPF│   │ XDP/eBPF│   │ XDP/eBPF│
+        │Maglev tbl│  │Maglev tbl│  │Maglev tbl│
+        │flow tbl │   │flow tbl │   │flow tbl │
+        └────┬────┘   └────┬────┘   └────┬────┘
+             │ DSR or IPIP/GUE tunnel    │
+             └────────┬──────────────────┘
+                      ▼
+        ┌──────────────────────────────────┐
+        │ L7 LB tier (Envoy / NGINX)       │
+        │ - TLS terminate (TLS 1.3, HTTP/3)│
+        │ - Path/header routing            │
+        │ - WAF, rate limit, retry, circ b │
+        └────────────┬─────────────────────┘
+                     ▼ HTTP/2 + mTLS
+        ┌──────────────────────────────────┐
+        │ Backend pool (1000s of pods)     │
+        │ /healthz, /ready                 │
+        └──────────────────────────────────┘
+
+Control plane (out of band):
+  ┌───────────────────────────────────────────────┐
+  │ Health checker + config (etcd / xDS)          │
+  │ - polls /healthz every 2–5s                   │
+  │ - rebuilds Maglev table on backend churn      │
+  │ - pushes table to all L4 LBs (deterministic   │
+  │   from backend list, ~64KB blob)              │
+  │ - pushes route configs to all L7 (xDS)        │
+  └───────────────────────────────────────────────┘
+</code></pre>
+<p>This pattern repeats whether the workload is public web (Cloudflare/Google), internal microservices (Envoy mesh at Lyft), DB connection routing (PgBouncer + ProxySQL in front of MySQL), or real-time video (Netflix Open Connect). At the small end it's just NGINX; at the large end it's anycast + L4 + L7 + mesh. Shape is identical.</p>
+<p>Two architectural levers:</p>
+<ul>
+<li><strong>Anycast</strong> makes a single VIP globally addressable. BGP advertises the same IP from every PoP; routing delivers each client to the topologically nearest. Failover is automatic on BGP withdrawal (~10–60s with tuning).</li>
+<li><strong>ECMP</strong> makes a single anycast PoP capacity-scaled. N L4 LB boxes behind the edge router; ECMP spreads packets by 5-tuple hash. When an LB dies, ECMP rehashes; surviving LBs run the <strong>same Maglev table</strong> so flows route to the <strong>same backend</strong> without state migration. This is what makes the LB tier durably stateless.</li>
+</ul>
+<hr>
+<h2 id="7-hard-problems">§7. Hard problems</h2>
+<h3 id="problem-1-stable-hashing-under-churn">Problem 1: Stable hashing under churn</h3>
+<p><strong>Naive</strong>: <code>backend_id = hash(5-tuple) mod N</code>. <strong>Fails</strong>: N changes 100→101 on deploy, 99% of flows get a different <code>backend_id</code>, all RESET — site appears to go down on every deploy. <strong>Fix</strong>: Maglev lookup table (§4) — only ~1/N of flows perturb on N→N+1. Plus the flow tracker that pins live 5-tuples to their original backend even when the table changes.</p>
+<p>State walkthrough: 1M live TCP connections across 100 backends, T=65537, ~655 slots per backend. At T=10s, B73 gracefully removed; table rebuilt with N=99. The ~655 slots that pointed to B73 are spread across the other 99 backends. Existing flows in the flow table → original backend until they drain. New flows → new table. Total perturbed: ~10k flows that were on B73, plus near-zero on other backends. ~1% perturbation on a 1% pool change.</p>
+<h3 id="problem-2-slow-start-protection-new-backend-gets-crushed">Problem 2: Slow-start protection — new backend gets crushed</h3>
+<p><strong>Naive</strong>: New backend B100 joins; table rebuilt; B100 immediately gets its 655 slots and 1% of all traffic. <strong>Fails</strong>: B100 has cold caches, cold JITs (Just-In-Time compilers), empty connection pools. p99 spikes to 5 seconds; B100 trips its own circuit breakers; health check fails; B100 ejected. Pool reverts to 99 backends sized assuming B100 was up. Cascading failure. <strong>Fix</strong>: weighted ramp-up. Table built with B100 at weight 0.01 → 0.1 → 0.5 → 1.0 over 60s. Envoy's <code>slow_start_config</code> declaratively; for Maglev, B100 claims a fractional slot count proportional to weight. Common in payments (a new gateway warming its connection to a slow upstream like the card network) and feed-ranking (an in-memory ML model taking 30s to JIT-compile hot paths).</p>
+<h3 id="problem-3-hot-backend-one-box-overloaded-despite-balanced-lb">Problem 3: Hot backend — one box overloaded despite balanced LB</h3>
+<p><strong>Naive</strong>: LB does even Maglev hashing or round-robin. <strong>Fails</strong>: One backend hosts a celebrity user getting 5M req/sec, or has a degrading disk, or is on a noisy hypervisor. LB has no idea; keeps sending its share. <strong>Fix</strong>: P2C + outlier detection. P2C: pick two random backends per request, send to the less-loaded; max-load variance drops dramatically. Outlier detection (Envoy <code>outlier_detection</code>): eject backends whose error rate or latency is &gt;3σ above cluster mean for &gt;30s, probe them back after a recovery window. Search workloads use this heavily — one slow shard blows up the p99 of a fan-out query. ML inference services do the same for GPU boxes hitting thermal throttling.</p>
+<h3 id="problem-4-health-check-accuracy-false-positive-ejects-everyone">Problem 4: Health-check accuracy — false positive ejects everyone</h3>
+<p><strong>Naive</strong>: Every backend's <code>/healthz</code> checks "can I reach the DB?" The DB has a 2-min outage. <strong>Fails</strong>: All backends simultaneously unhealthy. LB ejects all. Site dark even after DB recovers. <strong>Fix</strong>: layered health + panic mode. <code>/healthz</code> = process alive (TCP accept works). <code>/ready</code> = ready to serve. LB uses <code>/healthz</code>; orchestrator (Kubernetes) uses both. Panic mode (Envoy <code>healthy_panic_threshold</code>, default 50%): if more than half are unhealthy, route to ALL of them including the "unhealthy" — better to send traffic to backends that might serve it than to a guaranteed-empty pool. State walkthrough on an observability backend fronting a Prometheus ingestion fleet: 100 ingesters, all healthy; downstream storage hiccups; by T=30s all 100 report unhealthy. Without panic mode: 503 on every scrape, alerts fire on the wrong thing. With panic mode: traffic still flows, error rate caps at maybe 30% instead of 100%.</p>
+<h3 id="problem-5-sticky-session-vs-failover">Problem 5: Sticky session vs failover</h3>
+<p><strong>Naive</strong>: User session in backend memory; LB uses cookie-stickiness to pin user to B7. <strong>Fails</strong>: B7 dies, user loses cart. <strong>Fix</strong>: move session state to Redis/DynamoDB; backends become stateless. Sticky sessions become a <em>performance</em> optimization (warm L1 cache), not a correctness requirement. For workloads that genuinely need sticky — WebSocket (long-lived TCP that can't be reopened transparently), real-time gaming (each player's UDP flow must reach the same game-state authority for the match duration), interactive video conferencing (same SFU — Selective Forwarding Unit — mixes audio for a room) — failover semantics must be explicit: LB sends RST, client reconnects, new backend handles the reconnect (potentially with state-recovery from a session store). The application protocol must tolerate this.</p>
+<h3 id="problem-6-tls-termination-cost">Problem 6: TLS termination cost</h3>
+<p><strong>Naive</strong>: Every request does a fresh TLS 1.2 RSA-2048 handshake. <strong>Fails</strong>: At 1M handshakes/sec, ~500 CPU cores of crypto — LB becomes CPU-bound on TLS, not routing. <strong>Fix</strong>: stack of optimizations. (1) <strong>TLS 1.3</strong> with X25519 ECDHE: 1-RTT handshake, ECDSA P-256 ~0.1 ms vs RSA ~1 ms — ~10x. (2) <strong>Session resumption</strong> via PSK (Pre-Shared Key) tickets: returning clients skip the handshake; ~95% become 0-RTT or 1-RTT abbreviated — ~20x. (3) <strong>Hardware acceleration</strong>: AES-NI, QAT (Intel QuickAssist), HSM (Hardware Security Module) — 5x. (4) <strong>Connection multiplexing</strong>: HTTP/2 reuses one TLS connection for many requests — handshake amortized over 100s of requests. Combined: 1M handshakes/sec → ~5k handshakes/sec, easily handled. Public web relies on this heavily; mesh mTLS would melt CPUs without HTTP/2 multiplexing and certificate caching.</p>
+<h3 id="problem-7-syn-floods-and-l3l4-ddos">Problem 7: SYN floods and L3/L4 DDoS</h3>
+<p><strong>Naive</strong>: Attacker sends 1M SYN/sec with spoofed source IPs; LB allocates a flow entry per SYN. <strong>Fails</strong>: Flow table fills, legit flows displaced, site dies. <strong>Fix</strong>: SYN cookies at L4 — encode connection state in the SYN-ACK's initial sequence number; LB stores zero state for half-open connections. Verify the cookie on ACK arrival before allocating. Linux kernel does this natively; XDP-based LBs implement it in eBPF. For volumetric DDoS (100 Gbps of garbage), the LB triggers BGP blackholing of the attacker's prefix upstream; Cloudflare does this autonomously through its global DDoS detector.</p>
+<hr>
+<h2 id="8-failure-modes">§8. Failure modes</h2>
+<h3 id="mode-a-single-l4-lb-box-crashes">Mode A: Single L4 LB box crashes</h3>
+<p>10 L4 LB boxes, ECMP across them, each holding ~10% of flows. LB-7 fails. Edge router's ECMP detects it dead (BFD — Bidirectional Forwarding Detection — link probe at 100 ms intervals or BGP session drop). ECMP rehashes across the 9. Flows that hit LB-7 now hit LB-3; LB-3 has no flow table entry, falls through to Maglev — <strong>same Maglev table on every LB</strong> → same backend. Flow continues. ~5–10 packets lost during transition. <strong>Durability point</strong>: the Maglev table itself, replicated by control plane to every LB; no per-flow state needs cross-replication.</p>
+<h3 id="mode-b-entire-pop-goes-dark">Mode B: Entire PoP goes dark</h3>
+<p>PoP fiber cut. BGP detects no peer (or external monitor withdraws the route). Within 10–60s (BGP convergence), traffic to the anycast VIP shifts to the next-nearest PoP. All in-flight TCP at the dead PoP RESETs; clients retry, retry lands at new PoP; new connections work immediately. <strong>Durability point</strong>: BGP routes + the backend pool reachable from every PoP.</p>
+<h3 id="mode-c-control-plane-death">Mode C: Control-plane death</h3>
+<p>etcd/Consul cluster crashes. Data plane keeps running with the <strong>last known Maglev table</strong> — data plane never reads from control plane in the hot path; the table is pre-pushed. Backend additions/removals stall; backends that die look up to LB → LB still forwards → backend doesn't respond → L7 LB notices via passive health check (timeouts) and ejects. <strong>Durability point</strong>: the data plane's local cached table; control plane is not in the request path. This is a load-bearing decision — control planes routinely have higher unavailability than data planes, and the data plane must ride out 30-minute control-plane outages.</p>
+<h3 id="mode-d-partition-between-l4-and-l7">Mode D: Partition between L4 and L7</h3>
+<p>L4 LB can reach 30% of L7 LBs (rest are isolated). L4's Maglev table still lists all L7s as alive. 70% of flows time out. <strong>Fix</strong>: L4 has its own active health check on the L7 tier (separate from L7's check on backends). Within ~5s the L4 notices the dead L7s, rebuilds its table, continues on the remaining 30%. <strong>Durability point</strong>: each L4 makes its own eviction decision based on local probes — no cross-LB coordination.</p>
+<h3 id="mode-e-permanent-loss-simultaneous-deploy">Mode E: Permanent loss + simultaneous deploy</h3>
+<p>100 backends; 30 being rolled (10 at a time); mid-deploy a hardware failure takes out 15 more. Effective pool 100 → 55. Each backend now sees ~80% more traffic. If sized at 60% baseline, this pushes them to 108% → spiral. <strong>Fix</strong>: capacity buffer N+2 (one for failure, one for deploy) plus deploy gates that pause if observed error rate spikes. Combine with slow-start (Problem 2) so warming boxes don't get crushed during recovery.</p>
+<hr>
+<h2 id="9-why-not-round-robin-dns">§9. Why not round-robin DNS</h2>
+<p>The classic Junior answer: "Just give DNS multiple A records." It's almost right and totally wrong.</p>
+<p><code>dig api.example.com</code> → <code>[198.51.100.1, ..., .10]</code>. Client picks one (typically first), opens TCP.</p>
+<p><strong>Failure 1 — no health awareness.</strong> Backend .5 dies. DNS still returns it. Until DNS is updated AND TTLs expire on every resolver in the world, ~10% of traffic hits a dead backend. TTL of 60s is the <em>floor</em>; ISPs and mobile carriers cache well beyond TTL.</p>
+<p><strong>Failure 2 — no stickiness.</strong> Client may pick .3 first request and .7 second (resolver behavior is implementation-defined). In-memory session, sticky upload chunk, WebSocket — all break.</p>
+<p><strong>Failure 3 — uneven distribution.</strong> Round-robin DNS distributes across <em>resolvers</em>, not clients. If 80% of users are behind one big ISP resolver that cached .1, you get 80% on .1.</p>
+<p><strong>Failure 4 — no L7 features.</strong> No path routing, no TLS termination, no WAF, no rate limit, no canary.</p>
+<p><strong>Failure 5 — minutes-to-hours failover.</strong> DNS-driven failover is bounded by the worst-cached TTL on the planet. Anycast + LB failover is bounded by BGP convergence — 10–60s, sometimes sub-10s with reflectors. For 99.99% SLA, DNS-only is unviable.</p>
+<p>DNS load balancing is fine as a layer <em>above</em> the LB tier — picking which region's anycast VIP to send the client to. Bad substitute <em>for</em> the LB tier.</p>
+<hr>
+<h2 id="10-scaling-axes">§10. Scaling axes</h2>
+<h3 id="type-1-uniform-growth-more-backends-more-traffic">Type 1: uniform growth (more backends, more traffic)</h3>
+<table>
+<thead>
+<tr>
+<th>Scale</th>
+<th>Topology</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1k RPS</td>
+<td>Single NGINX, no L4 layer</td>
+</tr>
+<tr>
+<td>100k RPS</td>
+<td>NGINX cluster (3 boxes), ECMP'd, active-active</td>
+</tr>
+<tr>
+<td>1M RPS</td>
+<td>L4 + L7 split; L4 with kernel bypass underneath L7</td>
+</tr>
+<tr>
+<td>10M RPS</td>
+<td>Multi-region anycast, 3 regions, BGP-driven failover</td>
+</tr>
+<tr>
+<td>100M RPS</td>
+<td>Anycast across 50+ PoPs; Maglev table sizing matters — 65537 slots, 1k backends, 65 slots each</td>
+</tr>
+</tbody>
+</table>
+<p>Inflection points: ~100k RPS (outgrow single NGINX → cluster + ECMP); ~1M RPS (outgrow user-space-only → L4 with kernel bypass); ~10M RPS (outgrow single region → multi-region); ~100M RPS (outgrow single Maglev table → partitioned tables per region or larger T).</p>
+<h3 id="type-2-hot-route-concentrated">Type 2: hot route concentrated</h3>
+<p>The fleet might be sized for 10M RPS uniformly, but one route — <code>/api/feed</code> for a feed-heavy product, <code>/api/checkout</code> for a flash sale, <code>/v1/inference/recommend</code> for a hot new model — takes 80% of traffic. Adding boxes doesn't help; the hot route concentrates on a fixed backend pool.</p>
+<p>Fixes:
+- <strong>Per-route connection pools</strong> sized by traffic share, not equally
+- <strong>Per-route circuit breakers</strong> — when feed saturates, shed feed with 503s, protect checkout (Envoy <code>cluster.max_pending_requests</code>)
+- <strong>Per-route priority</strong> — checkout requests get queueing priority over feed
+- <strong>Request coalescing</strong> — when a single user dominates (a celebrity's profile gets 5M req/sec), recognize identical concurrent requests in a small window and fan one backend response back to many clients (Cloudflare, Varnish)</p>
+<p>The deepest hot-route scenarios (celebrity hotspot, sale-day overload) are architectural problems above the LB, but the LB enforces shedding and prioritization.</p>
+<hr>
+<h2 id="11-decision-matrix-vs-adjacent-categories">§11. Decision matrix vs adjacent categories</h2>
+<table>
+<thead>
+<tr>
+<th>Need</th>
+<th>Right tool</th>
+<th>Why not the alternative</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Distribute TCP/UDP across N backends with stickiness, sub-ms hop, packet-level perf</td>
+<td><strong>L4 LB</strong> (Maglev / Katran / Unimog / NLB)</td>
+<td>L7 is 100x slower per packet</td>
+</tr>
+<tr>
+<td>HTTP path routing, TLS terminate, per-route rate limit, retries</td>
+<td><strong>L7 LB</strong> (Envoy / NGINX / HAProxy / ALB)</td>
+<td>L4 can't see paths; API gateway adds 5–50ms not justified hot-path</td>
+</tr>
+<tr>
+<td>Inter-service mTLS mesh with observability, retries, canary</td>
+<td><strong>Service mesh</strong> (Envoy sidecars + Istio/Linkerd)</td>
+<td>Standalone L7 works but mesh embeds policy at every pod</td>
+</tr>
+<tr>
+<td>Cache content at the edge</td>
+<td><strong>CDN</strong> (Cloudflare, Akamai, Fastly, Open Connect)</td>
+<td>LB doesn't cache; CDN has its own LB inside</td>
+</tr>
+<tr>
+<td>Auth, schema validation, throttling, transformation at API edge</td>
+<td><strong>API gateway</strong> (Kong, AWS API Gateway, Apigee)</td>
+<td>L7 LB does some, but gateways add features at higher latency</td>
+</tr>
+<tr>
+<td>Pool DB connections, route reads/writes</td>
+<td><strong>DB proxy</strong> (PgBouncer, ProxySQL, vtgate)</td>
+<td>Generic L7 doesn't speak Postgres wire protocol</td>
+</tr>
+<tr>
+<td>First-hop coarse geographic distribution</td>
+<td><strong>GeoDNS</strong></td>
+<td>DNS-as-LB broken at scale (§9); DNS-on-top fine</td>
+</tr>
+</tbody>
+</table>
+<p>Thresholds: single backend hits ~30k RPS → add L4 LB. HTTPS terminate burns &gt;30% backend CPU → move to L7 LB. Global clients → anycast + multi-PoP L4. Microservice topology &gt;20 services with mTLS → service mesh. Public clients globally → CDN. API consumers need auth/throttling → API gateway in front of L7.</p>
+<hr>
+<h2 id="12-use-case-gallery">§12. Use case gallery</h2>
+<h3 id="public-web-traffic-cloudflare-akamai-fastly">Public web traffic (Cloudflare, Akamai, Fastly)</h3>
+<p>The textbook stack. Anycast VIPs from 300+ PoPs. L4 (Unimog at Cloudflare, custom forwarders at Akamai) does packet-level forwarding with Maglev hashing in XDP/eBPF at ~5 Mpps per box. L7 (NGINX-variant at Cloudflare, Apache Traffic Server at Akamai) does TLS 1.3 terminate, HTTP/3 (QUIC), WAF, rate limit, CDN cache lookup. The hard problem is DDoS — Cloudflare mitigates multi-Tbps attacks by dropping packets in XDP before they reach L7.</p>
+<h3 id="internal-microservices-envoy-in-a-service-mesh">Internal microservices (Envoy in a service mesh)</h3>
+<p>At Lyft, Stripe, Airbnb, every pod has an Envoy sidecar that handles outgoing requests with mTLS, retries, circuit breaking, observability (per-call tracing + metrics), connection pooling to N upstream pods. Cluster membership pushed via xDS from a control plane (Istio Pilot, custom). The hard problem is fan-out — one user request touches 50 services, so a 1% per-hop failure rate produces a 40% end-to-end failure rate; retries and hedging are essential.</p>
+<h3 id="database-connection-pooling-pgbouncer-proxysql-vtgate">Database connection pooling (PgBouncer, ProxySQL, vtgate)</h3>
+<p>Postgres connections are expensive (fork-per-connection, ~10 MB RSS each, ~ms to establish). A direct topology with 10k pods × 10 conns/pod = 100k connections explodes the DB. PgBouncer pools and shares ~100 backend connections among 100k client connections via transaction-level multiplexing. ProxySQL/vtgate go further — parse SQL, route reads to replicas, writes to primary, support read-after-write via session pinning, shard queries to the right keyspace.</p>
+<h3 id="api-gateway-routing-kong-aws-api-gateway-apigee">API gateway routing (Kong, AWS API Gateway, Apigee)</h3>
+<p>External developers hit one endpoint; gateway authenticates (OAuth2, API key, JWT), enforces per-customer quotas, applies request transformation (REST→gRPC, version mapping), routes to the right microservice. Higher latency budget (5–50 ms) than a pure LB because of policy layers. L7 LB with extensive plugin architecture optimized for policy enforcement.</p>
+<h3 id="video-streaming-routing-netflix-open-connect-youtube-cdn">Video streaming routing (Netflix Open Connect, YouTube CDN)</h3>
+<p>Open Connect appliances (OCAs) run NGINX-based servers inside ISP networks. Client requests for a video segment go through Netflix's control plane to pick the best OCA — same-ISP if available, nearest otherwise, with capacity checks. The LB is split: a global service decides which OCA owns the user's session, then DNS or HTTP redirect sends the client there. OCAs handle 100k+ concurrent HTTPS, multi-Gbps each.</p>
+<h3 id="real-time-gaming-low-latency-udp-lb">Real-time gaming (low-latency UDP LB)</h3>
+<p>A multiplayer match has 64 players each sending UDP every 20–50 ms to the game-state authority. The LB must route all 64 players' UDP flows to the same backend (the authoritative game server) for the match's duration. UDP has no connection; "stickiness" is (src_ip, src_port) → game_id mapping that lasts the match. Hard problems: sub-50 ms p99 LB hop latency, sticky failover (if the server dies, a new server must inherit game state — usually outside LB scope). L4 UDP LB with a custom session table keyed on game_id rather than 5-tuple.</p>
+<h3 id="database-read-replica-routing">Database read-replica routing</h3>
+<p>A primary + 10 read replicas. The LB (often inside the DB driver, or ProxySQL) routes reads to a least-loaded healthy replica and writes to the primary. Replica lag is the constant problem — a read right after a write may hit a replica that hasn't caught up. Solutions: session-pin reads-after-writes to the primary for N seconds, or LSN (Log Sequence Number) tracking where the client requests a minimum LSN and the LB picks a replica caught up. Protocol-aware L7 LB with replica-lag awareness.</p>
+<hr>
+<h2 id="13-real-world-implementations-with-numbers">§13. Real-world implementations with numbers</h2>
+<ul>
+<li><strong>Google Maglev</strong> (NSDI 2016). Distributed software L4 LB. ~1 Mpps per box in DPDK; cluster &gt;1 Tbps fronting Search, YouTube, GCP. Introduced the lookup-table consistent-hash algorithm every modern L4 copies.</li>
+<li><strong>Facebook Katran</strong> (open-sourced 2018). XDP/eBPF L4 LB. ~5 Mpps per server. Fronts every Meta property. Maglev-style consistent hashing in eBPF maps.</li>
+<li><strong>Cloudflare Unimog</strong> (~2020). XDP-based L4 LB. &gt;1B req/day, ~60M RPS peak, mitigates &gt;100 Tbps DDoS.</li>
+<li><strong>AWS Hyperplane</strong> (NLB data plane). Fleet of compute nodes with shared-memory flow tables. Millions of RPS per NLB, 20M+ concurrent connections per AZ, sub-100µs added latency.</li>
+<li><strong>AWS ALB</strong>. Managed L7. Scales by LCUs (Load Balancer Capacity Units). Sustained ~25–100k RPS per ALB.</li>
+<li><strong>NGINX at Netflix Open Connect</strong>. Every OCA appliance runs NGINX as HTTPS terminator + HTTP range-byte responder. Hundreds of thousands of concurrent connections per appliance, multi-Gbps.</li>
+<li><strong>HAProxy at GitHub</strong>. Fronts github.com, ~1M+ RPS, Lua-based routing for Git over HTTPS, Git over SSH proxy, API, web UI.</li>
+<li><strong>HAProxy at Stack Overflow</strong> (2016). ~30k RPS sustained, 70k peak, ~6 HAProxy boxes fronting the entire site.</li>
+<li><strong>Envoy at Lyft</strong>. Designed and open-sourced 2016, both edge and sidecar. ~250k RPS per proxy at peak. xDS dynamic config protocol originated here.</li>
+<li><strong>Envoy at Stripe</strong>. mTLS everywhere, sophisticated retry + idempotency-key handling. Millions of RPS fleet-wide.</li>
+<li><strong>GLB (GitHub Load Balancer)</strong> (open-sourced 2018). IPVS-based L4 with a "director" tier that consistently hashes flows to LB boxes, handling backend failures without ECMP rehash issues.</li>
+<li><strong>PgBouncer at Heroku, Instagram (early)</strong>. Multiplexes thousands of client connections onto tens of backend connections — 100x cut.</li>
+<li><strong>Vitess vtgate at YouTube, Slack</strong>. MySQL L7 LB that shards queries, hides shard topology. Millions of QPS at YouTube.</li>
+<li><strong>Linkerd at Microsoft, Buoyant customers</strong>. Rust-based sidecar proxy as a service-mesh alternative to Envoy.</li>
+</ul>
+<p>The spread is <strong>~10k RPS to ~60M RPS</strong> with 5–6 orders of magnitude of capacity envelope and very different architectural choices at each tier.</p>
+<hr>
+<h2 id="14-l7-routing-rules-in-depth">§14. L7 routing rules in depth</h2>
+<p>L4 routes by 5-tuple; L7 routes by everything in the request. The L7 routing language is what separates a packet forwarder from a programmable application gateway. Envoy's HTTP route configuration (RouteConfiguration → VirtualHost → Route) is the canonical model that most of the industry now mirrors (Istio VirtualService, Gloo, AWS App Mesh, Contour HTTPProxy, Linkerd ServiceProfile). Walking the dimensions:</p>
+<p><strong>Host-based routing.</strong> The first cut. <code>Host: api.example.com</code> lands on one VirtualHost (VH), <code>Host: admin.example.com</code> on another. Wildcards: <code>*.example.com</code> matches subdomains; longest-match wins (<code>api.foo.example.com</code> beats <code>*.example.com</code>). At Cloudflare or any multi-tenant edge, host-based routing scales to millions of VirtualHosts; the routing data structure is a radix trie on the reversed FQDN (Fully Qualified Domain Name) so longest-suffix-match is O(label count). One IP + one cert (via SNI — Server Name Indication, see §16) + one Envoy fleet serves the entire tenant base.</p>
+<p><strong>Path-based routing.</strong> Within a VirtualHost, match by URL (Uniform Resource Locator) path. Three modes: exact (<code>/health</code>), prefix (<code>/api/v1/</code>), regex (<code>^/users/(\d+)$</code>). Performance ordering: exact (hash lookup, ~10 ns) &gt; prefix (trie walk, ~100 ns) &gt; regex (RE2 — Google's safe regex engine — ~µs). Order matters in Envoy — routes are evaluated top-to-bottom on the first match; misplacing a catch-all <code>/</code> ahead of <code>/api/v1/users</code> will black-hole the specific route. Common pattern: top-level catch-all routes per service prefix → service-internal routes refine further.</p>
+<p><strong>Header-based routing (the canary primitive).</strong> Match on arbitrary request headers. The canonical canary case: <code>x-canary: true</code> routes to the new version's cluster, everything else to stable. Combined with header injection at the entry point (mobile app sends <code>x-canary: true</code> for internal employees by user-ID lookup), you get <strong>employee-only canary</strong> before opening to the public. The same primitive does <strong>dark launches</strong> (read-only canary that doesn't affect user state), <strong>A/B tests</strong> (header set by an experiment-assignment service upstream), and <strong>traffic replay</strong> (header added by a replay tool that mirrors prod traffic to staging).</p>
+<p><strong>Weight-based routing (gradual rollout).</strong> Within one route match, split traffic by weighted clusters: 99% to v1, 1% to v2 → 95/5 → 50/50 → 1/99 → 0/100, over hours or days. The weights are a control-plane knob (xDS push or Istio VirtualService update); Envoy converges within milliseconds. The probabilistic split is per-request and stateless; if a user must consistently see one variant, combine with a <strong>hash policy</strong> (e.g., <code>hash on cookie userId, modulo 100, compare to weight</code>) to make the choice sticky. This is the bedrock of progressive delivery — <code>kubectl apply</code> on a Flagger or Argo Rollouts CRD (Custom Resource Definition) drives the weights automatically based on observed error rate and latency from a metrics provider (Prometheus / Datadog).</p>
+<p><strong>Query-parameter-based routing.</strong> Match on <code>?version=v2</code> or <code>?region=eu</code>. Less common than header-based at the edge (URL parameters are user-visible and cacheable, which can be wrong for canary), but heavily used by internal API gateways where the query string is part of the contract.</p>
+<p><strong>Mirroring / shadowing (the test-in-prod primitive).</strong> Send N% of real traffic to a secondary cluster, <strong>ignore the response</strong>. The client sees only the primary's response, so user-visible behavior is unchanged. The shadow cluster (typically a new version) sees real production load and emits its own logs/metrics. Differential analysis compares primary-vs-shadow latency, error rate, response bodies (modulo non-determinism). Envoy <code>request_mirror_policies</code> does this natively — fire-and-forget, response discarded. Caveats: side effects double-execute (do not mirror writes against the real DB; the shadow needs a sandboxed datastore or read-only mode), and the shadow's load doubles the upstream pressure on dependencies (cache, search) unless they're sandboxed too.</p>
+<p><strong>Composability.</strong> All these dimensions stack. A real Envoy route might say "if Host is api.example.com AND path matches /v2/feed AND header x-experiment-bucket is in {7..9}, then 95% to stable, 5% to canary, mirroring 10% of traffic to integration-test cluster." Envoy compiles the whole tree into a route-matching DAG (Directed Acyclic Graph) and evaluates per request at ~100k RPS per core. Service mesh control planes (Istio Pilot, Linkerd's destination controller) own the high-level intent (canary at 5%) and translate to xDS RouteConfiguration blobs pushed to data planes.</p>
+<hr>
+<h2 id="15-health-check-strategies">§15. Health check strategies</h2>
+<p>The LB's view of backend health drives every routing decision; health-check accuracy is therefore load-bearing for site availability. Three families, plus several wire-protocol choices.</p>
+<p><strong>Active health checks.</strong> LB polls each backend on a schedule (<code>/healthz</code> every 2–5 seconds is typical). Pass → mark healthy and routable; fail → eject after a threshold (3 consecutive failures is the Envoy default for <code>unhealthy_threshold</code>); pass after eviction → re-add after a recovery threshold. Pros: fast detection of fully dead boxes (the box that stopped responding to TCP), independent of real traffic, evenly probes the fleet. Cons: at fleet scale this becomes a <strong>health-check storm</strong> — 1000 backends × every LB checks every 10 seconds = 100 probes/sec per backend, and on a 1000-LB / 1000-backend mesh it's 100k probes/sec just for liveness. Mitigation: sample (each LB checks a random subset of backends), share results across LBs via the control plane, or use <strong>lazy probing</strong> where backends are only probed if they haven't received real traffic in N seconds.</p>
+<p><strong>Passive health checks (outlier detection).</strong> LB watches real traffic and ejects backends whose error rate or latency exceeds a threshold — Envoy's <code>outlier_detection</code> ejects a backend that returns 5xx for <code>consecutive_5xx</code> requests in a row, with optional success-rate-based ejection (eject backends &gt;3σ below cluster mean). Pros: no extra probing traffic, observes real workload mix, detects "degrading" backends (still responding to /healthz but slow on real requests). Cons: requires actual traffic to detect failures (a backend with zero traffic looks healthy forever), and can be fooled by transient downstream failures (DB blip → all backends look bad → ejection storm → site dies).</p>
+<p><strong>Hybrid (active + passive).</strong> The production default. Active probing finds <strong>completely broken</strong> backends (TCP RST, /healthz returns 500, process gone). Passive ejection finds <strong>newly broken</strong> backends in the few-second window between brokenness onset and the next active probe — and finds <strong>subtly broken</strong> backends that pass /healthz but fail real requests. Envoy and modern L7 LBs run both simultaneously: active determines the <strong>eligible pool</strong>; passive prunes from that pool based on observed behavior.</p>
+<p><strong>HTTP health checks.</strong> The richest variant. LB sends a request (typically GET /healthz), expects a 2xx or 3xx status; can require specific headers (e.g., <code>x-app-version: v3.2.1</code> to detect mis-deployed boxes), can match a substring in the response body. Cost: an HTTP request per backend per interval. Best for L7 LB checking L7 backends.</p>
+<p><strong>TCP health checks.</strong> Just open a TCP connection, send optional bytes, expect optional response, close. Cheaper than HTTP, but coarser — verifies the process accepts TCP, says nothing about whether the app behind it is healthy. Right for L4 LB, or as a sanity check ahead of HTTP.</p>
+<p><strong>gRPC health checks.</strong> Standardized gRPC service (<code>grpc.health.v1.Health/Check</code>) that returns SERVING / NOT_SERVING / SERVICE_UNKNOWN. Streaming variant (<code>Watch</code>) avoids the per-probe handshake by maintaining a long-lived stream. Native for gRPC services; Envoy <code>grpc_health_check</code> config understands it directly.</p>
+<p><strong>The "/healthz returns 200 but service is broken" disaster.</strong> Classic outage pattern. /healthz returns 200 if the process is alive — it does <strong>not</strong> check the DB pool, doesn't run a query, doesn't verify the auth token cache is populated. Process is alive, real requests fail with 500. Mitigations:</p>
+<ul>
+<li><strong>Deep health checks</strong> that touch downstream dependencies. <code>/health/deep</code> runs a 1-row SELECT against the primary DB, pings Redis, checks the auth cert is unexpired. Run sparingly (every 30 s, not every 2 s) to avoid amplifying load on dependencies.</li>
+<li><strong>Synthetic checks</strong> run a real user-facing transaction (login + read a feed + log out) and require it succeed end-to-end. Run from a separate prober (Pingdom, Datadog Synthetics, in-house) outside the LB, results feed into deploy gates and alerting, not directly into LB routing.</li>
+<li><strong>Liveness vs readiness separation.</strong> Liveness (= "is the process alive?") drives <strong>restart</strong> decisions (Kubernetes kubelet restarts the pod if liveness fails). Readiness (= "is the process ready to serve?") drives <strong>routing</strong> decisions (LB sends traffic only to ready pods). Conflating them causes a degraded backend to be restarted in a loop instead of just being de-routed temporarily.</li>
+<li><strong>Panic mode (Problem 4 in §7).</strong> When &gt;50% of the pool is unhealthy, route to everyone anyway — a downstream-shared failure looks like a fleet-wide outage to /healthz, and you'd rather try than guarantee a black hole.</li>
+</ul>
+<p>Health-check accuracy is fundamentally hard because "is this backend healthy?" is application-defined and the LB is generic. The honest answer in production is "no single check is sufficient; layer them."</p>
+<hr>
+<h2 id="16-tls-termination-deep-dive">§16. TLS termination deep dive</h2>
+<p>TLS termination is where cryptography meets traffic engineering. The choices are far from neutral.</p>
+<p><strong>Where to terminate.</strong> Three options.</p>
+<ul>
+<li>
+<p><em>Edge LB termination.</em> The outermost LB (L7 at the PoP) terminates TLS, decrypts, routes plaintext (or re-encrypts with internal certs) to backends. Pros: TLS work centralized on a few boxes with hardware acceleration (AES-NI, QAT — Intel QuickAssist Technology, dedicated cards); backends speak plain HTTP; observability/WAF/inspection all work on plaintext. Cons: plaintext in the data center is a compliance issue for regulated workloads; an internal compromise reads bare traffic.</p>
+</li>
+<li>
+<p><em>L7 LB termination + re-encryption.</em> Edge L4 forwards to L7 LB which terminates TLS, runs L7 policies, then re-encrypts with internal mTLS to the backend. Pros: WAF/canary/etc. still work; backends still authenticated via mTLS. Cons: double the TLS work — once at edge, once at L7-to-backend. Usually fine because internal certs use ECDSA and session resumption is near-100%.</p>
+</li>
+<li>
+<p><em>Pass-through (TLS bridging or TLS straight-through to backend).</em> L4 LB forwards the encrypted bytes; only the backend has the cert. Pros: end-to-end encryption, simplest compliance story. Cons: L7 LB can't inspect or route by path/header (the bytes are encrypted); WAF impossible at the LB; SNI is the only signal available, so routing decisions degrade to one route per cert. Used for special cases: WebSocket-heavy traffic where L7 features aren't needed, or strict regulatory requirements.</p>
+</li>
+</ul>
+<p>The mainstream pattern is edge termination at the LB closest to the public, mTLS re-encryption from there inward.</p>
+<p><strong>SNI (Server Name Indication).</strong> Without SNI, one IP can host one cert (the cert is sent during the TLS handshake before the request, so the server doesn't know which domain the client wants). SNI is a TLS extension where the client sends the target hostname <strong>in the ClientHello</strong>, in plaintext. The server picks the matching cert from a SNI map. This is what makes anycast multi-tenant possible — one VIP at Cloudflare's edge serves millions of tenants' certs via SNI lookup. The SNI map at scale is a hash table keyed on hostname; cert objects (private key, cert chain, OCSP staple) are cached in memory and rotated independently. The plaintext SNI is also a leak — middleboxes (ISPs, governments) can see which domain you're hitting even over HTTPS. <strong>Encrypted ClientHello (ECH)</strong> is the post-2024 fix: the ClientHello is encrypted to a public key published in DNS, so the SNI is no longer visible. Cloudflare and Google enable ECH on supporting clients; rollout has been gradual.</p>
+<p><strong>ALPN (Application-Layer Protocol Negotiation).</strong> Another TLS extension. Client advertises supported protocols (<code>h2</code>, <code>http/1.1</code>, <code>h3</code>) in the ClientHello; server picks one and includes the choice in the ServerHello. This is how a single TLS endpoint serves HTTP/1.1, HTTP/2, and HTTP/3 (with separate transport — QUIC for h3) on the same port (443). The LB negotiates ALPN per connection; if the client supports <code>h2</code>, the LB upgrades, multiplexing many requests over one TCP connection, slashing handshake amortization. ALPN also negotiates non-HTTP protocols at scale — gRPC (which rides on HTTP/2 with the <code>grpc-exp</code> ALPN identifier in some stacks), WebSocket (negotiated post-handshake via HTTP Upgrade rather than ALPN, but ALPN-aware).</p>
+<p><strong>0-RTT in TLS 1.3.</strong> TLS 1.3 lets returning clients send <strong>application data in the very first round trip</strong>, before the full handshake completes, encrypted with a PSK (Pre-Shared Key) derived from a previous session. The latency win is dramatic: a mobile client on a 100ms-RTT cellular link saves 100–200 ms on every request after the first (no handshake round trip). The cost: 0-RTT data is <strong>replayable</strong> — an attacker who captured a 0-RTT packet can replay it later and the server has no way to tell. Mitigation: only allow 0-RTT for <strong>idempotent</strong> requests (GETs, OPTIONS), reject 0-RTT bytes for POSTs at the LB (Envoy's <code>early_data_policy: HTTP1_SAFE_CRLF</code> or equivalent) and force a full handshake.</p>
+<p><strong>Cert rotation under load.</strong> Certs expire (Let's Encrypt: 90 days; commercial certs: 1 year), and the rotation must not drop traffic. Process: the new cert is provisioned in parallel (ACME — Automated Certificate Management Environment — protocol talks to a CA like Let's Encrypt or an internal CA, completes the challenge, issues the cert). The LB loads the new cert into the SNI map alongside the old. A graceful flip swaps the default for new handshakes to the new cert. Old TLS sessions resuming via PSK keep working until their tickets expire. After a buffer period (24–48 hours) the old cert is removed. Throughout this, <strong>no connection is dropped</strong>. Envoy reloads cert configs from an SDS (Secret Discovery Service) endpoint on a control-plane push, atomically swapping per-listener cert references. Production rotation cadence is daily-to-weekly at Cloudflare scale (millions of customer certs); the LB tier has zero downtime.</p>
+<p><strong>HSM vs KMS-managed key story.</strong> TLS requires a private key. Where it lives matters.</p>
+<ul>
+<li><em>In-process file.</em> Easy and fast — the private key is in the LB's memory; signing operations happen in user space. Risk: a memory disclosure (Heartbleed, a process dump) leaks the key, an attacker can impersonate the site indefinitely until rotation.</li>
+<li><em>HSM (Hardware Security Module).</em> A physical or cloud-virtual device holds the private key inside tamper-resistant silicon. The LB sends a "sign this hash" request to the HSM; the HSM signs and returns the signature; the LB never touches the key. Pros: a complete memory disclosure leaks no key. Cons: signing latency goes from microseconds to milliseconds (HSM round trip), throughput capped by HSM signing rate (a few thousand signs/sec for a single HSM). Used by certificate authorities, financial institutions, regulated workloads. Common deployment: HSM in a separate VLAN, accessed via PKCS#11.</li>
+<li><em>KMS (Key Management Service).</em> The cloud equivalent — AWS KMS, GCP Cloud KMS, Azure Key Vault. The key never leaves the service; sign operations are HTTP API calls. Latency similar to HSM (ms per sign), but the LB also benefits from KMS-driven rotation (the KMS rotates underlying keys; clients see only key IDs). Used by AWS ALB internally — ALB private keys live in AWS KMS.</li>
+<li><em>Keyless TLS (Cloudflare's pattern).</em> Cloudflare terminates TLS at its edge for customers who refuse to share private keys (banks, governments). Cloudflare's edge runs the TLS handshake but forwards every signing operation to the customer's "key server" over a custom protocol; the customer's HSM signs; Cloudflare's edge completes the handshake. Adds one customer-side RTT to every handshake but Cloudflare never holds the key. Active in production for high-regulation tenants.</li>
+</ul>
+<p>For 99% of services, the right answer is private key in memory on the LB box, file-system permissions to lock it down, KMS for the <strong>encryption-at-rest key</strong> that decrypts the cert file at boot. HSM only when compliance or threat model demands it.</p>
+<hr>
+<h2 id="17-service-mesh-integration">§17. Service mesh integration</h2>
+<p>A service mesh is the realization "if Envoy is the LB primitive for everything, put one next to every pod." That makes the LB ubiquitous and the control plane the most important component.</p>
+<p><strong>Envoy as the data plane.</strong> Every pod gets an Envoy <strong>sidecar</strong> — a second container in the same Pod network namespace, intercepting all inbound and outbound traffic via iptables or eBPF (Cilium's approach). Outbound: the application calls <code>http://feed-service</code>; iptables redirects to the local Envoy on 127.0.0.1:15001; Envoy looks up <code>feed-service</code> in its cluster table (populated by xDS), picks a healthy endpoint via Maglev or P2C, opens an mTLS connection, sends. Inbound: traffic to the Pod IP is intercepted by Envoy on 15006, which terminates mTLS, applies inbound policy (rate limit, ACL — Access Control List), forwards to the application on its loopback. Each Envoy is the LB <strong>for that pod's interactions</strong>; the mesh is the union of all the Envoys' decisions.</p>
+<p><strong>Istio / Linkerd as the control plane.</strong> The Envoys are deaf without configuration. The control plane is what turns intent ("route 5% to v2 of feed-service") into the cluster/route configs every Envoy needs. Components: a discovery service (watches Kubernetes for service/endpoint changes), a config translation layer (CRDs → xDS resources), a cert authority (issues short-lived mTLS certs to every workload; rotation cadence typically 24 hours). Linkerd's control plane is Rust-based and minimalist; Istio's is bigger (Pilot, Citadel, Galley, etc.) but feature-richer.</p>
+<p><strong>xDS — eXtensible Discovery Service.</strong> The wire protocol between control plane and Envoy. A gRPC bidirectional stream where the control plane pushes resource updates; Envoy ACKs/NACKs. The xDS namespace decomposes:</p>
+<ul>
+<li><strong>LDS (Listener Discovery Service).</strong> What ports/addresses Envoy listens on, what filter chain processes each.</li>
+<li><strong>RDS (Route Discovery Service).</strong> For each HTTP listener, what RouteConfiguration (host/path/header rules — see §14).</li>
+<li><strong>CDS (Cluster Discovery Service).</strong> What logical upstream clusters exist (e.g., "feed-service-v2") and their load-balancing config (P2C, Maglev, weights).</li>
+<li><strong>EDS (Endpoint Discovery Service).</strong> Per cluster, what concrete endpoints (pod IPs and ports) are members. EDS updates are the most frequent — every pod birth/death emits an EDS push.</li>
+<li><strong>SDS (Secret Discovery Service).</strong> Per workload, what mTLS cert/key/CA bundle. SDS updates drive cert rotation.</li>
+<li><strong>ADS (Aggregated Discovery Service).</strong> Single stream that multiplexes all the above — preferred because it preserves causal ordering (cluster appears before its endpoints).</li>
+</ul>
+<p>At scale, the xDS push rate dominates the control plane's cost. A 5000-pod mesh with 100 services emits dozens of EDS pushes per minute under steady churn, multiplied by the number of Envoys subscribing. Optimizations: <strong>incremental xDS</strong> (push only the delta, not the full snapshot), <strong>scoped xDS</strong> (each Envoy subscribes only to clusters it cares about), <strong>federated control planes</strong> (one per region, each handling its local fleet).</p>
+<p><strong>The "L7 proxy attached to every pod" picture.</strong> This is conceptually load balancing per-call rather than per-edge — every call between two services hops through both ends' Envoys, gets mTLS, retries, tracing, rate limit, circuit breaking, all without the application doing any of it. The cost is two Envoy hops per call (each adds ~1 ms p50, ~3–5 ms p99). For a 50-service fan-out request, that's 100 hops; the total mesh tax is real (often 10–30% of end-to-end latency). The benefit is total uniformity: every call obeys the same rules, observability is end-to-end, mTLS is the floor.</p>
+<p><strong>Ambient mesh (post-sidecar evolution).</strong> Istio Ambient (2022+) replaces the per-pod sidecar with two shared components:</p>
+<ul>
+<li>A <em>node-level ztunnel</em> (zero-trust tunnel) — one per node, handles all the mTLS/identity work for every pod on the node. Implemented in Rust with eBPF redirect from Pods to ztunnel. No HTTP parsing here — it's an L4 tunnel.</li>
+<li>A <em>waypoint proxy</em> — a per-namespace or per-identity Envoy that handles L7 policy (the routing rules from §14). Requests that need L7 features traverse a waypoint; pure L4 mTLS traffic skips it.</li>
+</ul>
+<p>Wins: no Envoy in every pod (saves ~50–100 MB RSS per pod across a fleet of 10000 = significant), faster Pod startup (no sidecar init), simpler upgrades (upgrade the waypoint once, not 10000 sidecars). Trade-offs: less per-call isolation (a node-level ztunnel handling all Pods on the node is a shared failure domain), more network hops for L7 features (Pod → ztunnel → waypoint → ztunnel → Pod). Linkerd has a similar evolution; Cilium Service Mesh skips sidecars entirely with eBPF in the kernel (see §25).</p>
+<p>The arc of mesh design has been "the LB is everywhere → the LB is too expensive everywhere → keep the LB only where it adds value." Ambient and eBPF meshes are still load-balancing technology, but reshape where the proxy sits.</p>
+<hr>
+<h2 id="18-geo-routing-and-anycast-depth">§18. Geo-routing and anycast depth</h2>
+<p>The LB tier's first job at planet scale is "get this client to a nearby PoP." Three mechanisms ship in production; large CDNs use all three.</p>
+<p><strong>GeoDNS with ECS (EDNS Client Subnet).</strong> DNS resolvers traditionally hide the client IP from the authoritative DNS server — the auth sees only the resolver's IP, which may be in a different country (Google Public DNS 8.8.8.8 serves users globally). GeoDNS routes by IP; without the client's IP, it routes by the resolver's location, often badly. <strong>ECS</strong> (EDNS Client Subnet, RFC 7871) lets the resolver pass a truncated form of the client's IP (e.g., the /24 prefix) inside the DNS query as an EDNS option. The auth uses that prefix to look up geographic location in a database (MaxMind GeoLite, in-house IP-to-region maps from RUM — see below), and returns the IP of the nearest PoP. ECS is opt-in per resolver and per zone (privacy concern: it leaks more about the client than the resolver alone). Major DNS providers (Google, Cloudflare 1.1.1.1 disables ECS by default in fact, OpenDNS) have varying ECS support. The accuracy ceiling of GeoDNS is the IP-to-region database's accuracy; mobile carriers' IP blocks often misgeolocate (a Verizon block in Texas serves users in California, etc.).</p>
+<p><strong>BGP anycast.</strong> Skip DNS as the routing layer; let the network itself route. One IP (e.g., 1.1.1.1) is announced via BGP from many PoPs simultaneously. The internet's BGP machinery picks one PoP per source AS (Autonomous System) based on AS path length, local preference, and other BGP attributes — typically the topologically nearest, which strongly correlates with geographically nearest. Pros: no DNS to mess with; failover is automatic (PoP withdraws the BGP announcement, traffic shifts in seconds to minutes); attack surface for DDoS is <strong>diluted</strong> across all PoPs (10 Gbps attack split across 50 PoPs is 200 Mbps each, manageable). Cons: BGP picks <strong>per-route, not per-flow</strong>, and BGP routes can change mid-flow (route update from upstream peer). Anycast for UDP/QUIC is trivial; anycast for stateful TCP is hard.</p>
+<p><strong>RUM-based routing.</strong> Real User Monitoring data — actual latency measurements from real users, collected via JavaScript beacons or app SDKs — fed back into the DNS or BGP layer. Cloudflare and Akamai use RUM to learn "users in carrier X consistently get better latency from PoP B than PoP A even though PoP A looks closer." The decision becomes "for queries from this carrier's IP space, return PoP B." More accurate than IP-to-region database alone, especially for mobile and emerging markets. Feedback loop: RUM data updates every few hours; sustained changes (new submarine cable, peering shift) update the maps; transient anomalies are smoothed.</p>
+<p><strong>The "anycast island" pathology.</strong> A client's BGP route to anycast IP changes mid-flow (e.g., a peering link goes down, upstream router re-runs best-path selection, picks a different next-hop, traffic now lands at a different anycast PoP). The new PoP has no connection state for that flow — its kernel sends a TCP RST. The connection breaks visibly. With long-lived connections (HTTP/2, gRPC, WebSocket, large downloads), this is intolerable. Mitigations:</p>
+<ul>
+<li><strong>Flow-aware anycast steering.</strong> When a route changes, the new PoP recognizes "I don't have state for this flow," forwards the packet to the <strong>old PoP via an internal tunnel</strong> (which still has the state), rather than RST'ing. The old PoP serves the flow until it ends; new flows from the same client land at the new PoP. The LinkedIn/Cloudflare Unimog architecture builds this in: a "flow steering" component on every anycast machine keeps a flow-to-machine table, and machines forward packets among themselves to preserve state under route churn.</li>
+<li><strong>Connection ID-based routing (QUIC).</strong> QUIC's connection ID is independent of the 5-tuple. The LB at the new PoP can read the connection ID, look it up in a fleet-wide table, forward to whichever machine actually owns the connection. This is QUIC's killer feature for anycast (NAT — Network Address Translation — rebinding also benefits; mobile IP changes don't break QUIC flows).</li>
+<li><strong>Migrate proactively</strong> before the route changes. Hard in practice — the LB doesn't get advance notice of upstream BGP changes.</li>
+</ul>
+<p>Cloudflare's Unimog publication describes the flow-steering approach in detail. The "any" of anycast becomes "the right one" by introducing intra-fleet flow forwarding.</p>
+<hr>
+<h2 id="19-connection-draining">§19. Connection draining</h2>
+<p>Deploys are the most frequent failure mode the LB has to mask. Connection draining is the protocol.</p>
+<p><strong>The graceful-shutdown dance.</strong> When a backend (or LB itself) is going down for a deploy:</p>
+<ol>
+<li><em>Drain signal.</em> Orchestrator sends a "preStop" hook or the equivalent (Kubernetes' <code>terminationGracePeriodSeconds</code> window starts; Envoy receives <code>/healthcheck/fail</code> admin endpoint; HAProxy receives <code>SIGUSR1</code>).</li>
+<li><em>Stop accepting new traffic.</em> The backend marks itself unhealthy (its /healthz starts returning 503), and/or its registration in the LB pool is removed. The LB notices on the next active probe (or immediately if the LB has a control-plane push channel) and stops sending new connections.</li>
+<li><em>Existing connections finish.</em> In-flight requests complete naturally — the response is sent, the HTTP/1.1 keep-alive idle timeout fires, the HTTP/2 stream closes, the gRPC RPC completes.</li>
+<li><em>Forceful close after drain timeout.</em> If anything is still hanging on after, say, 30 seconds, the backend sends a <code>GOAWAY</code> on HTTP/2 streams (asking clients to migrate gracefully) and then SIGTERMs. After a final grace window (Kubernetes default 30s), SIGKILL.</li>
+</ol>
+<p>Done right, a deploy is <strong>invisible</strong> — no 5xx blip, no latency spike. Done wrong, every deploy is a small outage and the team learns to deploy at low-traffic hours rather than fix it.</p>
+<p><strong>The "30s isn't enough" problem.</strong> Long-poll connections, server-sent events (SSE), WebSocket, gRPC streaming RPCs, file uploads, and slow backend dependencies can all keep a connection alive far longer than 30 seconds. A WebSocket pinned to chat-service-pod-7 might live for hours. Forcing the close after 30 seconds means dropping every active chat session every deploy. Options:</p>
+<ul>
+<li><em>Longer drain timeout.</em> <code>terminationGracePeriodSeconds: 600</code> (10 minutes). Costs slower deploys (waiting on long-lived connections to finish), and might be unbounded for some traffic patterns.</li>
+<li><em>Drain signal to clients.</em> Send WebSocket close frame or HTTP/2 <code>GOAWAY</code> with <code>last_stream_id</code> set to a value below current — tells client to migrate gracefully to a new server. Clients reconnect to a different backend; the old one drains faster. Slack and Discord do this on chat servers.</li>
+<li><em>Connection rebalancing.</em> Periodically (independent of deploys), the LB or backend signals clients to reconnect, naturally migrating traffic and avoiding any one backend amassing too many long-lived connections. Avoids the deploy-time pileup.</li>
+<li><em>Sticky-session-aware draining.</em> If sessions are user-pinned and stored in state, drain by <strong>session count</strong>, not connection age — let the user finish their current task, but redirect on the next reconnect.</li>
+</ul>
+<p>The other failure mode: a backend SIGTERM'd without a drain period (the "panic kill") returns ECONNREFUSED to the LB mid-request. The LB sees 5xx, marks the backend unhealthy, retries on another backend — most cases recover transparently. But the customer-visible cost during a global deploy is real: rolling 1000 pods with no drain costs hundreds of 5xx per minute. Drain is the difference between zero-impact deploys and noticeable ones.</p>
+<hr>
+<h2 id="20-sticky-sessions">§20. Sticky sessions</h2>
+<p>Stickiness pins a logical session (user, customer, game match) to a specific backend across requests. The technique is older than load balancing as we know it.</p>
+<p><strong>Cookie-based stickiness.</strong> The LB sets a cookie on the first request — <code>Set-Cookie: lb-backend=B7; Max-Age=3600</code> — and on subsequent requests reads the cookie and forwards to B7 directly, bypassing the load-balancing decision. Envoy and HAProxy do this with <code>cookie</code> hash policies. The cookie can be:</p>
+<ul>
+<li><em>Opaque</em> (LB internal: a hash mapping to backend ID; clients don't see meaningful content).</li>
+<li><em>Signed</em> (HMAC over backend ID + expiry, prevents tampering).</li>
+<li><em>Encrypted</em> (full encryption with LB-only key, prevents inference).</li>
+</ul>
+<p><strong>IP-based stickiness.</strong> The LB hashes the client IP and routes consistently to a backend. No cookies, works for non-HTTP, but breaks behind NAT (many clients share one IP and get pinned to one backend; one client roaming between Wi-Fi and cellular gets re-pinned). IP stickiness with a hash policy is L4-LB-compatible; cookie stickiness requires L7.</p>
+<p><strong>Why most modern designs avoid stickiness.</strong> Stickiness is <strong>state leakage from the app to the LB</strong>. As soon as the LB knows "this user belongs on B7," the app has lost the freedom to:</p>
+<ul>
+<li><em>Restart B7</em> — the user's traffic is pinned there and won't easily move.</li>
+<li><em>Scale the pool</em> — adding B11 has no effect on the user's experience because they're stuck on B7.</li>
+<li><em>Failover B7</em> — when B7 dies, the user's session must explicitly migrate; the LB can do this but the application must support session re-establishment.</li>
+</ul>
+<p>The modern pattern is the opposite: <strong>stateless backends, state in a shared store.</strong> Sessions, carts, user preferences, in-flight game state — all live in Redis, DynamoDB, or a session service. Any backend can serve any request. The LB does pure round-robin or P2C. Scaling, restart, deploy, failover all become trivial.</p>
+<p><strong>When sticky is right.</strong> A short list of valid cases:</p>
+<ul>
+<li><em>WebSocket apps.</em> The TCP connection is the session; the LB has no choice but to pin it for the connection's life. (Note: this is stickiness <em>to a connection</em>, not stickiness <em>to a user</em> — different problem; reconnects can land elsewhere.)</li>
+<li><em>Server-sent events (SSE), long-poll, streaming HTTP.</em> Same as WebSocket — long-lived TCP that can't be transparently moved.</li>
+<li><em>Very latency-sensitive caches at the LB layer.</em> The LB can be smarter if it routes a user consistently to the backend that already has their L1 cache warm. The cost of state in the LB is small if it's purely a performance hint (the system stays correct if the hint is wrong).</li>
+<li><em>Game matches with strict liveness.</em> A 64-player UDP match must route every player to the authoritative game server for the match duration. The LB maintains a (game_id → backend) table; players' UDP flows all hash to the same game_id.</li>
+<li><em>Streaming media with large in-memory buffers.</em> A video session that loaded the first 10 GB of a movie's segments in memory benefits from sticky; reload-elsewhere costs a 10-GB re-fetch.</li>
+</ul>
+<p>When stickiness is justified, design <strong>failover behavior explicitly</strong>: when B7 dies, what happens to its sticky users? The application must tolerate "your session ended, reconnect to a new backend, recover state from Redis" as a normal event.</p>
+<hr>
+<h2 id="21-connection-pooling-at-the-lb">§21. Connection pooling at the LB</h2>
+<p>At hyperscale, "one TCP per request" is wasteful even for the LB-to-backend leg. The math: 100k RPS, 1ms per request, requires 100 concurrent connections — manageable. 1M RPS at 10ms requires 10k concurrent connections; at 100M RPS that's 1M concurrent connections, blowing past the 65k port limit per source IP (TCP source ports are 16-bit), and crushing the connection-establishment cost (TLS handshakes, mTLS cert checks, socket-table churn).</p>
+<p><strong>Backend connection pools.</strong> The LB maintains a pool of pre-opened TCP connections to each backend. A new request grabs an idle connection from the pool (an O(1) operation), sends, parks the connection back. Pool size sized to peak concurrent requests per backend. NGINX's <code>upstream { keepalive 100; }</code> configures 100 idle connections retained per upstream; Envoy's <code>http_protocol_options { max_connections: }</code> similar. The pool drains slowly (connections idle for &gt;60s closed by Envoy or by the backend's keep-alive timeout), refilling on demand.</p>
+<p><strong>HTTP/2 multiplexing to backends.</strong> HTTP/1.1 can't pipeline reliably (head-of-line blocking); each request needs its own connection or its own slot in a serial keep-alive chain. HTTP/2 multiplexes <strong>many streams over one TCP connection</strong>. The LB opens, say, 2 HTTP/2 connections to backend B7 and pipes 1000 concurrent streams down them. Sockets: 2 instead of 1000. Connection setup cost: amortized over thousands of requests. This is the single biggest scalability win for LB-to-backend; almost every modern proxy uses HTTP/2 backend connections.</p>
+<p><strong>HTTP/3 (QUIC) backend connections.</strong> Even better for some patterns. QUIC over UDP avoids TCP head-of-line blocking <em>between streams</em> (a lost packet for stream 7 doesn't block stream 8), useful when the LB-to-backend RTT is non-trivial (cross-region pools) or when packet loss is non-zero. Adoption lags HTTP/2 — backends must support h3, observability tools must understand UDP flows.</p>
+<p><strong>The "1M sockets from LB to backend pods" exhaustion.</strong> At very high scale, even pooled connections exhaust resources. Per-source-IP TCP source port limit is 65k. If the LB has 1 source IP and 1000 backends, max source ports per backend is ~65 (with reservation overhead). Solutions:</p>
+<ul>
+<li><em>More source IPs</em> on the LB. Assign 10 IPs, get 650 ports per backend. NICs and kernels handle this.</li>
+<li><em>HTTP/2 multiplexing,</em> as above — collapses 1000 streams into 1 socket.</li>
+<li><em>SO_REUSEPORT for outgoing connections.</em> In some kernels, multiple sockets can share a source IP/port for outbound; less common than for listening sockets.</li>
+<li><em>Connection-pool sharing across backend replicas.</em> If the LB serves N backends and each only sees ~10 RPS, opening 1 connection per backend is enough. Sharing is the default.</li>
+</ul>
+<p>A second related exhaustion: <strong>conntrack table on stateful firewalls.</strong> Linux's conntrack (NF_CONNTRACK) keeps per-flow state for connection tracking and NAT. Default table size is ~256k; at high LB scale, conntrack fills, new connections drop. Mitigations: disable conntrack on LB outbound (set <code>notrack</code> rules), bypass with XDP, or raise the table size. Cloudflare and Facebook have documented running their LBs with conntrack disabled entirely on the data plane path.</p>
+<hr>
+<h2 id="22-autoscaling-interaction">§22. Autoscaling interaction</h2>
+<p>The LB's metrics — request rate, latency, error rate, connection count — are the input signal for autoscaling. Done right, this closes the loop and makes capacity self-managing.</p>
+<p><strong>LB metrics feeding HPA (Horizontal Pod Autoscaler).</strong> The Kubernetes HPA reads metrics (default: CPU, memory; with custom metrics: anything) and scales pod counts up or down. Sourcing from the LB:</p>
+<ul>
+<li><em>Requests per second per pod.</em> If <code>request_rate &gt; 200 RPS/pod</code>, scale up. The LB exposes per-cluster RPS in Prometheus; an adapter (Prometheus Adapter, KEDA — Kubernetes Event-Driven Autoscaling) feeds it to the HPA.</li>
+<li><em>p95 latency.</em> If <code>p95 &gt; 100 ms</code>, scale up — the pool is saturating.</li>
+<li><em>Active connections per pod.</em> Bypasses RPS variability; "how busy is the average pod?" is a steadier signal.</li>
+<li><em>Error rate.</em> Scale up if errors are correlated with saturation, not with bugs.</li>
+</ul>
+<p>Composite scaling: HPA combines multiple metrics, uses the highest-recommended desired-replicas. Avoids oscillation around a single noisy metric.</p>
+<p><strong>The "thundering herd on scale-up" problem.</strong> Scale-up adds new pods. The LB sees them, treats them as full-capacity members of the pool, sends them their share of traffic immediately. The new pods are <strong>cold</strong>: JIT-compiled code paths aren't hot, connection pools to dependencies are empty, OS page caches are unwarmed, ML model weights aren't paged in. Cold p99 might be 5–10x the warm p99. Traffic ramp at full throttle pushes the cold pods into trip-circuit-breaker territory, the HPA sees saturation again, scales up further, and the cascade unfolds.</p>
+<p><strong>Warmup periods.</strong> Three layers fix this.</p>
+<ul>
+<li><em>Slow start at the LB.</em> Envoy's <code>slow_start_config</code> ramps the cluster weight of a newly-added endpoint from 0 to 100% over a configurable window (default 60s, can extend to 5+ minutes). The pod gets a fraction of normal traffic in the first minute; by minute 5 it's at full weight.</li>
+<li><em>Readiness probe with progressive criteria.</em> Kubernetes' readiness probe returns "ready" only after the pod has finished its warmup (model loaded, caches primed, dependencies pinged). The LB doesn't see the pod until it's actually ready.</li>
+<li><em>Pre-warming hooks.</em> The deploy pipeline replays a synthetic traffic profile against new pods (recorded production requests, 1% playback rate) before promoting them to live traffic. By the time the pod is in the LB's pool, its JITs and caches are warm.</li>
+</ul>
+<p>The combination eliminates the cold-start cliff. Without it, autoscaling becomes anti-scaling — adding pods makes things worse before they get better.</p>
+<p><strong>Predictive scaling.</strong> Reactive scaling (wait for saturation, scale up) loses by the warmup window. Predictive scaling (anticipate the upcoming load and pre-warm) wins. Used heavily for Black Friday, sports event surges, scheduled deployments. Inputs: time-of-day patterns, marketing-campaign schedules, traffic seasonality. The LB doesn't drive this directly, but its metrics feed the predictor.</p>
+<hr>
+<h2 id="23-ddos-protection-layers">§23. DDoS protection layers</h2>
+<p>The LB tier is the front line of denial-of-service defense. Attacks split into two regimes by layer.</p>
+<p><strong>Layer 3 / 4 attacks (volumetric).</strong> The attacker generates raw packet volume — SYN floods, UDP amplification (small DNS query, large reflected response), TCP reflection, ICMP floods. Defended at the <strong>edge</strong> before the LB processes anything.</p>
+<ul>
+<li><em>Anycast dilution.</em> As mentioned in §18, a multi-PoP anycast network splits an attack across N PoPs. A 1 Tbps attack against Cloudflare's IP shows up as ~5 Gbps per PoP at 200 PoPs — handleable. The bigger the network, the more dilution.</li>
+<li><em>ACLs (Access Control Lists) at the network layer.</em> Router ACLs drop traffic matching known-bad patterns (spoofed source IPs from bogon ranges, IPv4 fragments, malformed packets).</li>
+<li><em>Rate limiting at L4.</em> Per source IP, per source AS, per ASN region. XDP/eBPF programs maintain a sliding-window counter per source IP in a BPF map, drop packets above threshold. The decision is sub-microsecond.</li>
+<li><em>SYN cookies.</em> See §7 Problem 7 — handle SYN floods without flow-table memory.</li>
+<li><em>Upstream BGP coordination.</em> On a multi-Tbps attack, the LB operator asks its upstream transit providers to drop the attacker's prefix via BGP communities (RTBH — Remote Triggered Black Hole) or BGP FlowSpec. Cloudflare's Magic Transit pushes this into the customer's autonomous transit decisions automatically.</li>
+</ul>
+<p><strong>Layer 7 attacks (application abuse).</strong> Smaller traffic volume, but designed to exhaust application resources. Slowloris (open many TCP connections, send headers one byte at a time, hold sockets open), HTTP slow POST (similar with body), HEAD floods, expensive query patterns (<code>?sort=relevance&amp;fuzzy=true</code> over a search endpoint that doesn't cache), credential stuffing (login attempts with breached credentials). Defended at the L7 LB or upstream WAF.</p>
+<ul>
+<li><em>WAF (Web Application Firewall).</em> Rule-based and ML-based filtering. Known patterns (SQL injection, XSS, path traversal) blocked outright. Anomalous request patterns (large numbers of failed logins from one IP, unusual user-agent strings, requests with bot signatures) blocked or challenged. ModSecurity, Cloudflare WAF, AWS WAF.</li>
+<li><em>Rate limiting at L7.</em> Per user, per API key, per endpoint, per geo. Token-bucket or sliding-window counters per key. Envoy's <code>local_rate_limit</code> filter for per-instance limits, <code>rate_limit</code> filter calling out to an external rate-limit service (RLS — Rate Limit Service) for global limits.</li>
+<li><em>Bot management.</em> JavaScript challenges (force the client to execute code, weed out simple scrapers), CAPTCHAs (force a human-in-the-loop, useful but high-friction), TLS fingerprinting (JA3/JA4 hashes identify clients by their TLS handshake; bots have different fingerprints than browsers), behavioral analysis (mouse movements, request timing patterns).</li>
+<li><em>Connection limits per source.</em> Cap the number of concurrent connections from one IP to mitigate slowloris — 100 conns/IP is a reasonable default for human traffic.</li>
+</ul>
+<p><strong>The "Cloudflare absorbs Tbps" math.</strong> Cloudflare's published incident reports show absorbing &gt;100 Tbps attacks. The math: ~300 PoPs × ~400 Gbps capacity each = ~120 Tbps total. Anycast spreads the attack evenly (give or take), each PoP sees ~400 Gbps, handles it. The attacker can't concentrate the attack on one PoP because the routing decision is the internet's, not theirs. Their published Q3 2024 numbers showed multiple sustained &gt;5 Tbps attacks per quarter, including a 5.6 Tbps UDP flood handled with zero customer impact.</p>
+<p>The DDoS defense stack is a layered onion: edge anycast → L4 ACL → L4 rate limit → L7 rate limit → WAF → application. The closer to the edge, the cheaper to drop; the deeper, the more semantic context for the decision. Modern defense is <strong>automated</strong> — the network detects an attack pattern within seconds (typically via traffic anomaly detection on netflow data) and rolls out countermeasures across the fleet via BGP, control-plane updates, and WAF rule pushes.</p>
+<hr>
+<h2 id="24-failure-modes-not-covered-earlier">§24. Failure modes not covered earlier</h2>
+<p>The §8 failure modes covered LB box death, PoP failure, control-plane death, and partition. Three more deserve coverage.</p>
+<p><strong>Mode F: The LB itself crashes (need redundant LBs via ECMP).</strong> A single L4 or L7 LB box is not a deployment unit. The deployment unit is <strong>at least two LBs behind ECMP</strong>. The edge router announces the VIP via ECMP across N LB boxes; flow hashes spread traffic. When one dies (process crash, kernel panic, hardware fault), ECMP detects via BFD (Bidirectional Forwarding Detection — sub-second link probe) or BGP session drop, removes the dead next-hop, rehashes onto N-1. Flows that hit the dead box: those still in the dead box's flow table are gone (a few packets dropped); upon rehash, the survivor LB picks up via Maglev → same backend → connection continues. Without redundancy, the LB is a SPOF (Single Point Of Failure); with ECMP redundancy, LB failure is transparent within ~100 ms.</p>
+<p><strong>Mode G: LB to backend partition (LB thinks backends healthy, backends can't reach DB).</strong> A network partition isolates the backends from a critical downstream (DB, cache, message broker) while keeping the LB↔backend path healthy. The LB's /healthz probe to the backend succeeds (the backend's HTTP server is up). Real requests fail because the backend can't reach the DB. The LB has no signal — its probes pass, its passive ejection might catch some 5xx but slowly. Mitigations:</p>
+<ul>
+<li><em>Deep health checks.</em> /healthz includes a real DB ping (and Redis, and other criticals). Costs more probe traffic; pays off in detection accuracy. Make the deep checks rate-limited so the LB's probes don't take down the DB on a partial outage.</li>
+<li><em>Synthetic transactions.</em> A scheduled prober (separate from the LB) runs end-to-end user transactions every few seconds; results feed into LB pool exclusion. Detects DB problems even if /healthz is shallow.</li>
+<li><em>Backend self-reporting unhealthy.</em> When the backend detects its DB connections are timing out, it returns 503 on /healthz proactively. The LB ejects on the next probe. Slow (one probe interval), but no additional probe traffic.</li>
+<li><em>Adaptive ejection.</em> The LB tracks a sliding-window error rate per backend; if requests to B7 fail at 50% over 30 seconds, eject regardless of /healthz. Envoy's <code>outlier_detection</code> with consecutive_5xx and success_rate_minimum_hosts does this.</li>
+</ul>
+<p>This is the most subtle LB failure mode because "healthy from the LB's perspective" is divorced from "healthy from the user's perspective."</p>
+<p><strong>Mode H: Health-check storm (1000 backends × every LB checks every 10s = 100/sec per backend).</strong> At fleet scale, naive active health checking generates substantial load on the backends. 1000 backends, 200 LBs (mesh sidecars), each checking each backend every 10 seconds = 20000 checks/sec across the fleet, 20 checks/sec per backend. If each check is HTTP and costs ~1 ms, that's ~20 ms/sec of backend CPU just on health checks. Doubles or triples at mesh scale where every Envoy probes every cluster member it might route to.</p>
+<p>Mitigations:</p>
+<ul>
+<li><em>Sampling.</em> Each LB checks a random subset of backends; combine signals via the control plane. Coverage per backend is the same, total checks halved or quartered.</li>
+<li><em>Hierarchical health.</em> A small "health aggregator" service checks every backend, exposes aggregated health to all LBs via xDS push. LBs trust the aggregator, never probe directly. The aggregator is a SPOF, so deploy it replicated.</li>
+<li><em>Passive-only at the high end.</em> Skip active checks entirely; rely on real traffic + outlier detection. Works when traffic is high enough that any broken backend reveals itself within seconds.</li>
+<li><em>Long intervals plus event-driven.</em> Active checks every 30 seconds (not 2 seconds) for coarse liveness; event-driven exclusion (on observed errors) for fast detection.</li>
+</ul>
+<p>The lesson: every probe is a request. At fleet scale, the LB's monitoring traffic is itself a workload to manage.</p>
+<hr>
+<h2 id="25-observability-of-the-lb">§25. Observability of the LB</h2>
+<p>The LB sees every request — that makes it both the most important observability vantage point and the noisiest one. Production observability has three pillars and one investigation pattern.</p>
+<p><strong>Request logs (sampled, structured).</strong> Every request through the LB <em>could</em> log a row (timestamp, source IP, method, path, status, latency, upstream backend, bytes in/out, TLS cipher, response time, retry count). At 100k RPS, full logging is 100k rows/sec — petabytes per day. Production approach: <strong>structured + sampled</strong>.</p>
+<ul>
+<li><em>Structured</em> — JSON or protobuf rows shipped to a log pipeline (Kafka → S3 → Athena/Trino), with consistent field names. Searchable; not free-text.</li>
+<li><em>Sampled</em> — log 1% uniformly + 100% of errors + 100% of slow requests (&gt;p99). Captures the tail without paying for the median.</li>
+<li><em>Trace-linked</em> — every log row has a trace ID (e.g., W3C traceparent), so you can join LB logs to backend traces, DB traces, and downstream.</li>
+</ul>
+<p><strong>The four golden signals.</strong> SRE canon — every LB exposes these:</p>
+<ul>
+<li><em>Rate</em> — requests per second. The pulse. Sudden drop = upstream broken or client gone; sudden spike = surge or attack.</li>
+<li><em>Errors</em> — 5xx rate, 4xx rate. Distinguish: 5xx = our problem, 4xx = client problem (mostly). Watch the trend; absolute count varies by traffic.</li>
+<li><em>Latency</em> — distribution (p50, p95, p99, p99.9). Median is the experience; p99 is the worst experience that's still common.</li>
+<li><em>Saturation</em> — connection count, queue depth, CPU usage, memory usage. The "how close are we to failing under sustained load" signal. If saturation is creeping up, scale before latency or errors crack.</li>
+</ul>
+<p>The signals are reported per cluster (e.g., the feed cluster), per route, per upstream backend (so you can spot the one slow box), and overall.</p>
+<p><strong>Per-backend metrics.</strong> A backend's view from the LB might disagree with the backend's own metrics. The LB measures wall-clock time as seen at its socket; the backend measures application time. Network latency, queueing at the backend's accept queue, and TLS overhead all show up at the LB but not in the backend's logs. Per-backend LB metrics:</p>
+<ul>
+<li><em>Active connections</em> — how many open right now.</li>
+<li><em>RPS to this backend</em> — per-second.</li>
+<li><em>p50/p95/p99 latency to this backend.</em></li>
+<li><em>Error rate to this backend.</em></li>
+<li><em>Pending requests</em> — sometimes the LB has a queue of requests waiting for a free connection in the pool; this depth is a saturation indicator.</li>
+</ul>
+<p><strong>The "backend p99 is fine but LB p99 is bad" investigation.</strong> Classic. Backend reports p99 of 50 ms. LB reports p99 of 500 ms. Where did the extra 450 ms come from?</p>
+<ul>
+<li><em>Queue buildup at the LB.</em> Requests are arriving faster than the LB can dispatch (CPU saturation on the LB process). Each request waits in the LB's accept queue; queue time is invisible to the backend. Check: LB CPU &gt; 80%, accept queue depth &gt; 0, request rate increasing.</li>
+<li><em>Connection-pool exhaustion.</em> The LB has 100 connections to the backend; 101 simultaneous requests arrive; the 101st waits. The wait time shows in LB latency but not backend latency. Fix: bigger pool, HTTP/2 multiplexing.</li>
+<li><em>Retries.</em> The LB retried the request after a backend failure. The backend sees only the second (successful) attempt; the LB sees the total time. Filter logs by retry-count &gt; 0.</li>
+<li><em>TLS handshake overhead.</em> New connections cost 1-2 RTTs of TLS handshake. The LB measures from client's first byte; the backend measures only after handshake. Look at session resumption rates.</li>
+<li><em>Slow-start ramp.</em> A new backend is at 1% weight; rate-of-traffic feels normal but a small spike pushes it over its slowed capacity, queueing builds, latency spikes. Look at slow-start state.</li>
+</ul>
+<p>The recipe is "ask the LB and the backend for separate latency distributions, find the gap, and trace which queue or pool is the culprit." Sometimes the gap reveals a missing layer of metrics — adding pool-wait-time and accept-queue-depth metrics often reveals the answer.</p>
+<p><strong>Distributed tracing.</strong> OpenTelemetry / Zipkin / Jaeger. Every request gets a trace ID; the LB emits a span ("LB hop"), the backend emits its span ("backend processing"), downstream calls emit their spans. Visualized as a flame graph, you see exactly which hop took which time. This is the gold standard for cross-system latency investigations and the LB is the place to inject the trace ID if the client didn't.</p>
+<hr>
+<h2 id="26-kernel-level-and-ebpf">§26. Kernel-level and eBPF</h2>
+<p>The state of the art in L4 LB is migrating from user-space DPDK to in-kernel eBPF. The shift is a few years old and accelerating.</p>
+<p><strong>XDP (eXpress Data Path).</strong> A Linux kernel hook at the NIC driver level — the earliest possible point. An XDP program is eBPF bytecode loaded into the kernel; it inspects each incoming packet and returns one of:</p>
+<ul>
+<li><code>XDP_PASS</code> — continue up the normal kernel stack (eventually delivered to a socket).</li>
+<li><code>XDP_DROP</code> — discard the packet immediately. The fastest possible drop — used for DDoS mitigation.</li>
+<li><code>XDP_TX</code> — re-transmit out the same NIC after rewriting headers. Used for L4 LB return paths.</li>
+<li><code>XDP_REDIRECT</code> — send to a different NIC or to a different CPU. Used for multi-NIC LBs.</li>
+</ul>
+<p>XDP runs <strong>before</strong> kernel networking (no allocation of <code>sk_buff</code>, no routing decision, no netfilter), so packet processing is dramatically faster than user-space (1-2 orders of magnitude). Maglev table lookup, flow table lookup, header rewrite, retransmit — all happen in the XDP program, 50-200 ns per packet, 5-10 Mpps per core.</p>
+<p>The kernel ecosystem stays alive: <code>tcpdump</code> works on packets the XDP program PASSes, <code>ftrace</code> can attach to XDP entry/exit, perf events are emitted, <code>bpftool</code> introspects loaded programs.</p>
+<p><strong>eBPF for L7 routing without sidecars (Cilium).</strong> Cilium is an L7 service mesh implemented in eBPF. Instead of an Envoy sidecar per pod, Cilium loads eBPF programs into the kernel's socket layer that do:</p>
+<ul>
+<li><em>L4 load balancing</em> — replaces kube-proxy's iptables/IPVS with eBPF maglev.</li>
+<li><em>Network policy</em> — drops disallowed packets in the kernel based on identity (not IP).</li>
+<li><em>L7 routing</em> — a kernel-resident proxy (or a per-node Envoy, depending on Cilium version) handles HTTP routing for L7-required traffic.</li>
+<li><em>Observability</em> — eBPF programs emit metrics and trace events without a sidecar.</li>
+</ul>
+<p>The win: no sidecar means no per-pod Envoy, no resource overhead per pod, no startup latency, no upgrade dance. The constraint: eBPF can't do everything Envoy can (extensions, custom Lua filters, etc.) — Cilium handles the common cases in the kernel and falls back to Envoy for the rest.</p>
+<p><strong>The modern Linux load-balancing stack.</strong> A 2026-era L4 LB stack looks like:</p>
+<ul>
+<li><em>NIC offload</em> — RSS hashes 5-tuples and dispatches packets to N RX queues; each queue's interrupts are pinned to one CPU core. Packet rate scales with cores.</li>
+<li><em>XDP eBPF program</em> on each NIC RX queue. Runs Maglev lookup, flow tracking, header rewrite, drops bad traffic.</li>
+<li><em>BPF maps</em> (kernel hash tables) hold the Maglev table, flow table, backend mappings. Updated by user-space control plane via syscall.</li>
+<li><em>Optional sk_buff path</em> for traffic XDP can't decide (returned via XDP_PASS); standard kernel networking handles it.</li>
+</ul>
+<p>User-space DPDK code is moving to museum status for new projects. The maintenance cost of staying in DPDK (no kernel tooling, custom NIC driver, manual ARP/ICMP) is too high when XDP delivers ~80% of the perf with 100% of the kernel ecosystem.</p>
+<hr>
+<h2 id="27-proxy-less-load-balancing">§27. Proxy-less load balancing</h2>
+<p>The mesh pattern (Envoy at every pod, all calls through the proxy) has a tax. Proxy-less LB asks: what if the <strong>client</strong> picks the backend directly, no LB hop in between?</p>
+<p><strong>gRPC's client-side load balancing.</strong> gRPC has built-in support for client-side LB. The client is told (via a name resolver, e.g., DNS, xDS, or Consul) the <strong>set of backend endpoints</strong> and a load-balancing policy (round-robin, P2C, custom). On each call, the client picks an endpoint and opens (or reuses) a connection. The server-side LB is bypassed for internal calls.</p>
+<ul>
+<li><em>xDS-discovered backends.</em> The client subscribes to xDS — same protocol as Envoy uses. The control plane pushes endpoint updates; the client's resolver updates. The same xDS push that updates Envoy's CDS/EDS now updates every gRPC client. Consistent picture, no extra infrastructure.</li>
+<li><em>Picker policy.</em> Round-robin is default; custom pickers (P2C, locality-aware, latency-based) are pluggable.</li>
+</ul>
+<p><strong>Why this avoids the LB-hop tax for internal traffic.</strong> A typical mesh call costs:</p>
+<ul>
+<li><em>Client → sidecar Envoy.</em> ~0.5 ms hop. (Same machine, but still a context switch.)</li>
+<li><em>Sidecar → remote backend.</em> Network RTT (~0.5 ms data center).</li>
+<li><em>Remote backend → its sidecar.</em> Same-machine hop.</li>
+<li><em>Sidecar → application.</em> Same-machine hop.</li>
+</ul>
+<p>Total: ~2 ms of overhead per call before the application even sees the request. Multiplied by 50 services in a fan-out, that's 100 ms of overhead.</p>
+<p>Proxy-less gRPC:</p>
+<ul>
+<li><em>Client (application) → remote backend (application).</em> Network RTT only. Maybe ~0.5 ms.</li>
+</ul>
+<p>The mesh tax is gone for internal calls. Production data from Google (which uses proxy-less gRPC heavily internally) shows latency reductions of 10-30% for high-fan-out workloads.</p>
+<p><strong>The trade-offs.</strong></p>
+<ul>
+<li><em>Clients become smarter.</em> Every client (every language: Go, Java, Python, C++, etc.) needs the LB library, the xDS resolver, the connection-pool management. The "all logic in Envoy" benefit is gone — you reimplement it in every language.</li>
+<li><em>Policy distribution harder to centralize.</em> With a sidecar, "everyone retries 3x with exponential backoff" is a single Envoy config. With proxy-less, each client library's behavior must be consistent. xDS helps (the control plane pushes the same config), but library-version skew is real ("our Go client is on gRPC 1.50, Java client is on 1.55; their retry semantics differ slightly").</li>
+<li><em>Operational complexity.</em> A misconfigured client is harder to fix than a misconfigured sidecar (you can update the sidecar without touching the application; you can't update the client library without an application redeploy in most cases).</li>
+<li><em>Observability harder.</em> Without a sidecar, the trace/metric instrumentation must live in the client. gRPC has good built-in support for this, but it's another thing to keep consistent.</li>
+</ul>
+<p>The 2026 picture: proxy-less is winning for gRPC-heavy internal architectures (Google, ByteDance, large financial firms), and sidecars remain dominant for polyglot environments with mixed protocols (HTTP/1.1, gRPC, WebSocket, custom). Ambient mesh (Istio) and Cilium's eBPF mesh blur the line further — no sidecar, but a node-level proxy still gets the hop tax in less-acute form.</p>
+<hr>
+<h2 id="28-cost-and-economics">§28. Cost and economics</h2>
+<p>The LB's cost shows up everywhere — instance hours, bandwidth, license fees, engineer time. Worth understanding before adopting a managed service or building in-house.</p>
+<p><strong>Managed LB pricing.</strong> AWS ALB pricing (current as of 2026):</p>
+<ul>
+<li>Fixed hourly: $0.0225/hour per ALB (~$16.40/month standing). 50 ALBs = $820/month base.</li>
+<li>Per LCU (Load Balancer Capacity Unit): $0.008/LCU-hour. An LCU is "the max of new connections, active connections, processed bytes, rule evaluations." A medium-traffic ALB consumes 10-50 LCUs continuously, so ~$2-11/month per ALB at low load. At peaks (Black Friday on a retail ALB), an LCU spike to 1000+ for an hour = $8 for one hour.</li>
+<li>Free data in, $0.01-0.09/GB out (varies by region).</li>
+</ul>
+<p>For a small SaaS with one ALB doing 1k RPS sustained: ~$25-50/month. Affordable; just turn it on.</p>
+<p>For a hyperscaler doing 1M RPS on the same managed LB: tens of thousands per month per LB; multiply by hundreds of LBs and the bill is millions per year. The math starts to make in-house Envoy attractive.</p>
+<p>NLB pricing is similar shape but with NLCU (Network Load Balancer Capacity Unit) and different per-unit costs. GCP and Azure broadly comparable.</p>
+<p><strong>Self-managed Envoy/HAProxy TCO (Total Cost of Ownership).</strong> What does running your own LB actually cost?</p>
+<ul>
+<li><em>Hardware/cloud instances.</em> An Envoy fleet doing 250k RPS per instance needs N instances + headroom. Let's say a fleet of 50 c5.4xlarge instances ($0.68/hour each, $24,500/month all up).</li>
+<li><em>Bandwidth.</em> Same as managed — the data is leaving the data center either way.</li>
+<li><em>Engineering.</em> Building, operating, on-call. A team of 3-5 engineers ($1-2M/year fully loaded) is the realistic minimum to operate a custom LB tier at scale. Includes incident response, capacity planning, upgrade testing.</li>
+<li><em>Observability infrastructure.</em> Metrics ingest, log storage, tracing systems. Maybe $50-200k/year for a medium fleet.</li>
+<li><em>Software/maintenance.</em> Envoy is open source, but security patches, version upgrades, integration testing all cost time. HAProxy Enterprise is paid ($5-20k/year per pair of instances).</li>
+</ul>
+<p>Total: ~$2-3M/year for a self-managed fleet that replaces ~$5M/year of managed LB at scale. The "tipping point" depends on traffic volume.</p>
+<p><strong>The "we save $X by running our own LB" tipping point.</strong> Rough rule of thumb:</p>
+<ul>
+<li><em>Under $500k/year on managed LBs:</em> keep using managed. The engineering cost of in-house is higher than the LB savings. Spend the engineer-cycles on the product instead.</li>
+<li><em>$500k to $3M/year:</em> it depends. Specialized requirements (custom WAF rules, internal-only protocols, regulatory constraints) might force in-house; otherwise managed is still cheaper.</li>
+<li><em>Over $3M/year:</em> in-house pays off. The hyperscalers all run their own LBs (Cloudflare Unimog, AWS Hyperplane, Google Maglev, Facebook Katran) for exactly this reason — and because at their scale, they need features no managed LB provides.</li>
+</ul>
+<p>There's a non-monetary tipping point too: <strong>feature constraint</strong>. If a managed LB doesn't support a feature you need (HTTP/3 backend connections at a certain time, a specific TLS extension, a custom protocol), you build your own regardless of cost.</p>
+<p><strong>The "managed LBs hide the cost" pattern.</strong> A common surprise: the managed LB looks cheap until traffic grows or feature creep adds LCUs. A team starts at $50/month per ALB; six months later they have 200 ALBs (one per service per environment) and $200k/year in LB bills, and nobody planned for it. Practice: budget for managed LB cost growth at the same rate as traffic growth. Consider one ALB serving many backends (path-based routing) rather than one ALB per backend.</p>
+<p>The big architectural truth: load balancing has become so commoditized that the <strong>wrong question</strong> is "Envoy vs HAProxy vs Nginx." The right question is "managed or in-house," and the answer flips at predictable scale milestones.</p>
+<hr>
+<h2 id="29-summary">§29. Summary</h2>
+<blockquote>
+<p><em>Load balancing is a class of traffic-distribution infrastructure spanning kernel-bypass packet forwarders at the line-rate end (Maglev, Katran, Unimog — XDP/eBPF, Maglev-hash lookup tables, ~200 ns per packet) and user-space application-aware proxies at the policy-rich end (Envoy, NGINX, HAProxy — TLS terminate, path routing, retries, mesh policy); both layers chain in the canonical anycast + ECMP + L4 + L7 + backend topology, the Maglev table is the only replicated state and is deterministic from the backend list so the data plane is durably stateless, and the design's hardest problems — stable hashing under churn, slow-start, hot keys, layered health, sticky failover, TLS cost, SYN floods — all trace back to the same root: an LB is a routing decision repeated billions of times per day with no second chances.</em></p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

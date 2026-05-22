@@ -1,0 +1,1475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Databases — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/backend-fundamentals/">← Back to Backend Fundamental Components</a>
+        <h1 class="article-title">Databases</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Backend Fundamental Components
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>A technology reference on transactional databases — what they are, how they work at the byte level, where the design space splits, when to pick which variant. Use cases (payments, social profiles, e-commerce inventory, gaming leaderboards, SaaS documents) appear throughout as illustrations of the same class of technology bent to fit different workloads.</p>
+</blockquote>
+<hr>
+<h2 id="1-what-transactional-databases-are">§1. What Transactional Databases Are</h2>
+<p>A <strong>transactional database</strong> is a stateful storage system whose contract is built around <strong>ACID</strong> — Atomicity, Consistency, Isolation, Durability — applied to multi-row mutations of structured data. It is the system underneath anything where partial application is unacceptable: a bank account balance, an inventory count, a user's profile, a feature-flag assignment, a task in a workflow. The defining property is "promises that a transaction either fully happened or fully did not, and the result survives power loss."</p>
+<p>Transactional databases sit at one corner of a four-way design space:</p>
+<ul>
+<li><strong>Relational row stores (OLTP — OnLine Transaction Processing)</strong> — MySQL InnoDB, PostgreSQL, Oracle, SQL Server. B+ tree, row-oriented, strong ACID, secondary indexes. Canonical transactional database. Excellent for point lookups and small range scans; poor for analytical scans.</li>
+<li><strong>NewSQL / distributed SQL</strong> — Spanner, CockroachDB, YugabyteDB, OceanBase, TiDB. Relational interface and ACID, with horizontal scaling via consensus (Paxos/Raft) under the hood. Trades commit latency (TrueTime wait, Raft RTT — Round Trip Time) for cross-shard transactions that just work.</li>
+<li><strong>Wide-column / LSM (Log-Structured Merge) stores</strong> — Cassandra, ScyllaDB, HBase, Bigtable. LSM tree storage, partition-key access, tunable consistency. Strong at write throughput and horizontal scale; per-key linearization only (via expensive Paxos-backed Lightweight Transactions); multi-row transactions weak or absent.</li>
+<li><strong>Document stores</strong> — MongoDB, Couchbase, DocumentDB. Per-document JSON-like records, schemaless, single-document transactions historically (multi-document added in MongoDB 4.0+). Trades schema rigor for developer velocity; the document is the transactional unit.</li>
+</ul>
+<p>This doc focuses on the transactional layer — OLTP relational row stores and NewSQL cousins — because that is where the byte-level mechanics matter most. Wide-column and document variants borrow much of the machinery (WAL, MVCC, replication) but make different storage-layer tradeoffs; we contrast them in §3 and §13.</p>
+<p><strong>What transactional databases are NOT good for:</strong></p>
+<ul>
+<li><strong>Analytical scans over billions of rows.</strong> Row-oriented B+ tree is the wrong layout. Use a columnar store (Pinot, Druid, ClickHouse, BigQuery, Snowflake) for OLAP (OnLine Analytical Processing).</li>
+<li><strong>Time-series at firehose rates.</strong> Append-only timestamp-ordered workloads belong in LSM-based or time-series engines (Prometheus, InfluxDB, M3DB).</li>
+<li><strong>Global write-throughput at write-master scale.</strong> Single-leader OLTP caps around 20–50k commits/sec per primary. Past that, shard (losing cross-shard transactions unless you build 2PC) or move to NewSQL.</li>
+<li><strong>Eventually-consistent read-heavy workloads.</strong> If 10-second staleness is fine, you're paying for guarantees you don't need.</li>
+<li><strong>Binary blob storage.</strong> A 10 MB image in a BLOB column ruins your buffer pool. Use object storage; store the URL.</li>
+</ul>
+<p>Mental model: a transactional database is for the small set of <strong>mutable, structured, conservation-critical state</strong> at the heart of a system. Around it cluster derived stores — caches, search indexes, analytical warehouses, blob stores — that take the truth from the database and reshape it for different access patterns. Get the primary right; everything else can be rebuilt. Get the primary wrong; no amount of caching saves you.</p>
+<hr>
+<h2 id="2-inherent-guarantees">§2. Inherent Guarantees</h2>
+<p>What the technology provides by design, and what must still be layered above it.</p>
+<h3 id="provided-by-design">Provided by design</h3>
+<ul>
+<li><strong>Atomicity within a transaction.</strong> Statements in a <code>BEGIN ... COMMIT</code> block apply together or not at all. The load-bearing primitive.</li>
+<li><strong>Isolation at a configurable level.</strong> READ UNCOMMITTED → READ COMMITTED → REPEATABLE READ → SERIALIZABLE. MySQL defaults to REPEATABLE READ; PostgreSQL defaults to READ COMMITTED. Know which level you have, what anomalies (dirty read, non-repeatable read, phantom, write skew) each permits, and which your invariants require.</li>
+<li><strong>Durability after commit ack.</strong> With defaults (<code>innodb_flush_log_at_trx_commit=1</code> in MySQL, <code>synchronous_commit=on</code> in PostgreSQL), once <code>COMMIT</code> returns, the change survives crashes. The mechanism is the WAL (Write-Ahead Log) — §4.</li>
+<li><strong>Secondary indexes consistent with the base table.</strong> Index update is part of the same transaction as the row update.</li>
+<li><strong>In-database constraints</strong> — <code>UNIQUE</code>, <code>FOREIGN KEY</code>, <code>CHECK</code>, <code>NOT NULL</code> — enforced by the database, not the application.</li>
+</ul>
+<h3 id="must-be-layered-above">Must be layered above</h3>
+<ul>
+<li><strong>Linearizability across a cluster.</strong> Reads against a replica may see a stale snapshot. Use read-from-primary routing for read-after-write, or session-bound consistency tokens (PostgreSQL's <code>pg_current_wal_lsn</code> + replica wait; MySQL GTID-based replica-read).</li>
+<li><strong>Cross-shard atomicity.</strong> Once sharded, the database's transaction boundary stops at the shard. Cross-shard requires <strong>2PC (Two-Phase Commit)</strong>, <strong>sagas</strong>, or <strong>escrow patterns</strong> layered above. NewSQL bakes this in at the cost of commit-wait latency.</li>
+<li><strong>Idempotency of client requests.</strong> The database doesn't know an HTTP retry is "the same" as the original. Use an <code>idempotency_key</code> column with <code>UNIQUE</code> constraint, written inside the same transaction as the mutation (the Stripe pattern).</li>
+<li><strong>Replication topology choice.</strong> Async vs sync vs semi-sync has very different durability characteristics. The database supports all three; picking wrong forfeits durability.</li>
+<li><strong>Backup and PITR (Point-In-Time Recovery).</strong> Many outages are "backups exist, but nobody tested restore."</li>
+<li><strong>Schema evolution under load.</strong> Adding a column to a 1 TB table without locking it for hours is an art (pt-online-schema-change, gh-ost, PostgreSQL <code>CONCURRENTLY</code>).</li>
+<li><strong>Multi-region disaster recovery.</strong> Cross-region async replicas survive regional loss with non-zero RPO (Recovery Point Objective). Cross-region RPO=0 requires NewSQL with consensus or custom synchronous setup (brutal latency tax).</li>
+</ul>
+<p>Synthesis: the database guarantees <strong>single-node ACID and single-cluster recovery</strong>. Everything beyond — cross-shard, cross-region, end-to-end idempotency, schema migration — is the system designer's problem.</p>
+<hr>
+<h2 id="3-the-design-space">§3. The Design Space</h2>
+<p>Variants of transactional databases differ along several orthogonal axes. They interact; you don't pick freely.</p>
+<h3 id="storage-engine-b-tree-vs-lsm">Storage engine: B+ tree vs LSM</h3>
+<p>The most consequential choice. A <strong>B+ tree</strong> (InnoDB, PostgreSQL, SQLite, SQL Server) is a balanced tree of fixed-size pages with rows in the leaves sorted by primary key; updates rewrite pages in place; reads traverse log(n) pages. An <strong>LSM tree</strong> (RocksDB, Cassandra, HBase, ScyllaDB; the engine underneath CockroachDB) buffers writes in an in-memory memtable, flushes to immutable sorted files (SSTables), and compacts files in background; reads consult multiple files via bloom filters.</p>
+<p>Tradeoff: B+ trees give <strong>predictable low p99 reads and easy range scans</strong> at the cost of <strong>lower sustained write throughput</strong> (~20–30k commits/sec on commodity NVMe) due to random in-place writes. LSM trees give <strong>massive write throughput</strong> (~100–200k writes/sec/SSD) at the cost of <strong>less predictable p99 reads</strong> (compaction stalls; multi-SSTable reads). For a payments ledger needing <code>SELECT balance FOR UPDATE</code> to return in &lt;5ms, B+ tree wins. For Discord's Cassandra-based messaging time-series, LSM wins.</p>
+<h3 id="concurrency-control-mvcc-vs-locking">Concurrency control: MVCC vs locking</h3>
+<p><strong>MVCC (Multi-Version Concurrency Control)</strong> stores multiple versions of each row keyed by transaction ID; readers never block writers, writers never block readers. PostgreSQL and InnoDB both use MVCC with different implementations (PG stores xmin/xmax on the tuple; InnoDB stores undo log entries). Pure two-phase locking is rare in modern OLTP. MVCC is the modern default because a 30-second analytical scan must not block payment commits. Price: MVCC garbage (§7.5).</p>
+<h3 id="topology-single-leader-vs-multi-leader-vs-leaderless">Topology: single-leader vs multi-leader vs leaderless</h3>
+<p><strong>Single-leader</strong> is the OLTP default. One node accepts writes; others are read replicas. Simple, leader is the throughput ceiling. <strong>Multi-leader</strong> (rare in OLTP) allows writes at multiple nodes with treacherous conflict resolution. <strong>Leaderless</strong> (Cassandra, DynamoDB) lets any node accept writes with tunable quorums; not a fit for OLTP because per-row linearization is hard.</p>
+<h3 id="replication-semantics">Replication semantics</h3>
+<ul>
+<li><strong>Async</strong>: leader commits, ships log later. Best latency, worst durability — lose up to lag-window of acked writes on leader failure.</li>
+<li><strong>Sync</strong>: leader waits for at least one replica to <em>apply</em> before ack. Highest durability, highest tail latency.</li>
+<li><strong>Semi-sync</strong>: leader waits for replica to <em>receive</em> (not apply). Good balance — cross-AZ (Availability Zone) RTT (~1ms) on commit; RPO=0 on common-case failover. MySQL's <code>rpl_semi_sync_master_wait_for_slave_count</code>, PostgreSQL's <code>synchronous_standby_names</code>.</li>
+<li><strong>Consensus (Raft/Paxos)</strong>: a quorum persists the log before commit. NewSQL (Spanner, CockroachDB) and consensus DBs (etcd, FoundationDB). RPO=0 with automatic failover; every commit pays one quorum RTT.</li>
+</ul>
+<h3 id="comparison-table">Comparison table</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>OLTP row store (MySQL/PG)</th>
+<th>Wide-column LSM (Cassandra)</th>
+<th>NewSQL (Spanner/Cockroach)</th>
+<th>Document store (MongoDB)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Storage engine</td>
+<td>B+ tree</td>
+<td>LSM tree</td>
+<td>LSM (RocksDB underneath)</td>
+<td>B-tree (WiredTiger) or LSM</td>
+</tr>
+<tr>
+<td>Concurrency control</td>
+<td>MVCC + row locks</td>
+<td>LWT / per-key Paxos</td>
+<td>MVCC + consensus</td>
+<td>MVCC</td>
+</tr>
+<tr>
+<td>Topology</td>
+<td>Single-leader</td>
+<td>Leaderless</td>
+<td>Consensus per shard</td>
+<td>Single-leader replica set</td>
+</tr>
+<tr>
+<td>Replication</td>
+<td>Semi-sync configurable</td>
+<td>Quorum-based</td>
+<td>Raft/Paxos</td>
+<td>Replica set with majority</td>
+</tr>
+<tr>
+<td>Cross-row txn</td>
+<td>Native (within shard)</td>
+<td>None (sagas only)</td>
+<td>Native (cross-shard)</td>
+<td>Multi-doc since v4.0</td>
+</tr>
+<tr>
+<td>Peak writes/sec/shard</td>
+<td>20–30k</td>
+<td>100k+</td>
+<td>5–10k (Paxos cost)</td>
+<td>10–30k</td>
+</tr>
+<tr>
+<td>p99 read predictability</td>
+<td>High</td>
+<td>Low (compaction)</td>
+<td>Medium</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td>Schema enforcement</td>
+<td>Strong</td>
+<td>Per-keyspace, weak</td>
+<td>Strong</td>
+<td>Optional</td>
+</tr>
+<tr>
+<td>Typical use</td>
+<td>Payments, profiles, inventory</td>
+<td>Time-series, IoT, fanout</td>
+<td>Geo-distributed OLTP</td>
+<td>Per-tenant SaaS docs</td>
+</tr>
+</tbody>
+</table>
+<p>The synthesis: each row of "typical use" is a <em>consequence</em> of the column entries. Cassandra ends up at "time-series" because LSM + leaderless + quorum is what time-series wants. MySQL ends up at "payments" because B+ tree + MVCC + semi-sync is what conservation-of-money wants.</p>
+<hr>
+<h2 id="4-underlying-data-structure-byte-level-mechanics">§4. Underlying Data Structure: Byte-Level Mechanics</h2>
+<p>The depth section. We zoom into the storage engine, walk a single mutation byte by byte, and compare B+ tree mechanics to LSM mechanics explicitly. This is what separates "I've used a database" from "I know why this database is right."</p>
+<h3 id="41-b-tree-page-layout">4.1 B+ tree page layout</h3>
+<p>In InnoDB (the canonical B+ tree OLTP engine; PostgreSQL is similar in spirit), every table is stored as a <strong>clustered B+ tree keyed on the primary key</strong>. The leaves of the primary-key tree contain the row data. Secondary indexes are separate B+ trees whose leaves contain the primary key; non-covered queries pay a second lookup into the clustered tree.</p>
+<p>A page is the I/O unit — 16 KB by default in InnoDB, 8 KB in PostgreSQL. Each page is a node of the tree.</p>
+<pre><code>Page = 16 KB. Internal layout (simplified, InnoDB):
+┌──────────────────────────────────────────────────┐
+│ Page header (38 B): page_no, prev/next page,     │
+│   level, n_records, checksum, LSN                │
+├──────────────────────────────────────────────────┤
+│ Infimum + Supremum (system records, 26 B)        │
+├──────────────────────────────────────────────────┤
+│ User records (sorted by PK), each =              │
+│   record header (5 B) + PK + non-PK columns      │
+│   + DB_TRX_ID (6 B) + DB_ROLL_PTR (7 B)          │
+├──────────────────────────────────────────────────┤
+│ Free space                                       │
+├──────────────────────────────────────────────────┤
+│ Page directory (sparse index of slot offsets)    │
+├──────────────────────────────────────────────────┤
+│ FIL trailer (8 B): checksum + LSN                │
+└──────────────────────────────────────────────────┘
+
+Internal (non-leaf) pages: PK values + child page numbers, sorted.
+Leaf pages: PK values + full row data + MVCC fields.
+Leaf pages doubly linked (prev, next) → range scans are sequential.
+</code></pre>
+<h3 id="42-branching-factor-and-tree-height">4.2 Branching factor and tree height</h3>
+<p>With 16 KB pages, a ~16-byte PK, and a 4-byte child pointer, an internal page holds <strong>~800 child pointers</strong>. A leaf page holds <strong>~60 rows</strong> at 256 B/row.</p>
+<p>Worked example. A 70-billion-row table — payments ledger at Alipay scale or a profile-edges table at LinkedIn:</p>
+<ul>
+<li>Leaves: 70B / 60 ≈ 1.2B leaf pages</li>
+<li>Level above: 1.2B / 800 ≈ 1.5M pages</li>
+<li>Level above: 1.5M / 800 ≈ 1,900 pages</li>
+<li>Level above: 1,900 / 800 ≈ 3 pages</li>
+<li>Root: 1 page</li>
+<li><strong>Tree height = 5 levels.</strong></li>
+</ul>
+<p>Point lookup traverses 5 pages. With a multi-GB buffer pool, root + upper internal pages are always cached — hot lookup is 1–2 page reads, ~0.1ms p50. Cold lookup misses 2–3 levels, pays ~100µs per SSD random read, lands at ~5–8ms p99.</p>
+<p>A smaller use case — a 10M-row e-commerce inventory table at a mid-sized retailer:</p>
+<ul>
+<li>Leaves: 10M / 60 ≈ 170k</li>
+<li>Level above: 170k / 800 ≈ 200</li>
+<li>Root: 1</li>
+<li><strong>Tree height = 3 levels.</strong></li>
+</ul>
+<p>Different scale, same logarithmic ceiling. The branching factor is generous; B+ trees stay short.</p>
+<h3 id="43-mvcc-how-postgresql-and-innodb-differ">4.3 MVCC: how PostgreSQL and InnoDB differ</h3>
+<p>Both PostgreSQL and InnoDB implement MVCC. They store version information differently:</p>
+<ul>
+<li><strong>PostgreSQL</strong> stores <strong><code>xmin</code> and <code>xmax</code></strong> on every tuple — the inserting and deleting transaction IDs. An update is delete + insert: old tuple gets <code>xmax = T</code>, new tuple gets <code>xmin = T</code>. The result is <strong>tuple bloat</strong>; dead tuple versions accumulate in the heap until <strong>autovacuum</strong> runs.</li>
+<li><strong>InnoDB</strong> keeps the <strong>current row in the clustered index</strong> with two MVCC fields — <code>DB_TRX_ID</code> (6 B) and <code>DB_ROLL_PTR</code> (7 B). The <code>roll_ptr</code> points into a separate <strong>undo log</strong> tablespace holding old row images. To read an older version, follow <code>roll_ptr</code> through undo records. The purge thread reclaims undo entries no longer needed by any active read view. Cleaner main pages; cost moves to undo tablespace growth.</li>
+</ul>
+<p>A reader at transaction T, reading row R updated by transaction T':
+1. Inspects R in the clustered index. Reads <code>DB_TRX_ID = T'</code>.
+2. Consults its <strong>read view</strong> — the set of transactions visible at T's snapshot time.
+3. If T' committed before T's snapshot, T sees this version.
+4. Otherwise: follow <code>DB_ROLL_PTR</code> into the undo log to fetch the previous version. Recurse.</p>
+<p>This is what makes MVCC powerful: a 30-second analytical scan can run on a hot replica while writes continue at 10k/sec on the primary; the scan sees a frozen snapshot materialized via undo chains. The price is the long-running-reader problem (§7.5).</p>
+<h3 id="44-buffer-pool-the-lru-you-actually-need">4.4 Buffer pool: the LRU you actually need</h3>
+<p>The buffer pool is the database's in-memory page cache, sized to 60–80% of RAM. A naive LRU (Least Recently Used) has a known failure: one large scan (<code>SELECT * FROM events WHERE ts &gt; ...</code>) reads millions of pages, each touched once, evicting the hot working set.</p>
+<p>InnoDB defends with a <strong>mid-point insertion LRU</strong>:</p>
+<pre><code>buffer pool LRU list:
+  ┌──────── young (5/8) ────────┬──── old (3/8) ────┐
+  HEAD                          midpoint            TAIL (evict)
+  ↑                             ↑
+  promoted here on              new pages enter here.
+  second access after           Must survive innodb_old_blocks_time
+  the dwell time                ms (default 1000ms) to promote.
+</code></pre>
+<p>A newly read page enters at the midpoint. If touched again after a dwell time, it's promoted to the young head. A one-shot scan reads pages into the old region; they get evicted before they pollute the young set. PostgreSQL's buffer manager uses a clock-sweep variant of the same idea.</p>
+<p>Capacity-planning consequence: you don't need to fit the whole dataset in RAM. You need to fit the <strong>hot working set</strong>. A 17 TB shard with a 180 GB buffer pool is fine if 1% of accounts drive 99% of traffic.</p>
+<h3 id="45-wal-redo-log-the-durability-primitive">4.5 WAL / redo log: the durability primitive</h3>
+<p>The Write-Ahead Log (WAL, or "redo log" in InnoDB) makes the buffer pool safe. Invariant: <strong>every page modification is described in the WAL, and the WAL is on disk before the modification's commit is acked.</strong> Page writes themselves can lag commit by minutes; the WAL is the recovery oracle.</p>
+<p>The WAL is a sequential append-only stream of physical-logical records: "at LSN (Log Sequence Number) L, page P, offset O, write bytes B". Sequentiality is the trick — a single SSD doing random page writes might do 10k IOPS, but sequential WAL appends sustain hundreds of MB/sec.</p>
+<p>Commit protocol (MySQL default, <code>innodb_flush_log_at_trx_commit=1</code>):</p>
+<ol>
+<li>Transaction modifies pages in the buffer pool; pages marked dirty.</li>
+<li>Each modification appends a redo record into the in-memory log buffer.</li>
+<li>On <code>COMMIT</code>, flush log buffer via <code>write()</code> + <code>fsync()</code>.</li>
+<li><strong>Only after fsync returns is the commit acked.</strong></li>
+<li>Dirty pages stay in buffer pool for minutes before being written to actual locations.</li>
+<li>Periodic <strong>checkpoints</strong> advance the "redo from here" pointer, allowing WAL ring reuse.</li>
+</ol>
+<p><strong>Group commit</strong> is essential. A single NVMe fsync is ~50–200µs. At 18k commits/sec naive per-commit fsync saturates the SSD. InnoDB batches concurrent commits into one fsync — 100 transactions ride one fsync, effective rates well past 20k/sec. PostgreSQL implements the same idea (<code>commit_delay</code>, <code>wal_writer_delay</code>).</p>
+<h3 id="46-one-concrete-operation-byte-by-byte">4.6 One concrete operation, byte by byte</h3>
+<p>Walk a single <code>UPDATE</code> end to end. We'll use a debit on a payments ledger as the example — <code>UPDATE accounts SET balance = balance - 100 WHERE account_id = 42</code> — but the same machinery runs an inventory decrement, a profile-bio update, or a feature-flag rule change. Let the LSN before the operation be 1000.</p>
+<ol>
+<li><strong>Client → DB shard owning row 42</strong> receives <code>BEGIN; SELECT balance FOR UPDATE; UPDATE; COMMIT;</code>.</li>
+<li><strong>Lock acquisition</strong>: row lock on PK=42 in the clustered index. In-memory lock manager. No disk I/O.</li>
+<li><strong>Read existing row</strong>: B+ tree traversal. Root → level-3 → level-2 → level-1 → leaf. If leaf is hot, 0 disk I/O. If cold, 1 SSD read ~100µs. Current row: <code>balance=500, DB_TRX_ID=T_prior, DB_ROLL_PTR=undo_ptr_5</code>.</li>
+<li><strong>Compute new value</strong>: <code>balance = 400</code>.</li>
+<li><strong>Write to undo log first</strong>: new undo record at undo_ptr_6 with the old row image. Undo pages also in the buffer pool. A redo log record is appended in memory describing this undo write.</li>
+<li><strong>Mutate the leaf page in buffer pool</strong>: write <code>balance=400, DB_TRX_ID=T_current, DB_ROLL_PTR=undo_ptr_6</code>. Leaf page now dirty. Append redo record: <code>LSN=1042: physical write to page P_leaf, offset O, bytes &lt;new row&gt;</code>.</li>
+<li><strong>Secondary indexes</strong>: if there's a <code>(account_id, ts DESC)</code> index and ts is unchanged on a balance update, the index is untouched. If the indexed columns change, more pages dirty, more redo records.</li>
+<li><strong>Auxiliary inserts</strong> in the same transaction (journal entry, audit row): each is another B+ tree insertion, possibly triggering a page split (target leaf full → allocate new page, redistribute; InnoDB's right-split heuristic keeps left pages full for monotonic inserts). Page split logged with another redo record.</li>
+<li><strong>COMMIT</strong>: write a "transaction commit" redo record at LSN 1080. Flush log buffer to OS. <code>fsync(redo_log_fd)</code>. ~150µs on NVMe.</li>
+<li><strong>Semi-sync wait</strong> (if configured): binlog event sent to replica over TCP. Replica acks receipt. ~500µs–1ms RTT cross-AZ.</li>
+<li><strong>Acknowledge client</strong>: HTTP 200 with new value.</li>
+<li><strong>Asynchronously, seconds to minutes later</strong>: page cleaner thread flushes the dirty leaf page to disk. A checkpoint eventually advances the LSN floor past 1080. Until that checkpoint, the redo log entries from this commit are required for recovery.</li>
+</ol>
+<p><strong>Crash scenarios:</strong></p>
+<ul>
+<li>Crash between step 9 (fsync done) and step 11 (ack sent): client retries with the same <code>idempotency_key</code>. The idempotency row was inserted in the same transaction; the lookup finds it; we return the prior result. <strong>Durability point: the fsync at step 9.</strong></li>
+<li>Crash between step 6 (page dirtied) and step 9 (commit logged): redo log has no COMMIT record. Restart scans redo log from last checkpoint, finds partial transaction, rolls back via undo. Lock released. Client times out, retries — fresh attempt. <strong>Correct: the partial state never escaped.</strong></li>
+<li>Crash between step 11 (ack) and step 12 (page flushed): redo log has the commit. Restart scans forward from last checkpoint, finds COMMIT at LSN 1080, redoes the page mutation. Dirty page reconstructed in buffer pool.</li>
+</ul>
+<h3 id="47-b-tree-vs-lsm-explicit-comparison">4.7 B+ tree vs LSM, explicit comparison</h3>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>B+ tree (InnoDB)</th>
+<th>LSM tree (RocksDB)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Write path</td>
+<td>random page write + redo (sequential)</td>
+<td>sequential WAL + memtable, periodic flush</td>
+</tr>
+<tr>
+<td>Write amplification</td>
+<td>~3–5x (page + index + redo + binlog)</td>
+<td>~10–30x (compaction rewrites)</td>
+</tr>
+<tr>
+<td>Read amplification</td>
+<td>1–5 page reads (tree height)</td>
+<td>1 memtable + N SSTables (bloom-filtered)</td>
+</tr>
+<tr>
+<td>Space amplification</td>
+<td>~1.5x (fill factor ~70%)</td>
+<td>~1.1–2.2x</td>
+</tr>
+<tr>
+<td>Sustained writes/sec/SSD</td>
+<td>~20–30k small commits</td>
+<td>~100–200k</td>
+</tr>
+<tr>
+<td>p99 read</td>
+<td>low, predictable</td>
+<td>higher, less predictable (compaction stalls)</td>
+</tr>
+<tr>
+<td>Range scan</td>
+<td>excellent (linked leaves)</td>
+<td>good (merging iterators; tombstones add cost)</td>
+</tr>
+<tr>
+<td>Row-level locking</td>
+<td>native</td>
+<td>typically optimistic / version-based</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Why B+ tree for transactional workloads.</strong> Predictable p99 reads matter more than peak write throughput when your read path is "balance check before debit," "stock check before order," "ACL check before serve." Row-level locking with <code>FOR UPDATE</code> is how you serialize concurrent mutations without inventing CAS atop the engine. Accept ~20–30k commits/sec/primary because the workload shards cleanly.</p>
+<p><strong>Why LSM for high-write workloads.</strong> When the pattern is "append events keyed by partition, occasionally point-lookup by partition+timestamp," LSM is ~5x cheaper at the write path and compaction stalls don't show up because reads are bulk-scan, not user-facing. Cassandra and HBase dominate time-series and IoT; modern NewSQL systems use RocksDB underneath while building B+ tree-like transactional semantics above it.</p>
+<hr>
+<h2 id="5-capacity-envelope">§5. Capacity Envelope</h2>
+<p>What this technology can do, illustrated across very different scales.</p>
+<p><strong>Single-node OLTP — startup scale.</strong> A PostgreSQL on EC2 r6i.4xlarge (16 vCPU, 128 GB RAM, NVMe local SSD) sustains ~10k commits/sec at p99 &lt;10ms, ~50k point reads/sec from a hot buffer pool, ~1–10 TB working data. Plenty for a SaaS with 10k customers at 100 QPS each. Hacker News ran on one PostgreSQL until ~2016; Basecamp on one MySQL primary for years. Next bottleneck: write throughput on one primary. Adding read replicas scales reads, not writes. At ~30k commits/sec, sharding looks unavoidable.</p>
+<p><strong>Sharded relational — mid scale.</strong> Application-level sharding (Vitess at YouTube and Slack; ProxySQL; or hand-rolled). <strong>Notion</strong> sharded PostgreSQL ~2021 into ~32 logical partitions — ~5k writes/sec/shard, ~50k total. <strong>Stripe</strong> used MongoDB historically, migrating to sharded PostgreSQL — estimated 5–10k payments/sec peak (2024). <strong>Pinterest</strong> stores pins in 4096 logical MySQL shards across hundreds of physical instances; 600k pin-writes/sec during traffic peaks. Bottleneck: <strong>cross-shard transactions</strong>. Once you need "transfer money," "move a document between workspaces," "join two tenants' data," the application builds 2PC or sagas.</p>
+<p><strong>Vitess at YouTube — high scale.</strong> Sharding layer over MySQL for video metadata. <strong>Millions of QPS</strong> aggregate across thousands of shards; PB-class total data; p99 read on a hot shard &lt;10ms. Vitess solved the shard-router problem operationally while leaving the storage engine as MySQL InnoDB.</p>
+<p><strong>OceanBase / Alipay — payments at firehose rate.</strong> MySQL-compatible distributed SQL. <strong>583,000 payments/sec peak</strong> on Singles' Day 2020; ~150 billion txns/day; ~50 PB total ledger; p99 commit &lt;100ms including cross-shard 2PC; RPO=0; RTO &lt;30s for single-AZ failure. Upper bound currently shipping in production. Architecture: sharded MySQL-compatible engine + Paxos per shard + custom 2PC coordinator.</p>
+<p><strong>LinkedIn Espresso — profile data at PB scale.</strong> Distributed store for profiles, posts, comments, connections. <strong>PB-scale; ~10M QPS aggregate</strong> across thousands of shards. Per-shard MySQL with custom routing (Helix) and CDC (Change Data Capture) via Brooklin → Kafka → derived stores.</p>
+<p>The range — startup 10k QPS, mid-scale 50–500k, OceanBase hundreds of thousands with cross-shard transactions — is <strong>two orders of magnitude wide for the same technology class</strong>. What scales is the partitioning and replication topology above the storage engine; the storage engine itself (B+ tree, MVCC, WAL) is the same on a Notion shard as on an OceanBase shard.</p>
+<hr>
+<h2 id="6-architecture-in-context">§6. Architecture in Context</h2>
+<p>The canonical pattern for a transactional database in a production system. Not "the X system" — the shape that recurs across payments, profiles, inventory, leaderboards, SaaS documents, feature flags.</p>
+<pre><code>                              ┌──────────────────────────────┐
+                              │   Application servers        │
+                              │   (stateless, horizontal)    │
+                              └──────────┬───────────────────┘
+                                         │  idempotency_key on writes
+                                         │  partition_key chosen by app
+                                         ▼
+                              ┌──────────────────────────────┐
+                              │   Shard router / proxy       │
+                              │   (Vitess, ProxySQL, custom) │
+                              │   hash(partition_key) → shard│
+                              └──────────┬───────────────────┘
+                                         │
+            ┌──────────┬──────────┬──────┴───────┬──────────────┐
+            ▼          ▼          ▼              ▼              ▼
+       ┌────────┐ ┌────────┐ ┌────────┐    ┌────────┐    ┌────────┐
+       │ Shard  │ │ Shard  │ │ Shard  │ …  │ Shard  │    │ Shard  │
+       │   0    │ │   1    │ │   2    │    │  N-2   │    │  N-1   │
+       │ Primary│ │ Primary│ │ Primary│    │ Primary│    │ Primary│
+       │   │    │ │   │    │ │   │    │    │   │    │    │   │    │
+       │ semi-sync replicas (1–2 cross-AZ)                       │
+       │   │    │ │   │    │ │   │    │    │   │    │    │   │    │
+       │ Replica│ │ Replica│ │ Replica│    │ Replica│    │ Replica│
+       └───┬────┘ └───┬────┘ └───┬────┘    └───┬────┘    └───┬────┘
+           │ binlog / WAL stream │                           │
+           └──────────┬──────────┴──────────┬────────────────┘
+                      ▼                     ▼
+            ┌────────────────────┐ ┌────────────────────────┐
+            │  Cache tier        │ │  CDC (Debezium /       │
+            │  (Redis/Memcached) │ │   Brooklin) → Kafka    │
+            │  hot reads         │ │   feeds derived stores │
+            └────────────────────┘ └─────────┬──────────────┘
+                                             │
+                            ┌────────────────┼────────────────┬──────────────┐
+                            ▼                ▼                ▼              ▼
+                       ┌─────────┐      ┌─────────┐      ┌─────────┐    ┌─────────┐
+                       │ Search  │      │ OLAP /  │      │ Feature │    │ Object  │
+                       │ index   │      │ column  │      │ store   │    │ archive │
+                       │ (ES,    │      │ store   │      │ (Redis +│    │ (S3,    │
+                       │  Solr)  │      │ (Pinot, │      │  Iceberg│    │  Parquet│
+                       │         │      │  Druid) │      │  S3)    │    │  cold)  │
+                       └─────────┘      └─────────┘      └─────────┘    └─────────┘
+</code></pre>
+<p>The transactional database (left half) holds the <strong>source of truth</strong>. Around it cluster:</p>
+<ul>
+<li>A <strong>cache tier</strong> (Redis, Memcached) for hot reads — feed serving, profile rendering, ACL checks. Cache invalidation is the application's problem.</li>
+<li>A <strong>CDC pipeline</strong> (Debezium reading PostgreSQL logical replication, Brooklin reading MySQL binlog) publishing per-row change events to <strong>Kafka</strong>.</li>
+<li><strong>Derived stores</strong>: search indexes, OLAP column stores, ML feature stores, object archives. Each rebuildable from WAL/binlog history; each at bounded staleness (~5–10s typical); none is source of truth.</li>
+</ul>
+<p>Annotations: <strong>sharding</strong> at the router by hashing the partition key (account_id, user_id, tenant_id, pin_id). <strong>Replication</strong> within a shard group — primary fans out to semi-sync replicas in other AZs. <strong>CDC</strong> at the binlog/WAL layer, downstream of replication. <strong>Cache invalidation</strong> by row-level key, application-coordinated.</p>
+<p>This shape is the same whether the application is payments, social feed metadata, inventory, or SaaS documents. The variant (MySQL vs PostgreSQL vs MongoDB) and partitioning strategy changes by workload; the layout doesn't.</p>
+<hr>
+<h2 id="7-hard-problems-inherent-to-transactional-databases">§7. Hard Problems Inherent to Transactional Databases</h2>
+<p>Six fundamental challenges. Each shows up regardless of use case; illustrating examples come from across domains.</p>
+<h3 id="71-hot-row-contention">7.1 Hot row contention</h3>
+<p><strong>One line.</strong> One row receives so many writes that the row lock serializes them and the queue grows unboundedly.</p>
+<p><strong>Where it shows up.</strong> A Twitch streamer in a tipping system receives 100k tips/sec. A flash-sale SKU receives 50k decrements/sec at launch. A trending hashtag's counter increments at hundreds of thousands per second.</p>
+<p><strong>Why it breaks.</strong> A single InnoDB row lock supports ~1–5k updates/sec. At 100k/sec the lock queue grows; p99 explodes from 5ms to seconds; unrelated queries on the same shard suffer because the I/O thread is saturated.</p>
+<p><strong>Real fix: write-sharding within a row.</strong> Promote the hot row to N=64 sub-rows. Inserts route by <code>event_id % 64</code>. Reads aggregate via SUM. Pattern appears in tip-aggregation at livestreaming platforms, counter aggregation at social feed services, escrow patterns in <em>DDIA</em>. Withdrawals or strong-consistency reads coordinate cross-sub-row, accepting a 2PC tax in exchange for unblocked writes.</p>
+<p><strong>Inflection.</strong> Auto-promote when a row's write rate exceeds 1k/sec sustained for 60s.</p>
+<h3 id="72-cross-shard-transactions">7.2 Cross-shard transactions</h3>
+<p><strong>One line.</strong> Once sharded, a transaction touching two shards has no native atomicity primitive.</p>
+<p><strong>Where it shows up.</strong> A payment transfers money between accounts on different shards. A workspace move in Notion relocates pages from one tenant shard to another. A friend request in a social graph touches both users' adjacency lists.</p>
+<p><strong>Why it breaks.</strong> Concrete state (payments): t=0 Alice on shard 17 balance 1000, Bob on shard 203 balance 500. t=1 debit Alice → 900, commit shard 17. t=2 network blip, credit Bob on shard 203 times out. t=3 refund Alice, also times out. t=4 $100 gone. Conservation violated. Same pattern in inventory: decrement warehouse A, fail to increment warehouse B, stock lost.</p>
+<p><strong>Real fix: 2PC with a durable coordinator</strong> on top of per-shard XA transactions, or sagas with compensation if loose ordering is acceptable.</p>
+<pre><code>   Coordinator                Shard 17                       Shard 203
+   ───────────                ─────────                      ─────────
+   1. log: PREPARING(T)
+   2. ─── PREPARE ──────►     XA PREPARE: debit Alice
+                              (row locked, redo+binlog fsync'd)
+   3. ─── PREPARE ────────────────────────────────────►     XA PREPARE: credit Bob
+                                                            (row locked, fsync'd)
+   4. ◄── YES ──                                            ◄── YES ──
+   5. log: COMMITTED(T)   ← the durability point
+   6. ─── COMMIT ──────►     XA COMMIT
+   7. ─── COMMIT ─────────────────────────────────────►     XA COMMIT
+</code></pre>
+<p>The coordinator's COMMITTED log entry guarantees both participants commit even through restarts. Between PREPARE and COMMIT, both rows are locked (~16ms tail). Technically "2PC with participant timeouts" — participants abort unilaterally if the coordinator goes silent past a timeout. NewSQL bakes this in via Paxos-replicated transaction records at the cost of consensus-RTT commit latency.</p>
+<h3 id="73-replication-lag-and-read-after-write">7.3 Replication lag and read-after-write</h3>
+<p><strong>One line.</strong> A replica trails the primary by 50ms–2s; reading immediately after a write may see the old state.</p>
+<p><strong>Where it shows up.</strong> A user updates their LinkedIn bio, refreshes their profile, sees the old bio (read hit a replica). A merchant updates pricing, refetches the product list, sees old prices. A user posts a Notion comment, reloads the page, comment missing.</p>
+<p><strong>Why it breaks.</strong> At 50ms lag, ~1% of read-after-write hits a lagging replica. At 10k QPS that's 100 inconsistent reads/sec — visible in user complaints.</p>
+<p><strong>Real fix.</strong> Route read-after-write to the primary for ~5s after a user's write, tracked by session cookie. Or use session-bound consistency tokens — PostgreSQL returns <code>pg_current_wal_lsn</code> after a commit; a subsequent read waits for any replica to catch up (<code>pg_wal_replay_wait_for_lsn</code>). MySQL has similar via GTIDs (Global Transaction Identifiers). For invariant reads (balances), always read from primary; trade read scalability for correctness.</p>
+<h3 id="74-schema-evolution-under-load">7.4 Schema evolution under load</h3>
+<p><strong>One line.</strong> Adding a column, changing a type, adding an index — naively as table-locking DDL — blocks production traffic.</p>
+<p><strong>Where it shows up.</strong> A new feature adds <code>last_login_at</code> to a 500M-row users table at LinkedIn. A regulatory requirement adds <code>kyc_status</code> to a 10B-row accounts table. A redesign at Notion changes a column type from <code>INT</code> to <code>BIGINT</code> on a 5B-row blocks table.</p>
+<p><strong>Why it breaks.</strong> Vanilla <code>ALTER TABLE</code> in MySQL historically rewrote the table holding a metadata lock — hours of downtime on 500M rows.</p>
+<p><strong>Real fix: online schema change tools.</strong> MySQL: <code>pt-online-schema-change</code> or <code>gh-ost</code>. Both create a shadow table, dual-write via triggers (pt-osc) or binlog tailing (gh-ost), backfill, atomically swap. PostgreSQL: <code>CREATE INDEX CONCURRENTLY</code>; <code>ADD COLUMN ... DEFAULT NULL</code> (metadata-only since PG 11); <code>pg_repack</code> for rewrites. Type changes: dual-write to old and new columns, backfill, switch reads, drop old — multi-week dance.</p>
+<h3 id="75-long-running-transactions-and-mvcc-bloat">7.5 Long-running transactions and MVCC bloat</h3>
+<p><strong>One line.</strong> A long <code>BEGIN</code> holds an MVCC snapshot, blocking garbage collection of dead row versions across the whole database.</p>
+<p><strong>Where it shows up.</strong> An analyst leaves <code>psql</code> open with <code>BEGIN; SELECT ...</code> for an hour. A batch ETL runs a 30-minute scan inside a transaction. A stuck connection sits in <code>idle in transaction</code> after a crash.</p>
+<p><strong>Why it breaks.</strong> PostgreSQL: T starts at LSN 1000; 10M rows are updated while T runs; each update marks old tuples with <code>xmax</code>; autovacuum cannot reclaim because they're still visible to T's snapshot; table bloats 10x; eventually disk fills. InnoDB variant: long readers hold back undo log purge; undo tablespace grows unboundedly.</p>
+<p><strong>Real fix.</strong> <code>idle_in_transaction_session_timeout</code>, <code>statement_timeout</code> set to a few minutes; force-terminate longer transactions. Application: explicit query timeouts; share snapshots across short transactions rather than holding one big one. Monitor <code>pg_stat_activity</code> for old transactions and alert. Silent killer of production OLTP.</p>
+<h3 id="76-hot-partition-under-uneven-traffic">7.6 Hot partition under uneven traffic</h3>
+<p><strong>One line.</strong> Even with good sharding, traffic is rarely uniform; one shard runs hot while others idle.</p>
+<p><strong>Where it shows up.</strong> An e-commerce platform sharded by <code>customer_id</code> finds one marketplace seller is 50x median activity. A leaderboard sharded by <code>region</code> finds one region drives 80% of QPS. A multi-tenant SaaS sharded by <code>tenant_id</code> finds the largest tenant uses 20% of total capacity.</p>
+<p><strong>Why it breaks.</strong> Hash sharding spreads keys evenly but does not spread <em>traffic</em>. If one key gets 1000x the traffic, its shard is 1000x hotter. Uniform capacity expansion leaves the hot shard under-provisioned and others over-provisioned.</p>
+<p><strong>Real fix: tiered handling.</strong> For very hot keys: write-shard within the key (§7.1). For moderate skew: rebalance by moving partitions, not by hashing alone (Vitess's VReplication moves a key range to a different shard). For seasonal hotness: oversize the suspected hot shard ahead of peak — Singles' Day at Alipay, Black Friday at Amazon. Capacity planning is per-shard, not uniform.</p>
+<hr>
+<h2 id="8-replication-failover-and-disaster-recovery">§8. Replication, Failover, and Disaster Recovery</h2>
+<p>The previous sections treated replication as a knob (async / semi-sync / sync). At production scale, replication <em>is</em> the operational story — how data moves across nodes, how a primary loss becomes a 30-second blip instead of a 6-hour outage, how a "drop table production" is recoverable instead of a résumé-generating event. This section opens the box.</p>
+<h3 id="81-binlog-wal-streaming-mechanics-how-replication-actually-moves-data">8.1 Binlog / WAL streaming mechanics — how replication actually moves data</h3>
+<p>Replication is one node tailing another node's durability log. The mechanics differ between MySQL and PostgreSQL in shape but converge on the same idea: ship the log, replay it.</p>
+<p><strong>MySQL binlog.</strong> The binlog (binary log) is a <em>separate</em> log from the InnoDB redo log. Where redo is physical (page-level), binlog is logical (event-level) and is what replicas consume. Three formats:</p>
+<ul>
+<li><strong>Statement-based replication (SBR).</strong> The SQL statement is shipped (<code>UPDATE accounts SET balance = balance - 100 WHERE account_id = 42</code>). Compact. Breaks on non-deterministic functions (<code>NOW()</code>, <code>RAND()</code>, <code>UUID()</code>), on row-count-dependent statements, on triggers with side effects. Mostly deprecated.</li>
+<li><strong>Row-based replication (RBR).</strong> The <em>before</em> and <em>after</em> row images are shipped. Deterministic, safe under any statement. Larger payload — a single <code>UPDATE ... WHERE status='pending'</code> touching 100k rows ships 100k row events.</li>
+<li><strong>Mixed.</strong> Statement by default; auto-switch to row when the statement is non-deterministic. Default since MySQL 5.7.</li>
+</ul>
+<p><strong>GTID (Global Transaction Identifier).</strong> Each committed transaction gets a unique ID of the form <code>server_uuid:transaction_id</code>. Replicas track which GTIDs they have applied (<code>gtid_executed</code>). Failover becomes trivial: "give me everything after GTID <code>X:1042</code>." Before GTIDs, replicas tracked <code>(binlog_file, binlog_offset)</code> — which broke catastrophically when the primary changed (the new primary's binlog files are not the old primary's binlog files). GTIDs decouple the identifier from the physical file.</p>
+<p><strong>The replication threads.</strong></p>
+<pre><code>   Primary                            Replica
+   ───────                            ───────
+   Client commit
+       │
+       ▼
+   InnoDB redo log fsync
+       │
+       ▼
+   Binlog event append + fsync (sync_binlog=1)
+       │
+       ▼
+   Dump thread (per replica)
+       │ ── TCP ─────────────────────► IO thread
+                                           │
+                                           ▼
+                                       Relay log (on disk, replica's local)
+                                           │
+                                           ▼
+                                       SQL thread (or parallel workers)
+                                           │
+                                           ▼
+                                       Apply to InnoDB → local commit
+                                           │
+                                           ▼
+                                       Update gtid_executed
+</code></pre>
+<p>The <strong>dump thread</strong> on the primary is dedicated per replica — one TCP connection, streaming binlog events in commit order. The <strong>IO thread</strong> on the replica receives events and appends to the <strong>relay log</strong> (a local on-replica copy of the binlog segment). The <strong>SQL thread</strong> (legacy) or <strong>parallel workers</strong> (5.7+, <code>slave_parallel_workers=N</code>) read from the relay log and apply events to InnoDB. The split is deliberate: receiving is decoupled from applying so a slow apply doesn't backpressure the network.</p>
+<p><strong>PostgreSQL WAL streaming.</strong> PostgreSQL doesn't have a separate binlog — the redo log <em>is</em> the replication log. Streaming replication ships raw WAL records.</p>
+<pre><code>   Primary                            Replica
+   ───────                            ───────
+   Client commit
+       │
+       ▼
+   WAL record append + fsync (synchronous_commit=on)
+       │
+       ▼
+   walsender (per replica connection)
+       │ ── TCP ─────────────────────► walreceiver
+                                           │
+                                           ▼
+                                       Local WAL append + fsync
+                                           │
+                                           ▼
+                                       Startup process (recovery mode)
+                                       redoes WAL records onto local data files
+                                           │
+                                           ▼
+                                       Update pg_last_wal_replay_lsn
+</code></pre>
+<p><strong>Replication slots</strong> track which WAL segments are still needed by each replica. Without a slot, an aggressive <code>checkpoint</code> could recycle WAL segments before a lagging replica consumed them, breaking the replica. With a slot, the primary refuses to recycle WAL the replica still needs — at the cost that a permanently-disconnected replica's slot will fill the primary's disk (a recurring outage pattern; monitor <code>pg_replication_slots.confirmed_flush_lsn</code>).</p>
+<p><strong>LSN (Log Sequence Number).</strong> Both MySQL and PostgreSQL use a monotonic position into the log. PostgreSQL's LSN is a 64-bit byte offset (<code>pg_current_wal_lsn() → 0/3A12F8</code>). MySQL's binlog has <code>(file, position)</code> pre-GTID and GTID sets post-GTID. <strong>Lag</strong> is <code>primary_lsn − replica_lsn</code> in bytes, or seconds derived from "when was this LSN committed on primary." </p>
+<p><strong>One transaction byte-by-byte, primary → replica.</strong> Continuing the §4.6 example (debit Alice -100 at LSN 1042):</p>
+<ol>
+<li>Primary writes redo record at LSN 1042 (page mutation) and binlog event at GTID <code>srv-uuid:1042</code> containing the row before/after image.</li>
+<li>After local commit, primary's dump thread (or walsender for PG) reads the new binlog/WAL bytes and writes them to the TCP socket.</li>
+<li>The replica's IO thread (or walreceiver) receives the bytes. Replica writes them to its relay log (or local WAL) and fsyncs.</li>
+<li><strong>In semi-sync mode, the replica acks at this point.</strong> Primary's commit returns to the client.</li>
+<li>The replica's SQL thread (or startup process) reads from the relay log, applies the row write to the InnoDB clustered index (or the WAL records to the PG heap pages). Replica commits locally. Replica's <code>gtid_executed</code> (or <code>pg_last_wal_replay_lsn</code>) advances to 1042.</li>
+<li>The replica is now caught up. A read from this replica with snapshot ≥ 1042 sees the debit.</li>
+</ol>
+<p>The "lag" we obsess about is the time between step 1 and step 5 on a per-replica basis. Step 4 is what semi-sync waits for; step 5 is what sync_commit=remote_apply waits for.</p>
+<h3 id="82-replication-modes-deep-dive">8.2 Replication modes deep dive</h3>
+<p>The four modes and what they actually cost.</p>
+<p><strong>Async (default).</strong> Primary acks the client as soon as its local redo+binlog fsync returns. Replicas catch up at their own pace. Minimal commit latency (~150–300µs on NVMe). <strong>RPO &gt; 0</strong> on primary loss — anything not yet shipped to a replica is lost.</p>
+<pre><code>Client    Primary                  Replica
+   │        │                        │
+   │ COMMIT │                        │
+   ├───────►│                        │
+   │        │ fsync redo+binlog      │
+   │        │                        │
+   │        │ ──── async send ──────►│   (some time later)
+   │ ◄─ACK──┤                        │
+   │        │                        │
+            │ (replica may be 50ms,  │
+            │  500ms, or 30s behind) │
+</code></pre>
+<p><strong>Semi-sync (<code>rpl_semi_sync_master_wait_for_slave_count=1</code> in MySQL, <code>synchronous_commit=remote_write</code> in PG).</strong> Primary waits for the replica to acknowledge <strong>receipt</strong> (durable in replica's relay log / replica's WAL) before acking the client. Replica has not necessarily <em>applied</em> — but it's on durable storage. Crash of primary doesn't lose the commit. <strong>RPO ≈ 0</strong> in the common case.</p>
+<pre><code>Client    Primary                  Replica
+   │        │                        │
+   │ COMMIT │                        │
+   ├───────►│                        │
+   │        │ fsync redo+binlog      │
+   │        │ ── sync send ─────────►│
+   │        │                        │ fsync relay log / WAL
+   │        │ ◄────── ACK ───────────┤
+   │ ◄─ACK──┤                        │
+</code></pre>
+<p>Latency tax: one cross-AZ RTT, ~0.5–2ms typical. Cross-region: 50–200ms — usually unacceptable for OLTP.</p>
+<p><strong>Sync / <code>remote_apply</code> (<code>synchronous_commit=remote_apply</code> in PG).</strong> Primary waits for the replica to <em>apply</em> the change before acking. The strongest guarantee: a read on the named synchronous replica immediately after commit is guaranteed to see it. Brutal latency: 2× WAL fsync + apply time + RTT. Cross-AZ commits go from ~1ms to ~3–5ms; tail latencies pile up. Rare in production OLTP because the apply step is unpredictable.</p>
+<p><strong>Consensus-based (Raft/Paxos per shard).</strong> Spanner, CockroachDB, TiDB, OceanBase, FoundationDB. Each commit must persist on a <strong>majority</strong> of the replica set before acking. With 3 replicas, 2-of-3 must fsync — the commit survives any single failure including the primary's. Latency tax: one quorum RTT — ~5–15ms intra-region, 50–200ms cross-region.</p>
+<pre><code>   Leader                                  Followers
+   ──────                                  ─────────
+   commit T → Raft AppendEntries(T)
+       │ ── send to follower A ──────────► fsync, ack
+       │ ── send to follower B ──────────► fsync, ack
+       │
+       │   wait for majority (2 of 3 incl self) — ackd
+       │
+       ▼
+   Apply to state machine, ack client
+</code></pre>
+<p><strong>Concrete RTT numbers.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Same AZ</th>
+<th>Cross-AZ (same region)</th>
+<th>Cross-region (US-East ↔ US-West)</th>
+<th>Cross-continent</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Local NVMe fsync</td>
+<td>~150µs</td>
+<td>~150µs</td>
+<td>~150µs</td>
+<td>~150µs</td>
+</tr>
+<tr>
+<td>Async replication</td>
+<td>+0 (client)</td>
+<td>+0 (client)</td>
+<td>+0 (client)</td>
+<td>+0 (client)</td>
+</tr>
+<tr>
+<td>Semi-sync (<code>remote_write</code>)</td>
+<td>+0.2ms</td>
+<td>+0.5–1.5ms</td>
+<td>+50–80ms</td>
+<td>+150–250ms</td>
+</tr>
+<tr>
+<td>Sync (<code>remote_apply</code>)</td>
+<td>+0.5–2ms</td>
+<td>+1.5–4ms</td>
+<td>+60–100ms</td>
+<td>+180–300ms</td>
+</tr>
+<tr>
+<td>Raft quorum (3 replicas)</td>
+<td>+0.3–1ms</td>
+<td>+1–3ms</td>
+<td>+50–80ms (worst pair)</td>
+<td>+150–250ms</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The "wait for slave" knob when no replica is reachable.</strong> Semi-sync turns into a CP/AP choice. MySQL's <code>rpl_semi_sync_master_timeout</code> (default 10000ms = 10s): if no replica acks within timeout, the primary <em>falls back</em> to async — silently. AP behavior: writes proceed, durability degrades. To get CP behavior (block writes until a replica acks), set timeout very high or pair with semi-sync orchestration that quiesces the primary. PostgreSQL: if <code>synchronous_standby_names</code> is set and no named standby is available, <strong>writes block indefinitely</strong> — pure CP. Operators set up a "phantom standby" entry (<code>ANY 1 (replica_a, replica_b)</code>) so that loss of any one replica doesn't quiesce writes.</p>
+<h3 id="83-replication-topology-variants">8.3 Replication topology variants</h3>
+<p><strong>Primary → N replicas (star).</strong> The default. One primary streams to each replica directly. Each replica costs one TCP connection, one dump/walsender thread, replication-bandwidth equal to the write rate. Past 5–8 replicas, the primary's network and CPU start to feel it.</p>
+<pre><code>            ┌─► Replica A (same AZ, semi-sync)
+   Primary ─┼─► Replica B (other AZ, semi-sync)
+            ├─► Replica C (other AZ, async, for reads)
+            └─► Replica D (other region, async, for DR)
+</code></pre>
+<p><strong>Primary → relay → replicas (cascade).</strong> When fanout exceeds ~8 replicas, introduce an intermediate. The relay node is itself a replica; it re-streams to a downstream cohort. Pinterest historically used 1 primary → 1 intermediate → 6 replicas per shard so the primary served 1 dump thread instead of 6. Adds one hop of lag (~30–100ms).</p>
+<pre><code>   Primary ─► Intermediate Replay Replica ─┬─► Replica 1
+                                           ├─► Replica 2
+                                           ├─► Replica 3
+                                           └─► … Replica N
+</code></pre>
+<p><strong>Multi-primary (MySQL Group Replication, BDR for PostgreSQL).</strong> Two or more nodes accept writes; conflicts resolved by certification (Group Replication uses an in-memory total order based on Galera-style certification). Rare in OLTP because conflict resolution is treacherous — writing to the same row in two regions and reconciling by timestamp is silent corruption for "subtract 100 from balance" semantics. Multi-primary works when the partition discipline ensures <em>no key is written in two places</em> (geo-partitioning), which is just sharding with a different label.</p>
+<p><strong>Read replicas in different AZs/regions.</strong> A common 3-AZ setup: primary + 1 semi-sync replica in another AZ (RPO=0), + 2 async replicas split across AZs for read load + 1 cross-region async replica for DR.</p>
+<p><strong>Per-replica cost.</strong> Each replica costs ~1 commit cycle of CPU on the primary (the dump/walsender thread doing the network send) + network bandwidth equal to the write rate per replica + storage equal to the dataset. Eight replicas = 8x replication bandwidth. A 17 TB shard with 50 MB/s of write traffic = 400 MB/s outbound from the primary across all replicas — that's 3.2 Gbps. AWS r6i.4xlarge has 12.5 Gbps; comfortable. r6i.large at 0.75 Gbps would be saturated.</p>
+<h3 id="84-replication-lag-causes-monitoring-mitigation">8.4 Replication lag — causes, monitoring, mitigation</h3>
+<p>Lag is the operational metric. At 0ms lag, reads from replicas are consistent. At 30s lag, your bug tracker is full.</p>
+<p><strong>Causes.</strong></p>
+<ul>
+<li><strong>(a) Network bandwidth saturated by large transactions.</strong> A 100k-row <code>UPDATE products SET price = price * 1.05</code> generates ~50 MB of binlog row events in row-based format; ship over a 100 Mbps link and you have 4 seconds of replication lag just from the network. Mitigation: rate-limit large batch jobs, run them off-hours, or break into smaller transactions.</li>
+<li><strong>(b) Single-threaded SQL apply on replica (legacy MySQL pre-5.7).</strong> Before 5.7, the SQL thread was a single goroutine applying events in serial. A primary with 8 cores merrily committing in parallel sends events that the replica must apply sequentially. Replicas could not keep up with bursty primaries — this caused the famous 2010s "MySQL replication lag" incidents at Twitter, Facebook, et al.</li>
+<li><strong>(c) Replica I/O subsystem slower than primary.</strong> Smaller-instance replica (cost optimization) with slower SSDs; replica fsyncs at 100µs while primary fsyncs at 50µs. Once the replica is behind, it never catches up because the steady-state apply rate is below the primary's commit rate.</li>
+<li><strong>(d) Long-running queries on replica holding MVCC snapshot.</strong> An analytical query with a 30-minute snapshot prevents the replica from applying any vacuum or undo cleanup; eventually, replication threads slow down. PostgreSQL's <code>hot_standby_feedback=on</code> makes this worse — the replica's snapshot pins the primary's vacuum too. (Off-loading analytics to replicas is a feature; running 4-hour scans on the primary's hot-standby replica is malpractice.)</li>
+</ul>
+<p><strong>Monitoring.</strong></p>
+<ul>
+<li><strong>MySQL <code>SHOW SLAVE STATUS\G</code></strong> — <code>Seconds_Behind_Master</code>. <strong>Famously unreliable.</strong> It measures the timestamp delta between the <em>currently applied event</em> and the <em>current wall clock on the replica</em>. If the dump thread stalls — IO thread idle, SQL thread idle — <code>Seconds_Behind_Master</code> returns 0 even though replication is broken. Use <code>Performance Schema replication_applier_status_by_worker.LAST_APPLIED_TRANSACTION_END_APPLY_TIMESTAMP</code> for real numbers.</li>
+<li><strong>PostgreSQL <code>pg_stat_replication</code></strong> — <code>sent_lsn</code>, <code>write_lsn</code>, <code>flush_lsn</code>, <code>replay_lsn</code>. Replay lag in time: <code>now() - pg_last_xact_replay_timestamp()</code> on the replica.</li>
+<li><strong>Lag in bytes</strong> (<code>primary_lsn − replica_replay_lsn</code>) is more honest than lag in seconds because it doesn't lie when nothing's coming through.</li>
+<li><strong>Alert thresholds.</strong> 5s is the common "yellow" threshold; 30s is "red". 0.5s lag is normal for cross-AZ async. Anything &gt; 60s is an incident.</li>
+</ul>
+<p><strong>Mitigations.</strong></p>
+<ul>
+<li><strong>MySQL 5.7+ multi-threaded slave</strong>: <code>slave_parallel_workers=8</code>, <code>slave_parallel_type=LOGICAL_CLOCK</code>. Replica applies events in parallel based on commit groups from the primary — events that committed in the same group commit on the primary can replay in parallel on the replica.</li>
+<li><strong>PostgreSQL 10+ parallel apply</strong> via logical replication. Streaming replication is still single-threaded for physical WAL; logical replication has parallel workers.</li>
+<li><strong>Batch large transactions</strong> into smaller chunks. A 1M-row update split into 100x 10k-row chunks gives replication chances to keep pace.</li>
+<li><strong>Prioritize replication network.</strong> QoS on AWS Direct Connect or VPC; isolate replication traffic from application traffic.</li>
+<li><strong>Right-size replicas equal to or better than the primary.</strong> "Saving money" on a replica that has to keep up at primary's write rate is false economy.</li>
+</ul>
+<p><strong>Concrete walkthrough of a 30-minute replication lag incident and rolling recovery.</strong></p>
+<pre><code>t=0:    Daily analytics job kicks off on primary's reporting replica.
+        Query: UPDATE billing_summary SET rollup = (...) WHERE month = '2026-04'
+        Touches 50M rows; held in one transaction.
+t=2min: Replica's WAL apply slows — the long-held snapshot blocks vacuum,
+        and the bulk update generates 8 GB of binlog/WAL events.
+        Replication lag begins growing at ~2s per real second.
+t=10min: Lag = 16 minutes. Read-after-write breaks for any user whose request
+        hit this replica. Customer-facing impact: stale data in dashboards
+        showing yesterday's number.
+t=12min: Pager fires (replica_lag &gt; 5min for &gt;2min).
+        On-call inspects: pg_stat_replication shows replay_lsn frozen,
+        pg_stat_activity shows a 12-min-old query on the replica.
+t=15min: Cancel the long query on the replica (pg_cancel_backend(pid)).
+        Replication resumes. Lag plateaus at ~17min.
+t=15min: Reroute read-after-write traffic to the primary (feature flag).
+        Customer impact lifted; latency on primary rises 20% but tolerable.
+t=15min – t=45min: Replica catches up at ~30s per real second 
+        (apply rate &gt; network rate while behind; warm caches help).
+        Lag drains.
+t=45min: Lag = 0. Reroute read-after-write back to replica.
+t=46min: Post-incident: move the analytics job to a dedicated reporting replica
+        with hot_standby_feedback=off and statement_timeout=10min.
+        Add monitoring on long-running transactions on replicas.
+</code></pre>
+<p>The pattern matters: lag is rarely the network. It's almost always a bulk operation on the replica or a single-threaded apply behind a write-bursty primary.</p>
+<h3 id="85-failover-orchestration">8.5 Failover orchestration</h3>
+<p>How automatic primary promotion actually happens. Each tool implements the same essential flow with different operational tradeoffs.</p>
+<p><strong>Orchestrator (GitHub's MySQL topology manager).</strong> Runs as its own HA cluster (etcd/Raft-backed for itself). Polls every MySQL node every few seconds. On detecting primary unreachable for 3+ consecutive failed health checks (~30s), it runs:</p>
+<pre><code>   1. Detection: 3 consecutive health-check failures over 30s.
+   2. Election: query all replicas for their GTID_EXECUTED.
+                 Pick the one with the largest GTID (= most data).
+                 Tiebreak by lag / topology preferences.
+   3. Fencing: mark old primary as read-only via STONITH or 
+               network fence (if reachable); reject its writes.
+   4. Promotion: SET GLOBAL read_only=OFF on chosen replica.
+                 Re-point all other replicas: STOP SLAVE / CHANGE MASTER TO 
+                 the new primary.
+   5. Service discovery: update DNS / VIP / Vitess routing layer.
+   6. Re-attach old primary as a replica once recovered.
+</code></pre>
+<p>Wall-clock end-to-end: ~20–60s. The fencing step is the load-bearing one — see §8.6.</p>
+<p><strong>Patroni (PostgreSQL).</strong> Uses a <strong>DCS (Distributed Configuration Store)</strong> — etcd, Consul, or ZooKeeper — for leader election via the DCS's own consensus. Each Patroni-managed PG node owns a lease in the DCS; the leader's lease is the source of truth for "who is primary." On lease expiry (typically 30s without renewal), other nodes race to claim the lease; the one with the highest LSN wins.</p>
+<pre><code>   1. Old primary's lease in etcd expires (failed to renew for 30s).
+   2. All replicas observe lease expiry, query the DCS.
+   3. Each replica reports its pg_last_wal_replay_lsn.
+   4. Highest-LSN replica claims the leader key in etcd 
+       (atomic compare-and-swap).
+   5. Patroni on the winner runs pg_ctl promote.
+   6. Other replicas re-point: pg_rewind or fresh basebackup,
+       then standby.signal + primary_conninfo pointing at new primary.
+   7. HAProxy / PgBouncer routes connections to new primary via 
+       Patroni's REST API (/master endpoint).
+</code></pre>
+<p><strong>AWS RDS Multi-AZ.</strong> A synchronous standby in another AZ. On primary failure, AWS swaps the DNS CNAME from primary to standby (~30–60s end-to-end). Transparent to applications using the RDS endpoint. Storage is replicated synchronously via EBS-level mirroring, not at the engine layer — both nodes write to two AZs every commit.</p>
+<p><strong>Aurora.</strong> 6-way replicated storage layer (4-of-6 quorum on writes, 3-of-6 on reads) decoupled from compute. Failover is just spinning up a new compute node on the existing storage volume — no data rebuild, no replication catch-up. &lt;30s typical.</p>
+<p><strong>MHA (MySQL Master High Availability) — legacy.</strong> A Perl-based tool, deprecated for &gt;5 years, but still seen in older deployments. Replaced largely by Orchestrator.</p>
+<p><strong>End-to-end walkthrough of one failover.</strong> Primary on <code>db-shard17-primary.az-a</code> (running MySQL 8.0 with semi-sync, GTID enabled) goes silent at 14:32:07 UTC due to NIC failure.</p>
+<pre><code>14:32:07 — NIC dies on db-shard17-primary.
+14:32:10 — Orchestrator's first health check fails (timeout 3s).
+14:32:13 — Second health check fails.
+14:32:16 — Third health check fails. → Trigger failover.
+14:32:17 — Orchestrator queries 3 replicas:
+              replica-az-b: GTID_EXECUTED = srv-uuid:1-104289
+              replica-az-c: GTID_EXECUTED = srv-uuid:1-104289
+              replica-az-d: GTID_EXECUTED = srv-uuid:1-104287  (lagging)
+14:32:18 — Election: replica-az-b chosen (tied for highest GTID;
+              az-b matches &quot;preferred failover zone&quot; tag).
+14:32:19 — Fence old primary: 
+              (a) iptables rule on switching fabric blocks db-shard17-primary's MAC,
+              (b) Orchestrator increments epoch in etcd from 17 → 18.
+              Any future writes from the old primary are ignored by replicas
+              because their replicate_filter requires epoch ≥ 18.
+14:32:20 — Promote: SET GLOBAL read_only=OFF on replica-az-b.
+              CHANGE MASTER TO MASTER_AUTO_POSITION=1, MASTER_HOST=replica-az-b
+              on replica-az-c and replica-az-d.
+14:32:24 — Update Vitess routing layer: shard17 primary = replica-az-b.
+14:32:25 — Connection draining: existing app connections to old primary 
+              receive ECONNRESET; reconnect via Vitess to new primary.
+14:32:30 — All app pods reporting healthy writes to new primary.
+14:32:30 — Failover complete. Wall-clock: 23 seconds detection-to-traffic.
+14:35:00 — Old primary brought up on a spare host with a snapshot of
+              replica-az-b at the failover GTID; re-attached as a fresh replica.
+</code></pre>
+<p>The 23-second window is what RTO=30s SLAs are budgeted for.</p>
+<h3 id="86-split-brain-prevention">8.6 Split-brain prevention</h3>
+<p>Two writable primaries simultaneously = data corruption. Both accept conflicting writes; neither can replicate to the other; on reconciliation, one set silently wins.</p>
+<p><strong>Fencing tokens.</strong> A monotonic epoch number (or generation, or term, or fencing_token). Every primary write includes its epoch. Replicas reject writes from an epoch lower than their own. On promotion, the new primary's epoch is set to <code>old_epoch + 1</code>. The old primary, if still alive and writing, has an epoch that's now stale; its writes are rejected at the replica layer. This is the load-bearing primitive — without it, fast promotion is unsafe.</p>
+<pre><code>   epoch=17, primary=A    epoch=18, primary=B (after failover)
+
+   t=0: A writes &quot;balance=400&quot; with epoch=17 → replicas accept.
+   t=1: Network partition. A still thinks it's primary.
+   t=2: Orchestrator promotes B with epoch=18. Replicas now expect 18.
+   t=3: A writes &quot;balance=300&quot; with epoch=17 → REJECTED.
+   t=4: B writes &quot;balance=350&quot; with epoch=18 → ACCEPTED.
+</code></pre>
+<p><strong>STONITH (Shoot The Other Node In The Head).</strong> Hardware-level fencing. The orchestrator's failover step includes "power-cycle the suspected primary via IPMI/BMC" or "pull its switch port via SNMP." Brutal but unambiguous — a powered-off node cannot write. Used in legacy on-prem deployments. Cloud equivalent: terminate the instance via EC2 API.</p>
+<p><strong>Quorum-based decisions (Raft/Paxos).</strong> A consensus DB never elects a new leader without a majority. If a partition isolates the old leader, the partition with majority elects a new leader; the partition without majority refuses to elect. The old leader, observing it's lost quorum, demotes itself (step down on loss-of-quorum). No fencing needed at the application layer — the protocol itself is the fencing.</p>
+<p><strong>Watchdog timers.</strong> The primary itself watches its own connection to the orchestrator/DCS. If it loses heartbeat for N seconds, it self-demotes to read-only. Belt-and-suspenders against an orchestrator that promotes a new primary while the old primary is still alive and unaware.</p>
+<p><strong>Concrete split-brain scenario.</strong> Network partition between AZ-A (primary) and AZ-B (orchestrator + replicas). The primary in AZ-A is healthy but isolated; the orchestrator in AZ-B can't reach it, declares it dead, promotes a replica.</p>
+<pre><code>Without fencing:
+   t=0: Primary in AZ-A keeps accepting writes from local apps in AZ-A.
+   t=10s: Orchestrator promotes replica in AZ-B. Apps in AZ-B write to AZ-B.
+   t=10s — t=120s: Network heals. Two primaries existed for 110s.
+       Conflict: account_id=42 written on AZ-A (balance=400) 
+       and on AZ-B (balance=350). 
+       On reconciliation, AZ-A's later commits override → losing AZ-B's debit. 
+       Data corruption.
+
+With fencing:
+   t=0: Primary in AZ-A keeps accepting writes locally, but its writes 
+        can't reach replicas (partition).
+   t=10s: Orchestrator promotes replica in AZ-B with epoch=18.
+        Apps in AZ-A still connected to AZ-A primary attempt writes.
+   t=10s+: The application's connection-pool layer in AZ-A has stale 
+        routing — but the binlog tail-shipping fence ensures AZ-A's 
+        writes since t=0 (with stale epoch=17) cannot be replicated, 
+        and the AZ-A primary's writes are stranded on local disk.
+   t=120s: Partition heals. AZ-A primary observes the new epoch=18, 
+        demotes itself to replica, and *discards* its post-partition writes 
+        (or surfaces them as conflicts requiring manual resolution).
+        No corruption — the writes that were *acked* during the partition 
+        were rejected at the replica fence and never appeared as committed
+        to anyone outside AZ-A.
+</code></pre>
+<p>The lesson: fencing is what makes "we have automatic failover" not a euphemism for "we have automatic data loss."</p>
+<h3 id="87-backup-strategies">8.7 Backup strategies</h3>
+<p>The backup is the database's last-resort time machine.</p>
+<p><strong>Logical backups (mysqldump, pg_dump).</strong> SQL statements that recreate the schema and data. <code>pg_dump --format=custom</code> produces a portable archive; <code>mysqldump --single-transaction</code> produces a consistent snapshot. Portable across major versions; can be restored to a different engine. <strong>Slow</strong> for restore: a 1 TB logical dump takes 10+ hours to restore because it replays through the SQL parser, planner, and executor row-by-row. Best for schemas under ~100 GB and for cross-version migrations.</p>
+<p><strong>Physical backups (xtrabackup/Percona for MySQL, pg_basebackup for PostgreSQL).</strong> Copy of the on-disk data files plus enough WAL to make them consistent. xtrabackup hot-copies InnoDB tablespace files while logging concurrent WAL writes; pg_basebackup streams the entire PG data directory through walsender's interface. <strong>Fast restore</strong> — it's just disk I/O. A 1 TB physical backup restores in ~3 hours (limited by sequential disk write rate, ~300 MB/s on commodity NVMe). <strong>Tied to engine version</strong>: restoring an InnoDB 8.0 backup to an 8.1 instance requires special handling.</p>
+<p><strong>Incremental / WAL-archiving backups.</strong> A weekly or nightly base backup (full physical) + continuous archiving of every WAL segment to S3/GCS as it rolls off. Restore = base backup + replay WAL from base-backup LSN to desired recovery target. Storage cost is dominated by base backups; WAL archive is incremental.</p>
+<p><strong>3-2-1 rule.</strong> 3 copies of data, 2 different storage media, 1 offsite. For a 17 TB payments shard: production data (1 copy on EBS) + snapshot in same region (2nd copy, different physical media) + cross-region S3 archive (3rd copy, offsite). Plus the live replicas as bonus redundancy.</p>
+<p><strong>Encrypted at rest.</strong> For compliance (PCI-DSS, HIPAA, SOC2). Either at the storage layer (EBS encrypted, S3 SSE-KMS) or at the application layer (column encryption with a customer-managed key). Backup encryption is the same key, plus the additional risk of "what happens if we lose the KMS key while the encrypted backup is offsite" — keep the KMS keys themselves backed up with strict access control.</p>
+<p><strong>Concrete production setup.</strong> A payments database at 17 TB/shard, 256 shards:</p>
+<pre><code>   Per-shard backup plan:
+   - Nightly full physical backup via xtrabackup → S3 in same region.
+     Cost: ~15 TB compressed (xtrabackup compresses InnoDB pages well).
+     Wall-clock: ~3 hours per shard, run sequentially across shards using
+     a backup orchestrator (one shard at a time per AZ to limit network).
+   - Continuous binlog archive: every binlog segment rolls off → S3 within 5min.
+     Storage cost: ~3 TB/day across all shards; retention 30 days = 90 TB.
+   - Retention: 30 days of nightly + 7 yearly snapshots (anniversary backups)
+     for legal/compliance.
+   - Multi-region replication of the backup bucket itself via S3 CRR.
+   - Quarterly disaster-recovery drill: restore one shard's backup into a 
+     fresh cluster, replay binlog to a specific GTID, verify row counts and 
+     checksums against production replica. Document RTO.
+</code></pre>
+<p>The drill is the load-bearing piece. Backups that have never been restored are not backups; they are encrypted files of hope.</p>
+<h3 id="88-point-in-time-recovery-pitr">8.8 Point-in-time recovery (PITR)</h3>
+<p>The "drop table production" scenario at 11:00 AM on a Tuesday. An engineer running a maintenance script forgot to set the right database context; <code>DROP TABLE accounts</code> ran in production. Replicas faithfully replicated the drop. The table is gone everywhere.</p>
+<p>PITR is the procedure to recover to <strong>exactly</strong> the moment before the bad event.</p>
+<pre><code>Goal: restore to 2026-05-22 10:59:59 UTC (1 second before DROP TABLE at 11:00:00).
+
+Steps:
+  1. Identify exact target. Inspect binlog/WAL for the bad event.
+     MySQL: mysqlbinlog binlog.0001042 | grep -B5 'DROP TABLE accounts'
+     → found at GTID srv-uuid:1042087 at timestamp 2026-05-22 11:00:00.123
+     → recover to GTID srv-uuid:1042086 (the previous transaction)
+
+  2. Bring up a recovery cluster (separate from production).
+
+  3. Restore the most recent full physical backup before the event 
+     (last night's 02:00 UTC backup).
+     → 1 TB restore via xtrabackup-restore in 3 hours.
+
+  4. Replay WAL/binlog forward from backup LSN to recovery target.
+     MySQL: configure replication from binlog archive in S3,
+            STOP SLAVE at gtid_executed = srv-uuid:1042086.
+     PostgreSQL: recovery.conf / recovery_target_time = '2026-05-22 10:59:59'
+            or recovery_target_lsn = '0/3A12F800'.
+     Wall-clock: replay rate ~10–30 MB/s for WAL through SQL apply.
+     With 9 hours of binlog (last backup at 02:00 → recovery target 11:00),
+     and a 50 MB/s primary write rate, that's 1.6 TB of WAL to replay.
+     ~12–15 hours.
+
+  5. Stop precisely. Verify the dropped table exists with row count matching
+     prod's state at 10:59:59 (compare to checksums or daily count audit).
+
+  6. Promote the recovery cluster (or just extract the needed table).
+     Strategy A: copy the recovered table back into the production cluster 
+                 via mysqldump or pg_dump (faster than full failover).
+     Strategy B: failover production to the recovery cluster (RTO = the
+                 12 hours just spent).
+
+  7. Document the gap: any writes between 11:00:00 (the drop) and &quot;now&quot; 
+     that touched the dropped table are lost; reconstruct from upstream 
+     sources or accept the gap.
+</code></pre>
+<p><strong>Total time cost.</strong> ~1 hour per TB for the base restore + WAL replay time (~10–30 MB/s replay rate × WAL volume since base). For a 1 TB database with 9 hours of WAL since last backup: ~3 hours restore + ~12 hours replay = ~15 hours. For PB-scale, you need shard-parallel restore + WAL replay — restoring 256 shards in parallel for ~3 hours each instead of sequentially.</p>
+<p><strong>The real-world examples.</strong> GitHub's 2012 outage involved restoring from binlog after a database corruption; recovery took ~6 hours. GitLab's 2017 incident (<code>rm -rf</code> of the production directory) — 6 hours of work lost because backups had silently been broken for months. The pattern: PITR works if and only if backups are tested and binlog archive is intact.</p>
+<h3 id="89-cross-region-disaster-recovery">8.9 Cross-region disaster recovery</h3>
+<p>What survives the loss of a <em>region</em> — not just an AZ.</p>
+<p><strong>Active-passive (warm standby in another region).</strong> Async replication from the primary region to a passive cluster in another region. ~50–200ms lag (the cross-region RTT). RPO ≈ lag window (anything in flight at the moment of regional loss is lost). RTO = manual failover process: ~10–30 minutes including human decision-making.</p>
+<pre><code>   us-east-1 (active)                       us-west-2 (passive)
+   ─────────────────                        ──────────────────
+   Primary (semi-sync within region)        Standby cluster (async receive)
+       │                                            ▲
+       │ ─── async binlog/WAL stream ──────────────►│
+       │     (cross-region, 50–80ms RTT)            │
+       ▼                                            │
+   Apps in us-east-1 ──── write ──────►             │
+                                                    │
+                                          (No app traffic; cold standby)
+   On regional loss:
+   1. Page on-call. Triage: is this really regional loss or just AZ?
+   2. Manual: update DNS/route config to direct apps to us-west-2 primary.
+   3. Promote us-west-2 standby to read-write.
+   4. Reconfigure CDC pipelines to read from us-west-2 binlog/WAL.
+   5. Communicate RPO (lag window) to customer; reconstruct lost txns 
+      from upstream sources where possible (idempotency keys help).
+</code></pre>
+<p><strong>Active-active (writes accepted in multiple regions).</strong> Writes route to the nearest region for latency; conflict resolution required. Three approaches:</p>
+<ul>
+<li><strong>LWW (Last Write Wins) with vector clocks.</strong> Each write tagged with a vector of <code>(region, logical_clock)</code>. Conflicts resolved by causality where possible, falling back to timestamp. Silent corruption for monetary operations — losing a debit because two regions both wrote the same row and the older timestamp won. Avoid for OLTP.</li>
+<li><strong>CRDTs (Conflict-free Replicated Data Types).</strong> Counters that add (G-counters, PN-counters); sets that union (G-sets, OR-sets); maps and registers with last-writer-wins on specific fields. Eventual consistency is intrinsic. Works for like-counts, presence indicators, collaborative documents (Yjs, Automerge). Doesn't work for "balance must equal credits minus debits."</li>
+<li><strong>Partition-per-region (geo-partitioning).</strong> Each region owns a disjoint set of partitions. All writes for partitions owned by region X go to X; conflicts are impossible because no two regions ever write the same row. Spanner's geo-partitioning, CockroachDB's locality-aware partitioning. This is the cleanest active-active pattern but requires partitioning by a key that's stable per-tenant (a user's home region).</li>
+</ul>
+<p><strong>Latency tax of synchronous cross-region.</strong> A Raft commit across us-east-1 / us-west-2 / eu-west-1 (a "three-region" deployment for true RPO=0) pays the slowest pairwise RTT. US-East to US-West is ~70ms; US-East to EU-West is ~100ms; quorum on a write needs 2-of-3 in this geometry, which is ~70ms in the best case. Every commit is ~70–100ms. For OLTP at 10k commits/sec, this is structurally unviable — you couldn't keep enough transactions in flight to saturate the system.</p>
+<p><strong>Concrete cross-region setups.</strong></p>
+<ul>
+<li><strong>Stripe</strong>: primary in US, async standby in another region. RPO measured in seconds. Customer-facing OLTP runs in one region with low-latency commits.</li>
+<li><strong>Notion</strong>: PostgreSQL cross-region async replicas for DR. Active-passive.</li>
+<li><strong>OceanBase at Alipay</strong>: 3-region Paxos quorum across Beijing, Shanghai, Shenzhen. RPO=0, but ~30–50ms commit latency due to inter-DC RTT within China being short.</li>
+<li><strong>CockroachDB</strong>: geo-partitioning by <code>region</code> column where applicable; pure-async cross-region for fallback.</li>
+</ul>
+<p><strong>The "do you really need active-active" pushback.</strong> Active-passive at 50ms RPO with 30-minute RTO is more than adequate for ~95% of OLTP workloads. The latency cost of synchronous cross-region (50–200ms per commit) and the conflict resolution complexity of active-active (corruption risks, custom conflict handlers, application-level partitioning) are rarely worth it. Pick active-passive unless there is a <em>specific</em> requirement (regulatory data residency requiring writes in-region, hard latency targets for users in two regions) that forces active-active.</p>
+<h3 id="810-rtorpo-targets-and-architecture">8.10 RTO/RPO targets and architecture</h3>
+<p><strong>RTO (Recovery Time Objective)</strong> = how long to restore service after a failure. <strong>RPO (Recovery Point Objective)</strong> = how much data we can lose. Pair them deliberately; each step down costs an order of magnitude more.</p>
+<table>
+<thead>
+<tr>
+<th>RTO</th>
+<th>RPO</th>
+<th>Architecture</th>
+<th>Cost multiplier</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>30s</td>
+<td>0</td>
+<td>Semi-sync replicas in another AZ + automated failover (Orchestrator/Patroni). Cross-AZ commit latency.</td>
+<td>5–10x (replicas)</td>
+</tr>
+<tr>
+<td>5min</td>
+<td>0</td>
+<td>Same as above but with manual failover after automated detection — human gates the promotion.</td>
+<td>4–8x</td>
+</tr>
+<tr>
+<td>1hr</td>
+<td>15min</td>
+<td>Cross-region async replica + PITR via WAL archive. Lag = your worst-case RPO.</td>
+<td>2–4x</td>
+</tr>
+<tr>
+<td>24hr</td>
+<td>24hr</td>
+<td>Nightly logical backup to S3. No replication. Restore is sequential WAL-less.</td>
+<td>1.2x</td>
+</tr>
+<tr>
+<td>30s</td>
+<td>0</td>
+<td>(cross-region) Paxos/Raft quorum across regions. NewSQL or custom consensus.</td>
+<td>10–20x + latency</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The 95% pick</strong> for production OLTP at meaningful scale: RTO=30s RPO=0 within a region (semi-sync + cross-AZ failover), RTO=15min RPO≈lag-window across regions (async cross-region for DR).</p>
+<p>Cost intuition: every "step better" on RTO is a step better on automation; every "step better" on RPO is a step better on replication mode. Going from RPO=15min to RPO=0 means moving from async to semi-sync — 10x more cross-region bandwidth and replica capacity. Going from RPO=0 within-region to RPO=0 across-region means consensus across regions — 100ms commit latency tax, possibly fatal to throughput.</p>
+<p>The synthesis: RTO/RPO is a product decision, not a technology decision. Pick them based on what the business loses per minute of outage and per second of data loss; provision the architecture that achieves them; do not over-engineer.</p>
+<hr>
+<h2 id="9-failure-mode-walkthrough">§9. Failure Mode Walkthrough</h2>
+<p>Every failure named, with the durability point.</p>
+<p><strong>9.1 Primary crashes mid-transaction.</strong> T was writing pages; redo records buffered but not flushed. On restart, the database scans redo log from last checkpoint, finds no COMMIT for T, rolls back via undo log. Lock released. T never happened. Client times out, retries with idempotency key. <strong>Durability point</strong>: none for T; correct outcome.</p>
+<p><strong>9.2 Primary crashes after fsync of commit, before binlog ack to replica.</strong> T committed locally (redo log fsync'd at LSN 1080). Binlog event generated; semi-sync wait in progress or just completed. On restart, T is redo-replayed and surfaces in the table. Binlog also persisted (<code>sync_binlog=1</code>). Replicas read the event and apply it; if already received, replication is idempotent at event level. If client ack was sent, T is durable. If not, client retries with idempotency key, sees <code>status=committed</code> in idempotency row, returns prior result. <strong>Durability point</strong>: fsync of redo log + binlog at LSN 1080.</p>
+<p><strong>9.3 Network partition isolating primary from quorum of replicas.</strong> Primary can write locally but semi-sync is blocking (no replica reachable). With <code>wait_no_slave=ON</code>, new commits stall. Primary refuses writes; clients see timeouts. When partition heals, replication catches up. If long-lived, the orchestrator may demote the isolated primary and promote a reachable replica. To prevent split-brain: a fencing token (monotonic epoch) ensures the demoted primary cannot ack new writes; STONITH (Shoot The Other Node In The Head) at the infra layer is belt-and-suspenders. <strong>Durability point</strong>: most recent commit that achieved replica ack; anything past that on the demoted primary is rolled back.</p>
+<p><strong>9.4 Permanent loss of a primary.</strong> Disk fails or host catches fire. Replicas survive. Orchestrator promotes the replica with the highest binlog/WAL position (<code>SHOW SLAVE STATUS</code> in MySQL; <code>pg_last_wal_replay_lsn()</code> in PostgreSQL). Other replicas re-point. A fresh node is provisioned, snapshot-restored, added as third replica. Wall-clock to full redundancy: ~30 minutes; service back in &lt;30 seconds with degraded redundancy. <strong>Durability point</strong>: last semi-sync acked commit. RPO=0 in the common case.</p>
+<p><strong>9.5 Permanent loss of an entire AZ.</strong> Primary + 1 replica gone in AZ-A. 1 replica surviving in AZ-B. Promote the AZ-B replica. Provision two new replicas in AZ-C and AZ-D from snapshot. Service runs degraded (single-replica) for ~30 minutes during reconstruction. <strong>Durability point</strong>: surviving replica's last applied event.</p>
+<p><strong>9.6 Silent disk corruption (cosmic ray hits a B+ tree page).</strong> A page on the primary has a flipped bit; reads return wrong data. InnoDB writes a checksum in each page header/trailer; PostgreSQL writes per-page checksums when initdb'd with <code>--data-checksums</code>. On read, mismatch raises an I/O error; the row read fails; orchestrator routes to a replica. Corrupted page reconstructed by replaying binlog/WAL onto a freshly initialized region, or single-page recovery from a healthy replica. <strong>Durability point</strong>: any replica with the uncorrupted page. Without checksums, silent corruption silently violates invariants. Run them in production, not just dev.</p>
+<hr>
+<h2 id="10-why-not-the-obvious-simpler-alternative">§10. Why Not the Obvious Simpler Alternative</h2>
+<p><strong>"Just use flat files."</strong> Replaying every event since genesis to answer "balance of account 42?" costs 100ms per query. To make it fast you'd materialize current state — you've invented a database. To make materialization crash-safe you'd add a write-ahead log — you've invented WAL. To handle concurrent updates you'd add locks — you've invented a transaction manager. The naive alternative <em>becomes</em> the database through three rebuilds.</p>
+<p><strong>"Just use Redis as the primary."</strong> Memory cost: 17 PB of payments data in RAM is not financially sane (disk is 50–100x cheaper). Persistence: default AOF (Append-Only File) fsync is <code>everysec</code>, losing up to 1s of acked writes on crash; <code>always</code> makes Redis ~10x slower. Transactions: MULTI/EXEC has no rollback on conditional failure; Lua gives atomicity but not isolation across keys. Replication: async by default. Redis is the correct <strong>fast-path layer</strong> in front of a real database — caching, idempotency lookups, rate limiting. Not the durable primary for conservation-critical state.</p>
+<p><strong>"Just use a global distributed transaction across all shards."</strong> Global locks serialize the entire workload. At 583k writes/sec, holding a global lock for 100µs caps throughput at 10k/sec — 60x below need. The point of sharding is to break the contended-lock barrier.</p>
+<p><strong>"Just use Cassandra, it horizontally scales."</strong> Without LWT (Lightweight Transactions) you have no per-key ordering — concurrent writes resolve by timestamp (LWW — Last Write Wins), so clock skew silently loses a debit. With LWT you pay Paxos round-trips (4 messages, ~5ms each in-DC), capping LWT-per-partition at 200–500/sec. To transfer money atomically between two rows you'd build 2PC over LWT — stacking expensive protocols. Real failure: two concurrent debits both CAS <code>balance=500</code> to <code>balance=400</code>. One wins, one loses, retries. Under contention the retry storm collapses throughput to a few hundred/sec — same bottleneck as a MySQL row lock at 4x the infra cost. Cassandra is right for time-series, fanout, IoT; wrong for conservation.</p>
+<p><strong>"Use object storage as the database."</strong> Eventual consistency on listing, no cross-object transactions, no indexes, per-object overhead that makes per-row workloads economically absurd. Object storage is the right <strong>archive tier</strong> (Parquet, blobs); not a transactional substrate.</p>
+<hr>
+<h2 id="11-scaling-axes">§11. Scaling Axes</h2>
+<p>Transactional databases scale on two axes that demand different solutions.</p>
+<p><strong>Vertical scaling.</strong> Bigger machine: more cores, RAM, faster SSDs. A single PostgreSQL on 96-vCPU, 768 GB RAM, NVMe sustains ~30–50k commits/sec. <strong>Inflection</strong>: 30–50k is the commodity-hardware ceiling. Beyond that, lock manager and WAL fsync become structural bottlenecks. You can ride this for a long time (Notion did until 2021, Hacker News until 2016), but eventually you shard.</p>
+<p><strong>Horizontal scaling: read replicas.</strong> Add async or semi-sync replicas; route read-heavy queries; primary handles writes and read-after-write. <strong>Inflection</strong>: replicas help when read:write is high (&gt;10:1). Payments at 1:1 sees little benefit; profile-rendering at 1000:1 scales beautifully — 8 replicas → ~8x read capacity. Replica lag is the operational problem.</p>
+<p><strong>Horizontal scaling: sharding (Type 1 — uniform growth).</strong> When more entities (users, accounts, documents) require more capacity than one primary handles, partition by entity key. <code>hash(key) % N</code>; mod by power of two for clean resharding (N → 2N). Each shard is its own primary with replicas. A router (Vitess, ProxySQL, application-layer) maps queries to shards. <strong>Inflection</strong>: when per-shard write rate hits 30–50% of sustainable ceiling, stage the next split. 512 → 1024 with dual-write + backfill + cutover takes weeks but is online throughout. Cost is permanent: cross-shard joins are N×M, cross-shard transactions need 2PC, schema migrations coordinate across shards.</p>
+<p><strong>Horizontal scaling: hot keys (Type 2 — same entities, more rate per entity).</strong> The harder axis. The same entity (a Twitch streamer, a flash-sale SKU, a viral hashtag) sees increasing write rate. Sharding alone does not help — hot row is still on one shard. <strong>Fix</strong>: write-shard within the entity (§7.1). <strong>Inflection</strong>: a single row exceeds 1k writes/sec sustained. Beyond write-sharding, <strong>log-based pre-aggregation</strong> — append to a Kafka topic partitioned by entity, with a consumer batching in 100ms windows and applying a single SUM update. Lose strict per-event ordering (acceptable for tips, likes, clicks); preserve eventual sum. Useful past 100k writes/sec on one entity.</p>
+<p><strong>Both knobs needed.</strong> Sharding alone (Type 1) doesn't fix hot keys (Type 2). Write-sharding alone (Type 2) doesn't fix capacity growth (Type 1). Every large-scale OLTP deployment ends up with both.</p>
+<h3 id="111-sharding-strategies-in-depth">11.1 Sharding strategies in depth</h3>
+<p>The choice of <em>how</em> to shard outlives the choice of <em>whether</em> to shard. Three families.</p>
+<p><strong>Hash sharding.</strong> <code>shard_id = hash(partition_key) % N</code>. Spreads keys uniformly across N shards regardless of key distribution. Works for high-cardinality keys (account_id, user_id) where you don't need range queries on the partition key. The price: <strong>rebalancing on N change is painful</strong>. Going from 512 → 513 shards remaps ~99.8% of keys; nearly every row has to move. The standard mitigation is to <strong>round N to a power of two</strong> — sharding by <code>hash(key) % 1024</code> lets you split each shard cleanly in half (mod 1024 → mod 2048; keys with <code>(hash mod 2048) &lt; 1024</code> stay put, others move to the new sibling). Splitting halves only the bottom-half data, not the entire dataset. Vitess's <code>KeyspaceID</code> and most modern hand-rolled shard maps use this pattern. Pinterest's 4096 logical MySQL shards started at 256 and doubled three times — each doubling moved half the data.</p>
+<pre><code>hash sharding with power-of-two N:
+
+   N=4                      split shard 2 into 2a + 2b → N=5? NO, → N=8
+   ─────                    ────────────────────────────────────
+   key → hash → mod 4       key → hash → mod 8
+                            keys where (hash mod 4)==2 split:
+   shard 0                     (hash mod 8)==2 → stays in old shard 2 (renamed 2a)
+   shard 1                     (hash mod 8)==6 → moves to new shard 2b
+   shard 2  ← splitting     other shards unchanged.
+   shard 3
+</code></pre>
+<p><strong>Range sharding.</strong> Shards own contiguous ranges of the partition key. <code>[0, 1M) → shard 0, [1M, 2M) → shard 1, ...</code>. Good for sequential keys that need range queries (e.g., time-series, audit logs). <strong>Hotspot risk</strong> on time-shaped data: if you shard <code>events</code> by <code>event_id</code> and IDs are monotonic, all new inserts hit the highest-range shard while older shards go cold. This is the "hot last shard" problem. Mitigations: hash a prefix of a composite key, or shard by <code>(tenant_id, event_id)</code> so within-tenant ranges work but tenants spread.</p>
+<p><strong>Directory-based (lookup table) sharding.</strong> A separate metadata table maps <code>partition_key → shard_id</code>. Flexible: any rebalancing is a directory update. Common at startups before they regret it. Costs:</p>
+<ul>
+<li><strong>Extra hop.</strong> Every query consults the directory (cached, but a cache miss is a hop).</li>
+<li><strong>The directory becomes critical</strong> — it's now a single point of failure, often itself sharded later (turtles all the way down).</li>
+<li><strong>Cache coherence.</strong> Stale directory entries route to the wrong shard. Need eviction on shard moves.</li>
+</ul>
+<p>Used cleanly when partitions are tenant-shaped (each tenant has a "home shard" in a directory) and the directory is small enough to keep in memory on every app server.</p>
+<p><strong>Vitess VReplication for online resharding.</strong> The operational pattern for moving from N shards to 2N (or N → M with arbitrary mapping). Three phases:</p>
+<pre><code>   Phase 1 — Dual write + backfill
+   ───────────────────────────────
+   - Old shard (N) keeps accepting writes (and continues to be the source of truth).
+   - Set up VReplication: stream binlog from old shard → new shard.
+   - Backfill historical data: copy all rows from old shard to new shards 
+     (partitioned by the new sharding function).
+   - When backfill completes, new shards are caught up to the binlog tail.
+   - Continue dual-shipping new writes (old + new).
+
+   Phase 2 — Switch reads
+   ──────────────────────
+   - Verify new shards are consistent with old (row counts, checksums).
+   - Update routing layer to read from new shards.
+   - Old shards still receive writes (continuing dual-write for safety).
+   - Observe for several days — read traffic on new, can revert if issues.
+
+   Phase 3 — Switch writes + decommission
+   ──────────────────────────────────────
+   - Atomic cutover: writes now go to new shards only.
+   - Old shards become read-only &quot;archive&quot; for a grace period (days).
+   - After verification window, decommission old shards.
+</code></pre>
+<p>End-to-end, a 512 → 1024 resharding at Slack-scale runs <strong>weeks</strong> but the database stays online throughout. The Vitess implementation handles the dual-write, backfill orchestration, cutover, and rollback machinery — building this from scratch is a ~6-month engineering project.</p>
+<h3 id="112-auto-increment-vs-uuid-for-shard-key">11.2 Auto-increment vs UUID for shard key</h3>
+<p>The shard-key choice has hidden traps.</p>
+<p><strong>Sequential shard key.</strong> If the shard key (or its prefix) is auto-incrementing, all new rows pile on the last shard. A <code>posts</code> table sharded by <code>hash(post_id) % 1024</code> is fine — hash spreads — but a <code>posts</code> table sharded by <code>post_id range</code> with monotonic IDs creates a hot last shard. Common at startups: "we'll shard by <code>customer_id</code>, range-based" — fine for now, devastating later when one tenant's burst goes to one shard.</p>
+<p><strong>Hash of UUIDv4 as shard key.</strong> UUIDv4 is uniformly random; <code>hash(uuid) % N</code> spreads cleanly. No hot last shard, no distribution skew from key generation. Cost: <strong>no clustering</strong>. Two consecutive customer signups go to different shards. Cross-customer queries scatter to N shards.</p>
+<p><strong>Hash of natural business key.</strong> <code>hash(customer_id) % N</code> where <code>customer_id</code> is itself a UUIDv4 or a non-monotonic identifier. All of a customer's data lives on one shard; cross-customer queries are still scatter-gather but per-customer workflows (loading a customer dashboard) stay local.</p>
+<p><strong>UUIDv7 / ULID for primary key + customer_id for shard key.</strong> The modern pattern. UUIDv7 has a 48-bit timestamp prefix followed by random bits — it's globally unique, time-ordered (preserving B+ tree insert locality), but not predictable. Use it as the primary key for B+ tree friendliness. Use a <em>separate</em> shard key (<code>customer_id</code>, hashed) to control distribution. Best of both worlds.</p>
+<pre><code>   Bad:  shard by post_id range (post_id auto-increment)
+         → all new posts on last shard, hot.
+
+   OK:   shard by hash(post_id) — UUIDv4 post_id
+         → spreads evenly, but per-customer queries scatter.
+
+   Good: PK = post_id UUIDv7 (B+ tree friendly), 
+         shard by hash(customer_id) — per-customer locality preserved.
+</code></pre>
+<h3 id="113-multi-region">11.3 Multi-region</h3>
+<p>The final scaling axis. Covered in detail in §8.9; the scaling-relevant summary.</p>
+<p><strong>Active-passive (warm standby).</strong> Primary in one region, async cross-region replica in another. RPO ≈ replication lag window (typically seconds to minutes). RTO ≈ manual failover time (10–30 minutes). Cost: 1 extra cluster, plus cross-region bandwidth for async stream (~50 MB/s for a busy shard). <strong>The 95% pick</strong> for OLTP that needs cross-region DR.</p>
+<p><strong>Active-active (writes in multiple regions).</strong> Three variants — LWW with vector clocks (silent corruption risk, avoid for OLTP), CRDTs (eventual consistency, works for counters/sets/collaborative docs not for conservation), or partition-per-region (geo-partitioning — each region owns disjoint keys, no conflicts possible). Geo-partitioning is the cleanest active-active but requires keys with a natural regional home.</p>
+<p><strong>NewSQL with Raft across regions.</strong> True cross-region linearizability via consensus. 50–200ms commit latency per transaction. Right for workloads where you <em>need</em> a global serialization point (a global rate limiter, a shared inventory across regions). Wrong for any latency-sensitive OLTP (a 100ms-per-commit cap is a 10/sec-per-key write rate).</p>
+<p><strong>The pushback.</strong> Most OLTP workloads — payments, profiles, e-commerce, SaaS docs — do not need active-active. The latency tax and conflict resolution complexity are rarely worth the engineering and operational cost. The default is active-passive with manual failover; promote to active-active only when a concrete requirement (regulatory residency, hard latency targets in two regions) forces it.</p>
+<hr>
+<h2 id="12-operational-concerns">§12. Operational Concerns</h2>
+<p>The previous sections covered the storage engine (§4), hard problems (§7), replication (§8), and scaling axes (§11). This section covers the operational details that decide whether a deployment of those technologies stays alive at 3 AM on a Sunday or collapses under predictable load. These are concerns the database engine itself doesn't solve — but every operator of a transactional system must.</p>
+<h3 id="121-connection-pooling">12.1 Connection pooling</h3>
+<p>The 100-300 connection ceiling is real and load-bearing for PostgreSQL design.</p>
+<p><strong>Why PostgreSQL hits a wall around 100–300 connections.</strong> PostgreSQL uses a <strong>process-per-connection</strong> model (<code>fork()</code> on accept). Each connection is a separate OS process consuming ~10 MB of RAM (process stack + per-backend buffers + work_mem allocations). 300 connections = 3 GB just for process overhead, plus the per-backend work_mem (default 4 MB, scales with concurrent queries). Past ~300 active connections on a 32 GB instance, you're context-switching constantly, the OS scheduler thrashes, and lock contention on internal data structures (proc array, pg_stat) becomes the limit.</p>
+<p><strong>MySQL is lighter but still bounded.</strong> MySQL uses <strong>thread-per-connection</strong> — threads share the process, each consuming ~256 KB stack + per-thread buffers. 1000 threads is more tolerable than 1000 processes. But MySQL is still bounded by the internal lock manager's bookkeeping, the thread pool's scheduler, and the InnoDB buffer pool's latch contention. Default <code>max_connections = 151</code>; real-world deployments raise to 1000–5000.</p>
+<p><strong>The math that bites you.</strong> An app with 100 servers × 50 conn-per-server in its connection pool = 5000 connections. A PostgreSQL primary with <code>max_connections=500</code> will refuse new connections at 501. Apps start throwing <code>FATAL: sorry, too many clients</code>. The classic startup death-spiral.</p>
+<p><strong>Solutions.</strong></p>
+<p><strong>PgBouncer</strong> is the PostgreSQL canonical answer. Three pooling modes:</p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>One client = one server connection for...</th>
+<th>Compatible features</th>
+<th>Pool ratio</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Session</strong></td>
+<td>Full client session (login → logout)</td>
+<td>Everything (prepared stmts, SET LOCAL, temp tables)</td>
+<td>1:1 ish</td>
+</tr>
+<tr>
+<td><strong>Transaction</strong></td>
+<td>Single transaction (<code>BEGIN → COMMIT</code>)</td>
+<td>Most things, but breaks prepared stmts, SET LOCAL</td>
+<td>100:1</td>
+</tr>
+<tr>
+<td><strong>Statement</strong></td>
+<td>Single statement</td>
+<td>Only stateless queries (no txns, no prep stmts)</td>
+<td>1000:1</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Transaction-mode is the sweet spot for most workloads.</strong> App opens 5000 logical connections to PgBouncer; PgBouncer multiplexes them onto a 50-connection pool to PostgreSQL. 100x reduction. Caveat: applications using PostgreSQL features that hold connection-level state (<code>SET LOCAL search_path</code>, server-side prepared statements with PREPARE/EXECUTE, temp tables, advisory locks across transactions) break in transaction mode — they need session mode or to stop using those features.</p>
+<p><strong>ProxySQL</strong> for MySQL. Same idea — multiplexes client connections onto a smaller backend pool. Also adds query routing (sends reads to replicas, writes to primary), query rewriting, and rate limiting.</p>
+<p><strong>RDS Proxy</strong> is AWS's managed PgBouncer/ProxySQL equivalent. Lambda-friendly (Lambdas tend to thrash connection pools). </p>
+<p><strong>Concrete numbers.</strong></p>
+<pre><code>   Before pooling:
+     100 app servers × 50 conn each = 5000 connections to PostgreSQL.
+     PostgreSQL max_connections=500 → refuses 90% of connection attempts.
+     OR if max_connections=5000 → ~50 GB just for process overhead.
+
+   After pooling (transaction mode):
+     100 app servers × 50 conn each = 5000 connections to PgBouncer.
+     PgBouncer (on the PG host or a sidecar) → 50 connections to PostgreSQL.
+     PostgreSQL handles 50 backends comfortably: ~500 MB process overhead.
+     PgBouncer overhead: ~50 MB.
+     100x reduction in PG-side resource usage.
+</code></pre>
+<p><strong>Why this matters.</strong> A common startup outage: the app autoscales from 10 to 100 instances during a traffic spike; each instance's connection pool of 30 opens; 3000 new connections hit PostgreSQL; max_connections exceeded; PG refuses connections; app starts failing; pages fire. Pooler in front prevents this entirely.</p>
+<h3 id="122-deadlocks">12.2 Deadlocks</h3>
+<p>Two transactions hold locks the other needs. Database detects the cycle, picks a victim, returns a deadlock error.</p>
+<p><strong>Detection.</strong> PostgreSQL and MySQL both maintain a <strong>wait-for graph</strong>: when transaction T waits for transaction T', add edge T → T'. Periodically (every ~1 second by default; <code>deadlock_timeout</code> in PG) scan for cycles. On finding a cycle, pick a victim — usually the transaction that has done the least work — and abort it with <code>ERROR: deadlock detected</code> (PG) or <code>Error 1213: Deadlock found</code> (MySQL).</p>
+<p><strong>Application strategies.</strong></p>
+<ul>
+<li><strong>(a) Consistent lock ordering.</strong> Always acquire locks in a canonical order — e.g., always lock the lower account_id first. The classic example:</li>
+</ul>
+<pre><code>   Without consistent ordering — DEADLOCK:
+     Txn A: BEGIN; UPDATE accounts WHERE id=100; UPDATE accounts WHERE id=200;
+     Txn B: BEGIN; UPDATE accounts WHERE id=200; UPDATE accounts WHERE id=100;
+     A holds 100, waits for 200. B holds 200, waits for 100. Cycle. Deadlock.
+
+   With consistent ordering — SERIALIZE:
+     Always lock the lower account_id first.
+     Txn A wants (100, 200): locks 100 then 200.
+     Txn B wants (100, 200): locks 100 then 200.
+     They serialize cleanly. No deadlock.
+</code></pre>
+<ul>
+<li><strong>(b) Retry on deadlock.</strong> Deadlocks are transient — the victim's transaction is rolled back, so retry usually succeeds (the contending transaction has committed by then). Cap retries at 3–5 with exponential backoff.</li>
+<li><strong>(c) Reduce transaction scope.</strong> Long transactions hold locks longer, increase deadlock probability. Move non-transactional work outside <code>BEGIN ... COMMIT</code>. Use shorter transactions even at the cost of more round trips.</li>
+<li><strong>(d) <code>SELECT FOR UPDATE NOWAIT</code> / <code>SKIP LOCKED</code>.</strong> For queue workers competing for jobs: <code>SELECT FOR UPDATE SKIP LOCKED LIMIT 1</code> lets each worker grab a different row without contending on the same head. PostgreSQL added it in 9.5; MySQL in 8.0. Eliminates deadlocks in the queue-worker pattern.</li>
+</ul>
+<p><strong>Concrete example.</strong> A payments engine processing 1000 transfers/sec. Each transfer is <code>UPDATE accounts SET balance = balance - $X WHERE id = $sender; UPDATE accounts SET balance = balance + $X WHERE id = $receiver</code>. Without consistent ordering, deadlock rate is ~0.1% (one in a thousand transfers); during peak traffic this is 1/sec. With "always update lower account_id first" — zero deadlocks. Production-grade payments engines all do this.</p>
+<h3 id="123-isolation-level-anomalies-in-detail">12.3 Isolation level anomalies in detail</h3>
+<p>The standard isolation levels and what each permits.</p>
+<p><strong>Dirty read</strong> (READ UNCOMMITTED only). Reader sees writes from an uncommitted transaction. If the writer rolls back, the reader has acted on data that "never existed." PostgreSQL refuses to implement this — <code>SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED</code> is treated as READ COMMITTED. MySQL InnoDB implements it but nobody uses it in OLTP.</p>
+<p><strong>Non-repeatable read</strong> (permitted by READ COMMITTED). Within a transaction, the same <code>SELECT</code> returns different rows because another transaction committed in between.</p>
+<pre><code>   T1: BEGIN; SELECT balance FROM accounts WHERE id=42;  -- returns 500
+   T2: BEGIN; UPDATE accounts SET balance=400 WHERE id=42; COMMIT;
+   T1: SELECT balance FROM accounts WHERE id=42;  -- returns 400 (different!)
+</code></pre>
+<p>REPEATABLE READ prevents this — T1 sees the same value on both reads because MVCC pins T1's snapshot.</p>
+<p><strong>Phantom read</strong> (permitted by READ COMMITTED, also permitted by standard REPEATABLE READ; PG and InnoDB MVCC happen to prevent it for SELECT). Same range query returns different <em>row sets</em> because another transaction inserted/deleted rows.</p>
+<pre><code>   T1: BEGIN; SELECT COUNT(*) FROM orders WHERE customer=42;  -- returns 10
+   T2: BEGIN; INSERT INTO orders (customer, ...) VALUES (42, ...); COMMIT;
+   T1: SELECT COUNT(*) FROM orders WHERE customer=42;  -- standard SQL: returns 11 (phantom!)
+                                                         -- PG / InnoDB MVCC: still 10
+</code></pre>
+<p>PostgreSQL's MVCC and InnoDB's REPEATABLE READ both prevent phantoms for plain SELECT. SELECT FOR UPDATE in InnoDB uses gap locks to prevent phantoms; PG SERIALIZABLE uses SSI.</p>
+<p><strong>Lost update.</strong> Two concurrent UPDATEs both read 100, both compute 99, both write 99 — but conceptually two decrements happened.</p>
+<pre><code>   T1: BEGIN; SELECT balance FROM accounts WHERE id=42;  -- 500
+   T2: BEGIN; SELECT balance FROM accounts WHERE id=42;  -- 500
+   T1: UPDATE accounts SET balance=400 WHERE id=42; COMMIT;  -- writes 400
+   T2: UPDATE accounts SET balance=400 WHERE id=42; COMMIT;  -- writes 400
+
+   Two debits of 100 each, but balance went 500 → 400. One debit lost.
+</code></pre>
+<p>Real fix: <code>UPDATE accounts SET balance = balance - 100 WHERE id=42 AND balance &gt;= 100</code> (atomic), or <code>SELECT FOR UPDATE</code> followed by computation (locking blocks T2 until T1 commits), or REPEATABLE READ with explicit retry on serialization failure.</p>
+<p><strong>Write skew.</strong> The famous anomaly. Two transactions read overlapping data, write disjoint data, but together violate an invariant.</p>
+<pre><code>   Invariant: at least one doctor must be on-call.
+
+   T1: BEGIN; SELECT COUNT(*) FROM doctors WHERE on_call=true;  -- 2 doctors on-call
+   T2: BEGIN; SELECT COUNT(*) FROM doctors WHERE on_call=true;  -- still 2 (T2's snapshot)
+   T1: -- Alice sees &quot;I'm one of two, safe to go off-call&quot;
+       UPDATE doctors SET on_call=false WHERE id=Alice;  COMMIT;
+   T2: -- Bob sees the same, makes the same decision
+       UPDATE doctors SET on_call=false WHERE id=Bob;  COMMIT;
+
+   Now: 0 doctors on-call. Invariant violated. No row overlap.
+   REPEATABLE READ doesn't catch it — different rows updated by each txn.
+</code></pre>
+<p>REPEATABLE READ doesn't catch this because the two transactions never write to the same row. Only <strong>SERIALIZABLE</strong> prevents write skew. PostgreSQL's <strong>SSI (Serializable Snapshot Isolation)</strong> in 9.1+ uses <strong>predicate locks</strong> — tracks the predicates each transaction read (<code>WHERE on_call=true</code>) and aborts one if their predicates intersect with another's writes in a way that breaks serializability. The abort comes as <code>ERROR: could not serialize access due to read/write dependencies</code> — the application retries.</p>
+<p><strong>When SERIALIZABLE is worth the cost.</strong> Multi-row business invariants — "at least one doctor on-call," "total of all balances must equal initial deposits minus withdrawals," "no two reservations overlap on the same room." If your invariant is enforceable with a UNIQUE constraint or a single-row CHECK, you don't need SERIALIZABLE. If it spans multiple rows of data the application reads-then-decides-then-writes, you do. PG's SSI has ~10–20% throughput cost over REPEATABLE READ; usually acceptable for the safety.</p>
+<h3 id="124-index-types-beyond-b-tree">12.4 Index types beyond B-tree</h3>
+<p>PostgreSQL exposes a richer index zoo than MySQL because the GIN/GiST/BRIN access methods are part of the engine's extensible index API. The right index can be the difference between a 200ms query and a 5ms one.</p>
+<p><strong>B-tree (default).</strong> Equality and range queries. Sorted keys, leaf pages linked for sequential scan. The right answer ~80% of the time.</p>
+<p><strong>Covering indexes.</strong> A B-tree index that includes <em>all</em> columns referenced by a query, allowing an <strong>index-only scan</strong> (no clustered-tree lookup). </p>
+<pre><code>   Slow:
+   CREATE INDEX idx_user_email ON users (email);
+   SELECT name, email FROM users WHERE email = 'foo@bar';
+     → index scan finds row, then heap lookup for name (2x I/O).
+
+   Fast:
+   CREATE INDEX idx_user_email_inc ON users (email) INCLUDE (name);  -- PG 11+
+   SELECT name, email FROM users WHERE email = 'foo@bar';
+     → all data on the index page, no heap lookup. 10x faster on hot queries.
+</code></pre>
+<p>InnoDB's secondary indexes naturally cover when the queried columns are all PK columns (because secondary leaves contain the PK). PG needs explicit INCLUDE.</p>
+<p><strong>Partial indexes.</strong> Index only rows matching a predicate. Smaller index, faster updates, useful when most queries filter on the predicate.</p>
+<pre><code>   CREATE INDEX idx_active_users_email ON users (email) WHERE deleted=false;
+
+   - Index is ~30% the size if 70% of users are non-deleted (typical).
+   - Updates that mark a row deleted=true are free of index work.
+   - Queries with WHERE deleted=false implicitly hit this index.
+</code></pre>
+<p><strong>GIN (Generalized Inverted Index).</strong> For composite values — arrays, JSONB, full-text search. Each "element" of the composite is indexed; the lookup finds matching documents containing that element.</p>
+<pre><code>   CREATE INDEX idx_tags ON posts USING GIN (tags);
+   SELECT * FROM posts WHERE tags @&gt; ARRAY['postgres'];  -- &quot;contains postgres&quot;
+
+   CREATE INDEX idx_meta ON posts USING GIN (meta jsonb_path_ops);
+   SELECT * FROM posts WHERE meta @&gt; '{&quot;author&quot;:&quot;alice&quot;}';  -- JSONB containment
+
+   CREATE INDEX idx_search ON posts USING GIN (to_tsvector('english', body));
+   SELECT * FROM posts WHERE to_tsvector('english', body) @@ to_tsquery('claude &amp; code');
+</code></pre>
+<p>GIN handles <code>@&gt;</code>, <code>?</code>, <code>@@</code> operators efficiently. Slower to update than B-tree (each indexed value triggers multiple index entries).</p>
+<p><strong>GiST (Generalized Search Tree).</strong> For geometric data (PostGIS), range types, fuzzy match (trigrams). Tree of bounding-box-style structures.</p>
+<pre><code>   CREATE INDEX idx_geom ON locations USING GIST (geom);
+   SELECT * FROM locations WHERE ST_DWithin(geom, point, 1000);  -- within 1km
+
+   CREATE INDEX idx_period ON bookings USING GIST (period);  -- tsrange
+   SELECT * FROM bookings WHERE period &amp;&amp; '[2026-05-01, 2026-05-31)';
+</code></pre>
+<p><strong>BRIN (Block Range INdex).</strong> For naturally clustered data — time-series with monotonic timestamps. Tiny: stores one min/max per block range (e.g., per 128 pages = 2 MB block).</p>
+<pre><code>   CREATE INDEX idx_created ON events USING BRIN (created_at);
+   SELECT * FROM events WHERE created_at &gt; '2026-05-01';
+
+   - 1000x smaller than B-tree (a 10 GB B-tree → 10 MB BRIN).
+   - Slightly slower point lookups (must scan an entire block range).
+   - Perfect for time-series, append-only logs, IoT data.
+</code></pre>
+<p><strong>Hash indexes.</strong> Equality only. Niche. PG made them WAL-logged and crash-safe only in PostgreSQL 10; before that they were unsafe. MySQL's MEMORY engine uses them; InnoDB's "adaptive hash index" is automatic. Rarely beats B-tree in practice because B-tree handles equality almost as fast and supports range too.</p>
+<h3 id="125-vacuum-in-postgresql">12.5 VACUUM in PostgreSQL</h3>
+<p>PostgreSQL's MVCC stores dead tuples in the heap; VACUUM reclaims them. The lifecycle of a dead tuple decides whether your table grows monotonically or stays stable.</p>
+<p><strong>Why dead tuples exist.</strong> An UPDATE in PostgreSQL is "insert new tuple version + mark old tuple's <code>xmax</code> to the updating txn." The old tuple stays in the heap until VACUUM marks its space reclaimable. A DELETE marks <code>xmax</code>; same lifecycle.</p>
+<p><strong>Autovacuum.</strong> Runs in the background. Triggered when <code>n_dead_tup / n_live_tup &gt; autovacuum_vacuum_scale_factor</code> (default 0.2 = 20% dead). Tunable per-table via <code>ALTER TABLE foo SET (autovacuum_vacuum_scale_factor = 0.05)</code> for hot tables.</p>
+<p><strong>VACUUM vs VACUUM FULL.</strong></p>
+<ul>
+<li><strong>VACUUM</strong> marks dead tuples reusable — the space is available for new tuples within the same heap pages. <strong>Does not return space to the OS.</strong> Online — no exclusive lock. Run automatically by autovacuum.</li>
+<li><strong>VACUUM FULL</strong> rewrites the table to a new file with only live tuples. Returns space to OS. <strong>Takes an exclusive lock</strong> — blocks all reads and writes. Use only during maintenance windows. For online table-rewrite, use <strong>pg_repack</strong> instead.</li>
+</ul>
+<p><strong>pg_repack.</strong> An extension that does VACUUM FULL's job without the exclusive lock: creates a shadow table, copies live tuples, dual-writes via triggers during copy, atomically swaps. Production tool for shrinking a bloated table back to its non-bloated size.</p>
+<p><strong>Vacuum freeze and xid wraparound.</strong> PostgreSQL transaction IDs are 32-bit. After ~2 billion transactions, the xid counter wraps around. Tuples with very old xids would appear as "from the future" once the counter wraps. <strong>Vacuum freeze</strong> marks ancient tuples as "frozen" — visible to all transactions, no xid check needed. As long as autovacuum keeps up with freezing, wraparound never matters.</p>
+<p>When autovacuum falls behind (a heavy-write workload outruns the freezer): the database approaches the xid horizon, then <strong>stops accepting writes</strong> as a safety measure (<code>ERROR: database is not accepting commands to avoid wraparound data loss</code>). The famous outages:</p>
+<ul>
+<li><strong>Sentry (2015)</strong>: xid wraparound in PostgreSQL, database read-only for hours.</li>
+<li><strong>Mailchimp (2019)</strong>: similar incident, manual freeze required.</li>
+<li><strong>Joyent (2014)</strong>: SmartOS-on-Solaris filesystem corruption + xid wraparound.</li>
+</ul>
+<p>Monitoring: <code>SELECT datname, age(datfrozenxid) FROM pg_database</code> — anything over ~1 billion is concerning, over 2 billion is critical.</p>
+<p><strong>Monitoring autovacuum.</strong></p>
+<ul>
+<li><code>pg_stat_user_tables.n_dead_tup</code> — current dead tuple count per table.</li>
+<li><code>pg_stat_user_tables.last_autovacuum</code> — when autovacuum last ran on this table.</li>
+<li><code>pg_stat_progress_vacuum</code> — live progress of currently running vacuum.</li>
+</ul>
+<p><strong>Tuning.</strong> For hot tables (high update rate), lower <code>autovacuum_vacuum_scale_factor</code> (e.g., 0.05 = 5% dead triggers vacuum) and increase <code>autovacuum_max_workers</code> (default 3 — too few for clusters with many hot tables). Increase <code>autovacuum_vacuum_cost_limit</code> to make autovacuum run faster (it self-throttles by default to avoid I/O hogging).</p>
+<h3 id="126-auto-increment-vs-uuid-primary-key">12.6 Auto-increment vs UUID primary key</h3>
+<p>The primary key choice matters for B+ tree insert locality.</p>
+<p><strong>Sequential PK (auto-increment / serial).</strong> All new inserts hit the right edge of the B+ tree. The rightmost leaf page is always in the buffer pool (recently touched). Inserts are basically: append to right edge, occasionally split, advance. <strong>CPU-friendly, buffer-pool-friendly.</strong> But for sharded systems, sequential IDs concentrate inserts on whichever shard owns the high range — the "hot last shard" problem if you're not careful.</p>
+<p><strong>UUIDv4 PK.</strong> UUIDs are uniformly random 128-bit values. Each insert lands on a <em>different</em> leaf page across the entire tree. <strong>Bad for buffer pool locality</strong> — every insert dirties a page that may not be in cache. The B+ tree fans out evenly, but with cold I/O on inserts. Concrete impact: 30%+ slower on insert-heavy workloads.</p>
+<p><strong>UUIDv7 / ULID.</strong> Time-ordered prefix (48-bit timestamp) + random bits. <strong>New inserts go to roughly the right edge of the tree</strong> because the timestamp prefix advances monotonically. Restores B+ tree locality while keeping global uniqueness and unpredictability.</p>
+<p><strong>Concrete benchmarks</strong> (same hardware, same schema, 100M-row table):</p>
+<pre><code>   Workload: 100k inserts/sec sustained, mixed with point lookups.
+
+   PK type        Sustained insert rate    Notes
+   ──────────────────────────────────────────────────────────────────
+   Auto-increment 100k/sec                 right-edge hot, predictable
+   UUIDv4          30k/sec                 buffer pool thrashes; many cold reads
+   UUIDv7          80k/sec                 close to auto-increment, less skew
+</code></pre>
+<p><strong>The right pattern in 2026.</strong> For high-insert tables, prefer auto-increment for PK <em>and</em> a separate UUID/UUIDv7 column for external identifiers. Or use UUIDv7 as PK directly — close enough to sequential for B+ tree happiness, globally unique for distributed systems. UUIDv4 only when the predictability of UUIDv7's timestamp prefix is a security concern (rare).</p>
+<h3 id="127-query-planner-gotchas">12.7 Query planner gotchas</h3>
+<p>The cost-based optimizer makes assumptions; when those assumptions are wrong, it picks bad plans.</p>
+<p><strong>Skewed data fools the planner.</strong> "There are 5 customers; customer_id=42 has 90% of rows."</p>
+<pre><code>   SELECT * FROM orders WHERE customer_id = $1;
+
+   Planner uses statistics from pg_statistic:
+   - n_distinct = 5 (5 customers)
+   - Assumes uniform distribution: each customer ≈ 20% of rows.
+
+   For customer_id=42 (actually 90% of rows): planner expects 20%, 
+   picks index scan with bookmark lookup — but should have picked seq scan.
+   For other customers (each ≈ 2.5% of rows): planner expects 20%, 
+   picks seq scan — but should have used index. 
+</code></pre>
+<p>PostgreSQL's <code>CREATE STATISTICS</code> (10+) lets you create extended statistics — multivariate distribution, dependencies, most-common-values lists for specific columns. Refresh via <code>ANALYZE</code>. For <em>very</em> skewed data, <strong>plan hints</strong> (via <code>pg_hint_plan</code> extension) or <strong>stored plans</strong> (MySQL's optimizer hints in comments) lock the planner's choice.</p>
+<p><strong><code>EXPLAIN ANALYZE</code> reads bottom-up.</strong> The deepest node executes first. Cost numbers are <em>estimates</em> — they're not real seconds, they're abstract units. The <code>actual time=…</code> values are real, in milliseconds. Always compare estimated rows vs actual rows; a 100x mismatch is a sign the planner has bad statistics.</p>
+<p><strong>Run <code>ANALYZE</code> after bulk data changes.</strong> Autovacuum runs ANALYZE periodically but lags large changes. After loading a million rows, <code>ANALYZE the_table</code> immediately — otherwise the next query may plan as if the table is empty.</p>
+<p><strong>Index-only scans depend on visibility map freshness.</strong> PG's visibility map tracks which heap pages have all-visible tuples (no transaction would need to look at the heap to decide visibility). An index-only scan can skip the heap lookup if the visibility map says all-visible. <strong>Lagging autovacuum → stale visibility map → forced heap lookups → slower than expected</strong>. A table that recently had heavy writes has cold visibility-map bits; index-only scans degrade to index-then-heap until autovacuum updates the map.</p>
+<p>The synthesis: the planner is right 95% of the time; the other 5% is where you spend your time. Statistics drift, skewed data, and stale visibility-map bits cause more "why is this query slow today?" tickets than any other category.</p>
+<hr>
+<h2 id="13-decision-matrix">§13. Decision Matrix</h2>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>OLTP SQL (sharded MySQL/PG)</th>
+<th>Wide-column NoSQL (Cassandra)</th>
+<th>Document store (MongoDB)</th>
+<th>NewSQL (Spanner/Cockroach)</th>
+<th>Object storage (S3/GCS)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Multi-row ACID transactions</td>
+<td>Yes (within shard)</td>
+<td>No (LWT only, slow)</td>
+<td>Yes (since 4.0, slower)</td>
+<td>Yes (cross-shard native)</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Cross-shard atomicity</td>
+<td>Build with 2PC</td>
+<td>No (sagas only)</td>
+<td>Limited</td>
+<td>Native</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Strong consistency default</td>
+<td>Yes</td>
+<td>Tunable; default eventual</td>
+<td>Tunable</td>
+<td>Yes</td>
+<td>Per-object eventual</td>
+</tr>
+<tr>
+<td>Schema enforcement</td>
+<td>Strong</td>
+<td>Per-keyspace, weak</td>
+<td>Optional</td>
+<td>Strong</td>
+<td>None</td>
+</tr>
+<tr>
+<td>Peak writes/sec/shard</td>
+<td>20–30k</td>
+<td>100k+</td>
+<td>10–30k</td>
+<td>5–10k (consensus cost)</td>
+<td>High (per-prefix)</td>
+</tr>
+<tr>
+<td>p99 read predictability</td>
+<td>High</td>
+<td>Lower (compaction)</td>
+<td>Medium</td>
+<td>Medium</td>
+<td>Variable</td>
+</tr>
+<tr>
+<td>Range scan</td>
+<td>Excellent</td>
+<td>Good (partition-bounded)</td>
+<td>Good within document</td>
+<td>Good</td>
+<td>Per-prefix only</td>
+</tr>
+<tr>
+<td>Geographic distribution</td>
+<td>Hard (custom)</td>
+<td>Native (DC-aware quorums)</td>
+<td>Replica sets (basic)</td>
+<td>Native (consensus, TrueTime)</td>
+<td>Native (multi-region)</td>
+</tr>
+<tr>
+<td>Operational complexity</td>
+<td>Medium</td>
+<td>High (anti-patterns kill)</td>
+<td>Medium</td>
+<td>Lower (managed)</td>
+<td>Very low</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>Low (commodity)</td>
+<td>Low</td>
+<td>Medium</td>
+<td>High</td>
+<td>Very low for cold</td>
+</tr>
+<tr>
+<td>Typical fit</td>
+<td>Payments, profiles, inventory</td>
+<td>Time-series, fanout, IoT</td>
+<td>Per-tenant SaaS, content</td>
+<td>Geo-distributed OLTP</td>
+<td>Archive, blobs</td>
+</tr>
+</tbody>
+</table>
+<p><strong>When to pick which.</strong></p>
+<ul>
+<li><strong>Sharded OLTP SQL</strong> when you need ACID across multiple rows, write rate is thousands to millions/sec, and you can shard by a clean key. Default for payments, profiles, inventory, structured business data.</li>
+<li><strong>Wide-column NoSQL</strong> when write rate exceeds millions/sec and access is partition-keyed (time-series, event logs, IoT telemetry). Per-key consistency at best.</li>
+<li><strong>Document store</strong> when data is naturally document-shaped and per-tenant variable (CMS, freeform user data, prototype). Single-doc txns are the unit; multi-doc supported but slower.</li>
+<li><strong>NewSQL</strong> when you need cross-shard transactions and don't want to build the 2PC coordinator yourself. Higher commit latency and cost. Right pick when you'd otherwise build a custom transaction coordinator on sharded MySQL.</li>
+<li><strong>Object storage</strong> for blobs, archives, snapshots — anywhere access is "fetch by key." Never as primary OLTP.</li>
+</ul>
+<p>The synthesis: every adjacent category exists because OLTP SQL is bad at <em>one specific axis</em> (geographic distribution, write throughput per partition, schema flexibility, archival cost). Picking right means knowing which axis matters.</p>
+<hr>
+<h2 id="14-use-case-gallery">§14. Use Case Gallery</h2>
+<p>Five applications, each stressing a different facet of the design space.</p>
+<p><strong>Payments ledger (Alipay, Stripe, PayPal, Square).</strong> Stresses conservation invariants (sum of balances = sum of credits − debits), RPO=0, per-account total ordering, idempotency, cross-shard money transfer. <strong>Fit</strong>: sharded MySQL InnoDB with semi-sync cross-AZ replication; custom 2PC coordinator on XA transactions; idempotency rows colocated in the same transaction. Alipay's OceanBase is the same architecture with consensus replication. Defining choice: <strong>per-row strong consistency</strong> — every debit reads <code>SELECT balance FOR UPDATE</code>, takes a row lock, applies. No eventual consistency on the synchronous path. <strong>Anti-pattern</strong>: Cassandra — without LWT you lose conservation; with LWT you've inverted into a worse MySQL.</p>
+<p><strong>Social profile data (LinkedIn Espresso, Facebook TAO).</strong> Stresses extreme read fanout (one profile read by millions for feed rendering), modest per-user write rate, clean partitioning by user_id, social graph edges as data; consistency on edges matters less than on profile fields. <strong>Fit</strong>: sharded MySQL primary per user with massive read replicas and aggressive caching (TAO at Facebook is the cache layer in front of MySQL). Defining choice: <strong>read-scaling via replicas and caches</strong> — small write rate, enormous read rate, cache hit ratio drives everything. <strong>Anti-pattern</strong>: document store as primary. Profile is small structured data with strict access patterns; document flexibility is overhead.</p>
+<p><strong>E-commerce inventory (Amazon, Shopify, eBay).</strong> Stresses hot SKUs during flash sales (single-row contention on stock counters), cross-warehouse atomicity, reservation flow (hold stock for cart before commit), reconciliation against physical counts. <strong>Fit</strong>: sharded relational primary; write-sharding for hot SKUs during sales; TTL'd reservation holds; periodic reconciliation. Amazon DynamoDB handles parts with single-partition transactions; Shopify uses sharded MySQL via Vitess (80k+ checkouts/min Black Friday peak). <strong>Anti-pattern</strong>: single-primary OLTP at peak sale traffic — Black Friday is the inflection where per-shard capacity planning must precede the sale.</p>
+<p><strong>Gaming leaderboards (Riot, Discord, real-time PVP).</strong> Stresses high write rate per match (millions of matches/day), low read latency for "top 100 in my region," ranged scans by score, regional partitioning. <strong>Fit</strong>: hybrid — a transactional store (PostgreSQL, MySQL) for source of truth (match results, player stats) plus a sorted set (Redis ZSET) for the live leaderboard view; CDC keeps them aligned. Defining choice: <strong>separating the durable record from the query view</strong>. <strong>Anti-pattern</strong>: making OLTP serve top-100 rank at millions of QPS — <code>ORDER BY score LIMIT 100</code> on a billion-row table scans the index; Redis ZSETs are built for this.</p>
+<p><strong>SaaS multi-tenant data (Notion, Slack, Figma).</strong> Stresses per-tenant isolation, uneven tenant size (one customer 100x median), schema evolution as the product evolves, version history (Notion's block-level edits, Figma's frame-level edits), real-time collaboration. <strong>Fit</strong>: sharded PostgreSQL or MySQL with <code>tenant_id</code> as shard key; custom rebalancing for outsized tenants (largest get their own shard). Notion's architecture (2021+) is the canonical example; Slack uses Vitess on MySQL with <code>team_id</code>. Defining choice: <strong>tenant_id as primary partition key</strong> with affordances for skew. <strong>Anti-pattern</strong>: one database for all tenants with <code>tenant_id</code> as a column — works to ~100 tenants of similar size; fails when the largest outgrows one shard.</p>
+<hr>
+<h2 id="15-real-world-implementations-with-numbers">§15. Real-World Implementations with Numbers</h2>
+<p>Named systems shipping this technology at scale, across varied use cases.</p>
+<table>
+<thead>
+<tr>
+<th>System</th>
+<th>Use case</th>
+<th>Scale numbers</th>
+<th>Variant + pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Alipay OceanBase</strong></td>
+<td>Payments ledger</td>
+<td>583,000 payments/sec peak; 50 PB total; p99 &lt;100ms</td>
+<td>MySQL-compatible distributed SQL with Paxos per shard + custom 2PC</td>
+</tr>
+<tr>
+<td><strong>LinkedIn Espresso</strong></td>
+<td>Profile, posts, connections</td>
+<td>PB-scale; ~10M QPS aggregate; thousands of shards</td>
+<td>Sharded MySQL with Helix routing; Brooklin CDC to Kafka</td>
+</tr>
+<tr>
+<td><strong>YouTube Vitess (MySQL)</strong></td>
+<td>Video metadata</td>
+<td>Millions of QPS; PB-scale</td>
+<td>Vitess shard router over MySQL; online resharding workflow</td>
+</tr>
+<tr>
+<td><strong>Stripe</strong></td>
+<td>Payments processing</td>
+<td>Estimated 5–10k payments/sec peak; idempotency at scale</td>
+<td>Historically MongoDB; migrated portions to sharded PostgreSQL</td>
+</tr>
+<tr>
+<td><strong>Pinterest MySQL</strong></td>
+<td>Pins and boards</td>
+<td>600k pin-writes/sec peak; 4096 logical shards</td>
+<td>Hand-rolled sharded MySQL; PIN_ID partition key</td>
+</tr>
+<tr>
+<td><strong>Notion</strong></td>
+<td>Pages, blocks, documents</td>
+<td>~50k writes/sec; 32+ logical PG shards (post-2021 resharding)</td>
+<td>Sharded PostgreSQL; tenant_id partition; custom rebalancing</td>
+</tr>
+<tr>
+<td><strong>Facebook TAO + UDB</strong></td>
+<td>Social graph and profile</td>
+<td>Billions of reads/sec; PB-scale</td>
+<td>Sharded MySQL primary + TAO cache layer; aggressive read fanout</td>
+</tr>
+<tr>
+<td><strong>Amazon DynamoDB</strong></td>
+<td>E-commerce + shopping cart</td>
+<td>Millions of QPS; planet-scale</td>
+<td>LSM-based, partition-by-key, single-table transactions added later</td>
+</tr>
+<tr>
+<td><strong>Discord (Cassandra → ScyllaDB)</strong></td>
+<td>Messaging</td>
+<td>120M messages/day on ScyllaDB; LSM-based</td>
+<td>LSM wide-column for time-series-shaped messaging data</td>
+</tr>
+<tr>
+<td><strong>Shopify (MySQL/Vitess)</strong></td>
+<td>Multi-tenant e-commerce</td>
+<td>80k+ checkouts/min Black Friday peak; sharded by shop_id</td>
+<td>Sharded MySQL via Vitess; per-shop podding</td>
+</tr>
+<tr>
+<td><strong>GitHub MySQL</strong></td>
+<td>Repositories and metadata</td>
+<td>~30k QPS sustained; gh-ost for online migrations</td>
+<td>Sharded MySQL; in-house online-schema-change tooling</td>
+</tr>
+<tr>
+<td><strong>Slack (Vitess on MySQL)</strong></td>
+<td>Workspaces and messages</td>
+<td>Millions of QPS; thousands of shards; team_id partition</td>
+<td>Sharded MySQL via Vitess; team_id partition key</td>
+</tr>
+</tbody>
+</table>
+<p>The pattern across all of these: a <strong>B+ tree-based transactional engine</strong> (MySQL or PostgreSQL underneath, occasionally a custom variant like OceanBase) <strong>sharded by a clean partition key</strong> (account_id, user_id, tenant_id, pin_id, team_id, shop_id) <strong>with semi-sync or consensus replication</strong> for durability, <strong>CDC to Kafka</strong> for derived stores. Variations are in partition key choice, replication mode (semi-sync vs Paxos), and whether a higher-level distributed transaction layer (Vitess, custom 2PC, Spanner-style consensus) is needed for cross-shard.</p>
+<p>This is not coincidence. It's what works at scale when you need ACID on structured data. The fact that LinkedIn, Pinterest, Notion, Shopify, GitHub, and Slack converge on the same shape — sharded MySQL or PostgreSQL with custom routing and CDC — is the strongest possible signal that this is the answer.</p>
+<hr>
+<h2 id="16-summary">§16. Summary</h2>
+<blockquote>
+<p><em>A transactional database is a B+ tree (or LSM variant) wearing an ACID contract — its storage engine guarantees per-shard atomicity, isolation, and durability via MVCC and a write-ahead log fsync, but everything beyond a single shard (cross-shard transactions, geographic distribution, idempotent retries, schema evolution under load) is a layer the system designer must build above it. The reason sharded MySQL or PostgreSQL keeps winning at scale — at Alipay's 583k payments/sec, at LinkedIn's PB of profile data, at Notion's millions of documents, at Pinterest's billions of pins — is not that the storage engine is magic; it's that B+ tree + MVCC + WAL is the cheapest known way to give a developer the "this either happened or it didn't" contract on structured mutable data, and once you have that contract, every other concern in the system (caches, search, analytics, archives, derived views) reduces to "keep this thing fed from the WAL and rebuild on demand."</em></p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

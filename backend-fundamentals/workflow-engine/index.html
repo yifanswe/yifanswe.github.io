@@ -1,0 +1,1438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Workflow Engine — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/backend-fundamentals/">← Back to Backend Fundamental Components</a>
+        <h1 class="article-title">Workflow Engine</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Backend Fundamental Components
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p>A technology reference. Workflow engines as a class — Temporal, Cadence, AWS Step Functions, Apache Airflow, Argo Workflows, Netflix Conductor — sit at a specific layer in the backend stack, solve a specific problem (durable orchestration of multi-step processes), and have a specific internal structure (event sourcing plus deterministic replay, or some compromised variant of it). This doc is about the technology. We will see it serving payment lifecycles, ride dispatch, ETL (Extract Transform Load) pipelines, ML (Machine Learning) training, video transcoding, CI/CD (Continuous Integration / Continuous Delivery), and notification campaigns — different domains exploiting the same primitives.</p>
+<hr>
+<h2 id="1-what-workflow-engines-are">§1. What workflow engines ARE</h2>
+<p>A <strong>workflow engine</strong> is the piece of infrastructure that makes a <em>multi-step process</em> survive crashes, restarts, deploys, and time. You write code (or declare JSON, or draw a graph) that says "do A; if A succeeds, do B; if A fails, compensate and notify; wait three days for human approval; then do C." The engine guarantees that — once started — that process <strong>runs to completion regardless of who or what dies along the way</strong>. State is durable. Step retries are managed. The path is auditable.</p>
+<p>Three deliberately broad descriptions: the engine <em>orchestrates</em> (it tells other systems what to do, but the work happens in those systems), it is <em>durable</em> (state survives process restarts, persisted to a database before any reply is acknowledged), and it is <em>long-running-capable</em> (workflows can sit blocked for milliseconds or for months waiting for a signal, a timer, or a human).</p>
+<p>Where it sits in the stack:</p>
+<pre><code>       ┌─────────────────────────────────────────────────┐
+       │  Application / business logic                    │
+       │  (the workflow code or definition)               │
+       └─────────────────────────────────────────────────┘
+                            │
+                            ▼
+       ┌─────────────────────────────────────────────────┐
+       │  ★ WORKFLOW ENGINE (this layer)                  │
+       │    durable state, retries, timers, history,      │
+       │    sticky dispatch, idempotency support           │
+       └─────────────────────────────────────────────────┘
+                  │                          │
+                  ▼                          ▼
+       ┌─────────────────────┐    ┌─────────────────────┐
+       │  Persistent store   │    │  Worker fleet       │
+       │  (Cassandra,        │    │  (executes activity │
+       │   MySQL, DynamoDB)  │    │   business logic)   │
+       └─────────────────────┘    └─────────────────────┘
+                  │
+                  ▼
+       External systems (payment gateway, DB, message queue, S3,
+                         k8s pods, ML training cluster, ...)
+</code></pre>
+<p>The workflow engine is <strong>not</strong> the worker. It is the <em>coordinator</em> that tells workers what to do next based on the history of what they have already done.</p>
+<p><strong>Distinguish from adjacent categories.</strong> Several technologies look like workflow engines from a distance. They are not.</p>
+<ul>
+<li><strong>Cron / scheduler.</strong> Triggers on a clock. No concept of multi-step dependencies, retries beyond rerun-from-scratch, durable state, or compensation. Cron + status table is the naïve replacement; §9 dissects why it dies.</li>
+<li><strong>Message queues (Kafka, RabbitMQ, SQS).</strong> Move <em>messages</em>. No concept of "what step the workflow is on" or "retry this specific activity within the larger flow." You can choreograph on top, but you've moved every workflow concern — state, ordering, compensation, audit — into your application code.</li>
+<li><strong>Saga libraries (Axon, Eventuate).</strong> Code-level libraries that help structure compensation. Still need <em>something</em> underneath that owns durable state. The engine replaces both.</li>
+<li><strong>Batch DAG schedulers (Airflow, Luigi, Prefect, Dagster).</strong> Workflow engines, but the <em>batch shape</em> — daily/hourly DAGs (Directed Acyclic Graphs) of data tasks, where a run is one execution of a fixed DAG against a fixed window. Different concerns dominate: backfill, idempotent task reruns over a partition key, data lineage. They do not optimize for "millions of concurrent workflows each at a unique point." The design space splits hard between them and Temporal-class engines.</li>
+<li><strong>Function-as-a-service event chains (Lambda + EventBridge).</strong> Choreography without a coordinator. State in databases between functions; retries per-function, not per-workflow.</li>
+</ul>
+<p><strong>Not good for:</strong></p>
+<ul>
+<li><strong>Sub-millisecond request paths.</strong> The engine writes to a quorum-replicated store on every transition; not in a 10ms p99 RPC path. Workflows trigger fan-out work; the trigger itself is async.</li>
+<li><strong>Pure data transformation at line-rate.</strong> 10M events/sec through a transform wants a stream processor (Flink). Per-transition overhead too high.</li>
+<li><strong>Arbitrary scale per single workflow.</strong> A workflow's history is bounded (Temporal: 10MB/50k events). One workflow processing a billion items is wrong; the pattern is parent-fanout-to-child or <code>ContinueAsNew</code> (§7).</li>
+<li><strong>Bypassing determinism.</strong> Code-as-workflow engines sandbox workflow code: no <code>time.Now</code>, no random, no I/O outside activities. Fighting this is fighting the technology.</li>
+</ul>
+<hr>
+<h2 id="2-inherent-guarantees">§2. Inherent guarantees</h2>
+<p><strong>Provided by design.</strong></p>
+<ol>
+<li><strong>Durable workflow state.</strong> Every state transition is persisted to a quorum-replicated store before being acknowledged. If a process dies mid-workflow, the next worker that picks it up reaches an identical state by reading the persisted history. No workflow is silently lost.</li>
+<li><strong>Exactly-once activity dispatch from the engine's perspective.</strong> A given invocation — identified by a stable <code>activity_id</code> — has at most one in-flight attempt at any moment. Retries happen with stable identity, after the previous attempt has been declared failed or timed out. Never two parallel schedules of the same activity.</li>
+<li><strong>Automatic retries with configurable backoff.</strong> Declarative policy: initial interval, multiplier, max attempts, max duration, non-retryable error types. Activity failures caught by the engine, not user code.</li>
+<li><strong>Deterministic replay</strong> (Temporal/Cadence-class). State is reconstructible by re-running workflow code from event 1 against persisted history. Same code + same history always reaches the same next decision. Durability is cheap — no mid-workflow checkpointing, just replay.</li>
+<li><strong>Long-running waits as a first-class primitive.</strong> A workflow can sleep 30 days, wait for a signal, or wait for a timer, without holding process resources. The engine durably schedules the wake-up.</li>
+<li><strong>Complete audit history.</strong> Every event — start, decision, activity scheduled/completed/retried, timer fired, signal received, completion — with timestamps, payloads, failure traces.</li>
+<li><strong>Idempotency on workflow start.</strong> <code>StartWorkflow(workflow_id="order-123")</code> twice produces one workflow — the second returns the existing run.</li>
+</ol>
+<p><strong>Not provided. Must be layered on.</strong></p>
+<ol>
+<li><strong>Exactly-once <em>side effects</em>.</strong> Stable <code>activity_id</code> across retries; not exactly-once external effect. If your activity charges Stripe and the network drops after the charge, the retry charges again unless you pass an idempotency key. Application's job.</li>
+<li><strong>Low-latency dispatch under load.</strong> Single-digit ms at p50; intentionally not sub-ms. Wrong tool inside a single RPC budget.</li>
+<li><strong>Arbitrary throughput per single workflow.</strong> A workflow is a single shard owner; one workflow at 10k events/sec hammers one persistent-store partition. The engine scales by workflow count, not per-workflow rate (§10).</li>
+<li><strong>Bypass of determinism.</strong> Call <code>time.Now()</code> in workflow code and replay diverges — <code>NonDeterministicWorkflowError</code>. Load-bearing safety, but it exposes bugs rather than masking them.</li>
+<li><strong>Cross-workflow distributed transactions.</strong> Two workflows atomically committing a joint outcome — not provided. Build a saga (a workflow that calls compensating activities) on top.</li>
+</ol>
+<p>The contract: engine owns workflow-level durability, retry semantics, history, timer machinery. Application owns side-effect idempotency, business-correct compensation, and the data plane outside the workflow.</p>
+<hr>
+<h2 id="3-the-design-space">§3. The design space</h2>
+<p>Four distinct designs in the workflow-engine family, each with a different center of gravity, plus Argo as a fifth Kubernetes-native variant.</p>
+<p><strong>A. Code-as-workflow with deterministic replay (Temporal, Cadence).</strong> You write workflow code in a real language (Go, Java, Python, TypeScript, .NET). The engine intercepts every async point — <code>await ChargePayment(...)</code>, <code>workflow.Sleep(2h)</code>, <code>signal.Receive(ctx)</code> — and persists results as history events. Replay rebuilds state by re-running the code over the event log. Strengths: full expressivity, IDE support, native compensation (<code>defer cancelBlock</code>), long-running waits trivial, signals/queries first-class. Mainstream for <em>business process orchestration</em> — payments, order lifecycles, KYC (Know Your Customer) onboarding. Costs: determinism constraint forces discipline; SDK magic must be understood to debug; significant engineering investment to operate self-hosted.</p>
+<p><strong>B. Declarative state machine (AWS Step Functions, Azure Durable Functions in some modes).</strong> Workflows are JSON/YAML state machines: states, transitions, choices, parallel branches, retries. Activities referenced by name (e.g., Lambda ARN — Amazon Resource Name). Strengths: no determinism constraint, strong visual tooling, tight cloud integration (Step Functions can call ~200 AWS services directly). Costs: limited expressivity, JSON sprawls for complex flows, vendor lock-in. Step Functions Standard caps ~4k transitions/sec/account. Best for <em>cloud-native short orchestrations</em> and <em>AWS-heavy ETL</em>.</p>
+<p><strong>C. Batch DAG schedulers (Airflow, Prefect, Dagster, Luigi).</strong> A DAG of tasks, typically in Python. The engine schedules DAG runs against a parameterization — usually a date partition. A "workflow" is a <em>DAG run</em>, often on a schedule. Strengths: tailored for batch ETL/ML — backfills, idempotent task reruns over a partition key, data lineage, SQL/Spark integrations. Costs: wrong model for "10M concurrent workflows each at a unique point." Long-running waits awkward (sensors). Per-task overhead hundreds of ms.</p>
+<p><strong>D. JSON workflow DAG with worker poll (Netflix Conductor).</strong> JSON DAG of tasks (HTTP_TASK, DECISION_TASK, FORK_JOIN, SUB_WORKFLOW). Workers poll, execute, POST result. State in the engine's DB. Strengths: language-agnostic, good for polyglot teams. Netflix uses it for video encoding (Cosmos), recommendation refresh, content ingestion. Costs: less expressive than code-as-workflow; no deterministic replay (state is mutable); operational maturity behind Temporal.</p>
+<p><strong>E. Argo Workflows — Kubernetes-native.</strong> Kubernetes CRDs (Custom Resource Definitions) define workflows; each step is a pod. State in etcd via k8s. Targets <em>CI/CD pipelines</em>, <em>ML training</em>, <em>infrastructure automation</em>. Strengths: zero distance to Kubernetes, native to GitOps. Costs: each step a pod (overhead ~seconds), not viable for high-frequency micro-orchestrations.</p>
+<h3 id="comparison-table">Comparison table</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Temporal/Cadence</th>
+<th>Step Functions</th>
+<th>Airflow</th>
+<th>Conductor</th>
+<th>Argo Workflows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Definition model</td>
+<td>Code (Go/Java/Python/TS/.NET)</td>
+<td>JSON state machine</td>
+<td>Python DAG</td>
+<td>JSON DAG</td>
+<td>YAML CRD</td>
+</tr>
+<tr>
+<td>Persistence</td>
+<td>Event-sourced history (Cassandra/MySQL/Postgres)</td>
+<td>Managed</td>
+<td>Metadata DB (Postgres/MySQL)</td>
+<td>State DB (Postgres/Dynamo/ES)</td>
+<td>etcd via k8s</td>
+</tr>
+<tr>
+<td>Replay model</td>
+<td>Deterministic replay</td>
+<td>N/A (declarative)</td>
+<td>Task rerun within DAG run</td>
+<td>Resume from current task</td>
+<td>Resume from current step</td>
+</tr>
+<tr>
+<td>Determinism on user code</td>
+<td>Yes (sandboxed)</td>
+<td>None</td>
+<td>None</td>
+<td>None</td>
+<td>None</td>
+</tr>
+<tr>
+<td>Long-running waits</td>
+<td>Native (years)</td>
+<td>Native (≤1 yr Standard)</td>
+<td>Awkward (sensors)</td>
+<td>Native</td>
+<td>Pod sleep / external</td>
+</tr>
+<tr>
+<td>Throughput ceiling</td>
+<td>~100k+ transitions/sec sharded</td>
+<td>~4k/sec Standard</td>
+<td>~10k tasks/min</td>
+<td>~10k workflows/min</td>
+<td>~hundreds/min (pod overhead)</td>
+</tr>
+<tr>
+<td>Concurrency in flight</td>
+<td>Millions</td>
+<td>Up to ~1M</td>
+<td>Thousands (DAG runs)</td>
+<td>Hundreds of thousands</td>
+<td>Limited by k8s</td>
+</tr>
+<tr>
+<td>Compensation</td>
+<td>First-class via code</td>
+<td>Catch / parallel branches</td>
+<td>Painful</td>
+<td>Built-in tasks</td>
+<td>DIY</td>
+</tr>
+<tr>
+<td>Visibility</td>
+<td>Full event UI</td>
+<td>Visual graph</td>
+<td>DAG-run UI</td>
+<td>UI + REST</td>
+<td>argo CLI / UI</td>
+</tr>
+<tr>
+<td>Versioning of long-running flows</td>
+<td>GetVersion / patches</td>
+<td>State machine versions</td>
+<td>DAG file replacement</td>
+<td>JSON definition update</td>
+<td>YAML update</td>
+</tr>
+<tr>
+<td>Lock-in</td>
+<td>Self-host or Temporal Cloud</td>
+<td>AWS only</td>
+<td>OSS / Astronomer</td>
+<td>OSS</td>
+<td>Self-host on k8s</td>
+</tr>
+<tr>
+<td>Typical fit</td>
+<td>Business processes, sagas, payments</td>
+<td>AWS-heavy short orchestrations</td>
+<td>Scheduled batch ETL/ML</td>
+<td>Polyglot media/content</td>
+<td>k8s-native CI/CD, ML</td>
+</tr>
+</tbody>
+</table>
+<p>The variants overlap but each has a center of gravity. Picking is mostly about which center you live closest to.</p>
+<hr>
+<h2 id="4-underlying-data-structure-byte-level-mechanics">§4. Underlying data structure — byte-level mechanics</h2>
+<p>This is the section that separates Staff-level understanding from a feature-list reading. The depth differentiator: <strong>event sourcing plus deterministic replay</strong>.</p>
+<h3 id="4a-event-sourced-history">4a. Event-sourced history</h3>
+<p>The fundamental abstraction: <strong>a workflow is its history</strong>, not a row. History is an append-only sequence of typed events; state is <em>derived</em> by re-running workflow code over the event log.</p>
+<p>Two tables in a Temporal/Cadence-class engine (Cassandra canonical; MySQL/Postgres for smaller deployments):</p>
+<pre><code class="language-sql">CREATE TABLE history_node (
+  shard_id     int,
+  workflow_id  text,
+  run_id       uuid,
+  branch_id    uuid,        -- supports fork-on-reset
+  node_id      bigint,      -- first event id in this batch
+  txn_id       bigint,      -- optimistic concurrency token
+  events       blob,        -- batch of N serialized events
+  PRIMARY KEY ((shard_id), workflow_id, run_id, branch_id, node_id)
+);
+
+CREATE TABLE executions (
+  shard_id      int,
+  namespace_id  uuid,
+  workflow_id   text,
+  run_id        uuid,
+  execution     blob,
+  next_event_id bigint,
+  PRIMARY KEY ((shard_id), namespace_id, workflow_id, run_id)
+);
+</code></pre>
+<p><code>history_node</code> is the immutable event log (append-only). <code>executions</code> is a small mutable pointer per workflow: next event ID, current branch, last status. Mutations to <code>executions</code> use a <code>txn_id</code> compare-and-swap — optimistic concurrency per workflow.</p>
+<p>An event is a protobuf:</p>
+<pre><code>EventID:    int64    (monotonic within a run)
+EventType:  enum     (WorkflowExecutionStarted, ActivityTaskScheduled,
+                       ActivityTaskCompleted, TimerStarted, SignalReceived, ...)
+EventTime:  timestamp
+TaskID:     int64    (global ordering within shard)
+Version:    int64    (multi-cluster replication version)
+Attributes: oneof    (per-event-type payload)
+</code></pre>
+<p>Typical event size: 200B-2KB. A batch in <code>history_node</code> holds 5-20 events to amortize row overhead. Hard cap: <strong>50,000 events or 10MB</strong>, whichever first.</p>
+<h3 id="4b-why-event-sourcing-fits-the-access-pattern">4b. Why event sourcing fits the access pattern</h3>
+<p>Two dominant operations:</p>
+<ol>
+<li><strong>Append events at the tail.</strong> Pure sequential write. Cassandra's LSM (Log-Structured Merge tree) is built for this: append to memtable, flush to SSTable (Sorted String Table). ~10-20k writes/sec/node comfortable.</li>
+<li><strong>Read history range for replay.</strong> Sequential scan inside one Cassandra partition, inside one clustering range. Served from SSTables plus memtable.</li>
+</ol>
+<p>Append-mostly + occasional bulk range scan = exactly what LSM trees are designed for. The alternative — a single mutable state row — fails three ways: no audit (mutable rows show only current state), no deterministic replay (intermediate decisions unrecoverable), no retry semantics (start vs. completion must be distinct events). Event sourcing is the only structure that supports all three simultaneously.</p>
+<h3 id="4c-tradeoff-event-sourced-history-vs-mutable-state-row">4c. Tradeoff: event-sourced history vs. mutable state row</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Event-sourced history (LSM)</th>
+<th>Mutable state row (B+ tree)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Audit</td>
+<td>Complete by construction</td>
+<td>Need a separate change-log</td>
+</tr>
+<tr>
+<td>Replay</td>
+<td>Native</td>
+<td>Impossible without change-log</td>
+</tr>
+<tr>
+<td>Append throughput</td>
+<td>~10-20k/sec/node</td>
+<td>~2-5k/sec/node (page splits)</td>
+</tr>
+<tr>
+<td>Read latest state</td>
+<td>Scan history + replay (cached)</td>
+<td>Single point read</td>
+</tr>
+<tr>
+<td>Storage cost</td>
+<td>10-100x more</td>
+<td>Lean</td>
+</tr>
+<tr>
+<td>Schema evolution</td>
+<td>Hard (events immutable forever)</td>
+<td>Easy (ALTER TABLE)</td>
+</tr>
+</tbody>
+</table>
+<p>What you give up choosing event sourcing: cheap state queries (mitigated by sticky caches) and schema flexibility (event protos must be backward-compatible forever). What you gain: durability, replay, audit — for free.</p>
+<p>This is why Conductor — which uses a more mutable model — has weaker replay semantics than Temporal. The choice is architectural, not cosmetic.</p>
+<h3 id="4d-sharding-by-workflow_id">4d. Sharding by workflow_id</h3>
+<p>The engine shards by <code>hash(namespace + workflow_id) mod N</code>, typically N=4096 (16k at very large deployments). One <strong>shard</strong> is owned by exactly one history-service node at a time. The shard owns the in-memory mutex for every workflow ID in it — no two requests mutate the same workflow concurrently cluster-wide. All Cassandra rows for the shard's workflows live in one partition; reads/writes are local to one replica set. The shard also maintains transfer/timer/replication queues as rows in the same partition.</p>
+<p>When a history node dies, a membership protocol (Ringpop-style) detects and reassigns shards to survivors. New owners reload <code>executions</code> rows into cache — tens of seconds outage, no data loss because every event was quorum-written.</p>
+<h3 id="4e-sticky-task-queues">4e. Sticky task queues</h3>
+<p>Cassandra owns durability; replay is expensive. The <strong>sticky-execution cache</strong>: once a worker has replayed a workflow, it keeps the in-memory state alive and owns subsequent decision tasks until it crashes, evicts under memory pressure, or the workflow goes idle.</p>
+<pre><code>First decision task for workflow_id=X:
+  matching picks any free worker W from the task-queue partition
+  W replays full history (N events) → in-memory state
+  W signals: &quot;I am sticky for X; send future tasks to me&quot;
+
+Subsequent decision tasks for workflow_id=X:
+  matching routes directly to W's sticky queue
+  W executes the new code; no replay needed
+  Per-decision cost: O(new events), not O(total history)
+
+W crashes:
+  matching detects sticky timeout
+  next decision goes to the global task queue
+  some worker W' picks up, replays full history, becomes new sticky owner
+</code></pre>
+<p>At ~95% sticky hit rate, average replay cost amortizes across hundreds of decisions. Without sticky cache, every decision pays full replay — at 50-event median, that's ~50x more worker CPU.</p>
+<h3 id="4f-the-determinism-constraint">4f. The determinism constraint</h3>
+<p>Replay must produce the same decisions every time. Workflow code lives under a strict sandbox:</p>
+<table>
+<thead>
+<tr>
+<th>Forbidden</th>
+<th>Why</th>
+<th>What you do instead</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>time.Now()</code></td>
+<td>Wall clock differs across replays</td>
+<td><code>workflow.Now(ctx)</code></td>
+</tr>
+<tr>
+<td><code>rand.Float64()</code></td>
+<td>Different random on replay</td>
+<td><code>workflow.SideEffect(ctx, ...)</code> — result persisted</td>
+</tr>
+<tr>
+<td><code>os.Getenv</code> / external config read</td>
+<td>Environment differs on replaying worker</td>
+<td>Pass config as workflow input</td>
+</tr>
+<tr>
+<td>Direct HTTP / DB / Kafka call</td>
+<td>Side effects must be replayable</td>
+<td>Wrap in an Activity</td>
+</tr>
+<tr>
+<td>Goroutines / native threads / sleeps</td>
+<td>Non-deterministic scheduling</td>
+<td><code>workflow.Go</code>, <code>workflow.Sleep</code></td>
+</tr>
+<tr>
+<td>Iterating unsorted maps</td>
+<td>Iteration order differs</td>
+<td>Sort keys before iterating</td>
+</tr>
+<tr>
+<td>Mutating global state</td>
+<td>Not visible to other replays</td>
+<td>Use workflow-local variables</td>
+</tr>
+</tbody>
+</table>
+<p>The SDK enforces this with a custom scheduler: every await goes through the runtime, which consults history; if the event exists, return the stored result; if not, dispatch for real. This is what makes <code>await ChargePayment(input)</code> look like ordinary async code while being durable.</p>
+<p>If replay reaches a decision that doesn't match history, the engine raises <strong>NonDeterministicWorkflowError</strong> and parks the workflow. The error is loud on purpose.</p>
+<h3 id="4g-one-concrete-lifecycle-end-to-end">4g. One concrete lifecycle, end-to-end</h3>
+<p>A canonical payment-orchestration workflow, byte level.</p>
+<p><strong>T=0: API server calls <code>client.StartWorkflow(workflow_id="order-abc", ...)</code>.</strong> Frontend hashes <code>order-abc</code> → shard 1742. History-service node holding shard 1742 takes the per-workflow mutex (in-memory, scoped to the shard) and writes:</p>
+<pre><code>event #1: WorkflowExecutionStarted (workflow_type=OrderWorkflow, input, run_id)
+event #2: WorkflowTaskScheduled    (task_queue=ORDER_TQ)
+</code></pre>
+<p>Cassandra append, quorum write to 2 of 3 replicas. <strong>Durability point</strong>: when quorum acks, workflow is officially started. The history service enqueues the decision task.</p>
+<p><strong>T=2ms: Matching dispatches the decision task.</strong> Worker long-polls, gets the task. No cached state (first task). Fetches <code>GetHistory(order-abc, 1, 2)</code>. Replays. Workflow code runs to its first <code>workflow.ExecuteActivity(ctx, ChargePayment, input)</code>. Returns a future. Engine collects a command.</p>
+<p><strong>T=5ms: Worker sends <code>RespondWorkflowTaskCompleted</code></strong> with <code>ScheduleActivityTask(activity_type=ChargePayment, activity_id=1, retry_policy, timeouts)</code>. History appends events #3 <code>WorkflowTaskStarted</code>, #4 <code>WorkflowTaskCompleted</code>, #5 <code>ActivityTaskScheduled</code> (one Cassandra batch, quorum). Enqueues activity task on <code>CHARGE_TQ</code>.</p>
+<p><strong>T=10ms: Activity worker pulls.</strong> Calls payment provider with <code>idempotency_key=order-abc-1</code> (workflow_id + activity_id). Provider charges. Returns <code>charge_id=ch_xyz</code>. Worker calls <code>RespondActivityTaskCompleted</code>.</p>
+<p><strong>T=400ms: History appends events #6 <code>ActivityTaskStarted</code>, #7 <code>ActivityTaskCompleted(result=ch_xyz)</code>, #8 <code>WorkflowTaskScheduled</code>.</strong> New decision task to the sticky worker.</p>
+<p><strong>T=405ms: Same worker, no replay.</strong> <code>charge_payment_future.Get(ctx, &amp;charge_id)</code> returns <code>ch_xyz</code> immediately (event in history). Code continues to <code>ExecuteActivity(ctx, ReserveInventory, ...)</code>. Events 9-13 written. And so on.</p>
+<p>Total events for a 4-activity workflow: ~25. History: 5-10KB.</p>
+<p><strong>Crash survival at each step.</strong></p>
+<ul>
+<li>Before T=2ms (history not written): <code>StartWorkflow</code> RPC hasn't returned. Caller retries with same workflow_id; idempotent.</li>
+<li>Between T=2ms and T=5ms (worker took task, didn't respond): <code>ScheduleToStart</code> timeout fires, decision task re-enqueued, another worker replays, reissues the same <code>ScheduleActivityTask</code>. Idempotent by <code>activity_id</code>.</li>
+<li>Between T=10ms and T=400ms (activity worker died mid-call): <code>StartToClose</code> or heartbeat timeout fires. <code>ActivityTaskTimedOut</code> appended. Retry policy schedules a new attempt. The activity may have completed the side effect once — that is why the idempotency key matters.</li>
+</ul>
+<p>The <strong>durability point</strong> at every step is the quorum write. Until the ack lands, nothing has changed. After it lands, no crash can undo it.</p>
+<hr>
+<h2 id="5-capacity-envelope">§5. Capacity envelope</h2>
+<p>Workflow engines span four orders of magnitude.</p>
+<p><strong>Small: 10s to 1000s.</strong> Startup on <strong>AWS Step Functions</strong> for cron-driven backend jobs and onboarding. Free tier 4,000 transitions/month, then ~$25/M. Or a small team on <strong>self-hosted Temporal</strong> on three VMs for a payment-flow POC: ~100 concurrent, ~10 transitions/sec, ~50GB disk.</p>
+<p><strong>Mid: Coinbase.</strong> Wraps every withdrawal/deposit in a workflow (compliance demands single auditable trails). Mid-2020s: <strong>single-digit-millions of concurrent workflows</strong>, <strong>~10k transitions/sec sustained</strong>, heavy signals for human-approval gates. Sharded MySQL, ~50 history nodes, ~20 matching, ~200 workers. Histories average ~100 events; compliance flows wait weeks for manual review.</p>
+<p><strong>Large: Uber Cadence.</strong> By year 2 ran <strong>millions of workflows in flight</strong>, <strong>billions of activities/day</strong> across hundreds of services — trip lifecycle, fraud review, payouts, driver onboarding. Cassandra-backed, hundreds of nodes per region, multi-region active-active. Peak ~500k decision tasks/sec, ~10B activities/day, ~4 weeks hot retention.</p>
+<p><strong>Giant: Stripe Connect, Snap, Netflix Conductor.</strong> <strong>Stripe Connect</strong>: payout flows wait days for ACH (Automated Clearing House) settlement. <strong>Tens of millions of in-flight payouts</strong>. <strong>Netflix Conductor</strong>: <strong>tens of millions/day</strong> across Cosmos (video encoding/transcoding), content ingestion, recommendation refresh. <strong>Snap</strong>: Temporal for ad-creative review and content moderation, single-digit-millions in-flight.</p>
+<p>At this scale, <strong>federation</strong> is mandatory. A single cluster handles low-millions; beyond that, partition namespaces across clusters with global-namespace async replication. Blast-radius management dominates.</p>
+<table>
+<thead>
+<tr>
+<th>Scale tier</th>
+<th>Example</th>
+<th>In-flight</th>
+<th>Transitions/sec</th>
+<th>Backend</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Small</td>
+<td>Startup w/ Step Functions</td>
+<td>10s</td>
+<td>&lt;10/sec</td>
+<td>Managed</td>
+</tr>
+<tr>
+<td>Small-mid</td>
+<td>Self-host POC</td>
+<td>100-10k</td>
+<td>10-100/sec</td>
+<td>Single MySQL</td>
+</tr>
+<tr>
+<td>Mid</td>
+<td>Coinbase</td>
+<td>~1-5M</td>
+<td>~10k/sec</td>
+<td>Sharded MySQL</td>
+</tr>
+<tr>
+<td>Large</td>
+<td>Uber Cadence</td>
+<td>~10M</td>
+<td>~100k/sec</td>
+<td>Cassandra (100s nodes)</td>
+</tr>
+<tr>
+<td>Giant</td>
+<td>Stripe / Snap / Netflix</td>
+<td>10M+</td>
+<td>100k-500k/sec</td>
+<td>Federated multi-cluster</td>
+</tr>
+</tbody>
+</table>
+<p>Per-cluster ceiling: ~100k-500k transitions/sec. Past that, federate.</p>
+<hr>
+<h2 id="6-architecture-in-context-canonical-pattern">§6. Architecture in context — canonical pattern</h2>
+<p>The canonical code-as-workflow deployment:</p>
+<pre><code>                ┌─────────────────────┐
+                │  Workflow client    │   (your application code calling
+                │  (your API server)  │    StartWorkflow / SignalWorkflow
+                └──────────┬──────────┘    over gRPC)
+                           │
+                  gRPC: namespace + workflow_id
+                           ▼
+              ┌────────────────────────────┐
+              │   Frontend Service         │   stateless; auth, namespace
+              │   (load-balanced fleet)    │   routing, rate limiting
+              └─────┬─────────────┬────────┘
+                    │             │
+       ┌────────────┘             └────────────┐
+       │ (start, signal, query)                │ (poll for tasks)
+       ▼                                       ▼
+┌──────────────────────┐               ┌──────────────────────┐
+│  History Service     │  ◄──persist── │  Matching Service    │
+│  (sharded by         │               │  (task-queue         │
+│   hash(workflow_id)  │               │   partitioned)       │
+│   mod N shards)      │   dispatch    │                      │
+│                      │   tasks ─────►│  In-memory queues    │
+│  - workflow mutex    │               │  for decision and    │
+│  - writes events     │               │  activity tasks      │
+│  - emits visibility  │               └──────────┬───────────┘
+└──────┬───────────────┘                          │ long-poll
+       │ append + read                            ▼
+       ▼                              ┌──────────────────────────┐
+┌─────────────────────┐               │   Worker Pool             │
+│  Persistent store   │               │                          │
+│  (Cassandra /       │               │  - Workflow Worker:      │
+│   MySQL / Postgres /│               │      replays history,    │
+│   Dynamo)           │               │      decides next step   │
+│                     │               │  - Activity Worker:      │
+│  Partition: shard_id│               │      executes business   │
+│  Cluster: workflow_id,│             │      logic (HTTP, DB,    │
+│   run_id, event_id  │               │      Kafka, S3, etc.)    │
+│  Quorum writes      │               │                          │
+│                     │               │  Sticky task queue:      │
+│                     │               │   workflow_id pinned     │
+│                     │               │   to one worker          │
+└──────┬──────────────┘               └──────────────────────────┘
+       │  async stream
+       ▼
+┌─────────────────────────────────────────────────────┐
+│  Visibility pipeline                                │
+│   Persistent store → CDC (Change Data Capture) →    │
+│   Kafka → Elasticsearch / OpenSearch                │
+│   Cold storage: history archived to S3 after        │
+│   workflow close + retention period                 │
+└─────────────────────────────────────────────────────┘
+</code></pre>
+<p><strong>Sharding keys, per layer:</strong></p>
+<ul>
+<li>Frontend → History: <code>hash(namespace + workflow_id) mod N_shards</code> selects one history shard. That shard owns the mutex for that workflow ID cluster-wide.</li>
+<li>History → Persistent store: partition key = <code>shard_id</code>, clustering key = <code>(workflow_id, run_id, event_id)</code>. Within one partition, workflow histories sit adjacent.</li>
+<li>History → Matching: a decision task targets the task-queue partition <code>hash(task_queue_name + workflow_id) mod num_partitions</code>. Sticky routing: subsequent tasks for the same workflow target the worker's sticky partition.</li>
+<li>Matching → Worker: long-poll gRPC. P99 dispatch latency under 5ms on a healthy cluster.</li>
+<li>Visibility: CDC stream → Kafka topic partitioned by namespace; Elasticsearch indexer consumes for search.</li>
+</ul>
+<p>Conductor's architecture has the same shape but with a more REST-y interface (workers POST results) and less aggressive sharding. Step Functions hides this all behind an AWS managed front end but the components are conceptually parallel.</p>
+<hr>
+<h2 id="7-hard-problems-inherent-to-this-technology">§7. Hard problems inherent to this technology</h2>
+<p>Six challenges anyone using workflow engines will face. None are bugs; all are inherent.</p>
+<h3 id="71-determinism-violations-after-a-code-change">§7.1 Determinism violations after a code change</h3>
+<p><strong>Setup.</strong> Payment workflow in production. Six months later you add a fraud-check step between <code>ReserveInventory</code> and <code>NotifyWarehouse</code>. Deploy.</p>
+<p><strong>Naïve fix.</strong> Change the code, redeploy.</p>
+<p><strong>Failure.</strong> Workflow <code>order-abc</code> has events 5-8: ReserveInventory scheduled/completed, then WorkflowTaskScheduled. Replay through new code emits <code>ScheduleActivityTask(CheckFraud)</code>. But the next history event is <code>ScheduleActivityTask(NotifyWarehouse)</code> (old path). Mismatch. <strong>NonDeterministicWorkflowError</strong>. Workflow parks. Multiply by all running workflows — production traffic bricked.</p>
+<p><strong>Real fix.</strong> <code>GetVersion</code> API patches:</p>
+<pre><code class="language-go">v := workflow.GetVersion(ctx, &quot;add-fraud-check&quot;, workflow.DefaultVersion, 1)
+if v == 1 {
+    workflow.ExecuteActivity(ctx, CheckFraud, input).Get(ctx, nil)
+}
+workflow.ExecuteActivity(ctx, NotifyWarehouse, input).Get(ctx, nil)
+</code></pre>
+<p>First execution records a <code>MarkerRecorded</code> event with the version; replay returns the same version. Pre-deploy workflows see <code>DefaultVersion</code> and skip fraud check; new workflows see version 1.</p>
+<p>Appears verbatim in every domain: a Netflix Cosmos transcoding workflow adding a perceptual quality check; an ML training pipeline adding hyperparameter tuning; a CI/CD pipeline in Argo adding a lint stage. Same fix: branch on a version marker.</p>
+<h3 id="72-history-explosion-the-10mb-50k-event-cap">§7.2 History explosion: the 10MB / 50k-event cap</h3>
+<p><strong>Setup.</strong> A <em>customer subscription</em> workflow — one per customer — lives forever. After two years it has 100,000 events.</p>
+<p><strong>Naïve fix.</strong> Make the store hold bigger histories.</p>
+<p><strong>Failure.</strong> Replay cost. Every worker reads 100k events and re-runs workflow code over all of them. At 100 events/ms replay, 1s of CPU per decision. Across 10M long-lived workflows, unrunnable. Beyond CPU: row-size limits, blob serialization, and visibility pipeline all choke past ~10MB.</p>
+<p><strong>Real fix.</strong> <code>ContinueAsNew</code>. When history has accumulated enough (&gt;5000 events, &gt;1 day, or a business-meaningful boundary), workflow code calls <code>workflow.NewContinueAsNewError(ctx, NextRun, snapshotState)</code>. The engine closes the current run with <code>WorkflowExecutionContinuedAsNew</code>, starts a new run (same workflow_id, new run_id) with the snapshot as input. New run starts with one event.</p>
+<p>Subscription workflow <code>ContinueAsNew</code>s every billing cycle. A long ML training pipeline continues at each epoch. A video transcoding workflow continues at each output-quality tier. Same pattern, different domain.</p>
+<p>Cadence and Temporal both <strong>refuse</strong> to grow histories past 10MB/50k — workflow fails explicitly, forcing the design fix. The cap is load-bearing; prevents accidentally infinite workflows.</p>
+<h3 id="73-workflow-versioning-across-long-running-deployments">§7.3 Workflow versioning across long-running deployments</h3>
+<p><strong>Setup.</strong> An <em>approval workflow</em> waits 30 days for a human. You ship v2 that restructures the steps.</p>
+<p><strong>Naïve fix.</strong> Redeploy and hope.</p>
+<p><strong>Failure.</strong> v1 workflows cannot replay under v2 — mismatch storm.</p>
+<p><strong>Real fix.</strong> Two layers. <strong>Patches</strong> (modern API on top of <code>GetVersion</code>) for small targeted changes. <strong>Task-queue versioning / BuildID compatibility</strong> for deep restructuring: declare a <code>BuildID</code> for your worker binary; matching routes tasks to workers running a compatible BuildID with the one that started the workflow. Old workflows drain on old binaries; new on new.</p>
+<p>For incompatible v1 → v2: keep v1 workers alive until in-flight drain, or terminate-and-restart with v2-shaped input. No free lunch.</p>
+<p>Appears differently in different engines: Step Functions has state machine versions (aliases pin executions). Airflow has DAG-file replacement (each DAG run pinned to its DAG version). Argo pins each WorkflowTemplate execution to the spec at submit time.</p>
+<h3 id="74-activity-timeouts-vs-heartbeats">§7.4 Activity timeouts vs heartbeats</h3>
+<p><strong>Setup.</strong> A <em>long-running ML training activity</em> — 4 hours on a GPU. Sometimes 4 hours; sometimes the GPU hangs.</p>
+<p><strong>Naïve fix.</strong> <code>StartToClose = 6 hours</code>.</p>
+<p><strong>Failure.</strong> Two distinct problems. (1) Hung activity wastes a worker slot for 6 hours. (2) Worker dies mid-activity, engine doesn't know for 6 hours.</p>
+<p><strong>Real fix.</strong> Heartbeats. Long activities periodically <code>activity.RecordHeartbeat(ctx, progress)</code>. If none for <code>HeartbeatTimeout</code> (e.g., 60s), the activity is failed-fast and retried on another worker. Recorded progress lets the new attempt resume.</p>
+<p>Now <code>StartToClose = 6 hours</code> (legit slack) and <code>HeartbeatTimeout = 60s</code> (fast death detection). Four-knob problem:</p>
+<table>
+<thead>
+<tr>
+<th>Timeout</th>
+<th>Bounds</th>
+<th>Typical</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ScheduleToStart</code></td>
+<td>Queue wait before pickup</td>
+<td>10s-1min</td>
+</tr>
+<tr>
+<td><code>StartToClose</code></td>
+<td>Single attempt duration</td>
+<td>Minutes to hours</td>
+</tr>
+<tr>
+<td><code>ScheduleToClose</code></td>
+<td>Total time including retries</td>
+<td>Usually unset</td>
+</tr>
+<tr>
+<td><code>HeartbeatTimeout</code></td>
+<td>Between heartbeats</td>
+<td>15-60s</td>
+</tr>
+</tbody>
+</table>
+<p>Most production issues: <code>StartToClose</code> huge (activity is <em>sometimes</em> slow) without <code>HeartbeatTimeout</code> (worker death takes hours to detect). Identical in Airflow, Conductor, Step Functions.</p>
+<h3 id="75-activity-idempotency">§7.5 Activity idempotency</h3>
+<p><strong>Setup.</strong> <code>ChargePayment</code> calls a provider. Provider returns 200 OK. Network drops before the worker's response reaches the engine. Engine times out, retries. Card charged twice.</p>
+<p><strong>Naïve fix.</strong> <code>maximum_attempts = 1</code>. No retries.</p>
+<p><strong>Failure.</strong> Any transient failure fails the entire workflow. Untenable.</p>
+<p><strong>Real fix.</strong> Application-layer idempotency keys. The activity passes a stable key (<code>workflow_id + activity_id</code>) to the external API. Well-designed APIs dedupe — the second request returns the same response without re-charging.</p>
+<p>The engine guarantees <code>activity_id</code> is stable across retries (assigned at <code>ActivityTaskScheduled</code>, never changes). The engine does NOT promise exactly-once execution; it promises <strong>identity is stable</strong> so the application can implement exactly-once at the side-effect boundary. For systems without idempotency support: a <code>processed_keys</code> table with <code>INSERT IF NOT EXISTS</code> before the side effect.</p>
+<p>Applies in every domain. <em>Email campaign workflow</em> must not send the same email twice. <em>Deployment automation</em> applying a Kubernetes manifest uses a stable resource name (<code>kubectl apply</code> is idempotent by name). <em>Video transcoding</em> writes output to S3 with a deterministic key so re-runs overwrite.</p>
+<h3 id="76-signals-vs-queries-vs-updates-synchronous-interaction">§7.6 Signals vs queries vs updates: synchronous interaction</h3>
+<p><strong>Setup.</strong> A running workflow needs to receive "user clicked approve" and expose "current state" to a monitor.</p>
+<p><strong>Naïve fix.</strong> Poll a DB in workflow code.</p>
+<p><strong>Failure.</strong> Workflow code is event-driven, not tick-driven. DB polling is non-deterministic (forbidden). Reading state via a DB duplicates state outside the engine.</p>
+<p><strong>Real fix.</strong> Three primitives.</p>
+<ul>
+<li><strong>Signal</strong>: event sent into a workflow. Persisted as <code>WorkflowExecutionSignaled</code> in history. Workflow code blocks on <code>workflow.GetSignalChannel("approve").Receive(ctx, &amp;payload)</code>. Durable, ordered per workflow, replay-safe. Cost: each signal grows history.</li>
+<li><strong>Query</strong>: synchronous read of in-memory state. <strong>Not persisted</strong>. Engine invokes a read-only handler on the sticky worker. Cheap, frequent-OK.</li>
+<li><strong>Update</strong> (newer Temporal): synchronous write-and-respond. Engine writes the event, runs workflow logic, returns result in one shot. RPC-like.</li>
+</ul>
+<p><em>Human-approval workflow</em>: signals. <em>Deployment orchestration</em>: queries for status. <em>Long data pipeline</em>: signals for cancellation. "Signal storm" footgun — accidentally signaling the same workflow 1000 times/sec — is a known production issue. Same problem in Conductor (events vs status queries) and Step Functions (sendTaskHeartbeat vs DescribeExecution).</p>
+<h3 id="77-signals-queries-updates-the-three-external-interaction-primitives-in-depth">§7.7 Signals, queries, updates — the three external interaction primitives in depth</h3>
+<p>The trio is so fundamental to durable-execution engines that it deserves a self-contained treatment. Each primitive answers a different question about how the <em>outside world</em> talks to a running workflow.</p>
+<p><strong>Signal.</strong> Fire-and-forget. The client calls <code>SignalWorkflow(workflow_id, signal_name, payload)</code>. The frontend hashes to the shard owner, which appends <code>WorkflowExecutionSignaled</code> to history and enqueues a decision task. Returns to the caller as soon as the event is durably written — <em>not</em> when the workflow has reacted. Inside workflow code, a coroutine awaits on <code>workflow.GetSignalChannel(name).Receive(ctx, &amp;payload)</code>. Replay-safe by construction: signals are events, replay reads them back in order.</p>
+<p>Cost model: every signal is a quorum write to the history store plus one decision task. A signal storm of 1k/sec on one workflow saturates one shard. Practical signals/sec/workflow ceiling sits around 100-1000 depending on persistence backend. Multiply by number of workflows and you get cluster pressure.</p>
+<p>Use cases: human approval/rejection (<code>approve</code>, <code>reject</code>), external state changes (<code>order_cancelled</code>, <code>payment_received</code>), incoming events that influence flow (a driver going online, a fraud alert arriving). The convention "use a signal name per logical event" keeps the workflow easy to read; <code>signalled_data</code> channels become typed handlers.</p>
+<p><strong>Query.</strong> Synchronous read of workflow state. The client calls <code>QueryWorkflow(workflow_id, query_name, args)</code>. The frontend routes to the sticky worker (or any worker if no sticky owner; that worker replays then answers). The worker invokes a read-only handler registered in workflow code that returns a value derived from current state. <strong>Crucially, no history mutation.</strong> A query is invisible to replay — it does not appear in the event log, it cannot change the workflow's path.</p>
+<p>The constraint that bites people: query handlers must be deterministic and read-only. If you mutate workflow-local state in a query handler, replay will see two divergent states across workers and the next decision task can fail non-deterministically. Stripe-internal lore: a query handler that lazily computed a cached value the first time it was called, then returned the cache. On a different worker the cache wasn't populated, behavior diverged. Fix: queries must be pure functions of current state.</p>
+<p>Use cases: dashboards showing "what step is this workflow on," monitors showing in-flight inventory, debugging "why is this stuck."</p>
+<p><strong>Update</strong> (Temporal 1.21+, May 2023 onwards). Synchronous mutation with response. The client calls <code>UpdateWorkflow(workflow_id, update_name, args)</code> and blocks until the workflow returns a result. Internally, the engine writes <code>WorkflowExecutionUpdateAccepted</code>, runs the update handler in the workflow (which can call activities, await timers, etc.), and on completion writes <code>WorkflowExecutionUpdateCompleted</code> carrying the result. Engine streams the result back over the open RPC.</p>
+<p>Before Update, the only way to get a synchronous mutate-and-respond was the "signal + query polling" pattern: send a signal that mutates state, then poll a query until the state reflects the mutation. Ugly. Race-prone. Update collapses that into one round trip. Validators (a synchronous check that can reject the update before it lands in history) give a cheap admission gate — reject obviously bad updates without growing history.</p>
+<p>Use cases: bidding workflows where the client wants <code>placeBid → accept/reject</code>; deployment workflows where <code>requestPromotion → return promoted_revision</code>; subscription workflows where <code>applyDiscount → return new_total</code>. Anywhere RPC semantics fit better than fire-and-forget.</p>
+<p><strong>Comparison.</strong></p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Signal</th>
+<th>Query</th>
+<th>Update</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Direction</td>
+<td>Inbound only</td>
+<td>Outbound only</td>
+<td>In + Out</td>
+</tr>
+<tr>
+<td>Persisted in history</td>
+<td>Yes</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Mutates state</td>
+<td>Yes</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Sync/async</td>
+<td>Async</td>
+<td>Sync</td>
+<td>Sync</td>
+</tr>
+<tr>
+<td>Replay impact</td>
+<td>Replayed verbatim</td>
+<td>Skipped</td>
+<td>Replayed verbatim</td>
+</tr>
+<tr>
+<td>Validator/admission</td>
+<td>No</td>
+<td>N/A</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Backpressure</td>
+<td>Signal storm risk</td>
+<td>Cheap</td>
+<td>Update storm risk; validator gates</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Step Functions equivalents.</strong> <code>SendTaskSuccess</code>/<code>SendTaskFailure</code> (signal-like, completes a <code>WaitForCallback</code> task), <code>DescribeExecution</code> (query-like, reads execution state), no native update. Conductor: events trigger workflow progression (signal-like); REST API exposes status (query-like); no update.</p>
+<h3 id="78-workflow-cancellation-semantics">§7.8 Workflow cancellation semantics</h3>
+<p>Cancellation is a signal with extra ceremony. The user calls <code>CancelWorkflow(workflow_id)</code>. The engine appends <code>WorkflowExecutionCancelRequested</code> to history and schedules a decision task. Inside workflow code, the cancellation propagates to <code>ctx</code>: <code>ctx.Done()</code> channel closes (Go), <code>CancellationException</code> (Java), <code>CancelledError</code> (Python). The workflow code is expected to handle the cancel — typically by running compensation, then returning.</p>
+<p>But here is the asymmetric reality: <strong>the engine cannot cancel a running activity in flight.</strong> When a workflow is cancelled while an activity is mid-execution, the engine cannot reach inside the activity worker and halt it. What it can do: stop scheduling new activities, send a cancellation request that the activity <em>may</em> observe via heartbeat response.</p>
+<p><strong>Heartbeat-driven cancellation contract.</strong> An activity that wants to respond to cancellation must heartbeat regularly. When the activity calls <code>RecordHeartbeat(ctx, progress)</code>, the engine's response includes a flag — <code>CancelRequested = true</code> if the workflow has been cancelled or the activity itself has been requested-cancelled. The activity code must check that flag and exit cleanly. Pseudocode:</p>
+<pre><code class="language-go">for chunk := range bigDataset {
+    if err := activity.RecordHeartbeat(ctx, chunk.position); err != nil {
+        if errors.Is(err, activity.ErrCancelled) {
+            return cleanup(chunk.position)
+        }
+        return err
+    }
+    processChunk(chunk)
+}
+</code></pre>
+<p>Activities that ignore the flag — long-running CPU work without heartbeat checks, blocking I/O without a context-aware client — will run to completion regardless of the cancel. The "we cancelled but the activity already ran for 10 more minutes" reality is structural, not a bug. Common in ML training activities (4-hour GPU runs that don't check between steps), large file copies (a single <code>io.Copy</code> that doesn't observe context), and external API calls that aren't context-aware.</p>
+<p><strong>Cancellation is not termination.</strong> <code>TerminateWorkflow</code> is the harder hammer: writes <code>WorkflowExecutionTerminated</code> immediately, no chance for workflow code to compensate. Use Cancel when you want graceful unwinding; Terminate when the workflow is broken and you just want it gone (e.g., a non-deterministic-replay stuck workflow).</p>
+<p><strong>Cancellation scopes.</strong> Modern SDKs offer <code>CancellationScope</code> — wrap a block of workflow code so a cancel triggers only that block's compensation, not the whole workflow. Saga compensation (§7.9) uses this heavily: each forward step is wrapped in a scope whose cancel handler runs the corresponding compensation.</p>
+<p><strong>Operational reality.</strong> If you have a workflow stuck in a long activity that ignores cancel, you have two options: wait for <code>StartToClose</code> timeout (could be hours), or <code>TerminateWorkflow</code> and live with no compensation. Some teams adopt a rule: every activity longer than 60 seconds must heartbeat. Enforced via lint or activity wrappers.</p>
+<h3 id="79-sagas-and-compensation-in-detail">§7.9 Sagas and compensation in detail</h3>
+<p>The canonical multi-step business transaction that can't use a database transaction (because it spans services, hours/days, and external systems) uses the <strong>saga pattern</strong>: forward steps + compensation steps executed in reverse order on failure.</p>
+<p><strong>Structure.</strong> A booking workflow:</p>
+<pre><code>1. ChargeCard(user, $100)         → compensation: RefundCard(user, $100)
+2. ReserveInventory(item, qty=1)  → compensation: ReleaseInventory(item, qty=1)
+3. AssignWarehouseSlot(slot=42)   → compensation: ReleaseWarehouseSlot(slot=42)
+4. NotifyCustomer(email)          → compensation: SendCancellationEmail(email)
+</code></pre>
+<p>If step 3 fails, compensate 2 then 1 (in reverse). If step 4 fails, compensate 3 then 2 then 1. The pattern in Temporal Go SDK looks like:</p>
+<pre><code class="language-go">compensations := []func() error{}
+
+if err := workflow.ExecuteActivity(ctx, ChargeCard, ...).Get(ctx, nil); err != nil {
+    return err
+}
+compensations = append(compensations, func() error {
+    return workflow.ExecuteActivity(disconnectedCtx, RefundCard, ...).Get(ctx, nil)
+})
+
+if err := workflow.ExecuteActivity(ctx, ReserveInventory, ...).Get(ctx, &amp;reservationID); err != nil {
+    return runCompensations(compensations)
+}
+compensations = append(compensations, func() error {
+    return workflow.ExecuteActivity(disconnectedCtx, ReleaseInventory, reservationID).Get(ctx, nil)
+})
+// ... and so on
+</code></pre>
+<p><code>runCompensations</code> pops in reverse order and executes each. The <code>disconnectedCtx</code> is critical: it's a context that survives workflow cancellation, so compensations still run even if the whole workflow is being cancelled.</p>
+<p><strong>Compensation idempotency requirement.</strong> Every compensation activity must be idempotent. Why: compensation may itself fail and be retried. Refunding the same charge twice must be a no-op (the payment provider returns "already refunded"); releasing the same inventory item twice must be safe. The same <code>workflow_id + step_id</code> idempotency-key pattern from §7.5 applies.</p>
+<p><strong>Partial compensation reality.</strong> Real money flows have asymmetries. Charge succeeds, shipping fails: compensation runs <code>RefundCard</code>. The refund may take 5-10 business days to land on the customer's statement even though the activity returns immediately ("refund initiated"). Customer sees the charge, contacts support, gets told "wait for the refund." Workflow's job is to emit auditable events for support; can't make a slow external system faster.</p>
+<p><strong>Compensation fails too.</strong> The deeper recovery layer. <code>RefundCard</code> itself fails: payment provider returns 500 for 6 hours. Options:</p>
+<ol>
+<li><strong>Retry forever</strong> — the workflow stays in compensation indefinitely, alerts page on-call.</li>
+<li><strong>Manual intervention queue</strong> — escalate after N retries to a human-approval workflow: "compensation stuck, refund $100 to user X, charge_id=ch_xyz, please process manually." Human runs the refund out of band, sends a signal to mark compensation done.</li>
+<li><strong>Accept the asymmetry</strong> — record a <code>compensation_failed</code> event, complete the workflow as "failed with un-refunded charge," generate a ticket for the finance ops team.</li>
+</ol>
+<p>Most production sagas combine: retry with backoff for 24 hours, then escalate to manual. The audit trail (every attempt logged in workflow history) is the point — finance can prove what happened.</p>
+<p><strong>Choreography vs orchestration sagas.</strong> Choreography: each service emits "I did my part" events, downstream services listen and react. No central coordinator. Compensation requires each service to listen for "rollback" events. Fragile at scale (no global view of the saga state). Orchestration (the Temporal pattern): one workflow owns the steps and compensation order. Centralized, auditable, debuggable. The industry has converged on orchestration for non-trivial sagas.</p>
+<p><strong>Saga vs distributed transactions.</strong> A 2-phase commit (2PC) across services would also solve this, but at the cost of synchronous coordination, holding locks across services, and a global blocking phase. Sagas trade atomicity for availability: the system is never atomically consistent across the steps, but it eventually converges to either "fully done" or "fully compensated." For 99% of cross-service business workflows, that tradeoff is right.</p>
+<h3 id="710-workflow-versioning-at-production-scale-the-hardest-problem">§7.10 Workflow versioning at production scale — the hardest problem</h3>
+<p>§7.1 introduced <code>GetVersion</code>. The full picture at production scale is a year-long migration playbook, not a single API call.</p>
+<p><strong>The constraint.</strong> A <em>payment workflow</em> runs for 30 days (waiting on ACH settlement and human review). During those 30 days, the team deploys 14 times. Each deployment changes the workflow code. Replay of a 30-day-old workflow under today's code must still produce the same decisions it made yesterday. Multiply by tens of millions of in-flight workflows, each frozen at a different code version.</p>
+<p><strong>The three strategies in production use.</strong></p>
+<p><strong>1. <code>GetVersion(versionId, minSupported, maxSupported)</code> — in-place compatibility.</strong> The most common pattern. For each behavior-changing edit, wrap with a <code>GetVersion</code> block. The engine records a <code>MarkerRecorded</code> event with the version on first execution; replay returns the same version. Old workflows see <code>DefaultVersion</code>, new ones see version 1.</p>
+<pre><code class="language-go">v := workflow.GetVersion(ctx, &quot;v2-fraud-check&quot;, workflow.DefaultVersion, 2)
+switch v {
+case workflow.DefaultVersion:
+    // original behavior, pre-fraud-check
+case 1:
+    // first fraud-check version
+    workflow.ExecuteActivity(ctx, CheckFraudV1, ...).Get(ctx, nil)
+case 2:
+    // refined fraud-check with merchant heuristic
+    workflow.ExecuteActivity(ctx, CheckFraudV2, ...).Get(ctx, nil)
+}
+</code></pre>
+<p><code>minSupported</code> lets you garbage-collect: when no workflow older than version 1 exists, change to <code>GetVersion(ctx, "v2-fraud-check", 1, 2)</code>. The engine refuses to replay versions below <code>minSupported</code>, forcing those workflows to be terminated. Hygiene matters — workflows accumulate <code>GetVersion</code> calls across years of evolution and become hard to read.</p>
+<p><strong>2. The "patch" pattern — explicit conditional logic.</strong> Sometimes a deployment introduces a new check that didn't exist before. Old workflows skip it; new ones execute it. Modern Temporal SDKs ship <code>Patch(ctx, patchId)</code> and <code>DeprecatePatch(ctx, patchId)</code> as cleaner aliases over <code>GetVersion</code>. <code>Patch</code> returns true if the workflow started after the patch was deployed, false otherwise. <code>DeprecatePatch</code> returns true unconditionally — used after you've drained out the old workflows and want to mark the patch removable.</p>
+<p>The lifecycle: introduce <code>Patch</code> → wait for old workflows to drain → call <code>DeprecatePatch</code> → in next deployment, remove the patch entirely (assuming you've waited long enough). This is the GC story for <code>GetVersion</code> markers.</p>
+<p><strong>3. Forced-replay-fail strategy — last resort.</strong> When a code change is fundamentally incompatible (e.g., reordering activities, changing input types, removing a step). Options:</p>
+<ul>
+<li><strong>Worker BuildID versioning.</strong> Tag worker binaries with a BuildID. Matching routes tasks for a workflow to a worker that's compatible with the BuildID the workflow started on. Old workflows drain on old binaries; new workflows route to new binaries. When old workflows are done, retire the old binary.</li>
+<li><strong>Terminate and restart.</strong> Kill all in-flight v1 workflows, restart them as v2 with whatever state can be ported. Brutal but sometimes the right answer for low-value, short-lifetime workflows.</li>
+<li><strong>Migration workflow.</strong> Start a one-time workflow per in-flight v1 workflow that reads its state, signals it to a graceful stop, then starts a fresh v2 with that state.</li>
+</ul>
+<p><strong>Concrete walkthrough — a payment workflow that ran for 30 days, code deployed twice during.</strong></p>
+<p>Day 0: <code>PaymentWorkflow</code> starts for <code>order-abc</code>. Code version is v1. Event 1 written.</p>
+<p>Day 5: Workflow has progressed through steps 1-3 of 7. Engineer ships v2 of the workflow that adds a step between 3 and 4 (a compliance check). v2 wraps the new step in <code>Patch(ctx, "add-compliance-step")</code> so:</p>
+<pre><code class="language-go">if workflow.Patch(ctx, &quot;add-compliance-step&quot;) {
+    workflow.ExecuteActivity(ctx, ComplianceCheck, ...).Get(ctx, nil)
+}
+</code></pre>
+<p><code>order-abc</code> is at step 4 already. Replay reaches the <code>Patch</code> call. The engine looks for a <code>MarkerRecorded</code> event for "add-compliance-step"; finds none (workflow started before the patch). Returns <code>false</code>. Workflow skips the compliance check. Good — workflow continues on its original path.</p>
+<p>Day 12: Engineer ships v3 that changes the retry policy of <code>step 5</code> (which <code>order-abc</code> hasn't reached yet). Pure activity-options change, no <code>Patch</code> needed — when <code>order-abc</code> reaches step 5 it'll use v3's options.</p>
+<p>Day 14: <code>order-abc</code> reaches step 5 (the post-settlement reconciliation). Replay under v3 — different retry policy, but the activity hasn't started yet, so no replay conflict. Decision is reached, activity scheduled with v3's options. History captures it.</p>
+<p>Day 25: ACH settlement completes. Workflow signals progress to step 6 (notify), then step 7 (close). Replay under v3 of all 25 days' history works because:</p>
+<ul>
+<li>Steps 1-3 still execute the same code (no relevant <code>GetVersion</code>/<code>Patch</code> calls).</li>
+<li>Step 4: <code>Patch("add-compliance-step")</code> returns <code>false</code> (no marker), skips.</li>
+<li>Step 5: v3's retry policy applies (activity-options live at schedule-time).</li>
+<li>Steps 6-7: same code, no version branches.</li>
+</ul>
+<p>Day 30: Workflow completes. Engineer ships v4 that deprecates <code>add-compliance-step</code> (every workflow that could have hit that branch has now finished). Two deployments later, the <code>Patch</code> call is removed entirely from the codebase.</p>
+<p><strong>The 18-month migration of long-running workflows.</strong> Some workflows are <em>years</em> long. Customer subscriptions, regulatory holds, multi-year warranties. Migrating these from <code>WorkflowV1</code> to <code>WorkflowV2</code> (a structural rewrite) takes 18 months because you must keep both workflow types deployed and let v1 workflows drain naturally. Operationally:</p>
+<ol>
+<li><strong>Month 0:</strong> Deploy v2 alongside v1. New workflows start as v2.</li>
+<li><strong>Month 6:</strong> All "year" workflows started in month -1 have drained. v1 worker pool can be downsized.</li>
+<li><strong>Month 12:</strong> All "18-month" workflows drained. Last v1 binary retired.</li>
+<li><strong>Month 18:</strong> Cleanup of dead <code>GetVersion</code> branches in v2 codebase.</li>
+</ol>
+<p>Painful. Inescapable.</p>
+<p><strong>Step Functions, Airflow, Argo each have their own version story.</strong> Step Functions: state machine versions + aliases pin executions to a version. Airflow: DAG file replacement is uncontrolled — each DAG run is pinned to the DAG version it started on (via a serialized DAG snapshot, in newer Airflow). Argo: a <code>WorkflowTemplate</code> is snapshotted at submit time, so submitted workflows are immune to subsequent template edits. The shape — pin running executions to the code that started them, evolve new executions freely — is universal.</p>
+<h3 id="711-workflow-determinism-whats-forbidden-and-why">§7.11 Workflow determinism — what's forbidden and why</h3>
+<p>§4f gave the constraint. The full picture: every workflow SDK ships a deterministic sandbox that polices what workflow code can do. Violations either fail loudly at runtime (caught) or silently corrupt replay (uncaught — the dangerous category).</p>
+<p><strong>Caught violations (SDK rejects at register/runtime).</strong></p>
+<table>
+<thead>
+<tr>
+<th>Violation</th>
+<th>Why fails replay</th>
+<th>SDK enforcement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>time.Now()</code> / <code>Date.now()</code></td>
+<td>Wall clock varies across replays</td>
+<td>Sandboxed in TypeScript/Python; Go panics at runtime</td>
+</tr>
+<tr>
+<td><code>rand.Float64()</code></td>
+<td>New random number on replay</td>
+<td>Same as above</td>
+</tr>
+<tr>
+<td><code>os.Getenv</code> / file read</td>
+<td>Worker environment varies</td>
+<td>Static analyzer warning; runtime panic</td>
+</tr>
+<tr>
+<td>Goroutine / thread / native async</td>
+<td>Non-deterministic scheduling</td>
+<td>Replaced by <code>workflow.Go</code>, <code>workflow.NewFuture</code></td>
+</tr>
+<tr>
+<td>Direct <code>time.Sleep</code></td>
+<td>Doesn't survive replay; blocks the workflow task</td>
+<td>Use <code>workflow.Sleep</code></td>
+</tr>
+<tr>
+<td><code>http.Get</code> / <code>db.Query</code> direct</td>
+<td>Side effect not in history</td>
+<td>Must go through an activity</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Uncaught violations (subtle bugs in replay).</strong></p>
+<p>These are the disasters. Code that runs fine on first execution but mismatches on replay.</p>
+<ul>
+<li><strong>Iterating maps with non-deterministic iteration.</strong> Go's <code>map</code> and Python's <code>dict</code> (pre-3.7) iterate in random order. If workflow code does <code>for k, v := range myMap { workflow.ExecuteActivity(ctx, A, k) }</code>, the order of activity scheduling differs between executions. Replay sees a different schedule order, mismatches. <strong>Fix:</strong> sort keys explicitly before iterating.</li>
+<li><strong>Sort with pointer comparison.</strong> A real disaster: <code>sort.Slice(items, func(i, j int) bool { return items[i].ptr &lt; items[j].ptr })</code>. Pointer addresses differ across processes. The sorted order is non-deterministic. The "we added a sort that uses pointer comparison" disaster is canonical lore — found by a workflow stuck in <code>NonDeterministicWorkflowError</code> after a deploy that added the sort.</li>
+<li><strong>Floating-point math across architectures.</strong> Rare but real: x86 vs ARM workers can produce subtly different floats. Workflow code that branches on a float comparison can diverge. Fix: use integer math in workflow code; do floating-point in activities.</li>
+<li><strong>System-call return values.</strong> <code>os.Hostname()</code>, <code>os.Pid()</code> — different per worker. Replay on a different worker diverges.</li>
+<li><strong>Locale-dependent string sorting.</strong> <code>sort.Strings(strs)</code> uses the OS locale in some platforms. Locale differences across workers cause divergent sorts.</li>
+<li><strong>Async timers without workflow API.</strong> Spawning a goroutine that calls <code>time.Sleep</code> and then mutates workflow state: that goroutine runs only on first execution; replay never re-creates it. State diverges.</li>
+</ul>
+<p><strong>The deterministic sandbox in each SDK.</strong></p>
+<ul>
+<li><strong>Go SDK.</strong> Workflow code runs in a custom coroutine scheduler (<code>workflow.Go</code> instead of <code>go</code>). Time access via <code>workflow.Now</code>. The SDK monkey-patches enough to catch most violations; uncaught ones surface as <code>NonDeterministicWorkflowError</code> on next replay.</li>
+<li><strong>TypeScript SDK.</strong> Runs workflows in v8 isolates (separate JavaScript contexts) with <code>globalThis</code> patched: no <code>Date.now</code>, no <code>Math.random</code>, no <code>fetch</code>. The strongest sandbox of the three.</li>
+<li><strong>Python SDK.</strong> Uses <code>asyncio</code> with a custom event loop that drives workflow tasks; <code>time.time()</code> and friends are patched. Less hermetic than v8 isolates.</li>
+<li><strong>Java SDK.</strong> Workflow code runs in a Workflow Thread (a custom scheduler atop standard Java threads); thread-local context tracks workflow identity. Forbidden APIs (e.g., <code>Thread.sleep</code>) are detected via byte-code inspection at registration.</li>
+</ul>
+<p><strong>Why deterministic at all?</strong> Two design choices were on the table: "checkpoint state after every step" (Cadence's path: no) vs "rerun code over event log" (the path: yes). Checkpointing requires serializing all in-memory state — workflow-local variables, channel buffers, deferred work. Across long-lived workflows with rich state, that's huge. Replay over events trades CPU (re-run code) for storage (no state snapshots). Cheap CPU vs expensive storage was the bet, and it's been right for a decade.</p>
+<p><strong>Why loud failure?</strong> <code>NonDeterministicWorkflowError</code> is loud on purpose. Any silent corruption — workflow takes a different path than it would have — is a money/safety bug. Better to park the workflow and require a human/<code>GetVersion</code> patch than silently send the customer to the wrong fulfillment center.</p>
+<h3 id="712-side-effects-and-local-activities">§7.12 Side effects and local activities</h3>
+<p>Two patterns that look like activities but aren't full activities. They exist precisely because the determinism constraint is sometimes too strict.</p>
+<p><strong>SideEffect.</strong> "I need a random number, once." A workflow that picks a random partition assignment, or generates a UUID for downstream use, can't call <code>rand.Float64()</code> directly (non-deterministic). Wrapping in a full activity is heavyweight (round-trip through matching, separate worker, history events for schedule + start + complete). <code>workflow.SideEffect(ctx, func(ctx workflow.Context) interface{} { return rand.Float64() })</code> is the lightweight path:</p>
+<ol>
+<li>First execution: the function runs in the workflow worker. Result is captured. Engine writes <code>MarkerRecorded</code> event with the value.</li>
+<li>Replay: workflow reaches <code>SideEffect</code>. Engine reads the marker, returns the stored value. Function is <em>not</em> re-run.</li>
+</ol>
+<p>One event in history vs. three for an activity. Stays inside the workflow worker process. Use cases: generate a UUID, pick a random A/B-test bucket, read a feature flag at a deterministic point.</p>
+<p>Caveats: the function should be fast and side-effect-free (don't make HTTP calls from a <code>SideEffect</code>; if the marker is lost, you don't get a retry). The result must be serializable. If the function panics, the workflow fails (no retry).</p>
+<p><strong>MutableSideEffect.</strong> Variant: re-evaluates the function on each call, but only writes a new marker if the result changed. Useful for "read a slowly changing config value, only update if it actually changed." Most teams just use the regular <code>SideEffect</code> with explicit caching in workflow state.</p>
+<p><strong>Local Activity.</strong> "I need to call an HTTP endpoint without paying the matching round-trip." A normal activity goes:</p>
+<pre><code>workflow worker → frontend → history → matching → activity worker → execute → respond → frontend → history → workflow worker
+</code></pre>
+<p>A local activity skips the matching dispatch:</p>
+<pre><code>workflow worker → execute in same process → respond → workflow worker
+</code></pre>
+<p>The result is still written to history as a <code>MarkerRecorded</code>-style event (so replay is correct), but the dispatch latency drops from ~10ms to ~submillisecond. Use cases: a quick local computation that's too complex for <code>SideEffect</code> (because it might fail and benefit from retries), but too cheap to deserve full activity machinery.</p>
+<p>Tradeoffs:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Activity</th>
+<th>Local Activity</th>
+<th>SideEffect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Runs on separate worker</td>
+<td>Yes</td>
+<td>No (same as workflow)</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Recorded in history</td>
+<td>Schedule, Start, Complete</td>
+<td>Single marker</td>
+<td>Single marker</td>
+</tr>
+<tr>
+<td>Automatic retries via policy</td>
+<td>Yes</td>
+<td>Limited (within workflow task budget)</td>
+<td>None (no retry semantics)</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>~10ms+ dispatch</td>
+<td>Submillisecond</td>
+<td>Submillisecond</td>
+</tr>
+<tr>
+<td>Timeout flexibility</td>
+<td>Full timeout knobs</td>
+<td>Capped by workflow task timeout</td>
+<td>None</td>
+</tr>
+<tr>
+<td>Use case</td>
+<td>External I/O, long work</td>
+<td>Fast in-process calls, retries OK</td>
+<td>One-shot non-deterministic value</td>
+</tr>
+</tbody>
+</table>
+<p>The danger with local activities: people overuse them for everything because they're fast. Then a workflow task gets a 20-second local activity that exceeds the workflow task timeout, causing the entire decision to fail. Convention: local activities should be sub-second, max a few seconds.</p>
+<hr>
+<h2 id="8-failure-modes">§8. Failure modes</h2>
+<p><strong>Worker crash mid-activity.</strong> Activity worker dies between <code>ActivityTaskStarted</code> and <code>RespondActivityTaskCompleted</code>. If heartbeating: <code>HeartbeatTimeout</code> fires → engine emits <code>ActivityTaskTimedOut</code> → retry policy schedules a new attempt. If not: <code>StartToClose</code> fires; same outcome, slower. Side effect may have completed once — application-layer idempotency key makes retry a no-op. <strong>Durability point</strong>: <code>ActivityTaskStarted</code> committed with quorum.</p>
+<p><strong>History service shard loss.</strong> Node owning shards 1700-1799 crashes. Membership protocol detects, reassigns. New owners reload <code>executions</code> rows from the persistent store. ~30s pause for affected shards; no data loss because every event was quorum-written. Durability rests on RF=3 with quorum writes — 1 lost replica survivable; simultaneous loss of 2 replicas of the same partition is the only failure that loses durability.</p>
+<p><strong>Deterministic replay breaks after a code change.</strong> Covered in §7.1. Recovery: park workflow on <code>NonDeterministicWorkflowError</code>, deploy a <code>GetVersion</code> patch, unpark. Symptom is sharp and immediate — preferable to silent corruption.</p>
+<p><strong>Activity stuck forever.</strong> Worker alive but looping. Eventually <code>StartToClose</code> fires regardless of heartbeats. Operational override: terminate workflow via UI, which writes <code>WorkflowExecutionTerminated</code>.</p>
+<p><strong>Signal lost / duplicated.</strong> Client retries <code>SignalWorkflow</code>; signal persisted twice. Engine does not dedupe by default. Include a deterministic signal-key in the payload and dedupe in workflow code, or use <code>SignalWithStart</code> (idempotent on workflow_id).</p>
+<p><strong>Persistent-store quorum loss.</strong> Two of three replicas down: writes fail. Workflow progress halts; <code>StartWorkflow</code> returns errors. No data loss because nothing was acked. Recovery: restore replicas; workflows resume.</p>
+<p><strong>Matching service partition loss.</strong> A matching node holding 1k partitions crashes. Tasks aren't lost — they exist as transfer-queue or timer-queue rows in the persistent store. A new matching node loads them on reassignment. ~10-30s blip; no work lost.</p>
+<p><strong>Network partition between client and frontend.</strong> Client retries <code>StartWorkflow</code>. Idempotent by workflow_id. Application-layer dedupe is necessary for signals.</p>
+<hr>
+<h2 id="9-why-not-cron-a-status-table">§9. Why not cron + a status table?</h2>
+<p>The naïve replacement engineers reach for first:</p>
+<pre><code class="language-sql">CREATE TABLE workflows (
+  id VARCHAR(64) PRIMARY KEY, current_step VARCHAR(64),
+  state_blob BLOB, last_updated TIMESTAMP
+);
+</code></pre>
+<p>Cron sweeps <code>WHERE current_step != 'DONE' AND last_updated &lt; NOW() - INTERVAL 1 MINUTE</code> and re-runs each row's current step.</p>
+<p>This works for ten workflows. It dies before a hundred. Eight failure modes, each requiring you to reinvent a piece of the engine:</p>
+<ol>
+<li><strong>No retry semantics.</strong> <code>charge_payment</code> fails with a network error. Status still <code>START</code>. Cron calls again. Was the first attempt applied? Double charge unless every call carries an idempotency key — your job to build for every step.</li>
+<li><strong>No compensation.</strong> <code>reserve_inventory</code> fails after <code>charge_payment</code> succeeded. Who refunds? Hand-written <code>rollback_to(state)</code> covering every branch.</li>
+<li><strong>No visibility.</strong> Workflow stuck at <code>RESERVED</code> for 6 hours. Did <code>notify_warehouse</code> silently fail? You write a custom dashboard.</li>
+<li><strong>Race on status update.</strong> Two cron workers pick the same row. Both call <code>notify_warehouse</code>. You add a <code>version</code> column and conditional UPDATE — reinventing optimistic concurrency, badly.</li>
+<li><strong>Status drift.</strong> Operator updates <code>current_step</code> to "unstick" a workflow. <code>state_blob</code> inconsistent. Workflow advances down the wrong branch. Money disappears.</li>
+<li><strong>No replay.</strong> Bug discovered. "What would have happened with the fix?" Status-table has only current state, not path.</li>
+<li><strong>No long-running waits.</strong> "Wait 30 days for human approval" — build a scheduler with a <code>scheduled_tasks</code> table and a poller. Reinventing timers, badly.</li>
+<li><strong>No scaling.</strong> Cron sweep over 10M rows every minute is a full table scan. Index it; index maintenance slows writes. Shard by <code>id mod N</code>; reinventing shard-aware engines.</li>
+</ol>
+<p>This is exactly why Uber built Cadence: dozens of internal teams had each rolled status-table workflow systems, all suffering subsets of the above. Once you have more than a handful of nontrivial workflows, the engineering ROI of adopting a workflow engine is overwhelming.</p>
+<h3 id="91-the-canonical-migration-from-cron-state-table">§9.1 The canonical migration from cron + state table</h3>
+<p>The "we already have a cron-driven status table; how do we get to Temporal" migration is one of the most-walked paths in the workflow-engine space. The shape of the legacy system:</p>
+<pre><code>workflows table (status, current_step, state_blob, last_updated)
+   ▲
+   │  UPDATE current_step, state_blob WHERE id = ...
+   │
+cron jobs (every 1 minute)
+   ├─ ProcessChargingWorkflows: SELECT * WHERE current_step = 'charging'
+   ├─ ProcessShippingWorkflows: SELECT * WHERE current_step = 'shipping'
+   └─ ProcessExpiredWorkflows:  SELECT * WHERE last_updated &lt; NOW() - 1h
+</code></pre>
+<p>Each cron handler runs the relevant step and updates the row. The migration usually goes in five phases.</p>
+<p><strong>Phase 1: stand up Temporal in shadow mode.</strong> Deploy the cluster. Build the v2 workflow that mirrors the cron logic in code. Don't route any traffic to it yet. Validate operationally — workers can start, signals flow, observability works.</p>
+<p><strong>Phase 2: shadow workflow comparison.</strong> Start a v2 workflow alongside every v1 row, but the v2 is <em>informational only</em> — it logs what it would have done, doesn't perform side effects. Build tooling that compares v1's state and v2's state at each tick; alerts on divergence. Run for 2-4 weeks until divergence is sub-1% and explained.</p>
+<p><strong>Phase 3: dual-run with reconciliation.</strong> Both v1 and v2 perform side effects, but with idempotency keys scoped to the workflow ID. Both attempt to charge the card, both attempt to ship. The downstream services dedupe on the idempotency key — only the first one actually charges. The race winner is recorded. Build dashboards: % of workflows where v2 won, % where v1 won, % of mismatches. The dual-run phase shakes out subtle bugs (timing differences, race orderings).</p>
+<p><strong>Phase 4: gradual cutover.</strong> Route 1% of new workflows to v2 only. Monitor for a week. Bump to 10%, then 50%, then 90%, then 100%. In-flight v1 workflows continue to completion on the cron path; new workflows are v2.</p>
+<p><strong>Phase 5: drain and decommission.</strong> Wait for v1 workflows to drain. Decommission the cron jobs and the <code>workflows</code> table. Archive the state-blob history for compliance.</p>
+<p><strong>Patterns that survive the migration.</strong></p>
+<ul>
+<li><strong>The idempotency-key convention.</strong> If you've been doing dual-run, you already have stable keys on every downstream call. Carry that into v2.</li>
+<li><strong>The state-blob → workflow-input mapping.</strong> The legacy state blob is the source of truth for what data the workflow needs. Promote the relevant fields to workflow inputs.</li>
+<li><strong>The "stuck workflow" dashboard.</strong> Legacy systems usually have a dashboard for "workflows with last_updated &gt; 1h." Port the query to Temporal's visibility API: "open workflows with no recent decision task." Familiar to ops.</li>
+<li><strong>The compensation table.</strong> If the legacy system has a <code>compensations</code> table tracking refunds and rollbacks, that's exactly your saga's compensation list. Move it into the workflow code as a stack.</li>
+</ul>
+<p><strong>Patterns that don't survive.</strong></p>
+<ul>
+<li><strong>The "fix it by UPDATE-ing a row" runbook.</strong> Operators used to nudge stuck workflows by changing <code>current_step</code> in the DB. Equivalent in Temporal is <code>ResetWorkflow</code> (rewind to an earlier event) — different mental model. Train ops on the new tooling.</li>
+<li><strong>Polling for status.</strong> Code that polled the <code>workflows</code> table for "is it done yet" must move to <code>DescribeWorkflowExecution</code> or a query handler.</li>
+<li><strong>Batch SELECT-and-update tactics.</strong> "Find all workflows in step X and advance them" — Temporal expects each workflow to drive itself. Don't try to recreate the cron sweep; let signals drive transitions.</li>
+</ul>
+<p>The end state: cleaner code, cleaner ops, real audit trail. Costs: an engine to operate, a team to know it. Worth it past ~5 distinct workflow types.</p>
+<hr>
+<h2 id="10-scaling-axes">§10. Scaling axes</h2>
+<p>Two fundamentally different growth axes. They demand different fixes.</p>
+<p><strong>Type 1: more workflows (uniform expansion).</strong> From 1M concurrent to 100M concurrent of roughly the same shape (median 50 events, 5-minute duration).</p>
+<ul>
+<li><strong>1M concurrent</strong>: ~10 history nodes, ~5 matching, 3 persistent-store RF=3, ~50 workers. 4096 shards overkill (~250 workflows/shard).</li>
+<li><strong>10M concurrent</strong>: ~50 history, ~20 matching, 20 persistent-store. Per-shard cache warming matters.</li>
+<li><strong>100M concurrent</strong>: Single-region single-cluster too risky (blast radius). <strong>Inflection point</strong>: federate. Temporal global namespaces with async cross-region replication. Each cluster handles a subset of namespaces.</li>
+</ul>
+<p>Also split namespaces by <em>business domain</em>: orders, fraud, payouts, content moderation — each in its own namespace with quotas and isolation. A fraud bug cannot bring down orders.</p>
+<p>Persistent-store scaling: linear. 100M × 100 events × 1KB ≈ 10TB hot. RF=3 on 100 nodes → ~300GB/node, comfortable on NVMe.</p>
+<p><strong>Type 2: long-running workflows (hotspot intensification).</strong> Same count; each is a beast.</p>
+<ul>
+<li><strong>50 events</strong>: Replay trivial. Sticky cache 95%. CPU idle.</li>
+<li><strong>5,000 events</strong>: Replay cost real. Cold restart ~100ms CPU per decision. Cache eviction hurts. Fix: aggressive sticky tuning + <code>ContinueAsNew</code> at meaningful boundaries.</li>
+<li><strong>50,000 events</strong>: Engine's hard limit. Workflow structurally wrong; redesign. <code>ContinueAsNew</code> mandatory.</li>
+</ul>
+<p><strong>Noisy workflow anti-pattern.</strong> One workflow signaling itself 1000/sec is a per-shard hotspot: one persistent-store partition hammered. Other workflows on the same shard suffer write amplification. Fix: redesign (more frequent <code>ContinueAsNew</code>, or split), or move to its own shard. <strong>No resharding fix for per-workflow hotspots</strong> — the shard owns the workflow; you cannot split one workflow across two shards without breaking serializability. The application must change.</p>
+<p><strong>Inflection points.</strong> 1M → 10M concurrent: add shards/nodes (linear). 10M → 100M: federate (topology shift). 1k → 50k events/workflow: <code>ContinueAsNew</code> mandatory. Single → multi-namespace: when one workflow class can blast-radius others.</p>
+<hr>
+<h2 id="11-decision-matrix-vs-adjacent-categories">§11. Decision matrix vs adjacent categories</h2>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Workflow engine (Temporal-class)</th>
+<th>DB-driven saga</th>
+<th>Choreography (queue)</th>
+<th>Batch DAG (Airflow)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Number of steps</td>
+<td>2-100s</td>
+<td>2-3</td>
+<td>2-10</td>
+<td>5-100 (per DAG)</td>
+</tr>
+<tr>
+<td>Workflow duration</td>
+<td>ms to years</td>
+<td>ms to hours</td>
+<td>ms to minutes</td>
+<td>Hours (per run)</td>
+</tr>
+<tr>
+<td>Concurrent in-flight</td>
+<td>1k-100M+</td>
+<td>&lt;10k (DB choke)</td>
+<td>Queue limit</td>
+<td>&lt;10k (Airflow choke)</td>
+</tr>
+<tr>
+<td>Compensation</td>
+<td>First-class</td>
+<td>DIY</td>
+<td>DIY</td>
+<td>DIY</td>
+</tr>
+<tr>
+<td>Auditability</td>
+<td>Complete event history</td>
+<td>Manual change-log</td>
+<td>Queue logs</td>
+<td>DAG-run history</td>
+</tr>
+<tr>
+<td>Long waits (days)</td>
+<td>Native</td>
+<td>DIY scheduler</td>
+<td>DIY scheduler</td>
+<td>Awkward (sensors)</td>
+</tr>
+<tr>
+<td>Visibility UI</td>
+<td>First-class</td>
+<td>DIY</td>
+<td>DIY</td>
+<td>First-class for DAGs</td>
+</tr>
+<tr>
+<td>Operational cost</td>
+<td>High (run an engine)</td>
+<td>Low (just a DB)</td>
+<td>Low (just a queue)</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td>Best for</td>
+<td>Business processes, sagas</td>
+<td>&lt;5 flows, low scale</td>
+<td>Loose event-driven</td>
+<td>Daily/hourly ETL</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Pick a workflow engine</strong> when: multi-step processes with compensation, audit, or long durations; more than a handful of distinct flow types; scale beyond a single DB's saga capacity; need replay/audit; long-running waits.</p>
+<p><strong>Pick DB-driven sagas</strong> when: one or two simple flows, low scale (&lt;10k concurrent), can't afford engine operational overhead, flows short enough that crash recovery is rare.</p>
+<p><strong>Pick choreography (message queue)</strong> when: genuinely event-driven (each service reacts independently), no global "workflow state" anyone cares about. Often coexists with an engine: queue moves events; engine coordinates workflows.</p>
+<p><strong>Pick batch DAG (Airflow)</strong> when: data processing on a schedule, with backfills and idempotent task reruns over a partition key.</p>
+<p><strong>Pick Argo Workflows</strong> when: sequence of Kubernetes pods (CI/CD, ML training); team already on k8s; per-step overhead in seconds acceptable.</p>
+<p><strong>Thresholds for switching from DB-saga to engine:</strong> &gt;5-10 distinct workflow types; any workflow &gt;10 minutes; non-trivial compensation (&gt;2-3 rollback steps); path-not-just-state audit; any workflow &gt;10 steps. The real signal: engineers reinventing engine features (timers, signal handlers, retry-with-backoff helpers) in status-table code. Once you see that, you've outgrown the table.</p>
+<hr>
+<h2 id="12-cron-style-scheduled-workflows">§12. Cron-style scheduled workflows</h2>
+<p>Cron-on-a-schedule is a workflow engine's most boring but most underestimated feature. Temporal exposes <strong>Schedules</strong> (formerly cron schedules) — a first-class resource that says "start this workflow on this cron expression with these inputs."</p>
+<pre><code>ScheduleSpec:
+  cron_expression: &quot;0 */4 * * *&quot;     # every 4 hours
+  workflow_type: DailyReconciliation
+  task_queue: RECONCILIATION_TQ
+  workflow_input: {...}
+  catchup_window: 24h
+  pause_on_failure: false
+</code></pre>
+<p>The Schedule resource lives in the engine. The engine fires the schedule at each tick, starting a fresh workflow execution. Each execution is independent (separate run_id, separate history).</p>
+<p><strong>Difference from external cron + workflow start.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>External cron (k8s CronJob) → <code>StartWorkflow</code></th>
+<th>Native Schedule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Idempotency on tick</td>
+<td>DIY (cron retries on failure can double-start)</td>
+<td>Engine guarantees one start per scheduled time</td>
+</tr>
+<tr>
+<td>Missed executions during outage</td>
+<td>DIY (which ticks were missed? you'd have to log them externally)</td>
+<td><code>catchup_window</code> tracks misses</td>
+</tr>
+<tr>
+<td>Backfill</td>
+<td>DIY</td>
+<td>Schedule <code>backfill</code> API replays missed executions</td>
+</tr>
+<tr>
+<td>Pause</td>
+<td>Stop the CronJob, but a tick mid-execution is undefined</td>
+<td>Schedule <code>pause</code> is an engine action; in-flight workflows continue</td>
+</tr>
+<tr>
+<td>Observability</td>
+<td>Two systems to query</td>
+<td>One UI shows schedule + all triggered runs</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The "we missed 10 executions during the outage, should we backfill?" decision.</strong> Real conversation. Cluster went down for 8 hours. Schedule fires every hour. Eight ticks didn't run.</p>
+<p>Options:</p>
+<ol>
+<li><strong>Skip them.</strong> Acceptable for "best-effort" schedules — e.g., a cache refresh that runs hourly. Today's data was a bit stale; tomorrow will be fine.</li>
+<li><strong>Backfill all 8.</strong> Run them sequentially or in parallel, in chronological order. Each tick is a workflow that takes "scheduled time" as input. Activities use that time, not <code>workflow.Now</code>. Useful for analytics rollups: each tick computes the previous hour's data.</li>
+<li><strong>Backfill the most recent only.</strong> For "current state" schedules where only the latest matters. E.g., a daily ranking refresh — yesterday's ranking is moot; only run today's.</li>
+<li><strong>Manual triage.</strong> Sometimes backfill is unsafe (e.g., a customer-facing email send). Disable the schedule, look at each missed tick individually.</li>
+</ol>
+<p><code>catchup_window</code> is the engine-side knob: if a tick should have fired more than the window ago, skip it. Default in Temporal is 1 minute (paranoid). For "always backfill" schedules, set it to 30 days.</p>
+<p><strong>Schedule-on-a-schedule (anti-pattern).</strong> Some teams chain a schedule that runs a workflow that itself contains a <code>workflow.Sleep(1h)</code> loop. Don't — schedules are the right primitive for "fire periodically." Sleeping inside a workflow holds history events forever.</p>
+<p><strong>Step Functions, Airflow.</strong> Step Functions has <code>EventBridge Schedules</code> as the cron mechanism — same shape. Airflow's entire premise is scheduling: every DAG has a <code>schedule_interval</code>. Argo has <code>CronWorkflows</code>. The primitive is universal across the category.</p>
+<hr>
+<h2 id="13-multi-tenancy-and-namespaces">§13. Multi-tenancy and namespaces</h2>
+<p>A single workflow cluster usually hosts workloads from many teams. Without isolation, a noisy team can starve everyone else. <strong>Namespaces</strong> are the primary isolation primitive in Temporal/Cadence.</p>
+<p><strong>What a namespace is.</strong> A logical workflow space. Each namespace has:</p>
+<ul>
+<li>Its own set of workflows (no cross-namespace <code>workflow_id</code> collisions; you can have <code>order-123</code> in <code>payments</code> and <code>order-123</code> in <code>subscriptions</code> and they're different).</li>
+<li>Its own task queues (a worker polls a specific namespace + task queue).</li>
+<li>Its own retention policy (how long workflow histories are kept after closure).</li>
+<li>Its own visibility index (Elasticsearch namespace).</li>
+<li>Its own quotas (rate limits on starts, signals, queries, persistence writes).</li>
+<li>Its own ACLs (which user/service can start/signal/query workflows here).</li>
+</ul>
+<p><strong>Why namespaces instead of separate clusters.</strong> Cluster-level isolation is the strongest but most expensive. Each cluster needs a separate persistent store, separate matching/history/frontend fleet, separate visibility pipeline. Per-team clusters at a company with 50 teams = 50× the operational cost. Namespaces share the cluster but give logical isolation cheaply.</p>
+<p><strong>Per-tenant quotas.</strong> Critical for shared clusters. Each namespace can be configured with:</p>
+<ul>
+<li><code>MaxWorkflowExecutionsPerSecond</code> — start rate limit.</li>
+<li><code>MaxSignalsPerSecond</code> — signal rate limit.</li>
+<li><code>MaxWorkflowTaskExecutionsPerSecond</code> — decision-task throttle.</li>
+<li><code>MaxActivityExecutionsPerSecond</code> — activity-dispatch throttle.</li>
+<li><code>RPSPerNamespace</code> — coarse RPC rate.</li>
+</ul>
+<p>The frontend enforces these; over-quota requests get throttled (HTTP 429-equivalent). Without quotas, a runaway team that signals a workflow 10k times/sec can saturate the cluster.</p>
+<p><strong>The "noisy tenant blocks others" problem.</strong> Even with quotas, hot shards can hurt neighbors. A namespace gets unlucky and 50 of its workflows hash to the same shard; that shard's persistence partition is hot. Other namespaces with workflows on the same shard see write latency. Mitigations:</p>
+<ul>
+<li><strong>Per-namespace sharding hints</strong> (some engines support routing namespaces to a subset of shards).</li>
+<li><strong>Persistence rebalancing</strong> (Cassandra repair + manual key range moves).</li>
+<li><strong>Federation</strong> — move the noisy namespace to its own cluster.</li>
+</ul>
+<p><strong>Tenant onboarding pattern.</strong> A team requests a namespace. Ops provisions it with conservative quotas, monitors usage for 2 weeks, then either raises quotas or splits the namespace if the team's workflows are heterogeneous (e.g., fast/slow flows in the same namespace would benefit from separate quotas).</p>
+<p><strong>Multi-tenant in Step Functions, Argo, Conductor.</strong> Step Functions: account + region is the isolation; sub-account isolation via IAM but no native namespace. Argo: Kubernetes namespaces map 1:1 — natural fit. Conductor: workflow names + permission scopes; less aggressive than Temporal.</p>
+<p><strong>Cross-namespace coordination.</strong> Sometimes a workflow in namespace A needs to start a child workflow in namespace B. Modern Temporal supports this via cross-namespace child workflows; older Cadence required signals to a workflow in the other namespace. Cross-namespace adds latency and coupling — prefer single-namespace designs unless there's a strong reason.</p>
+<hr>
+<h2 id="14-history-search-and-observability">§14. History search and observability</h2>
+<p>Workflows generate billions of events. Querying them — "show me every order workflow that failed in step 3 between Tuesday and Thursday" — is a distinct concern from running them.</p>
+<p><strong>Visibility API.</strong> Temporal's <code>Visibility</code> is the search/list interface. Backed by Elasticsearch (or OpenSearch). The history service emits a Change Data Capture stream of visibility records (workflow started, completed, search attributes updated); the visibility indexer consumes the stream and writes to Elasticsearch.</p>
+<p>Each workflow has system attributes (<code>WorkflowId</code>, <code>WorkflowType</code>, <code>RunId</code>, <code>ExecutionStatus</code>, <code>StartTime</code>, <code>CloseTime</code>, <code>TaskQueue</code>) automatically indexed. Plus custom <strong>search attributes</strong> declared per namespace:</p>
+<pre><code class="language-go">workflow.UpsertSearchAttributes(ctx, map[string]interface{}{
+    &quot;CustomerTier&quot;:  &quot;Gold&quot;,
+    &quot;OrderAmount&quot;:   299.99,
+    &quot;StuckInStep&quot;:   &quot;FraudCheck&quot;,
+})
+</code></pre>
+<p>Each <code>UpsertSearchAttributes</code> call writes a marker event in history <em>and</em> updates the visibility index. The search attributes become queryable.</p>
+<p><strong>Querying.</strong> Visibility supports a SQL-like query language:</p>
+<pre><code>WorkflowType = &quot;OrderWorkflow&quot; 
+  AND ExecutionStatus = &quot;Failed&quot; 
+  AND StuckInStep = &quot;FraudCheck&quot;
+  AND StartTime BETWEEN &quot;2026-05-15&quot; AND &quot;2026-05-22&quot;
+ORDER BY StartTime DESC
+LIMIT 100
+</code></pre>
+<p>Used heavily for ops dashboards, batch operations (mass-restarting workflows that hit a known bug), compliance audits, customer support ("here's every workflow we ran for customer X").</p>
+<p><strong>Custom search attributes are a contract.</strong> Once you index a workflow type with attribute <code>CustomerTier</code>, you must keep the meaning stable. Renaming or repurposing breaks queries. Some teams version the attribute names (<code>CustomerTierV2</code>).</p>
+<p><strong>Replay debugging.</strong> The killer feature for incidents. When a workflow has a bug, download its history (one binary file ~10-100KB) and replay it locally:</p>
+<pre><code class="language-bash">tctl workflow show --workflow_id order-abc --output_filename history.bin
+</code></pre>
+<p>Then in your dev environment:</p>
+<pre><code class="language-go">replayer := worker.NewWorkflowReplayer()
+replayer.RegisterWorkflow(OrderWorkflow)
+err := replayer.ReplayWorkflowHistoryFromJSONFile(logger, &quot;history.bin&quot;)
+</code></pre>
+<p>The workflow runs with all activities mocked (their results come from history). You can set breakpoints, step through, see exactly what decisions the code took. Indispensable for debugging stuck workflows: "why did this workflow take path A instead of B?"</p>
+<p><strong>The "find all payment workflows that failed in step 3" query in practice.</strong> Real example. A bug shipped that caused payment workflows to fail in the fraud-check step. Ops query:</p>
+<pre><code>WorkflowType = &quot;PaymentWorkflow&quot; 
+  AND ExecutionStatus = &quot;Failed&quot; 
+  AND StuckInStep = &quot;FraudCheck&quot;
+  AND StartTime &gt; &quot;2026-05-20T00:00:00Z&quot;
+</code></pre>
+<p>Returns 4,217 workflow IDs. Then batch operation: <code>tctl workflow batch terminate --query "&lt;above&gt;"</code> or <code>tctl workflow batch reset --reset-type LastWorkflowTask --query "&lt;above&gt;"</code>. Resets all matching workflows to before the failed step. They retry under the fixed code.</p>
+<p>This batch operation pattern — query + bulk action — is one of the highest-leverage capabilities a workflow engine provides. Without it, "fix 4k workflows" is a team-week of one-off scripts.</p>
+<p><strong>Cost of visibility.</strong> Elasticsearch is the expensive component for many large clusters. A workflow that updates <code>UpsertSearchAttributes</code> 100 times in its life creates 100 index updates. Multiply by 100M workflows = 10B index updates. Visibility clusters can grow larger than the primary persistence cluster in cost. Hygiene: only <code>Upsert</code> when the attribute actually changes; avoid high-cardinality attributes.</p>
+<hr>
+<h2 id="15-cost-economics">§15. Cost economics</h2>
+<p>Engine costs split across three axes.</p>
+<p><strong>History storage.</strong> Each event ~200B-2KB serialized; batched in <code>history_node</code> rows of 5-20 events. Workflow history ~5-50KB typical, ~500KB-1MB for long workflows. Storage cost = <code>(workflow rate) × (avg history size) × (retention period)</code>.</p>
+<p>Concrete: 10M workflows/day, avg history 20KB, retention 30 days. → 10M × 20KB × 30 = <strong>6 TB hot</strong>. Cassandra RF=3 → 18 TB raw. At ~$0.10/GB/month on commodity NVMe → ~$1.8k/month for storage alone. Add cold archival to S3 after retention → cents/GB/month, near-free.</p>
+<p><strong>Compute fleet.</strong></p>
+<ul>
+<li><strong>History service.</strong> Sized by shard count × write rate. Rule of thumb: each history node owns 100-500 shards, handles 5-10k writes/sec. 4096 shards / 200 shards-per-node = 20 history nodes for a mid-large cluster.</li>
+<li><strong>Matching service.</strong> Sized by task-queue throughput. ~30-100 nodes for 100k tasks/sec.</li>
+<li><strong>Frontend.</strong> Stateless, scales with API QPS. Often 10-30 nodes.</li>
+<li><strong>Worker fleet.</strong> Scales with workflow execution rate × activity rate. Long-polling workers wait idle most of the time; sized for peak concurrency, not average load. The "long polls, idle cost" reality: a worker waiting for tasks consumes connection slots in the matching service and a small CPU baseline. With 1000 workers each holding 10 long polls, that's 10k open connections continuously.</li>
+</ul>
+<p>Worker idle cost is real. A team that over-provisions workers (10x what's needed) is paying for 10x the idle long polls. Mitigation: tune <code>MaxConcurrentActivityExecutionSize</code> and <code>MaxConcurrentWorkflowTaskExecutionSize</code> per worker; reduce worker fleet size; use auto-scaling tied to task-queue backlog.</p>
+<p><strong>Visibility / Elasticsearch.</strong> Often the surprise cost. Each workflow generates 3-10 visibility events (start, status changes, completion, plus any <code>UpsertSearchAttributes</code>). 100M workflows/year × 5 events × 1KB = 500 GB. Elasticsearch storage + replication + hot-warm-cold tiering. Easily 2-5x the primary persistence cost.</p>
+<p><strong>The "workflow rate × event rate × retention" multiplication.</strong> This product is the headline number. Examples:</p>
+<ul>
+<li>Small cluster: 1k workflows/day × 20 events/workflow × 30 days retention = <strong>600k events stored</strong>. Trivial.</li>
+<li>Mid: 1M workflows/day × 30 events × 30 days = <strong>900M events</strong>. Solid mid-sized Cassandra deployment.</li>
+<li>Large: 100M workflows/day × 50 events × 30 days = <strong>150B events</strong>. Federated cluster, multi-region, dedicated team.</li>
+</ul>
+<p><strong>Cost-saving levers.</strong></p>
+<ul>
+<li><strong>Shorten retention.</strong> 30 days → 7 days. Most workflows are debugged within 7 days of completion. Archive to S3 for compliance, drop from hot.</li>
+<li><strong><code>ContinueAsNew</code> more aggressively.</strong> A subscription workflow that lives forever and grows to 50k events is a million times more expensive to store than one that <code>ContinueAsNew</code>s monthly with a 100-event history per cycle.</li>
+<li><strong>Snapshotting via <code>ContinueAsNew</code>.</strong> Truncate history by closing the current run and starting fresh with a compact snapshot as input. Every event before the <code>ContinueAsNew</code> is archived to S3 after retention. This is the canonical pattern for long-lived workflows.</li>
+<li><strong>Reduce <code>UpsertSearchAttributes</code> frequency.</strong> Each Upsert is one history event + one index update.</li>
+<li><strong>Right-size worker fleet.</strong> Use auto-scaling tied to <code>WorkflowTaskBacklog</code> / <code>ActivityTaskBacklog</code> metrics.</li>
+</ul>
+<p><strong>Temporal Cloud pricing for reference.</strong> Charged per <strong>action</strong> (workflow start, signal, query, activity completion, timer fire, etc.) plus storage. At list, ~$25/M actions for the first tier, scaling down. A workflow with 30 events ≈ 30 actions. 1M workflows/day = ~30M actions/day = ~900M/month → ~$22k/month at list. Add storage. Add support. Big teams negotiate down significantly. Compare to self-hosted: a 20-node Cassandra cluster + 50-node engine fleet + ops headcount usually crosses $50k+/month before you've shipped anything. Cloud breaks even early; self-host pays off at large scale.</p>
+<hr>
+<h2 id="16-workflow-vs-activity-idempotency">§16. Workflow vs activity idempotency</h2>
+<p>Two distinct flavors of idempotency live in the engine, with different enforcement points.</p>
+<p><strong>Workflow start idempotency.</strong> Built in. <code>StartWorkflow(workflow_id="order-123")</code> is idempotent on <code>workflow_id</code>. The engine maintains the invariant "at most one running workflow per <code>workflow_id</code> at any time" via the shard mutex. Calling <code>StartWorkflow</code> twice with the same <code>workflow_id</code>:</p>
+<ul>
+<li>If the first is still running: the second returns the existing run's handle (or <code>WorkflowExecutionAlreadyStartedError</code>, depending on <code>WorkflowIDReusePolicy</code>).</li>
+<li>If the first has completed: behavior depends on <code>WorkflowIDReusePolicy</code>:</li>
+<li><code>AllowDuplicate</code>: start a new run with the same ID, new run_id.</li>
+<li><code>AllowDuplicateFailedOnly</code>: only allow if the previous run failed.</li>
+<li><code>RejectDuplicate</code>: reject.</li>
+<li><code>TerminateIfRunning</code>: cancel the in-flight and start fresh.</li>
+</ul>
+<p>The <code>workflow_id</code> is your business-domain idempotency key. A common convention: <code>workflow_id = "order-{order_id}"</code> ensures one workflow per order forever.</p>
+<p><strong>Activity idempotency.</strong> Not built in. The engine guarantees:</p>
+<ul>
+<li><code>activity_id</code> is stable across retries (the same logical activity invocation, possibly multiple physical attempts).</li>
+<li><code>attempt</code> is incremented on each retry.</li>
+</ul>
+<p>The engine does NOT guarantee:</p>
+<ul>
+<li>The side effect is performed at most once. (Retries can re-execute a side effect that completed but failed to ack.)</li>
+<li>The application-layer key is constructed correctly.</li>
+</ul>
+<p>Application's job: construct an idempotency key from <code>activity_id</code> + <code>attempt</code> (or just <code>activity_id</code> if you want all retries to dedupe to the same external operation) and pass it to the external system.</p>
+<pre><code class="language-go">func ChargePayment(ctx context.Context, input PaymentInput) (string, error) {
+    activityInfo := activity.GetInfo(ctx)
+    idempotencyKey := fmt.Sprintf(&quot;%s-%s&quot;, activityInfo.WorkflowExecution.ID, activityInfo.ActivityID)
+    return stripeClient.Charge(input, stripe.WithIdempotencyKey(idempotencyKey))
+}
+</code></pre>
+<p>If Stripe receives two requests with the same key, it returns the cached result of the first — the side effect happens once. Without the key, the second retry charges the card again. This is the boundary where exactly-once semantics actually live.</p>
+<p><strong>External idempotency keys vs activity-derived keys.</strong> Two flavors:</p>
+<ul>
+<li><strong>Activity-derived</strong> (above): key is a function of <code>workflow_id + activity_id</code>. Stable across retries; different across logical invocations. The default for most cases.</li>
+<li><strong>Externally provided</strong>: the caller of the workflow provides a business idempotency key. Example: a <em>deduplicated job submission API</em> where the caller passes <code>request_id</code>, and the workflow uses that as the idempotency key for downstream services. Necessary when the caller might call the workflow multiple times for the same logical request.</li>
+</ul>
+<p><strong>The "two activities in the same workflow with the same external effect" footgun.</strong> If two activities in the same workflow both call <code>Stripe.Charge</code> with <code>idempotencyKey = workflow_id</code>, they collide — the second returns the first's response. Always include the <code>activity_id</code> in the key, not just the <code>workflow_id</code>.</p>
+<hr>
+<h2 id="17-temporal-cloud-and-managed-offerings">§17. Temporal Cloud and managed offerings</h2>
+<p>When to run an engine yourself vs. let someone else run it.</p>
+<p><strong>Self-host arguments.</strong></p>
+<ul>
+<li><strong>Deep customization.</strong> Custom persistence backend (your in-house Cassandra fork), custom matching algorithm, integration with proprietary auth (your internal IDP — Identity Provider), bring-your-own-key encryption.</li>
+<li><strong>On-prem requirement.</strong> Regulated industries (banking, healthcare in some geographies) that can't ship data to a third party.</li>
+<li><strong>Cost at very large scale.</strong> Past ~1B actions/month, Cloud's per-action pricing exceeds the all-in cost of self-hosting + a small operations team.</li>
+<li><strong>Co-location with workloads.</strong> Latency-sensitive workflows where the engine + workers + persistence + downstream services all need to be in the same network.</li>
+</ul>
+<p><strong>Managed (Temporal Cloud, AWS Step Functions, Conductor managed via Orkes) arguments.</strong></p>
+<ul>
+<li><strong>Small team.</strong> A 5-person team building a payment system shouldn't spend half its time on Cassandra repair.</li>
+<li><strong>Fast startup.</strong> Cloud is a 1-day onboarding vs a 3-month self-hosted cluster bring-up.</li>
+<li><strong>Operational coverage.</strong> 24/7 ops, upgrade management, hot-fixes for engine bugs, capacity planning — all included.</li>
+<li><strong>Multi-region failover.</strong> Temporal Cloud offers cross-region replication as a feature; self-hosted requires you to build it.</li>
+</ul>
+<p><strong>Temporal Cloud pricing model.</strong> Pay-per-action + storage + support tier. Actions billed at ~$25/M list (negotiable). Storage at ~$0.05/GB-hour. Support tiers from Bronze (best-effort) to Platinum (24/7 phone). Predictable economics — you pay roughly proportional to use.</p>
+<p><strong>Hybrid pattern.</strong> Some teams self-host their primary clusters (cost + customization) but use Cloud for staging/dev environments (low volume, fast iteration). Operational footprint scales sub-linearly.</p>
+<p><strong>When the calculus flips.</strong></p>
+<ul>
+<li>Crossing ~1k namespaces (per-namespace ops overhead in Cloud becomes a constraint; self-host wins).</li>
+<li>Crossing ~1B actions/month (cost curve favors self-host).</li>
+<li>Crossing geographic boundaries that Cloud doesn't serve (e.g., China, certain government regions).</li>
+</ul>
+<p>For most teams under 100 engineers building business workflows, Cloud wins on TCO (Total Cost of Ownership). For platform teams at large companies offering workflow-as-a-service internally, self-host is usually the right answer.</p>
+<hr>
+<h2 id="18-durable-execution-as-a-movement">§18. Durable execution as a movement</h2>
+<p>"Durable execution" has emerged as a category label. Temporal coined it; an ecosystem of lighter-weight alternatives has grown alongside.</p>
+<p><strong>Temporal-class: full durable execution with event-sourced replay.</strong> Temporal, Cadence, Restate. Heavy clusters, deterministic SDKs, designed for millions of in-flight workflows.</p>
+<p><strong>Lighter-weight serverless durable execution.</strong></p>
+<ul>
+<li><strong>Inngest.</strong> SaaS, serverless. Workflows are TypeScript functions deployed to Inngest's runtime. Triggers via events. Step functions within Inngest are durable (each step's result is persisted). Targets the "we want durability for short workflows" wedge — typical workflows are seconds to minutes, not days.</li>
+<li><strong>Restate.</strong> Open-source. Durable RPC + Kafka-style log. Less coupled to a specific SDK; works with HTTP services that adhere to the Restate protocol. Aims for "durable execution as a library, not a platform."</li>
+<li><strong>Trigger.dev.</strong> Like Inngest but more developer-experience focused. Workflows are TypeScript; Web UI for triggering and monitoring. Free tier; pricing kicks in around mid-volume.</li>
+<li><strong>Cloudflare Workflows.</strong> Cloudflare's recent entry. Durable execution embedded in the Workers runtime. JavaScript-only, ties into Workers ecosystem.</li>
+</ul>
+<p><strong>The "we have small workflows but want durability" wedge.</strong> A team running 1k workflows/day, each 30 seconds, doesn't need a Temporal cluster. They want:</p>
+<ul>
+<li>Durable retries on failures.</li>
+<li>Activity-equivalent step boundaries.</li>
+<li>A UI to see what's running.</li>
+</ul>
+<p>Inngest/Trigger.dev/Restate all fit. Temporal would be overkill — both operationally (running a cluster) and conceptually (the deterministic-replay model has more rules than needed for 30-second workflows).</p>
+<p><strong>When these beat Temporal.</strong></p>
+<ul>
+<li><strong>Cold-start matters.</strong> Inngest's serverless runtime spins up a function per workflow step; no idle worker fleet. For sub-100/day workflows, that's a win.</li>
+<li><strong>JavaScript-first stacks.</strong> Trigger.dev and Inngest are TypeScript-native; the dev experience is tighter than Temporal's TS SDK (which is excellent but still requires the deterministic-replay mindset).</li>
+<li><strong>Event-driven by default.</strong> Inngest's primary trigger is an event; Temporal's is a <code>StartWorkflow</code> call. For "react to user signed up" workflows, Inngest's mental model fits better.</li>
+</ul>
+<p><strong>When Temporal still wins.</strong></p>
+<ul>
+<li><strong>Long-running workflows.</strong> Anything &gt;1 day favors Temporal. Inngest can do it but you're paying serverless overhead for idle time.</li>
+<li><strong>Complex sagas with custom retry/compensation.</strong> Temporal's first-class support is hard to beat.</li>
+<li><strong>Self-hosting requirement.</strong> Most of the new entrants are SaaS-only.</li>
+<li><strong>High throughput.</strong> Temporal scales to 100k+ transitions/sec per cluster; Inngest is multi-tenant SaaS with shared capacity.</li>
+</ul>
+<p><strong>The category is consolidating.</strong> Expect 2-3 winners (Temporal, Inngest, maybe Restate) over the next few years. The shape — "durable functions with replay or persisted-step semantics" — is converging across all of them.</p>
+<hr>
+<h2 id="19-airflow-vs-temporal-the-confusion-that-wont-die">§19. Airflow vs Temporal — the confusion that won't die</h2>
+<p>Two engines, two completely different problem shapes, frequently confused. The confusion is so common it deserves its own section.</p>
+<p><strong>Airflow's center of gravity: batch DAGs on a schedule.</strong> A DAG is a static graph of tasks. A run is one execution of the DAG against a parameterization (typically a date partition). Tasks are usually heavyweight (Spark jobs, dbt runs, ML training scripts). Per-task overhead measured in hundreds of milliseconds to seconds (scheduler poll loop + worker dispatch).</p>
+<p>Strengths:</p>
+<ul>
+<li>Backfills (rerun the DAG for past dates).</li>
+<li>Data lineage (which task produced which dataset, dating across runs).</li>
+<li>Sensor-style waits (poll for an external condition).</li>
+<li>Catchup logic when the scheduler was down.</li>
+<li>Integration with the data ecosystem: SQL operators, S3 sensors, dbt, Spark, etc.</li>
+</ul>
+<p>Weaknesses:</p>
+<ul>
+<li>Long-running concurrent workflows (each at a unique point) — not designed for. Airflow can run thousands of DAG runs concurrently, but not millions.</li>
+<li>Per-task latency too high for fast orchestrations.</li>
+<li>Awkward for "wait for an external signal" — you build a sensor that polls.</li>
+</ul>
+<p><strong>Temporal's center of gravity: long-running stateful workflows with millions of concurrent instances.</strong> A workflow is a piece of code that runs durably. Each workflow is unique — different inputs, different state. Tasks (activities) can be heavyweight or lightweight (a single HTTP call). Per-activity overhead measured in milliseconds.</p>
+<p>Strengths:</p>
+<ul>
+<li>Millions of concurrent workflows, each at a different point.</li>
+<li>Long-running waits (days, months) without holding resources.</li>
+<li>Signals from external systems (vs polling).</li>
+<li>Code-as-workflow with full language expressivity.</li>
+<li>Compensation / sagas as first-class patterns.</li>
+</ul>
+<p>Weaknesses:</p>
+<ul>
+<li>Batch backfills over a date range — awkward. Temporal has no built-in concept of "rerun this workflow for every day in 2024."</li>
+<li>Data lineage — not provided.</li>
+<li>Per-task overhead too high for line-rate data transformations.</li>
+<li>Determinism constraints make some data manipulation patterns ugly.</li>
+</ul>
+<p><strong>The "we put a 1-second-running workflow in Airflow" anti-pattern.</strong> A team wanted to orchestrate a 4-step API call sequence that takes 1 second total. They put it in Airflow. Each task has ~500ms of scheduler overhead. The whole "workflow" takes 3 seconds. They run 10k/day. Airflow's scheduler is saturated with task scheduling for these tiny workflows; their real DAGs (the actual ETL) are delayed. Wrong tool. Temporal would handle this in 50ms per workflow with no scheduler pressure.</p>
+<p><strong>The "we put a daily ETL in Temporal" anti-pattern.</strong> A team built their daily data pipeline as Temporal workflows. Every morning at 2 AM, one workflow per partition (1k partitions/day) starts. Each runs a Spark job. The Spark jobs are 30 minutes to 4 hours. Workflows hold history events for each activity (Spark job start, complete, retry on failure). After a year, the visibility cluster is full of completed workflows. Backfills are painful — each requires triggering a new workflow run, no native concept of "rerun the pipeline for last week." Wrong tool. Airflow would handle this with native backfill support, DAG visualization showing dependencies between days, and built-in data-lineage hooks.</p>
+<p><strong>The decision rule.</strong></p>
+<ul>
+<li><strong>Time axis is the calendar?</strong> (Daily, hourly partitions.) <strong>Airflow.</strong></li>
+<li><strong>Time axis is the workflow's own life?</strong> (This workflow lives from when the order is placed until delivery.) <strong>Temporal.</strong></li>
+</ul>
+<p>Restated: if your workflow's mental model is "today's run vs yesterday's run," it's batch DAG (Airflow). If the mental model is "this workflow is processing one customer's transaction, born and dies independently of any clock," it's durable execution (Temporal).</p>
+<p>Many teams need both. A daily ETL pipeline (Airflow) feeds data that a real-time order workflow (Temporal) reads. They live in the same stack and coexist; they don't replace each other.</p>
+<hr>
+<h2 id="20-failure-modes-not-covered">§20. Failure modes not covered</h2>
+<p>§8 covered the routine failure modes — worker crashes, shard losses, signal duplicates. The deeper category: failures of the engine itself, the ones that require engineering escalation.</p>
+<p><strong>History database split-brain.</strong> Cassandra's eventual consistency is mostly hidden behind quorum reads/writes, but it can leak. Scenario: a partition between two Cassandra DCs. Both sides keep accepting writes (active-active). The same shard's <code>executions</code> row is updated on both sides with different <code>txn_id</code> values. When the partition heals, repair reconciles using timestamps — and the loser's writes are silently discarded. If those writes corresponded to acked workflow events, the workflow's view diverges from what clients were told.</p>
+<p>Mitigation: deploy Cassandra with proper consistency (CL_QUORUM for both reads and writes, RF=3, ideally RF=3 per DC with cross-DC quorum). Periodically run consistency checks comparing history hashes between DCs. Critical workflows pin to a single DC for write traffic.</p>
+<p>Recovery from divergence: extremely painful. Possibly involves replaying events from backups against a single-DC source of truth, manually reconciling discrepancies. Usually weeks of forensics + ops.</p>
+<p><strong>Workflow stuck in NotFound because shard moved during partition.</strong> A network partition isolates a history node from the shard registry. The registry believes the node is dead, reassigns its shards to a survivor. The original node still thinks it owns those shards (split-brain). Clients hitting the original see "workflow exists" responses; clients hitting the survivor see "NotFound" because the survivor hasn't loaded the shard state yet. After the partition heals, the original gives up ownership; clients see consistent behavior, but during the partition some signal/query traffic was misrouted.</p>
+<p>Recovery: usually self-heals once the partition closes. For workflows that received conflicting responses (signal accepted on old owner, query NotFound on new owner), reset to before the partition.</p>
+<p><strong>Replay break after Temporal version upgrade.</strong> The engine itself ships with internal protocol changes. Upgrading from Temporal 1.18 to 1.22 across a multi-month period can introduce replay differences if the upgrade affects how certain event types are serialized. The official upgrade path is conservative — N-2 version compatibility — but customers occasionally hit edge cases where an old workflow's history can't be replayed under a new engine version.</p>
+<p>Mitigation: pre-production replay tests using <code>WorkflowReplayer</code> against a representative sample of in-flight workflow histories. If any fail, hold the upgrade.</p>
+<p>Recovery: pin the workflow to a specific Temporal SDK version, run an older worker pool, drain the workflow. Engineering escalation may be needed (Temporal support helps with upgrade-related replay issues).</p>
+<p><strong>Visibility-index lag during scale events.</strong> A traffic spike triples workflow start rate. The visibility indexer (consumer of the CDC stream from persistence to Elasticsearch) falls behind. UIs and dashboards see stale data — workflows that completed 10 minutes ago still appear "Running." Programmatic queries against visibility return wrong results.</p>
+<p>Mitigation: monitor visibility lag (Kafka consumer lag metric). Scale the visibility indexer pre-emptively. For queries that need fresh data, use <code>DescribeWorkflowExecution</code> (reads directly from history, not visibility) instead of <code>ListWorkflows</code>.</p>
+<p>Recovery: scale up visibility, wait for catchup, audit any decisions made during the lag window.</p>
+<p><strong>Persistent-store schema migration.</strong> Adding an index, changing a column type. Cassandra requires running schema changes one column family at a time, with replication factor coordination. Done wrong, half the cluster sees the old schema and half the new — writes from one side are unreadable by the other. Practical mitigation: run all schema changes in a dedicated maintenance window, with replication paused, and validate on a staging cluster first.</p>
+<p><strong>Worker memory exhaustion from large workflow histories.</strong> A workflow that grew to 8MB of history (close to the 10MB limit). Workers replay it; each replay holds the full history in memory plus workflow state. 100 such workflows on one worker = 1GB of replay memory. Worker OOMs (Out Of Memory), task fails over to another worker, that one also OOMs. Cascading failure of the worker fleet for that workflow type. Mitigation: per-worker concurrency limits scaled to expected history size; aggressive <code>ContinueAsNew</code>.</p>
+<p><strong>The "task queue partition hotspot" failure.</strong> A task queue with 4 partitions. One workflow type accidentally targets only partition 0 (e.g., via a sticky-routing bug). Partition 0's matching shard becomes saturated; tasks back up; new workflow starts time out. Other partitions are idle. Mitigation: monitor per-partition task counts; rebalance partition assignments; in extreme cases, increase partition count and migrate.</p>
+<hr>
+<h2 id="21-use-case-gallery">§21. Use case gallery</h2>
+<p>The same technology serves wildly different domains.</p>
+<p><strong>Payment lifecycle orchestration — Stripe Connect, Coinbase.</strong> Each money movement is a workflow: validate, fraud check, charge/transfer, wait for external clearing (ACH 1-3 business days), reconcile, notify. Compensation: refund or reverse on failure. Demands: audit (SOX — Sarbanes-Oxley, PCI-DSS — Payment Card Industry Data Security Standard), exactly-once side effects, long durations, human-approval signals. <strong>Variant fit</strong>: code-as-workflow (Temporal); too complex for declarative state machines, too audit-strict for choreography.</p>
+<p><strong>Ride lifecycle — Uber, Lyft.</strong> Each ride a workflow: match driver, accept, navigate to pickup, ride, drop off, charge rider, pay driver, handle disputes. Minutes to hours, days for disputes. Tens of millions/day. <strong>Variant fit</strong>: code-as-workflow at high scale; Uber's original Cadence use case.</p>
+<p><strong>Order fulfillment — DoorDash, Amazon.</strong> Place → confirm → batch → assign courier → pickup → deliver → reconcile. Tens of millions of new workflows/day at peak. 30-60 minutes typical, hours for scheduled. Signals from couriers, customers, support. <strong>Variant fit</strong>: code-as-workflow with heavy signal use.</p>
+<p><strong>CI/CD orchestration — Argo Workflows on Kubernetes.</strong> Pipeline = clone → build → test → security scan → deploy → smoke test → promote. Each step a containerized pod. Hundreds to thousands of pipelines/day. <strong>Variant fit</strong>: Argo. The work <em>is</em> containers; co-locating the engine with Kubernetes is right. Temporal would be overkill for per-step overhead.</p>
+<p><strong>ML training pipelines — Argo + Airflow + sometimes Temporal.</strong> Batch training on a schedule (daily recommendation model retrain): Airflow — DAG runs, backfills, lineage. Containerized triggered pipelines: Argo on k8s. Experiment management or online learning loops with feedback signals: Temporal (each experiment a long-lived workflow that mutates as data arrives). <strong>Variant fit</strong>: depends on shape.</p>
+<p><strong>Video transcoding — Netflix Cosmos (Conductor).</strong> Each upload triggers: validate, demux, transcode to multiple formats (bitrates, codecs, resolutions), QC (Quality Control), package, publish to CDN (Content Delivery Network). Tens of millions/day. Heterogeneous worker pools. <strong>Variant fit</strong>: Conductor. Polyglot workers, JSON definitions, language-agnostic poll/POST.</p>
+<p><strong>Email/notification campaigns — Mailchimp, marketing platforms.</strong> Compute audience, render template, send batch, track opens/clicks, retry bounces. Hundreds of millions of recipients per campaign; campaigns last days. <strong>Variant fit</strong>: workflow engine for campaign orchestration (one workflow per campaign); stream processor for the per-email send path.</p>
+<p><strong>Data ETL DAGs — Airbnb, Lyft, every data team.</strong> Daily ETL = extract, transform, validate, load to warehouse, refresh downstream tables, quality checks. Hundreds of DAGs per team; hourly/daily schedules. <strong>Variant fit</strong>: Airflow. Built for exactly this shape.</p>
+<p>The breadth is the point. Workflow engines are not "the payments tool" or "the data pipeline tool" — they are an orchestration primitive that, in different variants, serves different shapes of multi-step process.</p>
+<hr>
+<h2 id="22-real-world-implementations-with-numbers">§22. Real-world implementations with numbers</h2>
+<p><strong>Uber Cadence (2017-present).</strong> Built by the team led by Maxim Fateev. By 2019 ran the majority of Uber's stateful business logic. <strong>Millions of workflows in flight</strong>, <strong>billions of activity executions per day</strong>, Cassandra-backed, hundreds of nodes per region, multi-region active-active. Foundational reference for code-as-workflow.</p>
+<p><strong>Temporal (Cadence fork, 2019-present).</strong> Same architectural lineage with more aggressive SDK iteration (Go, Java, Python, TypeScript, .NET, PHP). Temporal Cloud's largest customers run <strong>single-digit-millions of concurrent workflows</strong> with <strong>tens of thousands of actions/sec/namespace</strong>. Self-hosted at Stripe, Snap, Datadog, Box, Coinbase.</p>
+<p><strong>Stripe Connect.</strong> Temporal-class durable execution for payout flows. Workflow waits days for ACH settlement and must compensate on failure. <strong>Tens of millions of in-flight payouts</strong> at any time.</p>
+<p><strong>Coinbase.</strong> Wraps every withdrawal in a workflow because compliance demands a single auditable trail. Single-digit-millions in-flight.</p>
+<p><strong>DoorDash order lifecycle.</strong> Order = place → confirm → batch → assign → pickup → deliver → reconcile, 30-60 minutes typical. <strong>Tens of millions of new workflows/day</strong> at peak.</p>
+<p><strong>Netflix Conductor (2016-present).</strong> Open-source. Powers Cosmos (video encoding/transcoding) plus content ingestion and recommendation refresh. <strong>Tens of millions of workflows/day</strong>. Also used by Airbnb for async payouts.</p>
+<p><strong>Apache Airflow (2014-present, Airbnb origin).</strong> Dominant choice for scheduled ETL/ML. Largest deployments (Airbnb, Lyft, Pinterest) run <strong>tens of thousands of DAG runs/day</strong>.</p>
+<p><strong>AWS Step Functions (2016-present).</strong> Managed declarative state machines. Standard: 4k transitions/sec/account, ~$25/M transitions. Express: at-most-once, 5-min max. Widely used in AWS-heavy shops.</p>
+<p><strong>Argo Workflows (2017-present, Intuit origin).</strong> Kubernetes-native via CRDs. Heavy use for CI/CD and ML training on k8s. Adopted across CNCF (Cloud Native Computing Foundation) ecosystem (Adobe, Intuit, Tesla).</p>
+<p><strong>Snap.</strong> Temporal for ad-creative review, content-moderation pipelines. Single-digit-millions in-flight.</p>
+<p>The pattern: any organization with multi-step business processes, long durations, and audit needs converges on a workflow engine after one or two attempts at "just a status table." The shape determines which variant fits — but the conclusion that <em>some</em> engine is needed is robust across domains.</p>
+<hr>
+<h2 id="23-summary">§23. Summary</h2>
+<blockquote>
+<p><em>A workflow engine is event sourcing weaponized for business processes: every workflow is its append-only history, every worker is a deterministic replay machine, every activity is at-least-once with stable identity so application-layer idempotency keys can give exactly-once side effects, and the whole thing is sharded by hash(workflow_id) onto a quorum-replicated store with sticky in-memory caches on workers so we pay full replay cost once per worker handoff and zero on the steady-state path — buying durable state, retries, long waits, replay, and audit in exchange for forcing every line of workflow code to be deterministic.</em></p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

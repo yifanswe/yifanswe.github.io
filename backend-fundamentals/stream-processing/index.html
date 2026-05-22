@@ -1,0 +1,2076 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stream Processing — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/backend-fundamentals/">← Back to Backend Fundamental Components</a>
+        <h1 class="article-title">Stream Processing</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Backend Fundamental Components
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p>A technology reference on <strong>stream processing engines</strong> as a class — Apache Flink, Kafka Streams, Spark Structured Streaming, Apache Beam, Materialize, RisingWave, Samza. What stream processing IS, the contract it provides, the byte-level mechanics of checkpointing and exactly-once, the design space, the hard problems, and how the same technology serves payments fraud detection, real-time ML features, IoT alerting, product analytics, and CDC (Change Data Capture) pipelines differently.</p>
+<hr>
+<h2 id="1-what-stream-processing-is">§1. What stream processing IS</h2>
+<p>A stream processor is a <strong>runtime that executes continuous queries over unbounded sequences of events while maintaining incrementally-updated state</strong>. The query never finishes. Each new event mutates internal state, possibly emits derived events, and the result of any conceptual aggregation is always "as of the most recent event we've processed."</p>
+<p>Three properties together define the category and distinguish it from neighbors:</p>
+<ol>
+<li><strong>The input is conceptually unbounded.</strong> There is no "end of data." The job runs for months or years.</li>
+<li><strong>The query is incremental.</strong> When event <code>e</code> arrives, the engine computes <code>f(state, e) → (new_state, output)</code>. It does NOT re-scan all prior events to recompute the result. This is what gives stream processors their per-event O(1) cost vs batch's per-refresh O(N) cost.</li>
+<li><strong>State is durable and replayable.</strong> The engine carries operator-local state (counters, window buffers, join hash tables, ML model parameters) across events, persists it on a regular cadence, and can replay missed input from a durable log to rebuild that state after a crash.</li>
+</ol>
+<p>What it solves: low-latency analytics over arriving events. The reader of the output sees aggregations and derived signals reflecting <strong>seconds-old</strong> input, sometimes sub-second, instead of waiting for the next batch run. Concretely: a fraud-risk score on a card swipe within 200ms of the swipe; a real-time ML feature ("clicks in the last 5 minutes for user U") refreshed continuously; a derived materialized view ("active sessions per region") with the freshness of a database read.</p>
+<h3 id="what-stream-processing-is-not">What stream processing is NOT</h3>
+<ul>
+<li><strong>Not a message queue.</strong> Kafka, Pulsar, RabbitMQ carry events. They do not aggregate, window, or hold derived state. A stream processor sits <em>on top of</em> a queue.</li>
+<li><strong>Not a batch processor running quickly.</strong> Spark's daily batch reduces O(all_data) per run. Even cut to 1-minute micro-batches it still re-reads each micro-batch's input file. Stream processors mutate one entry of state per event.</li>
+<li><strong>Not an OLTP database.</strong> Databases serve random point reads and writes from many clients; stream processors execute a fixed query graph and rarely accept random queries (Materialize is the boundary case).</li>
+<li><strong>Not an OLAP system.</strong> Snowflake, BigQuery, ClickHouse run interactive ad-hoc queries against stored data. Stream processors run one query repeatedly on arriving data.</li>
+<li><strong>Not great at</strong>: random ad-hoc queries against history (no, query the warehouse); long-running synchronous request/response (no, the model is async push); cross-system distributed transactions beyond the source-and-single-sink boundary (the 2PC machinery is narrow).</li>
+</ul>
+<h3 id="where-it-sits-in-the-stack">Where it sits in the stack</h3>
+<pre><code>   producers ──► [Kafka / Kinesis / Pulsar / Pub-Sub]  ◄── durable log
+                          │
+                          ▼
+                   [Stream Processor]    ◄── this doc
+                          │
+                          ▼
+   ┌──────────────────────┼──────────────────────────┐
+   ▼                      ▼                          ▼
+sinks (Kafka,        derived views          OLAP / DW for history
+Postgres, S3,        (Materialize,          (Snowflake, BigQuery,
+Redis, downstream)   serving DBs)           Pinot, Druid)
+</code></pre>
+<p>The stream processor consumes events, holds derived state, and emits to one or more sinks. It is the <strong>always-on incremental compute layer</strong>.</p>
+<hr>
+<h2 id="2-inherent-guarantees-and-what-you-must-layer-on">§2. Inherent guarantees — and what you must layer on</h2>
+<p>A stream processor's contract is narrower than people assume. The phrase "exactly-once" gets thrown around carelessly; understand precisely what is and isn't guaranteed.</p>
+<h3 id="what-you-get-by-design">What you get by design</h3>
+<ul>
+<li><strong>Exactly-once application semantics for internal state.</strong> The engine guarantees that, after recovery, the engine's <em>internal</em> state matches what it would have been had no failure occurred. Counters are not double-incremented. Window aggregates are correct. This is achieved via <em>consistent snapshots</em> (Chandy–Lamport barriers in Flink, Kafka transactions in Kafka Streams, batch-IDs in Spark).</li>
+<li><strong>Exactly-once end-to-end when the sink cooperates.</strong> If the sink supports transactional writes (Kafka transactional producer, JDBC with XA, idempotent upsert against a keyed store), the engine can coordinate a Two-Phase Commit (2PC) such that records become visible exactly once. The 2PC coordinator is typically the stream processor's coordinator (JobManager in Flink) and the prepare/commit are tied to checkpoint barriers.</li>
+<li><strong>Event-time processing with watermarks.</strong> The engine separates <em>event time</em> (timestamp on the record) from <em>processing time</em> (wall clock at the operator) and supplies a <em>watermark</em> abstraction — a monotone-increasing claim "I believe no event with timestamp ≤ W will arrive anymore." This makes window-based aggregations correct under out-of-order arrival.</li>
+<li><strong>State durability across crashes.</strong> State is checkpointed to durable storage (S3, HDFS, GCS) on a configurable cadence. After a crash, the job resumes from the last successful checkpoint with no lost state.</li>
+<li><strong>Ordering within a key.</strong> When events are partitioned by some key and processed by a single operator instance per key, the engine preserves the source's ordering for that key. Different keys may interleave.</li>
+</ul>
+<h3 id="what-you-do-not-get">What you do NOT get</h3>
+<ul>
+<li><strong>NOT distributed transactions across multiple unrelated systems.</strong> "Exactly-once" applies to the engine's state plus one cooperating sink (and any second sink that joins the same 2PC group). A pipeline that writes to Kafka AND to Stripe's payments API AND sends an SMS via Twilio is NOT exactly-once. Those external side effects must be made idempotent (using deterministic identifiers).</li>
+<li><strong>NOT bounded state for free.</strong> RocksDB, Hummock, or any state backend will grow without limit if the application logic does not specify TTLs (Time-To-Live), eviction, or window closure. Stream processors do not magically forget data. This is the #1 cause of streaming-job outages in practice.</li>
+<li><strong>NOT true exactly-once with arbitrary side effects.</strong> Sending a Slack alert, writing to a non-transactional file, calling an external REST endpoint — these are at-least-once by nature. The engine cannot rewind the world.</li>
+<li><strong>NOT a synchronous request/response contract.</strong> The engine is push-based. Clients that need "ask question, get answer" must query a downstream serving store the engine populates, not the engine directly. Materialize bends this rule by offering Postgres-protocol queries against streaming views, at the cost of architectural complexity.</li>
+<li><strong>NOT low recovery time without effort.</strong> Cold restart from S3 checkpoints can take minutes to tens of minutes for large state. Local recovery, region-based restart, and standby task managers all need to be configured.</li>
+<li><strong>NOT a scheduler for cron-like batch jobs.</strong> Use Airflow, Argo Workflows, or Dagster for that.</li>
+</ul>
+<p>The cardinal sin: claiming exactly-once end-to-end when the downstream sink is a non-idempotent REST API. Be honest about the contract.</p>
+<hr>
+<h2 id="3-the-design-space">§3. The design space</h2>
+<p>Stream processors split along five orthogonal axes:</p>
+<h3 id="axis-1-execution-model-micro-batch-vs-true-streaming">Axis 1: Execution model — micro-batch vs true streaming</h3>
+<ul>
+<li><strong>Micro-batch (Spark Structured Streaming, ksqlDB historical mode)</strong>: the engine accumulates events for a tiny interval (typically 100ms–1s), then runs a Spark job over that micro-batch. Pro: rich SQL, reuse of Spark batch optimizations, simple semantics. Con: latency floor is the micro-batch interval; you cannot hit sub-100ms p99.</li>
+<li><strong>True per-event streaming (Flink, Kafka Streams, Samza, Storm, Materialize, RisingWave)</strong>: each event is processed individually as it arrives. Pro: latency in the 10–200 ms range; backpressure is per-channel and finer-grained. Con: more complex semantics, harder failure modes.</li>
+</ul>
+<h3 id="axis-2-embedded-library-vs-cluster">Axis 2: Embedded library vs cluster</h3>
+<ul>
+<li><strong>Embedded library (Kafka Streams)</strong>: a JAR you include in your microservice. No cluster to operate; horizontal scaling is "deploy more pods of your service." State is stored locally and changelogged back to Kafka. Limited to Kafka-as-source-and-sink, JVM-only, single-cluster operations.</li>
+<li><strong>Standalone cluster (Flink, Spark Streaming, Samza, Storm)</strong>: a dedicated cluster of JobManager + TaskManagers (or equivalent). Better fit for cross-source pipelines, large state, sophisticated windowing, polyglot sinks. Higher operational cost.</li>
+</ul>
+<h3 id="axis-3-declarative-sql-vs-imperative-dsl">Axis 3: Declarative SQL vs imperative DSL</h3>
+<ul>
+<li><strong>SQL-first (Materialize, RisingWave, ksqlDB, Flink SQL, Spark SQL on streams)</strong>: define streaming jobs as SQL views. The optimizer plans the dataflow. Analysts can author jobs. Limited extensibility for custom logic.</li>
+<li><strong>DSL / API (Flink DataStream, Kafka Streams DSL, Beam SDK, Storm)</strong>: imperative code (Java, Scala, Python) defining the dataflow. Full extensibility, custom windows, custom state, ML library integration. Steeper learning curve.</li>
+</ul>
+<h3 id="axis-4-general-purpose-processor-vs-materialized-view-database">Axis 4: General-purpose processor vs materialized-view database</h3>
+<ul>
+<li><strong>General-purpose (Flink, Spark, Kafka Streams, Samza, Storm)</strong>: you write the job, deploy it, monitor it. It emits to a sink; clients query the sink.</li>
+<li><strong>Materialized-view streaming database (Materialize, RisingWave, Confluent's KSQL pull queries)</strong>: you create a streaming SQL view, and clients query the view directly via Postgres protocol. The system maintains incremental view results internally and serves point queries from them with the freshness of a streaming aggregation and the convenience of a database.</li>
+</ul>
+<h3 id="axis-5-unified-batch-stream-api-vs-streaming-only">Axis 5: Unified batch + stream API vs streaming-only</h3>
+<ul>
+<li><strong>Unified (Apache Beam, Flink Table API, Spark Structured Streaming)</strong>: write the pipeline once, run it on batch input OR streaming input. Useful when the same business logic is needed for backfills and online.</li>
+<li><strong>Streaming-only (Storm historically, ksqlDB, Materialize)</strong>: optimized for streaming, batch backfill is a separate concern (often handled via a batch system).</li>
+</ul>
+<h3 id="comparison-table">Comparison table</h3>
+<table>
+<thead>
+<tr>
+<th>Engine</th>
+<th>Model</th>
+<th>Latency p99</th>
+<th>Throughput / cluster</th>
+<th>State backend</th>
+<th>Exactly-once strategy</th>
+<th>SQL?</th>
+<th>Best for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Apache Flink</strong></td>
+<td>True streaming</td>
+<td>10–200 ms</td>
+<td>10M events/sec</td>
+<td>RocksDB / heap</td>
+<td>2PC sink + Chandy–Lamport barriers</td>
+<td>Flink SQL</td>
+<td>Complex stateful pipelines, low latency, custom windowing</td>
+</tr>
+<tr>
+<td><strong>Kafka Streams</strong></td>
+<td>True streaming</td>
+<td>50–500 ms</td>
+<td>~1M events/sec / instance</td>
+<td>RocksDB + Kafka changelog</td>
+<td>Kafka transactional offset + state + sink commit</td>
+<td>None</td>
+<td>Stateful consumer inside a microservice, Kafka-native</td>
+</tr>
+<tr>
+<td><strong>Spark Structured Streaming</strong></td>
+<td>Micro-batch</td>
+<td>200 ms – 2 s</td>
+<td>5M events/sec</td>
+<td>Files + checkpoints (HDFS)</td>
+<td>Idempotent sinks via batch-ID; experimental continuous mode</td>
+<td>Spark SQL</td>
+<td>Hybrid batch + stream, Spark shops, ETL</td>
+</tr>
+<tr>
+<td><strong>Apache Beam</strong></td>
+<td>Unified abstraction; runs on Flink/Spark/Dataflow runners</td>
+<td>Depends on runner</td>
+<td>Depends on runner</td>
+<td>Depends on runner</td>
+<td>Depends on runner</td>
+<td>SQL via runners</td>
+<td>Pipeline portability across runners; Google Dataflow</td>
+</tr>
+<tr>
+<td><strong>Apache Samza</strong></td>
+<td>True streaming</td>
+<td>50–200 ms</td>
+<td>~5M events/sec</td>
+<td>RocksDB + Kafka changelog</td>
+<td>At-least-once + idempotent producer</td>
+<td>SamzaSQL</td>
+<td>Local-state-heavy jobs (LinkedIn-style derived datasets)</td>
+</tr>
+<tr>
+<td><strong>Materialize</strong></td>
+<td>True streaming, incremental view maintenance</td>
+<td>100 ms – 1 s</td>
+<td>~1M events/sec</td>
+<td>Custom (Timely Dataflow, Persist)</td>
+<td>View consistency + idempotent recomputation</td>
+<td>Postgres-protocol SQL</td>
+<td>SQL analytics on streams; ad-hoc queries on streaming data</td>
+</tr>
+<tr>
+<td><strong>RisingWave</strong></td>
+<td>True streaming, materialized views</td>
+<td>100 ms – 1 s</td>
+<td>~1M events/sec</td>
+<td>Hummock (S3-backed LSM)</td>
+<td>Two-phase commit on Hummock barriers</td>
+<td>Postgres-protocol SQL</td>
+<td>Cloud-native streaming SQL on object storage</td>
+</tr>
+<tr>
+<td><strong>Apache Storm</strong></td>
+<td>True streaming (per-record tuples)</td>
+<td>50–500 ms</td>
+<td>~1M events/sec</td>
+<td>None native (Trident has state)</td>
+<td>At-least-once acker-based; Trident adds exactly-once</td>
+<td>None</td>
+<td>Legacy; rarely chosen for new builds</td>
+</tr>
+</tbody>
+</table>
+<p>The first three (Flink, Kafka Streams, Spark) are the workhorses. Materialize and RisingWave are growing fast for streaming-SQL use cases. Beam is the portability layer used heavily inside Google. Samza powers a lot of LinkedIn but is less common elsewhere.</p>
+<hr>
+<h2 id="4-byte-level-mechanics-state-backends-checkpoint-barriers-2pc-sinks-event-time">§4. Byte-level mechanics: state backends, checkpoint barriers, 2PC sinks, event time</h2>
+<p>This is the section where the engine's internals stop being abstract. We'll use Flink as the depth anchor (it has the most explicit and best-documented mechanism) and note where other engines diverge.</p>
+<h3 id="4a-state-backends-where-state-actually-lives">4a. State backends — where state actually lives</h3>
+<p>Flink (and Samza, Kafka Streams) all face the same question: where do you put the keyed state for hundreds of millions of distinct keys, each with multiple values?</p>
+<pre><code>┌────────────────────────────────────────────────────────────────┐
+│ HashMapStateBackend (formerly MemoryStateBackend)              │
+│  • State lives in JVM heap as Java HashMap                     │
+│  • Checkpoints serialize the whole heap state                  │
+│  • Use case: state &lt; 100 MB per slot, latency critical         │
+│  • Limit: ~1 GB before OOM; checkpoints block under pressure   │
+└────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│ EmbeddedRocksDBStateBackend  ◄── default for large state       │
+│  • State is RocksDB on local NVMe, off-heap                    │
+│  • LSM tree: writes → memtable → flush → L0 → ... → L6 SSTs    │
+│  • Checkpoints upload SST files (incremental) to S3/HDFS       │
+│  • State size limited by local SSD, not heap                   │
+│  • get/put cost ~10–100 µs (block cache hit) to ~1 ms (miss)   │
+└────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>Why <strong>LSM (Log-Structured Merge) tree</strong>, not B+ tree, for streaming state? The dominant access pattern is "read-then-write" on the same key, repeated thousands of times per minute (every event for a popular key triggers <code>get → put</code>). An LSM absorbs writes at memtable speed (~1M ops/sec/core, pure RAM); a B+ tree would need a page-modify + WAL fsync per put, ~10x slower for writes. Reads are amortized by the block cache and bloom filters (typical hit rate &gt;99% for hot keys).</p>
+<pre><code>RocksDB write path:
+  state.put(&quot;user_42|window_12:00&quot;, count=7)
+        │
+        ▼
+  [Memtable]   ◄── skip-list in RAM, sorted by key (~64 MB default)
+        │   when full → immutable, flush
+        ▼
+  [L0 SSTs]    ── newest, may overlap key ranges
+        │
+        ▼ leveled compaction
+  [L1, L2, ... L6 SSTs]
+        │
+        ▼
+  Each SST: sorted blocks (~4 KB each), block index, bloom filter
+            stored on local NVMe
+
+RocksDB read path:
+  state.get(&quot;user_42|window_12:00&quot;)
+    1. check memtable → if hit, return
+    2. check immutable memtable
+    3. check L0 SSTs (newest first), bloom filter skips most
+    4. check L1, L2, ... L6 SSTs (each level: at most one SST owns the key)
+    5. read 4 KB block (page cache or disk)
+    6. binary search within block, return value
+</code></pre>
+<p>The trade-off you give up vs B+ tree is <strong>read amplification</strong>. Worst case, a query touches memtable + 1 SST per level × 7 levels = 8 lookups. Bloom filters reduce average touch to ~1.1 SSTs. For OLTP point queries on cold data, B+ tree wins; for streaming workloads (~99% writes, hot key clusters), LSM wins by 5–10x.</p>
+<p>Kafka Streams and Samza also use RocksDB. Materialize uses its own <em>Persist</em> layer built on object storage; RisingWave uses <em>Hummock</em>, also an LSM but designed to live entirely on S3 / object storage so that compute and state can scale independently — that's the cloud-native trick. Spark Structured Streaming stores state as Parquet-like files on HDFS, less efficient but simpler.</p>
+<h3 id="4b-chandylamport-snapshot-algorithm-the-deepest-concept">4b. Chandy–Lamport snapshot algorithm — the deepest concept</h3>
+<p><strong>The problem:</strong> a distributed dataflow with N operators across M machines, each holding mutable state. You want a <em>globally consistent snapshot</em> — a state such that for every event, either the event has been fully processed by every operator it should have touched, OR not yet processed by any. No half-applied events. And you want to do this without stopping the world.</p>
+<p><strong>Chandy–Lamport (1985)</strong> says: send a special marker (a <em>barrier</em>) along every channel of the dataflow. When an operator receives a barrier on every input channel, it snapshots its state and forwards the barrier on every output. The collection of all per-operator snapshots forms a globally consistent cut.</p>
+<p>Flink's implementation:</p>
+<pre><code>TIME ──────────────────────────────────────────────────────►
+
+Source:    e1  e2  [BARRIER_N]  e3  e4  [BARRIER_N+1] ...
+                          ▲
+                          │ JobManager triggered checkpoint N
+                          │ by injecting barrier_N at all sources
+
+  When BARRIER_N flows past an operator:
+    1. operator finishes processing events that arrived BEFORE the barrier
+    2. operator snapshots its state (RocksDB SSTs as they are at this moment)
+    3. operator emits BARRIER_N to all downstream outputs
+    4. operator resumes processing events arriving AFTER the barrier
+
+  Result: every operator's snapshot is a &quot;consistent cut&quot; — every event
+  before barrier_N is fully applied, every event after is not.
+</code></pre>
+<h3 id="4c-aligned-vs-unaligned-checkpoints">4c. Aligned vs unaligned checkpoints</h3>
+<p>When an operator has multiple input channels (e.g., after a <code>keyBy</code> shuffle, each downstream slot receives input from many upstream slots), what does it do when barrier_N arrives on channel A but not yet on channel B?</p>
+<p><strong>Aligned checkpoints (default):</strong> buffer events on the channel that has seen the barrier. Wait for the barrier on all channels. Then snapshot, then resume.</p>
+<pre><code>Aligned:
+  channel A ──e1─e2─B(N)─e3─e4───►   e3,e4 buffered until B(N) arrives on B
+  channel B ──e5──────B(N)─e6──►
+                       ▲
+                       │ snapshot now; then drain buffered e3,e4 + e6
+</code></pre>
+<p>Pro: each operator's input set is unambiguous — snapshot reflects exactly the state after consuming everything before the barrier.
+Con: if channel B is slow (GC pause, network congestion, hot upstream), channel A stalls. Under sustained backpressure, alignment time can grow into seconds, blowing past the latency SLO (Service Level Objective).</p>
+<p><strong>Unaligned checkpoints (Flink 1.11+):</strong> as soon as the barrier arrives on the <em>first</em> input, snapshot immediately, capturing in-flight buffer state for the other channels. On restore, those buffered events are replayed before processing resumes.</p>
+<pre><code>Unaligned:
+  channel A ──e1─e2─B(N)─e3─e4───►
+  channel B ──e5──────B(N)──e6──►
+                          ▲
+                          │ snapshot triggers when EITHER channel sees B(N)
+                          │ in-flight e3,e4 (channel A) captured in snapshot
+</code></pre>
+<p>Pro: barrier propagates at the speed of the fastest path; checkpoint duration roughly constant under backpressure.
+Con: snapshot size grows (you save in-flight buffer state); more CPU and S3 bandwidth.</p>
+<p><strong>Rule of thumb:</strong> aligned by default. Switch to unaligned when sustained <code>lastCompletedCheckpointDuration / checkpointInterval &gt; 0.7</code> — typically when backpressure ratio sustained &gt; 0.5.</p>
+<p>Kafka Streams takes a fundamentally different approach: instead of barriers, it commits a Kafka transaction that atomically updates source offsets, the state-store changelog topic, AND the output topic. The transaction itself is the snapshot.</p>
+<p>Spark Structured Streaming uses <strong>batch IDs</strong>: each micro-batch has a unique numeric ID. State changes for batch N are written to a directory <code>state/N/</code> on HDFS. If a crash happens during batch N, the next attempt re-runs batch N from scratch, producing the same state directory deterministically. Sinks check the batch ID before writing to avoid duplicates.</p>
+<h3 id="4d-end-to-end-exactly-once-via-two-phase-commit-2pc-sinks">4d. End-to-end exactly-once via Two-Phase Commit (2PC) sinks</h3>
+<p>Internal exactly-once (checkpoint barriers) gives you: "the engine's state is consistent." But the <strong>sink</strong> writes externally — Kafka, Postgres, S3. If we just write naively, after a crash we might replay events that already wrote downstream. So end-to-end exactly-once requires the sink to participate in the checkpoint.</p>
+<p>The pattern is <strong>2PC sink</strong>:</p>
+<pre><code>       Source         Operators           Sink
+         │                │                │
+         │   barrier_N    │   barrier_N    │
+         │ ────────────►  │ ────────────►  │
+         │                │                │ pre-commit (PREPARE):
+         │                │                │   open Kafka txn (or
+         │                │                │   begin XA transaction)
+         │                │                │   write records, flush
+         │                │                │   (NOT visible yet to
+         │                │                │    read_committed consumers)
+         │                │                │   ack barrier_N to JM
+         │                │                │
+         │            JobManager: all acks received
+         │                │                │   persist ckpt N metadata
+         │                │                │   to S3
+         │                │                │
+         │                │ notifyCheckpointComplete(N)
+         │                │  ─────────────►│
+         │                │                │ commit:
+         │                │                │   Kafka txn commit
+         │                │                │   records now visible
+</code></pre>
+<p>Two phases:</p>
+<ol>
+<li><strong>Pre-commit (PREPARE):</strong> when barrier_N arrives at sink, open a transaction (Kafka transactional producer with stable <code>transactional.id</code>, or JDBC XA <code>prepare</code>, or write to a temp S3 path). Write all records buffered since the last barrier. Flush. Do NOT commit. Ack the barrier to the JobManager.</li>
+<li><strong>Commit:</strong> after the JobManager confirms checkpoint N is durable in S3 (all operators acked, metadata persisted), it sends <code>notifyCheckpointComplete(N)</code> to the sink. The sink then commits the transaction. Records become visible.</li>
+</ol>
+<p><strong>Crash analysis:</strong></p>
+<ul>
+<li><em>Before pre-commit:</em> no records written. Source rewinds to checkpoint N-1 offsets, replay produces same records. Exactly-once.</li>
+<li><em>During pre-commit:</em> open transaction aborted by coordinator timeout. On recovery, source rewinds, replay. Exactly-once.</li>
+<li><em>After pre-commit, before commit:</em> transaction state persisted in checkpoint. On recovery, sink re-discovers the open transaction (by transactional ID) and commits it. Exactly-once.</li>
+<li><em>After commit:</em> nothing to do. Recovery proceeds with no replay of these records.</li>
+</ul>
+<p>The key invariant: <strong>the sink transaction commit is bound to the checkpoint metadata commit</strong>. The JobManager is the 2PC coordinator.</p>
+<p><strong>Sink classes:</strong></p>
+<ul>
+<li><strong>Transactional sink:</strong> Kafka (transactional producer), MySQL/Postgres with XA, distributed DBs supporting 2PC. Implements <code>TwoPhaseCommitSinkFunction</code> in Flink, or analogous in other engines.</li>
+<li><strong>Idempotent sink:</strong> upsert by primary key (Postgres <code>ON CONFLICT</code>, Cassandra upsert, S3 with deterministic object names based on (key, timestamp)). Allows safe replay; effectively-exactly-once at the visible state.</li>
+<li><strong>At-least-once sink:</strong> anything else — appending to a file, sending an email, calling a REST API. Don't claim exactly-once over these.</li>
+</ul>
+<h3 id="4e-event-time-and-watermarks">4e. Event time and watermarks</h3>
+<p><strong>Event time</strong> is the timestamp on the event payload (e.g., the moment a swipe was attempted, the timestamp on a sensor reading). <strong>Processing time</strong> is the wall clock at the operator. They diverge because:</p>
+<ul>
+<li>Producers in different regions deliver events with skew of 0–60 seconds.</li>
+<li>Network blips delay batches by minutes.</li>
+<li>Replay (rewinding to old offsets) sends old timestamps through the current wall clock.</li>
+</ul>
+<p>Computing "transactions per merchant in the last 5 minutes" using processing time gives wrong answers under any of these. Event-time windows fix this.</p>
+<p>A <strong>watermark</strong> is the engine's heuristic claim: "I believe no event with timestamp ≤ W will arrive on this stream anymore." Watermarks are emitted by sources alongside data, propagated along the dataflow, and combined at operators (operator's watermark = min over input watermarks).</p>
+<p>A typical strategy:</p>
+<pre><code class="language-java">WatermarkStrategy
+    .&lt;MyEvent&gt;forBoundedOutOfOrderness(Duration.ofSeconds(10))
+    .withTimestampAssigner((e, ts) -&gt; e.getEventTimeMillis());
+</code></pre>
+<p>This says: watermark = max event time seen on this partition − 10 seconds. The 10s budget tolerates out-of-order arrivals up to 10 seconds late.</p>
+<h3 id="4f-window-state-and-one-event-walked-end-to-end">4f. Window state and one event walked end-to-end</h3>
+<p>Consider a 5-minute tumbling event-time window, keyed by user_id, used for a product analytics aggregation:</p>
+<pre><code>For event-time tumbling window of 5 min, keyed by user_id:
+
+  RocksDB state layout (logical):
+    state[&quot;user_42|window_12:00_12:05&quot;] = clicks = 3
+
+  On every CLICK event for user_42 at event_time = 12:03:17:
+    1. operator computes window: floor(12:03:17 / 5min) = window_12:00_12:05
+    2. state.get(&quot;user_42|window_12:00_12:05&quot;) → 3
+    3. state.put(&quot;user_42|window_12:00_12:05&quot;, 4)
+    4. register timer at watermark = 12:05:00 (window close)
+
+  When watermark advances past 12:05:00:
+    5. timer fires
+    6. window result emitted to sink
+    7. window state cleared (TTL or explicit purge)
+</code></pre>
+<p>Walking one event through Flink end-to-end (the gold-standard walkthrough):</p>
+<pre><code>Event: user_42 clicks at event_time = 12:03:17.123 UTC.
+
+Step 1: PRODUCE
+  App server publishes to Kafka topic clicks.
+  Producer hashes &quot;user_42&quot; → partition 42.
+  Broker writes to log segment (sequential disk write), replicates to
+  ISR (in-sync replicas), returns offset 9,765,432. (~10 ms)
+
+Step 2: FLINK SOURCE
+  TaskManager 17 owns partition 42 (parallelism = partition count).
+  Source thread polls broker, deserializes event, assigns event_time.
+  Updates partition watermark: max_seen = 12:03:17.123, wm = 12:03:07.123.
+  Forwards event to keyBy operator.
+
+Step 3: KEYBY SHUFFLE
+  keyBy(user_id) hashes &quot;user_42&quot; → bucket 167.
+  Bucket 167 lives on TaskManager 31, slot 5.
+  Event travels through Flink's Netty-based network stack with
+  credit-based flow control. (~5 ms, intra-rack)
+
+Step 4: KEYED PROCESS — STATE READ + MUTATE
+  Slot 5 on TM 31 sets thread-local key context = &quot;user_42&quot;.
+  Determines window: 12:00 – 12:05.
+  state.get(&quot;user_42|w_12:00-12:05&quot;)
+    → RocksDB lookup:
+       (a) memtable check: miss
+       (b) bloom filter on L0 SSTs: key might exist in SST 3
+       (c) block index on SST 3: key falls in block 47
+       (d) check page cache for block 47: HIT
+       (e) binary search in 4 KB block: found, count = 3
+  Returns 3.
+  state.put(&quot;user_42|w_12:00-12:05&quot;, 4)
+    → RocksDB insert:
+       (a) append (key, 4) to memtable skip-list (~5 µs)
+       (b) RocksDB's own WAL (Write-Ahead Log) is typically DISABLED
+           in Flink because Flink's checkpoint is the durability mechanism
+       (c) return
+  Operator schedules a timer for window close at watermark = 12:05:00.
+
+Step 5: SINK PRE-COMMIT (next barrier)
+  60s later, JobManager injects barrier N+1 at all sources.
+  Sources snapshot Kafka offsets, emit barrier downstream.
+  Keyed operators snapshot RocksDB (incremental SST upload to S3:
+    only the SSTs that have changed since the previous barrier).
+  Sink receives barrier, opens a Kafka transaction, writes any
+  output records buffered since the last barrier, flushes, acks
+  barrier to JobManager.
+  JobManager collects all acks, persists ckpt N+1 metadata to S3.
+  JobManager sends notifyCheckpointComplete(N+1) to sink.
+  Sink commits Kafka transaction. Records visible downstream.
+
+Step 6: DURABILITY POINT
+  The event is durable end-to-end once Kafka commits the sink transaction
+  AND the checkpoint metadata is in S3. If everything crashes immediately
+  after this, recovery from checkpoint N+1 will not replay the event
+  (source offsets advanced past it), and any output is already in Kafka.
+</code></pre>
+<p>Most candidates stop at "Flink does checkpointing." Only Staff candidates explain WHY the sink-commit ordering matters and what survives at each step.</p>
+<hr>
+<h2 id="5-windowing-in-depth">§5. Windowing in depth</h2>
+<p>Windowing is where event-time semantics meet application correctness. A window is "a finite slice of an infinite stream over which an aggregation makes sense." Four window classes exist; choosing among them is one of the highest-leverage modeling decisions in a streaming job.</p>
+<h3 id="51-tumbling-windows-non-overlapping-fixed-size">5.1 Tumbling windows — non-overlapping, fixed-size</h3>
+<p>Tumbling windows partition time into contiguous, non-overlapping fixed-size buckets. An event belongs to exactly one window. The classic "events per 1-minute bucket" pattern.</p>
+<pre><code>event_time axis:
+  12:00       12:01       12:02       12:03       12:04
+   │           │           │           │           │
+   │ ╔═══════╗ │ ╔═══════╗ │ ╔═══════╗ │ ╔═══════╗ │
+   │ ║ win 0 ║ │ ║ win 1 ║ │ ║ win 2 ║ │ ║ win 3 ║ │
+   │ ╚═══════╝ │ ╚═══════╝ │ ╚═══════╝ │ ╚═══════╝ │
+        ▲           ▲           ▲           ▲
+        e1,e2       e3          e4,e5,e6    e7
+</code></pre>
+<p><strong>Use case:</strong> "transactions per merchant per minute," "active devices per minute," "request rate per endpoint per minute" — anything where the bucketing is uniform and you only need each event counted once.</p>
+<p><strong>Mechanics:</strong> the window assigner computes <code>window_start = floor(event_time / window_size) * window_size</code>. State is keyed by <code>(user_key, window_start)</code>. When the watermark advances past <code>window_start + window_size + allowedLateness</code>, the window closes, result emits, and state is garbage-collected.</p>
+<p><strong>Trade-off:</strong> boundary effects. An event at 11:59:59.999 lands in window 0; an event at 12:00:00.001 lands in window 1. For metrics that should "smooth across" the boundary (e.g., "rolling rate over the last 60 seconds"), use sliding windows instead.</p>
+<h3 id="52-sliding-windows-overlapping-slide-window">5.2 Sliding windows — overlapping, slide &lt; window</h3>
+<p>Sliding windows have fixed size but advance by a smaller step. Each event belongs to multiple windows simultaneously (specifically, <code>window_size / slide_size</code> of them).</p>
+<pre><code>window size = 5 min, slide = 1 min:
+   12:00              12:05
+   │                  │
+   ╔══════════════════╗
+   ║ win [12:00, 12:05) ║
+   ╚══════════════════╝
+        ╔══════════════════╗
+        ║ win [12:01, 12:06) ║
+        ╚══════════════════╝
+             ╔══════════════════╗
+             ║ win [12:02, 12:07) ║
+             ╚══════════════════╝
+
+An event at 12:03:30 belongs to FIVE windows: [11:59,12:04), [12:00,12:05),
+[12:01,12:06), [12:02,12:07), [12:03,12:08).
+</code></pre>
+<p><strong>Use case:</strong> smooth rolling aggregates — "average latency over the last 5 minutes, updated every minute," "fraud-feature: declines in the last 5 min, refreshed every 1 min."</p>
+<p><strong>Cost:</strong> state and processing multiply by the overlap factor. A 5-minute window sliding every 1 minute holds 5× the state of a 1-minute tumbling window. A 1-hour window sliding every 1 second is catastrophic (3600× state amplification). Pick the slide as coarse as your freshness budget allows.</p>
+<p><strong>Optimization:</strong> pane-based incremental aggregation. The engine stores per-minute partial sums; when emitting the 5-minute window result, it sums 5 panes. State grows by O(panes), not O(events).</p>
+<h3 id="53-session-windows-gap-based-dynamic-size">5.3 Session windows — gap-based, dynamic size</h3>
+<p>Session windows have no fixed length. They group consecutive events for the same key as long as the gap between successive events is below a threshold. When the gap exceeds the threshold, the session closes.</p>
+<pre><code>key = user_42:
+
+events:    e1   e2     e3                    e4   e5
+time:     12:00 12:01 12:02                 12:35 12:36
+                              gap = 33 min
+                            &gt; 30 min threshold
+
+sessions:
+  [12:00, 12:02 + 30min] ── session A: contains e1, e2, e3
+  [12:35, 12:36 + 30min] ── session B: contains e4, e5
+</code></pre>
+<p>The engine treats each new event as potentially starting a new session, ending the previous one, or extending one. If two existing sessions become "connected" because a late event arrives in the gap between them, they MERGE into one session — a subtle and expensive operation.</p>
+<p><strong>Concrete walkthrough — sessionization for user activity tracking:</strong></p>
+<pre><code>Scenario: web analytics for an e-commerce site. Session gap = 30 minutes
+of inactivity. Per-session features: page views, conversion event present?,
+total dwell time, referring source.
+
+T = 12:00:00  user_42 visits home page
+  → no existing session for user_42
+  → open session S1 = [12:00:00, 12:00:00 + 30min)
+  → state[&quot;user_42|S1&quot;] = {pages: 1, conv: false, dwell: 0, src: &quot;google&quot;}
+
+T = 12:02:13  user_42 visits product page
+  → existing session S1 still open (12:02:13 &lt; 12:30:00)
+  → extend S1 to [12:00:00, 12:02:13 + 30min) = [12:00:00, 12:32:13)
+  → state[&quot;user_42|S1&quot;] = {pages: 2, conv: false, dwell: 133s, src: &quot;google&quot;}
+
+T = 12:25:00  user_42 checks out (conversion!)
+  → extend S1 to [12:00:00, 12:55:00)
+  → state[&quot;user_42|S1&quot;] = {pages: 3, conv: true, dwell: 1500s, src: &quot;google&quot;}
+
+T = 12:55:00  watermark advances past 12:55:00
+  → S1 timer fires
+  → emit session result downstream: {user: 42, pages: 3, conv: true,
+                                       dwell: 1500s, src: &quot;google&quot;,
+                                       start: 12:00:00, end: 12:25:00}
+  → state[&quot;user_42|S1&quot;] cleared (TTL)
+
+T = 13:30:00  user_42 returns
+  → no open session
+  → open session S2 = [13:30:00, 14:00:00)
+  → state[&quot;user_42|S2&quot;] = {pages: 1, ...}
+
+  ── LATE EVENT TWIST ──
+
+T = 13:35:00  a late event arrives for user_42 with event_time = 12:40:00
+  → 12:40:00 falls in the gap between (S1 end + 30min) = 12:55:00 and
+    S2 start = 13:30:00 — wait, no, it falls within the 30-min extension
+    range of the original S1 if the gap hadn't closed.
+  → Watermark already advanced past 12:55:00, so S1 was closed.
+  → Goes to side-output for late-event reconciliation, OR if
+    allowedLateness is configured, the engine recreates S1 state from
+    the closed-but-retained window and merges.
+</code></pre>
+<p><strong>State characteristics:</strong> session windows are the highest-state-cost window type because each session can have unbounded duration in principle. Bound max session duration explicitly (<code>window.maxSize(24h)</code>) or risk state explosion from bot keys with neverending sessions.</p>
+<h3 id="54-global-windows-custom-triggers">5.4 Global windows + custom triggers</h3>
+<p>Global windows are one-window-per-key with no automatic close. They're used when none of the built-in window types fit and you implement custom firing logic via a Trigger.</p>
+<pre><code>The global window:
+
+key = sensor_42:
+  [─────────────────────────────────────────────────────────────►
+   single global window per key, never closes by itself
+   events e1, e2, e3, e4, ... all accumulate here
+
+Custom Trigger fires when:
+  • count of events reaches N (count trigger)
+  • event-time elapsed reaches T (event-time trigger)
+  • a punctuation event arrives (custom predicate)
+  • combination of above
+</code></pre>
+<p><strong>Use case:</strong> machine-learning feature computation where the "window" is "last 1000 observations" rather than "last 5 minutes." Custom triggers also enable patterns like "fire when budget is exceeded" or "fire when a sentinel event arrives." This is the most flexible and most footgun-prone window type — you own evictor logic (which events to discard from state) and trigger logic (when to fire).</p>
+<h3 id="55-watermarks-how-the-engine-decides-no-more-events-before-t">5.5 Watermarks — how the engine decides "no more events before T"</h3>
+<p>A watermark is the engine's monotone-increasing claim about <em>event-time progress</em>. The semantic is: "I, the source, believe no further events with event_time ≤ W will arrive on this channel." Watermarks travel alongside data records through the dataflow and combine at multi-input operators as <code>output_watermark = min(input_watermarks)</code>.</p>
+<p><strong>How sources compute watermarks:</strong></p>
+<pre><code>Strategy 1: Bounded out-of-orderness
+  watermark = max(event_time_seen_so_far) − max_lateness_budget
+
+  Example: forBoundedOutOfOrderness(Duration.ofSeconds(10))
+  After seeing event with event_time = 12:03:17, emit watermark = 12:03:07.
+  Events with timestamps in (12:03:07, 12:03:17] are still tolerated;
+  events with timestamps ≤ 12:03:07 are considered LATE.
+
+Strategy 2: Monotone timestamps (in-order assumption)
+  watermark = max(event_time_seen_so_far)
+  Tolerates zero out-of-orderness. Faster watermark advance, more late events.
+
+Strategy 3: Punctuated
+  emit watermark only on receipt of a specific marker event
+  Useful for sources like Kafka topics where the producer injects
+  &quot;I've drained partition through timestamp T&quot; markers.
+</code></pre>
+<p><strong>Bounded vs unbounded out-of-orderness:</strong></p>
+<ul>
+<li><strong>Bounded:</strong> the engine assumes some maximum lateness (10s, 60s, 5 min). Watermark advances aggressively; results emit promptly; events later than the budget are LATE.</li>
+<li><strong>Unbounded:</strong> the engine can never declare "no more events before T" with certainty. The engine still emits <em>something</em> (the source heuristic), but the user must accept that results are speculative.</li>
+</ul>
+<p><strong>The late-event problem:</strong> events that arrive after their window has closed. Three handling strategies:</p>
+<ol>
+<li><strong>Drop silently</strong> (default for many engines). Aggregations are slightly wrong for old windows; downstream consumers see no signal of the loss.</li>
+<li><strong>Allowed lateness + re-emit:</strong> <code>allowedLateness(5 min)</code> keeps the closed window's state alive for an extra 5 minutes. Late events update the result; the engine re-emits the updated aggregation (UPSERT semantics for downstream).</li>
+<li><strong>Side outputs:</strong> route late events to a separate stream (<code>OutputTag</code> in Flink) for offline reconciliation. The primary pipeline emits "good enough live" results; a batch job reconciles with the side output.</li>
+</ol>
+<pre><code class="language-java">SingleOutputStreamOperator&lt;Result&gt; primary = stream
+    .keyBy(Event::getUserId)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .allowedLateness(Time.minutes(5))
+    .sideOutputLateData(lateEventTag)   // very-late events here
+    .aggregate(new MyAgg());
+
+DataStream&lt;Event&gt; veryLate = primary.getSideOutput(lateEventTag);
+veryLate.addSink(new ReconciliationSink());
+</code></pre>
+<p>The trade-off between "drop silently," "re-emit with allowed lateness," and "side output to reconciliation" is application-dependent. Fraud detection often picks side output (audit trail needed); engagement dashboards pick allowed lateness (consumers expect occasional re-emits); IoT alerting often drops silently (a stale alert is worse than a missed one).</p>
+<hr>
+<h2 id="6-state-backend-tuning">§6. State backend tuning</h2>
+<p>Section §4a covered what state backends ARE. This section is operational: how to TUNE them so they actually keep up at scale.</p>
+<h3 id="61-rocksdb-column-families-per-state-primitive">6.1 RocksDB column families per state primitive</h3>
+<p>Flink maps each state primitive (<code>ValueState</code>, <code>MapState</code>, <code>ListState</code>, etc.) to a dedicated RocksDB column family. Column families are physically distinct LSM trees inside one RocksDB instance — they share the WAL but maintain separate memtables, SSTs, and compaction schedules.</p>
+<pre><code>Inside one TaskManager slot:
+  RocksDB instance &quot;operator_keyed_state&quot;
+   ├── column family &quot;cf_value_state__feature_v1&quot;  ◄── ValueState&lt;Double&gt;
+   ├── column family &quot;cf_map_state__friend_set&quot;    ◄── MapState&lt;UserId, Boolean&gt;
+   ├── column family &quot;cf_list_state__events_buf&quot;   ◄── ListState&lt;Event&gt;
+   ├── column family &quot;cf_window_state__w_5min&quot;     ◄── window contents
+   └── column family &quot;cf_timer_state__event_time&quot;  ◄── Flink timer service
+</code></pre>
+<p><strong>Why this matters for tuning:</strong></p>
+<ul>
+<li>Different state primitives have different access patterns. A ValueState used as a per-key counter is read-heavy on hot keys; a MapState used as a friend set is large but accessed less frequently. Separating column families lets the engine tune block cache, write buffer size, and compaction style per state.</li>
+<li>Hot column families can dominate compaction CPU. If one column family receives 95% of writes, RocksDB's compaction queue is dominated by that family; cold families lag in compaction and accumulate L0 files.</li>
+<li>Schema evolution operates per column family. Migrating one state's schema does not touch others.</li>
+</ul>
+<h3 id="62-incremental-checkpoints-only-changed-sstables-uploaded">6.2 Incremental checkpoints — only changed SSTables uploaded</h3>
+<p>The naïve checkpoint serializes the entire state to S3 every interval. For a 100 GB state job with a 60-second checkpoint interval, that's 100 GB / 60s = 1.7 GB/s of upload bandwidth per TaskManager — usually infeasible.</p>
+<p><strong>Incremental checkpoints</strong> exploit the LSM tree's immutability invariant: once an SST file is written, it never changes. Only new SSTs (created since the last checkpoint) need to be uploaded.</p>
+<pre><code>Checkpoint N at T=60s:
+  RocksDB SSTs on local NVMe:
+    sst-001  ─┐
+    sst-002  ─┼── existed at ckpt N-1, already in S3 ─── NOT uploaded
+    sst-003  ─┘
+    sst-100  ─┐
+    sst-101  ─┼── created since last ckpt              ─── UPLOAD
+    sst-102  ─┘
+
+  Checkpoint metadata in S3:
+    ckpt-N-metadata.json = {
+      &quot;sst_files&quot;: [&quot;sst-001&quot;, &quot;sst-002&quot;, &quot;sst-003&quot;, &quot;sst-100&quot;, &quot;sst-101&quot;, &quot;sst-102&quot;],
+      &quot;kafka_offsets&quot;: {...},
+      &quot;pending_2pc_txns&quot;: {...}
+    }
+</code></pre>
+<p>The SSTs already in S3 are referenced by their content hash; new ones are uploaded. Typical bandwidth reduction: 90–99%.</p>
+<p><strong>Gotcha:</strong> S3 storage cost grows because old SSTs are retained as long as any checkpoint references them. The engine garbage-collects unreferenced SSTs after a retention threshold. Misconfigured retention can multiply S3 spend by 10×.</p>
+<h3 id="63-state-migration-on-job-upgrade">6.3 State migration on job upgrade</h3>
+<p>When the job's code changes (new operator, new state primitive, different keying), the old checkpoint may not be directly compatible. The engine offers tools to migrate state across job versions.</p>
+<p><strong>Compatible upgrade:</strong> the new job has the same operator UIDs and state schemas. The engine restores state automatically. This is the happy path — pin UIDs explicitly via <code>.uid("operator-name")</code> to make UID stability survive code refactors.</p>
+<p><strong>Schema migration:</strong> if a state schema changes (e.g., a POJO gains a field), the engine deserializes the old bytes with the new schema using Avro/POJO evolution rules. Adding a nullable field is safe; removing a field is safe (lossy); renaming requires explicit migration.</p>
+<p><strong>Topology change migration:</strong> if the job's DAG changes (new operator inserted, parallelism changes drastically), the engine offers <code>--allowNonRestoredState</code> (drop unmatched state) and explicit operator-state remapping. This is operator-painful and usually triggers a "savepoint, edit, restore" workflow (see §10 Job Upgrade Strategies).</p>
+<h3 id="64-schema-evolution-of-stored-state-avro-evolution-rules-apply">6.4 Schema evolution of stored state — Avro evolution rules apply</h3>
+<p>Stream-processor state is durable across job lifetimes. Schema evolution applies the same way it does for any persistent format:</p>
+<ul>
+<li><strong>Forward-compatible changes:</strong> adding optional fields with defaults, adding new enum values (with a "default" fallback). Old code reading new state ignores the new field.</li>
+<li><strong>Backward-compatible changes:</strong> removing fields that the new code doesn't use. New code reading old state ignores the absent field.</li>
+<li><strong>Breaking changes:</strong> renaming fields, changing field types, removing required fields. These require explicit migration logic.</li>
+</ul>
+<p>Flink supports Avro-based state with rich evolution and POJO-based state with limited evolution (Java field add/remove). For complex schema changes, write a migration job: read state via state-processor-API, transform, write into a new state in a fresh checkpoint.</p>
+<h3 id="65-why-rocksdb-tuning-matters-block-cache-compaction-style">6.5 Why RocksDB tuning matters — block cache, compaction style</h3>
+<p>RocksDB has hundreds of tuning parameters. For streaming workloads, the load-bearing ones:</p>
+<p><strong>Block cache size:</strong> the in-memory cache of hot SST blocks. A miss costs a disk read (~100 µs SSD); a hit costs a memory lookup (~100 ns). For a hot-key-dominated workload, the block cache hit rate determines per-event latency. Default ~8 MB is usually too small; tune to 20–40% of TaskManager memory.</p>
+<p><strong>Compaction style:</strong></p>
+<ul>
+<li><strong>Leveled compaction (default):</strong> classic LSM with strict per-level size ratios. Lower write amplification on writes, lower space amplification, but more compaction CPU on hot updates.</li>
+<li><strong>Tiered (universal) compaction:</strong> less compaction work; higher space amplification (state on disk can be 2–3× actual size). Useful when local SSD is plentiful but CPU is constrained.</li>
+<li><strong>FIFO compaction:</strong> for ephemeral state with TTL — just delete old SSTs without compaction. Fast but not useful for general-purpose keyed state.</li>
+</ul>
+<p><strong>Write buffer size (memtable):</strong> larger memtables (256 MB vs default 64 MB) reduce L0 flush frequency and write amplification. The trade-off is RAM usage and slower recovery from crashes (more WAL to replay — though Flink typically disables RocksDB WAL because checkpoints are the durability mechanism).</p>
+<p><strong>Bloom filter bits per key:</strong> 10 bits/key (default) gives ~1% false-positive rate. For workloads where most reads miss (e.g., dedupe by sequence-id with mostly-unique keys), increase to 15–20 bits/key to reduce SST touches.</p>
+<p><strong>The tuning-loop:</strong> measure with RocksDB statistics (read amplification, write amplification, compaction stalls, block cache hit rate). Adjust one parameter at a time. Retest. Flink exposes RocksDB metrics through <code>metrics.reporter.rocksdb.factory.class</code> configuration.</p>
+<hr>
+<h2 id="7-backpressure">§7. Backpressure</h2>
+<p>Backpressure is the engine's mechanism for preventing fast producers from overwhelming slow consumers. It's also the most-misunderstood streaming concept — engineers see "backpressure: 80%" in Flink UI and panic, when in fact backpressure is the normal way streaming engines preserve correctness under load.</p>
+<h3 id="71-what-happens-when-a-sink-slows-down">7.1 What happens when a sink slows down</h3>
+<pre><code>Normal flow:
+  Source → Op1 → Op2 → Sink → External system
+     1M/s   1M/s  1M/s   1M/s     1M/s consumed
+
+Sink slows (e.g., downstream Kafka becomes slow, or external REST API
+adds latency):
+
+  Source → Op1 → Op2 → Sink → External system
+     1M/s   1M/s  1M/s   500k/s   500k/s consumed
+                              ▲
+                              └── sink's output buffer fills
+
+Sink's input network buffer (allocated by upstream Op2) fills:
+
+  Op2 → Sink
+        [████████████████████]  ◄── buffers full
+        Op2's &quot;send&quot; call blocks (credit-based flow control runs out of credits)
+
+Op2 stops sending to Sink:
+
+  Op2 cannot emit → Op2's processing loop blocks waiting on output buffer
+  Op2 stops consuming from its input buffers
+
+  Op1 → Op2
+        [████████████████████]  ◄── Op2's input buffers fill
+
+  Op1 stops sending to Op2 → Op1 stops consuming from its input
+
+  Source → Op1
+           [████████████████████]  ◄── Op1's input buffers fill
+
+  Source stops sending → Source's Kafka consumer poll() loop slows
+
+  Eventually: Kafka consumer lag grows. Source pulls from Kafka at the
+  rate the slowest downstream operator can absorb.
+</code></pre>
+<p>The cardinal property: <strong>backpressure propagates back from the slowest operator to the source</strong>. The source naturally slows its consumption from the durable log. The log buffers the un-consumed data (this is exactly what Kafka retention is for). When the slow operator catches up, backpressure releases and the source resumes full-rate consumption.</p>
+<p>This is GOOD. It means: under transient downstream slowness, the source DOES NOT drop data, DOES NOT OOM the engine, DOES NOT silently lose events. It naturally rate-limits at the slowest stage.</p>
+<h3 id="72-detecting-backpressure">7.2 Detecting backpressure</h3>
+<p><strong>Via Flink UI:</strong> the JobGraph view shows backpressure indicators per operator. The metric is sampled: Flink threads periodically dump their stack and check whether they're blocked on <code>LocalBufferPool.requestBuffer()</code> (the call that blocks when output buffers are full). The ratio of samples-blocked to samples-total is the "backpressure ratio."</p>
+<pre><code>Flink UI legend:
+  OK        backpressure ratio &lt; 10%
+  LOW       10% – 50%
+  HIGH      &gt; 50%
+
+Per-operator color codes propagate UPSTREAM from the bottleneck.
+A HIGH on Op2 means Op2 is being slowed by something downstream (sink
+or further operators). A HIGH on Source means the next operator down is
+the bottleneck.
+</code></pre>
+<p><strong>Via metrics:</strong>
+- <code>numRecordsInPerSecond</code> and <code>numRecordsOutPerSecond</code> diverging across an operator (in &gt; out for a sustained period) indicates the operator is itself the bottleneck.
+- <code>outputBufferPoolUsage</code> near 1.0 indicates the output buffers are full — backpressure from below.
+- <code>inputBufferPoolUsage</code> near 1.0 indicates the input buffers are full — backpressure from above.
+- <code>idleTimeMs</code> near 0 means the operator is constantly working, which combined with input-buffer-full is the textbook bottleneck signature.</p>
+<p><strong>Via Kafka consumer lag:</strong> the canonical end-user-visible symptom of sustained backpressure. The source can't keep up; lag grows monotonically. The size of the lag bounds the freshness of output.</p>
+<h3 id="73-fix-patterns">7.3 Fix patterns</h3>
+<p><strong>1. Increase parallelism on the bottleneck operator.</strong> If the bottleneck is a CPU-bound transformation, more parallelism gives it more cores. Practical: identify the bottleneck via UI, increase its parallelism (<code>.setParallelism(n)</code>), repartition the input.</p>
+<p><strong>2. Fix the slow sink.</strong> Most backpressure is caused by sinks. Check downstream:
+- Kafka cluster health (broker CPU, disk IO, replication lag).
+- External API rate limits.
+- Database write lock contention.
+- Network egress saturation (especially cross-AZ).</p>
+<p>The sink fix usually pays for itself; the engine fix is band-aid.</p>
+<p><strong>3. Use bigger network buffers.</strong> Flink's network stack uses fixed-size buffer pools per channel. If the working set of in-flight data is larger than the buffer pool, threads block frequently. <code>taskmanager.memory.network.fraction</code> (default ~10% of TM memory) and <code>taskmanager.network.memory.buffers-per-channel</code> (default 2) can be increased. Pays off when traffic is bursty rather than sustained-high.</p>
+<p><strong>4. Switch to unaligned checkpoints.</strong> Under sustained backpressure, aligned checkpoints stall on the slow channel waiting for the barrier. Unaligned checkpoints decouple barrier propagation from event processing — the checkpoint completes even when the operator is stuck on a slow downstream.</p>
+<p><strong>5. Backpressure-induced load shedding.</strong> For overload that is fundamentally beyond capacity, configurable load shedding (drop a percentage of low-priority events) is the last resort. Most engines don't offer this natively; you implement it at the source or in a filter stage with a sampling decision.</p>
+<hr>
+<h2 id="8-side-outputs-and-complex-event-processing-cep">§8. Side outputs and Complex Event Processing (CEP)</h2>
+<p>Two related advanced features: routing different event classes from a single operator (side outputs), and detecting sequential patterns over streams (CEP — Complex Event Processing).</p>
+<h3 id="81-side-outputs-routing-different-event-types-from-one-operator">8.1 Side outputs — routing different event types from one operator</h3>
+<p>The basic abstraction: a single operator emits to its primary output AND to one or more side outputs, each tagged with an <code>OutputTag</code>. Downstream sub-graphs subscribe to specific tags.</p>
+<pre><code>                       primary output ──► main pipeline ──► OLAP sink
+ProcessFunction ───┬──►
+                   ├──► side output &quot;late events&quot;     ──► reconciliation
+                   ├──► side output &quot;malformed&quot;       ──► dead-letter queue
+                   └──► side output &quot;high-value-user&quot; ──► priority pipeline
+</code></pre>
+<p><strong>Why side outputs matter:</strong></p>
+<ul>
+<li><strong>Error handling without breaking the topology.</strong> A malformed JSON event would otherwise crash the deserializer. With a side output, the operator catches the parse error and routes the raw bytes to a dead-letter queue for offline inspection. The main pipeline continues.</li>
+<li><strong>Late-event isolation.</strong> Window operators emit "very late" events to a side output for batch reconciliation; the main pipeline keeps emitting near-real-time aggregates.</li>
+<li><strong>Multi-tenancy without multiple jobs.</strong> A single operator can classify events into "free-tier," "paid-tier," "internal" outputs, each handled by a different downstream pipeline with different SLOs (Service Level Objectives).</li>
+<li><strong>CDC routing.</strong> Debezium events with <code>op=INSERT</code>, <code>op=UPDATE</code>, <code>op=DELETE</code> can be routed to separate side outputs for different downstream consumers.</li>
+</ul>
+<pre><code class="language-java">final OutputTag&lt;Event&gt; lateTag = new OutputTag&lt;&gt;(&quot;late&quot;) {};
+final OutputTag&lt;String&gt; errorTag = new OutputTag&lt;&gt;(&quot;error&quot;) {};
+
+SingleOutputStreamOperator&lt;Result&gt; main = events
+    .process(new ProcessFunction&lt;Event, Result&gt;() {
+        @Override
+        public void processElement(Event e, Context ctx, Collector&lt;Result&gt; out) {
+            try {
+                if (e.eventTime &lt; ctx.timerService().currentWatermark()) {
+                    ctx.output(lateTag, e);
+                    return;
+                }
+                out.collect(transform(e));
+            } catch (Exception ex) {
+                ctx.output(errorTag, e.rawBytes);
+            }
+        }
+    });
+
+main.getSideOutput(lateTag).addSink(new ReconciliationSink());
+main.getSideOutput(errorTag).addSink(new DeadLetterSink());
+main.addSink(new MainSink());
+</code></pre>
+<h3 id="82-complex-event-processing-cep-pattern-matching-over-streams">8.2 Complex Event Processing (CEP) — pattern matching over streams</h3>
+<p>CEP is a declarative DSL for detecting sequential or contextual patterns in event streams. The classic example: "user logs in, then 5 failed login attempts within 1 minute, then a withdrawal of more than $10,000."</p>
+<p>Flink's CEP library compiles a pattern into an NFA (Non-deterministic Finite Automaton) and runs it per key. State per partial match is held in the engine's keyed state.</p>
+<pre><code>Pattern: login → 5×failed_login (within 60s) → large_withdrawal
+
+NFA:
+  state_0 ── login_event ──► state_1
+  state_1 ── failed_login (count: 1) ──► state_2
+  state_2 ── failed_login (count: 2) ──► state_3
+  ...
+  state_6 ── failed_login (count: 5, within 60s of state_1) ──► state_7
+  state_7 ── withdrawal(amount &gt; 10_000) ──► MATCH
+
+  (any event in [state_1, state_7) with elapsed &gt; 60s aborts the match)
+</code></pre>
+<p>Flink CEP API:</p>
+<pre><code class="language-java">Pattern&lt;Event, ?&gt; pattern = Pattern.&lt;Event&gt;begin(&quot;login&quot;)
+    .where(SimpleCondition.of(e -&gt; e.type.equals(&quot;LOGIN_SUCCESS&quot;)))
+    .next(&quot;failedLogins&quot;)
+    .where(SimpleCondition.of(e -&gt; e.type.equals(&quot;LOGIN_FAILED&quot;)))
+    .timesOrMore(5)
+    .within(Time.minutes(1))
+    .next(&quot;withdrawal&quot;)
+    .where(SimpleCondition.of(e -&gt; e.type.equals(&quot;WITHDRAWAL&quot;)
+                                    &amp;&amp; e.amount &gt; 10_000));
+
+PatternStream&lt;Event&gt; patternStream = CEP.pattern(events.keyBy(Event::userId),
+                                                  pattern);
+
+DataStream&lt;Alert&gt; alerts = patternStream.select(
+    new PatternSelectFunction&lt;Event, Alert&gt;() {
+        @Override
+        public Alert select(Map&lt;String, List&lt;Event&gt;&gt; match) {
+            return new Alert(match.get(&quot;login&quot;).get(0).userId,
+                             match.get(&quot;withdrawal&quot;).get(0).amount,
+                             &quot;POSSIBLE_ACCOUNT_TAKEOVER&quot;);
+        }
+    });
+</code></pre>
+<p><strong>Why CEP belongs in a stream processor:</strong> the pattern matcher needs the same primitives — event-time ordering, watermark-aware timeouts, keyed state, exactly-once recovery — as any other streaming operator. Building it externally would re-implement those primitives.</p>
+<p><strong>Use cases:</strong> account-takeover detection (the example), supply-chain SLA violation ("order placed → not shipped within 48h"), trade surveillance ("large order followed by counter-trade within 5 ms" — but at that latency you need hardware FPGAs, not Flink), customer journey funnels ("page A → page B → conversion within 30 min").</p>
+<p><strong>Limitations:</strong></p>
+<ul>
+<li><strong>State explosion under concurrent matches.</strong> If thousands of partial matches per key exist simultaneously, state can grow rapidly. Tune <code>AfterMatchSkipStrategy</code> carefully.</li>
+<li><strong>Latency vs correctness trade-off.</strong> Long pattern timeouts mean the engine holds state until the pattern times out or matches. A 24-hour pattern timeout means 24 hours of held state for every partial match.</li>
+<li><strong>No counter-factuals.</strong> CEP cannot easily express "X happened but Y did not." Patterns are positive-existence; absence-of-event requires custom ProcessFunction logic with timers.</li>
+</ul>
+<hr>
+<h2 id="9-sql-on-streams">§9. SQL on streams</h2>
+<p>Stream processors increasingly speak SQL. The motivation: analysts who can write SELECT statements outnumber Scala/Java engineers, and the dataflow optimizations a SQL planner generates beat hand-coded job graphs for most aggregation queries.</p>
+<h3 id="91-flink-sql-table-api">9.1 Flink SQL / Table API</h3>
+<p>Flink SQL is a SQL dialect with streaming extensions. A query like:</p>
+<pre><code class="language-sql">SELECT
+  user_id,
+  TUMBLE_START(event_time, INTERVAL '5' MINUTE) AS window_start,
+  COUNT(*) AS click_count,
+  COUNT(DISTINCT page_id) AS unique_pages
+FROM clicks
+GROUP BY user_id, TUMBLE(event_time, INTERVAL '5' MINUTE);
+</code></pre>
+<p>compiles to a DataStream job: source → keyBy(user_id) → tumbling 5-min event-time window → aggregator → sink. The optimizer chooses window implementation, state layout, and parallelism.</p>
+<p><strong>Streaming-specific extensions:</strong></p>
+<ul>
+<li><code>TUMBLE</code>, <code>HOP</code>, <code>SESSION</code> window TVFs (Table-Valued Functions).</li>
+<li><code>WATERMARK FOR event_time AS event_time - INTERVAL '10' SECOND</code> in DDL (Data Definition Language) — watermark strategy at table creation.</li>
+<li><code>MATCH_RECOGNIZE</code> for pattern matching (Flink's SQL equivalent to CEP).</li>
+<li><code>INSERT INTO ... SELECT ...</code> to define a continuous job.</li>
+</ul>
+<p><strong>Table API</strong> is the programmatic equivalent — fluent Java/Scala/Python API that compiles to the same internal representation as SQL.</p>
+<h3 id="92-ksqldb-on-kafka">9.2 ksqlDB on Kafka</h3>
+<p>ksqlDB is Confluent's SQL layer on top of Kafka Streams. SQL queries run as Kafka Streams topologies in a ksqlDB server cluster. State is in RocksDB + Kafka changelog topics, exactly like raw Kafka Streams.</p>
+<pre><code class="language-sql">-- Define a stream from a Kafka topic:
+CREATE STREAM clicks (user_id BIGINT, page_id BIGINT, event_time BIGINT)
+WITH (KAFKA_TOPIC='clicks', VALUE_FORMAT='JSON',
+      TIMESTAMP='event_time');
+
+-- Continuous aggregation:
+CREATE TABLE clicks_per_user AS
+SELECT user_id, COUNT(*) AS click_count
+FROM clicks
+WINDOW TUMBLING (SIZE 5 MINUTES)
+GROUP BY user_id;
+
+-- The resulting TABLE is a Kafka topic, materialized as a queryable state
+-- store. ksqlDB serves pull queries against it via REST.
+</code></pre>
+<p>Strengths: tight Kafka integration, low operational complexity for Kafka shops. Weaknesses: limited to Kafka-as-source-and-sink, less mature optimizer than Flink SQL.</p>
+<h3 id="93-risingwaves-postgresql-compatible-streaming-sql">9.3 RisingWave's PostgreSQL-compatible streaming SQL</h3>
+<p>RisingWave exposes a PostgreSQL wire protocol. Connect with <code>psql</code>, write SQL, the engine runs it as a continuous stream-processing job. Materialized views are first-class — they're computed incrementally as input streams arrive.</p>
+<pre><code class="language-sql">CREATE SOURCE clicks (user_id BIGINT, page_id BIGINT, event_time TIMESTAMP)
+WITH (connector='kafka', topic='clicks', ...);
+
+CREATE MATERIALIZED VIEW clicks_per_user_5min AS
+SELECT user_id,
+       window_start,
+       window_end,
+       COUNT(*) AS click_count
+FROM TUMBLE(clicks, event_time, INTERVAL '5' MINUTES)
+GROUP BY user_id, window_start, window_end;
+
+-- Query the view directly:
+SELECT * FROM clicks_per_user_5min
+WHERE user_id = 42
+ORDER BY window_start DESC
+LIMIT 10;
+</code></pre>
+<p>The view is always up-to-date with sub-second freshness. The query result is served from RisingWave's internal Hummock-backed state, not from re-reading raw data.</p>
+<h3 id="94-materialized-views-over-streams">9.4 Materialized views over streams</h3>
+<p>The unifying abstraction: a materialized view is an aggregation expression whose result is maintained incrementally as input changes. Stream processors are essentially materialized-view engines:</p>
+<pre><code>Input event log    ─►   Streaming SQL engine    ─►   View result (queryable)
+(append-only)          (incremental compute)        (point-lookup latency)
+</code></pre>
+<ul>
+<li><strong>Flink SQL with sink to Kafka/Postgres:</strong> view result is a derived dataset; consumers query the sink.</li>
+<li><strong>ksqlDB tables:</strong> view result is queryable via REST pull queries against the server.</li>
+<li><strong>RisingWave / Materialize:</strong> view result is queryable via PostgreSQL wire protocol; the engine itself serves as the database for the view.</li>
+</ul>
+<h3 id="95-query-optimizer-differences-vs-traditional-sql">9.5 Query optimizer differences vs traditional SQL</h3>
+<p>Streaming SQL optimizers face a different cost model than batch SQL optimizers. Batch optimizers minimize "total work" — total CPU, total IO. Streaming optimizers minimize "per-event work" — incremental cost as a new event arrives.</p>
+<p><strong>Differences:</strong></p>
+<ul>
+<li><strong>No table scans.</strong> The input is an unbounded stream; there's no "scan the whole table" plan node. All inputs are subscribed to incrementally.</li>
+<li><strong>State cost dominates.</strong> A join's cost is dominated by the size of the hash table maintained in state, not by per-event lookup cost. The optimizer prefers join orderings that keep state small.</li>
+<li><strong>Watermark propagation matters.</strong> Some operators (windows, aggregations) need watermarks to emit results. The optimizer ensures watermarks flow through every required path.</li>
+<li><strong>No re-execution.</strong> Batch queries can re-execute on failure. Streaming queries continue from checkpoints; the optimizer must produce a job graph compatible with state restore.</li>
+<li><strong>Incremental aggregation.</strong> The optimizer rewrites aggregations to compute partial results per pane (for windows) and combine them, rather than recomputing on every event.</li>
+</ul>
+<p><strong>Result:</strong> queries that look identical in batch and streaming SQL can have wildly different physical plans. A naïve <code>SELECT COUNT(*) FROM big_table</code> works in batch; the equivalent on a stream requires either bounded windows or an unbounded state (often disallowed by the planner).</p>
+<hr>
+<h2 id="10-job-upgrade-strategies">§10. Job upgrade strategies</h2>
+<p>A streaming job runs continuously. Upgrading it — new code, new feature, bug fix — without losing state or duplicating processing is one of the operationally trickiest parts of running streaming infrastructure.</p>
+<h3 id="101-savepoints-manually-triggered-checkpoint-at-job-stop">10.1 Savepoints — manually-triggered checkpoint at job stop</h3>
+<p>A <strong>savepoint</strong> is a checkpoint with manual trigger and unbounded lifetime. Where ordinary checkpoints are triggered every N seconds and retain the last few, savepoints are explicit "here is a snapshot of my job, save it forever (or until I delete it)."</p>
+<pre><code>Upgrade workflow with savepoint:
+
+1. Trigger savepoint:
+     flink savepoint &lt;job-id&gt; s3://savepoints/my-job/
+   → engine takes a global consistent snapshot, writes to S3, returns path.
+
+2. Stop the job:
+     flink cancel &lt;job-id&gt;
+   → job stops. State is preserved in the savepoint.
+
+3. Deploy new code, restart from savepoint:
+     flink run --fromSavepoint s3://savepoints/my-job/snapshot-abc \
+               --allowNonRestoredState \
+               my-new-jar.jar
+   → new job picks up from the savepoint's source offsets and state.
+</code></pre>
+<p>The <code>--allowNonRestoredState</code> flag lets the new job ignore operator state that the new code no longer needs (e.g., a removed operator). Without it, the engine refuses to start if any state in the savepoint has no destination.</p>
+<h3 id="102-in-place-upgrade-compatible-state-schema">10.2 In-place upgrade — compatible state schema</h3>
+<p>When the new code's state schemas are compatible with the old (via Avro evolution, POJO add/remove field, etc.), the upgrade is "in-place": stop the job, restart with new code from the savepoint, and the engine deserializes old state with new code transparently.</p>
+<p>Compatible changes:
+- Adding a new operator with no state.
+- Adding optional fields to a POJO state.
+- Renaming a class (via <code>@TypeInfo</code> annotations preserving the type identity).
+- Adding new column families (new state primitives) — they start empty.</p>
+<p>In-place is the fast path; aim for it.</p>
+<h3 id="103-parallel-run-new-job-alongside-old-switch-traffic">10.3 Parallel run — new job alongside old, switch traffic</h3>
+<p>When the new code is incompatible (different keying, different sink schema, different operator UIDs), the safest approach is parallel run:</p>
+<pre><code>T = 0: only old job is running.
+       old_job ──► sink (alias=v1)
+
+T = 1: start the new job consuming the same Kafka source from a recent offset.
+       old_job ──► sink_v1
+       new_job ──► sink_v2     (warming up state via replay)
+
+T = warmup: new_job has caught up; its sink_v2 is current.
+
+T = switch: clients (downstream consumers) switch from sink_v1 to sink_v2.
+            For tables: alias swap. For event streams: switch consumer group.
+
+T = post-switch: old_job is decommissioned.
+                 old_job ────► sink_v1   (paused / stopped)
+                 new_job ──► sink_v2     (live)
+</code></pre>
+<p>Cost: doubled compute during the parallel run. Benefit: zero-downtime, zero-data-loss, full validation of the new job against live traffic before flipping.</p>
+<p>This is the standard approach for major version upgrades, key changes, or operator-graph changes. The pattern is sometimes called "blue-green deployment for streaming."</p>
+<h3 id="104-we-changed-the-function-but-state-is-incompatible-recovery-options">10.4 "We changed the function but state is incompatible" — recovery options</h3>
+<p>When state is incompatible and parallel run isn't feasible (cost, state too large to re-warm):</p>
+<p><strong>Option 1: write a state migration job.</strong> Use Flink's State Processor API to read state from the old savepoint, transform it, and write a new savepoint compatible with the new code. Run this offline, then start the new job from the new savepoint.</p>
+<p><strong>Option 2: bootstrap from a side source.</strong> If the state can be recomputed from a durable source (Kafka with long retention, S3 archive), drop the state and replay from a sufficiently old offset.</p>
+<p><strong>Option 3: accept the loss.</strong> For some workloads (e.g., a rolling-window aggregation with a 1-hour window), starting with empty state and letting it warm up for an hour is acceptable.</p>
+<p><strong>Option 4: dual-key the state during the migration window.</strong> Write a transitional version of the code that writes to BOTH the old and new state schemas. Run it long enough that the new state is fully populated. Then deploy a version that only reads the new state.</p>
+<p>The "we deserialize wrong bytes" disaster mode is described in §11 (Schema Evolution). The job either crashes immediately (type incompatibility detected) or silently emits garbage (type accidentally matches but semantics differ). The latter is far worse — detect it via schema-fingerprint checks at startup.</p>
+<hr>
+<h2 id="11-schema-evolution-of-state">§11. Schema evolution of state</h2>
+<p>State is the long-lived asset of a streaming job. Schema evolution rules determine whether the next code change is a one-line update or a multi-day migration project.</p>
+<h3 id="111-flink-managed-avro-pojo-with-evolution-rules">11.1 Flink-managed: Avro / POJO with evolution rules</h3>
+<p>When state is declared with Flink's type serializers (POJOs, Avro schemas, Scala case classes), the engine handles evolution automatically — within the limits of the evolution rules.</p>
+<p><strong>Avro evolution rules:</strong></p>
+<pre><code>Allowed changes (forward + backward compatible):
+  • Add a field with a default value
+  • Remove a field that had a default
+  • Add a new enum value (with default fallback)
+  • Promote int → long, float → double (numeric widening)
+  • Rename via aliases (Avro feature)
+
+Disallowed:
+  • Change a field's type without aliases
+  • Make a previously-optional field required
+  • Rename without an alias
+  • Change a record's namespace
+</code></pre>
+<p><strong>POJO evolution rules (Flink's POJO type info):</strong></p>
+<ul>
+<li>Adding a new field: safe; missing-from-old-state fields get the Java default (0, null, etc.).</li>
+<li>Removing a field: safe; old-state value is read and discarded.</li>
+<li>Renaming a field: NOT safe by default; requires <code>@TypeInfo</code> mapping.</li>
+<li>Changing a field's type: NOT safe; requires a migration.</li>
+</ul>
+<h3 id="112-raw-bytes-you-handle">11.2 Raw bytes: you handle</h3>
+<p>When state is opaque bytes (custom serialization, byte arrays, deeply nested structures with manual serde), the engine does nothing. You write a <code>TypeSerializer</code> with custom upgrade logic and version markers.</p>
+<pre><code>Custom serializer schema evolution skeleton:
+
+class MyStateSerializer extends TypeSerializerSnapshot&lt;MyState&gt; {
+  int version() { return 3; }  // current writer version
+
+  MyState deserialize(byte[] bytes) {
+    int writtenVersion = readInt(bytes, 0);
+    if (writtenVersion == 1) {
+      return upgradeFromV1ToV3(deserializeV1(bytes));
+    } else if (writtenVersion == 2) {
+      return upgradeFromV2ToV3(deserializeV2(bytes));
+    } else if (writtenVersion == 3) {
+      return deserializeV3(bytes);
+    } else {
+      throw new RuntimeException(&quot;Unknown version &quot; + writtenVersion);
+    }
+  }
+}
+</code></pre>
+<p>Cost: high (you write the migration), but full control over the on-disk format.</p>
+<h3 id="113-adding-fields-removing-fields-renaming">11.3 Adding fields, removing fields, renaming</h3>
+<p><strong>Adding fields:</strong> the easiest. Old state lacks the field; the deserializer fills it with a default. New events populate it.</p>
+<p><strong>Removing fields:</strong> safe but lossy. Old state still has the field's bytes; the deserializer skips them.</p>
+<p><strong>Renaming fields:</strong> unsafe without aliases. Old state has bytes under <code>old_name</code>; new code looks for <code>new_name</code> and gets a default — silently losing the data. Always provide an alias when renaming.</p>
+<h3 id="114-the-we-deserialize-wrong-bytes-disaster-mode">11.4 The "we deserialize wrong bytes" disaster mode</h3>
+<p>The worst case: the engine deserializes old bytes with a new schema that is <em>type-compatible but semantically different</em>. Example:</p>
+<pre><code>Old state schema:
+  class UserStats {
+    int totalRequests;   // bytes [0..4)
+    int errorCount;      // bytes [4..8)
+  }
+
+New code (developer reorders fields):
+  class UserStats {
+    int errorCount;      // bytes [0..4)
+    int totalRequests;   // bytes [4..8)
+  }
+</code></pre>
+<p>Avro with aliases would catch this (fields are named, not positional). POJO without explicit type-info migration would also catch it (POJO uses field names internally). But a custom byte-level serializer with no version check would happily reinterpret old bytes as the new layout: every job since the deploy emits garbage — "errorCount = old totalRequests, totalRequests = old errorCount."</p>
+<p>The garbage propagates downstream. Aggregations are wrong but in a way that may not trigger alarms (the values are reasonable-looking, just incorrect). This is the silent-corruption mode.</p>
+<p><strong>Defenses:</strong></p>
+<ul>
+<li>Always include a schema version marker in serialized state.</li>
+<li>Use Flink's POJO/Avro type info, not custom serializers, when feasible.</li>
+<li>Run schema-compatibility checks in CI: deserialize old savepoint test fixtures with the new code; fail the build on type mismatch.</li>
+<li>For critical state, write a "smoke test" that compares an aggregate over the new state to a known-correct value computed from raw events post-deploy.</li>
+</ul>
+<hr>
+<h2 id="12-multi-tenancy-and-isolation">§12. Multi-tenancy and isolation</h2>
+<p>A production Flink/Spark cluster typically runs many jobs. How they share resources determines the noisy-neighbor blast radius.</p>
+<h3 id="121-running-multiple-jobs-on-shared-taskmanagers">12.1 Running multiple jobs on shared TaskManagers</h3>
+<p>The simplest model: one TaskManager has N slots; each slot runs one task. Multiple jobs can place tasks on the same TaskManager — different slots, but shared JVM, shared memory pool, shared CPU.</p>
+<pre><code>TaskManager TM-5 (16 GB RAM, 8 slots):
+  slot 0: job_fraud_features (parallelism task 0)
+  slot 1: job_fraud_features (parallelism task 1)
+  slot 2: job_ad_clicks (parallelism task 0)
+  slot 3: job_ad_clicks (parallelism task 1)
+  slot 4: job_session_aggregator (parallelism task 0)
+  slot 5: job_session_aggregator (parallelism task 1)
+  slot 6: empty
+  slot 7: empty
+</code></pre>
+<p><strong>Pros:</strong> efficient resource packing; one TaskManager fleet serves many jobs.</p>
+<p><strong>Cons:</strong> noisy neighbors. A misbehaving job's GC pause stalls slots in unrelated jobs. A slot leaking memory eventually OOMs the JVM and kills all slots.</p>
+<h3 id="122-slot-sharing-groups">12.2 Slot sharing groups</h3>
+<p>Flink defaults to allowing tasks from <em>different operators in the SAME job</em> to share slots. This is efficient — pipelined stages share a slot and avoid network shuffles. Different jobs can also share slots if explicitly allowed.</p>
+<pre><code>Default slot-sharing: tasks from the same job's chained pipeline stages
+share a slot to enable in-memory data exchange instead of network.
+
+Slot Sharing Group &quot;default&quot;:
+  slot 0: source(p=0) → map(p=0) → keyBy → window(p=0) → sink(p=0)
+  slot 1: source(p=1) → map(p=1) → keyBy → window(p=1) → sink(p=1)
+  ...
+</code></pre>
+<p>Custom slot-sharing groups can isolate operators within a job (e.g., keep a heavy state operator on its own slot to prevent it from starving lighter operators). At the multi-job level, slot-sharing across jobs is usually disabled.</p>
+<h3 id="123-resource-isolation-via-separate-jobmanagers">12.3 Resource isolation via separate JobManagers</h3>
+<p>For strong isolation between jobs (different SLOs, different security domains, different on-call teams), each job gets its own JobManager and TaskManager fleet. The Kubernetes pattern:</p>
+<pre><code>Job A:
+  JobManager pod (HA: 2 replicas with leader election via k8s lease)
+  TaskManager pods (10 replicas with PodAntiAffinity for AZ spread)
+  Dedicated namespace, resource quota, NetworkPolicy
+
+Job B:
+  JobManager pod
+  TaskManager pods
+  Separate namespace
+</code></pre>
+<p>This is the "session vs application mode" trade-off. <strong>Session mode</strong>: one Flink cluster serves many jobs; cheap setup, noisy neighbors. <strong>Application mode</strong>: one Flink cluster per job; expensive but isolated, idiomatic on Kubernetes.</p>
+<p>For Staff-level designs, "application mode per critical job, session mode for low-priority batch-streaming" is a common pattern.</p>
+<h3 id="124-cgroup-limits">12.4 cgroup limits</h3>
+<p>When multiple TaskManagers share a physical node, Linux cgroups (control groups) limit CPU and memory per TM. The Kubernetes resource limits (<code>resources.limits.cpu</code>, <code>resources.limits.memory</code>) are implemented via cgroups.</p>
+<pre><code>cgroup hierarchy on a node:
+  kubelet/
+   ├─ pod_taskmanager_jobA_0/
+   │   └─ cpu.shares = 4096, memory.limit_in_bytes = 16 GB
+   ├─ pod_taskmanager_jobB_0/
+   │   └─ cpu.shares = 2048, memory.limit_in_bytes = 8 GB
+   └─ ...
+
+CPU contention: cgroups distribute CPU proportional to cpu.shares.
+Memory: hitting the memory limit triggers OOMKill, the kernel reaps
+the cgroup. Kubernetes restarts the pod.
+</code></pre>
+<p>cgroups give CPU and memory isolation. They do NOT isolate disk IO bandwidth or network bandwidth by default; for those, use <code>blkio</code> and <code>tc</code> (Traffic Control) qdiscs respectively, or run noisy jobs on dedicated nodes.</p>
+<h3 id="125-the-noisy-neighbor-problem">12.5 The noisy-neighbor problem</h3>
+<p>The classic symptom: a low-priority job suddenly degrades a critical job's latency. Investigation:</p>
+<ol>
+<li><strong>CPU contention:</strong> both jobs maxing out cores on the same node. cgroup shares mediate, but a CPU-spinning job hurts the latency-critical job's wakeup time.</li>
+<li><strong>Memory pressure:</strong> one job grows close to its limit, the JVM does long GC cycles, slot threads stall. If they share the JVM, the other job's tasks stall too.</li>
+<li><strong>Disk IO:</strong> one job's RocksDB compaction saturates local NVMe. The other job's reads queue.</li>
+<li><strong>Network bandwidth:</strong> one job's cross-AZ shuffle dominates the VPC's per-AZ bandwidth budget; the other job's source pulls slow down.</li>
+<li><strong>Checkpoint storage:</strong> both jobs writing to S3 simultaneously; S3 per-prefix throttling kicks in; checkpoint duration grows.</li>
+</ol>
+<p><strong>Mitigations:</strong> application-mode (dedicated cluster), dedicated nodes (taints/tolerations for critical jobs), per-job S3 path sharding, per-job dedicated Kafka clusters.</p>
+<hr>
+<h2 id="13-cost-economics">§13. Cost economics</h2>
+<p>A production streaming job's monthly cost is usually dominated by three components: TaskManager compute, checkpoint storage, and network egress. Knowing the relative contributions guides optimization priorities.</p>
+<h3 id="131-checkpoint-storage-s3-rocksdb-state-size-checkpoint-frequency">13.1 Checkpoint storage — S3 + RocksDB state size × checkpoint frequency</h3>
+<pre><code>Checkpoint storage cost model:
+
+  cost_per_month = state_size_GB × s3_storage_$_per_GB_month
+                   + retained_checkpoints × state_size_GB × s3_storage_$
+                   + checkpoint_PUTs_per_month × s3_PUT_$
+                   + checkpoint_GETs_per_month × s3_GET_$    (on recovery)
+
+Worked example:
+  State size: 1 TB
+  Retained checkpoints: 3 (last completed + 2 historical)
+  Incremental delta per checkpoint: 50 GB
+  Checkpoint interval: 60s → 43,200 checkpoints/month
+  S3 standard storage: $0.023/GB/month
+  S3 PUT: $0.005 per 1000
+
+  Steady-state storage: 3 × 1 TB = 3 TB → 3000 × $0.023 = $69/month
+  Incremental SST upload: 50 GB × 43,200 = 2.16 PB upload/month (bandwidth)
+  Per-checkpoint PUT count: ~10 (one per SST) × 43,200 = 432,000 PUTs/month
+                            → 432 × $0.005 = $2.16/month (negligible)
+
+Network egress (S3 cross-AZ to TaskManager):
+  If checkpoints are in the same region but different AZ:
+    50 GB × 43,200 × $0.01/GB cross-AZ = $21,600/month
+  If same AZ: free, but loses AZ-failure durability.
+
+Typical: storage cheap, PUTs negligible, NETWORK is the issue.
+</code></pre>
+<p><strong>Mitigations:</strong></p>
+<ul>
+<li><strong>Reduce state size:</strong> TTL on state, more aggressive eviction.</li>
+<li><strong>Reduce checkpoint frequency:</strong> 60s → 5 min. Trade-off: replay window after crash grows. Bound by RPO (Recovery Point Objective).</li>
+<li><strong>Same-AZ S3:</strong> use S3 single-AZ buckets if the durability budget allows (probably not for production).</li>
+<li><strong>Compression:</strong> Flink can compress checkpoint payloads; ~3× reduction for typical SST contents.</li>
+</ul>
+<h3 id="132-taskmanager-fleet-cost">13.2 TaskManager fleet cost</h3>
+<pre><code>TaskManager fleet cost model:
+
+  cost_per_month = num_taskmanagers × instance_cost_per_hour × 730 hours
+
+Worked example:
+  60 TaskManagers on m6id.4xlarge (16 vCPU, 64 GB RAM, NVMe local):
+    on-demand: ~$1.00/hour × 60 × 730 = $43,800/month
+    reserved 1y: ~$0.60/hour × 60 × 730 = $26,280/month
+    spot: ~$0.30/hour × 60 × 730 = $13,140/month (but spot-interrupt risk)
+
+  At 1M events/sec sustained, this is ~30k events/sec per TM. CPU
+  is usually the bottleneck for stateful operators; RAM hosts the
+  block cache.
+</code></pre>
+<p><strong>Mitigations:</strong></p>
+<ul>
+<li><strong>Right-size instances:</strong> more memory if block cache hit rate is low; more CPU if compaction is the bottleneck.</li>
+<li><strong>Reserved/spot mix:</strong> baseline on reserved, burst on spot. Spot interruption handled by checkpoint replay.</li>
+<li><strong>Reduce parallelism if over-provisioned:</strong> measure per-slot utilization; cut excess.</li>
+<li><strong>Higher-IOPS storage:</strong> sometimes faster NVMe per TM reduces TM count (CPU was waiting on storage).</li>
+</ul>
+<h3 id="133-network-egress-for-cross-az-shuffles">13.3 Network egress for cross-AZ shuffles</h3>
+<p>Cross-AZ network egress costs ~$0.01/GB on AWS, $0.01/GB on GCP, $0.02/GB on Azure. The unsexy but often-largest line item for high-throughput streaming.</p>
+<pre><code>Network egress model:
+
+  Per-event size: 1 KB serialized
+  KeyBy shuffle: 100% of records cross the network (worst case)
+  At 1M events/sec, shuffle traffic = 1 GB/s = 86.4 TB/day = 2.6 PB/month
+
+  If 30% of shuffle is cross-AZ (random spreading across 3 AZs):
+    0.78 PB/month × $0.01/GB = $7,800/month
+
+  Sources reading from Kafka in the same AZ: 0 egress.
+  Sources reading from Kafka in a different AZ: 100% of input is egress.
+</code></pre>
+<p><strong>Mitigations:</strong></p>
+<ul>
+<li><strong>Pre-aggregate at source:</strong> combine multiple events for the same key before shuffle. 10× reduction for hot keys.</li>
+<li><strong>Rack-local Kafka brokers:</strong> TaskManagers consume from same-AZ Kafka brokers via <code>client.rack</code> configuration. Kafka returns same-AZ replicas when possible.</li>
+<li><strong>Single-AZ deployment:</strong> if AZ failure isn't a hard constraint (some internal analytics jobs), single-AZ saves a lot. Bad idea for production-critical paths.</li>
+<li><strong>Smaller event payloads:</strong> drop unused fields before publishing to Kafka.</li>
+</ul>
+<h3 id="134-the-shrink-state-aggressively-patterns">13.4 The "shrink state aggressively" patterns</h3>
+<p>Since state size drives storage cost, checkpoint duration, and recovery time, shrinking it is one of the highest-leverage optimizations.</p>
+<p><strong>TTL on state:</strong> every state primitive in Flink supports <code>StateTtlConfig</code>. Set explicit TTL (e.g., 24 hours after last access). Background cleanup compacts away expired entries during normal LSM compaction.</p>
+<p><strong>Broadcast state for small lookups:</strong> instead of a stateful operator joining against a per-key reference table, broadcast a small table (e.g., 1 GB feature flag config) to all operators. Each operator holds an in-memory copy; lookups are O(1) without keyed state.</p>
+<p><strong>Approximate algorithms:</strong> HyperLogLog for distinct counts (~2 KB per HLL instance vs O(unique values) for an exact set), Count-Min Sketch for frequency, T-Digest for quantiles. The trade-off: bounded error rate for vast state reduction.</p>
+<p><strong>Aggressive window closing:</strong> if you don't need allowedLateness, set it to 0. Late events go to side outputs, but window state closes immediately on watermark advance.</p>
+<p><strong>Periodic full compaction:</strong> schedule manual full RocksDB compactions during low-traffic hours. Reduces tombstone count and stale state.</p>
+<hr>
+<h2 id="14-unified-batchstream">§14. Unified batch/stream</h2>
+<p>The dream: one engine, one API, one set of bugs. Three engines/frameworks claim this.</p>
+<h3 id="141-flinks-one-engine-for-batch-stream-via-bounded-streams">14.1 Flink's "one engine for batch + stream" via bounded streams</h3>
+<p>Flink models batch as "a stream that happens to end." A bounded source has a definite final offset; the engine knows when it has consumed all data; aggregations emit final results without waiting for further events.</p>
+<pre><code>Streaming: source is unbounded Kafka topic, watermark advances by event_time.
+Batch:     source is bounded S3 file, watermark advances to infinity at EOF.
+
+Same DataStream API. Same operators. Same state backend.
+Same checkpoint/recovery (or not, if batch mode disables checkpoints).
+</code></pre>
+<p><strong>What changes between batch and streaming modes:</strong></p>
+<ul>
+<li><strong>Checkpoints:</strong> typically disabled in batch mode (replay is from input, not state).</li>
+<li><strong>Network shuffle:</strong> batch can use "blocking" shuffles (intermediate results materialized to disk between stages, enabling fault-tolerant re-execution of failed tasks). Streaming uses "pipelined" shuffles.</li>
+<li><strong>Scheduling:</strong> batch can schedule stages sequentially (stage 1 completes, then stage 2 starts). Streaming runs all stages concurrently.</li>
+<li><strong>Windowing:</strong> batch windows close at end-of-input. Streaming windows close at watermark.</li>
+</ul>
+<p>The argument FOR unification: rewriting the same business logic twice (Spark batch + Flink streaming, or dbt + Kafka Streams) is the #1 source of "online/offline feature skew" in ML systems.</p>
+<h3 id="142-sparks-structured-streaming-on-batch-engine">14.2 Spark's "structured streaming on batch engine"</h3>
+<p>Spark goes the other direction: streaming is "batch chopped into micro-batches." A Structured Streaming query runs the same logical SQL as a batch query, with the engine treating each micro-batch as a small Spark job.</p>
+<pre><code>Logical query: SELECT user_id, COUNT(*) FROM events GROUP BY user_id
+
+Batch execution: one job over the full input, one COUNT aggregation.
+Streaming execution: one job per micro-batch over the new events, plus
+                     incremental state maintenance (state in HDFS files).
+</code></pre>
+<p><strong>Strengths:</strong> the optimizer, the type system, the dataframe API are identical. A team that knows Spark batch gets Spark streaming nearly for free.</p>
+<p><strong>Weakness:</strong> the micro-batch model has a latency floor (typically 100ms–1s). For true sub-100ms requirements, Spark Continuous Processing exists but is experimental and limited.</p>
+<h3 id="143-apache-beam-as-portability-layer">14.3 Apache Beam as portability layer</h3>
+<p>Beam is not an engine; it's an API. You write a pipeline in Beam SDK (Java, Python, Go), then run it on a Beam <strong>runner</strong>: Flink runner, Spark runner, Dataflow runner (Google's managed engine), Samza runner, Storm runner.</p>
+<pre><code>            Beam SDK (Java / Python / Go)
+                       │
+            Pipeline → portable representation
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+  Flink Runner    Spark Runner   Dataflow Runner
+        │              │              │
+     Flink jobs   Spark jobs    Google Dataflow
+                                     workers
+</code></pre>
+<p><strong>Pros:</strong> one codebase runs anywhere. Useful for portability between cloud providers, or for pipelines that need to backfill via Dataflow (Google's preferred batch path) and run online via Flink (preferred streaming path).</p>
+<p><strong>Cons:</strong> Beam's model is the lowest common denominator across runners. Some Flink-specific optimizations (state-processor-API access, custom window assigners) are not available through Beam. The abstraction has a tax.</p>
+<h3 id="144-when-unification-is-right-vs-when-batch-needs-its-own-engine">14.4 When unification is right vs when batch needs its own engine</h3>
+<p>Unification is right when:</p>
+<ul>
+<li>The business logic is genuinely the same between batch and streaming (ML feature computation, derived-dataset materialization).</li>
+<li>The "online" and "offline" outputs must match exactly (feature parity is a model-quality requirement).</li>
+<li>The team has more streaming expertise than batch.</li>
+</ul>
+<p>Unification is wrong (use separate engines) when:</p>
+<ul>
+<li>Batch needs complex query optimization (cross-join, large-shuffle aggregations) that streaming optimizers don't handle well.</li>
+<li>Batch processes much larger inputs (full table scans of multi-TB warehouses); streaming engines are tuned for per-event cost, not per-row cost over enormous bounded inputs.</li>
+<li>The "batch" is itself a different workload (ad-hoc analyst queries against a data warehouse — that's Snowflake or BigQuery, not a streaming engine).</li>
+</ul>
+<p>Practical pattern: use Beam or Flink batch mode for derived-dataset backfills that share logic with the streaming path; use Spark + dbt for warehouse ETL; use stream processing for the live serving path.</p>
+<hr>
+<h2 id="15-cdc-change-data-capture-into-stream-processing">§15. CDC (Change Data Capture) into stream processing</h2>
+<p>CDC is the canonical pattern that turned stream processing from "an exotic tool" to "the modern ETL substrate." The pattern:</p>
+<pre><code>   OLTP database (Postgres / MySQL)
+         │
+         │ database write-ahead log
+         │ (binlog, WAL)
+         ▼
+   ┌───────────────┐
+   │   Debezium    │   ◄── Kafka Connect source, reads the DB log,
+   │               │      emits change events to Kafka
+   └───────┬───────┘
+           │
+           ▼
+   ┌──────────────────────────────┐
+   │   Kafka topic: db.public.    │
+   │   orders                     │
+   │   • op=INSERT/UPDATE/DELETE  │
+   │   • before / after snapshots │
+   └──────────┬───────────────────┘
+              │
+              ▼
+   ┌──────────────────────────────┐
+   │   Flink (or Materialize,     │
+   │   RisingWave) consumes CDC   │
+   │   stream, joins with other   │
+   │   streams or reference data, │
+   │   maintains derived views    │
+   └──────────┬───────────────────┘
+              │
+              ▼
+   ┌──────────────────────────────┐
+   │   Derived store: OLAP        │
+   │   (ClickHouse, Pinot),       │
+   │   search (Elasticsearch),    │
+   │   cache (Redis), other DB    │
+   └──────────────────────────────┘
+</code></pre>
+<h3 id="151-why-cdc-is-the-modern-etl">15.1 Why CDC is the modern ETL</h3>
+<p>Traditional ETL was "every hour, dump the entire OLTP database to a warehouse and process." Problems:</p>
+<ul>
+<li><strong>Lock contention or replica lag.</strong> The dump locks tables or hits a replica with replication lag.</li>
+<li><strong>Latency floor.</strong> Hourly dumps mean hourly freshness.</li>
+<li><strong>Cost.</strong> Dumping the whole DB transfers data that mostly hasn't changed.</li>
+<li><strong>Schema drift.</strong> The dumper has to know the schema; schema changes break it.</li>
+</ul>
+<p>CDC inverts this: read the change log (Postgres WAL, MySQL binlog). Only changed rows flow. Latency is seconds. Schema changes propagate as new events. No table locks. The OLTP database operates as normal.</p>
+<h3 id="152-snapshots-vs-incremental">15.2 Snapshots vs incremental</h3>
+<p>CDC needs to handle two phases:</p>
+<p><strong>Snapshot phase:</strong> the source connector starts. It needs initial state of every row. Two strategies:</p>
+<ul>
+<li><strong>Database snapshot at startup:</strong> the connector does <code>SELECT * FROM table</code> at startup with a snapshot isolation level, emits each row as an <code>INSERT</code> event. Then it switches to log-streaming mode. Drawback: snapshot can take hours on large tables; connector restarts re-snapshot from scratch unless checkpoint is preserved.</li>
+<li><strong>Incremental snapshot (Debezium's modern approach):</strong> snapshot in chunks while concurrently streaming the log. New writes flow live; the chunked snapshot fills in old data. No long blocking phase.</li>
+</ul>
+<p><strong>Incremental phase:</strong> the connector reads the log incrementally. Each transaction's changes flow to Kafka as a batch. The connector tracks log offset (LSN in Postgres, binlog file+position in MySQL) and commits the offset to Kafka Connect.</p>
+<h3 id="153-the-catchup-mode">15.3 The catchup mode</h3>
+<p>A common failure: the connector is down for hours; the database log retains the writes; on restart, the connector has to catch up. Catchup processing rate must exceed the database's incoming write rate, or the connector lags forever.</p>
+<p>Mitigations:</p>
+<ul>
+<li><strong>Log retention longer than worst-case outage.</strong> Postgres <code>wal_keep_size</code>, MySQL <code>expire_logs_days</code>. Set generously.</li>
+<li><strong>Parallel apply.</strong> Some connectors can parallelize within a single source by hash-partitioning across primary keys. Order within a primary key is preserved.</li>
+<li><strong>Catchup-mode budget.</strong> Provision more connector instances during catchup; scale down after caught up.</li>
+</ul>
+<h3 id="154-cdc-pipeline-integration-with-stream-processing">15.4 CDC pipeline integration with stream processing</h3>
+<p>Flink and friends consume CDC streams as a special source type: events have <code>before</code> and <code>after</code> snapshots plus an operation type (<code>c</code> for create, <code>u</code> for update, <code>d</code> for delete, <code>r</code> for read from snapshot phase).</p>
+<p>Flink SQL natively understands CDC streams:</p>
+<pre><code class="language-sql">CREATE TABLE orders (
+    order_id BIGINT PRIMARY KEY,
+    user_id BIGINT,
+    amount DECIMAL,
+    status VARCHAR
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'cdc.public.orders',
+    'format' = 'debezium-json'
+);
+
+-- Join CDC stream with another CDC stream:
+CREATE TABLE user_revenue AS
+SELECT u.user_id, SUM(o.amount) AS lifetime_revenue
+FROM orders o JOIN users u ON o.user_id = u.user_id
+GROUP BY u.user_id;
+-- ↑ this view updates incrementally as orders/users are inserted,
+--   updated, or deleted in the source databases.
+</code></pre>
+<h3 id="155-cdc-failure-modes">15.5 CDC failure modes</h3>
+<ul>
+<li><strong>Schema-evolution mismatches.</strong> The source DB ADDs a column; Debezium emits events with the new column; the Flink schema is out of date; Flink crashes or silently ignores the new column. Mitigation: schema registry, automated schema drift detection.</li>
+<li><strong>Delete handling.</strong> A DELETE in the source produces a tombstone event (<code>op=d</code> with null after-state). Downstream stores need delete-aware logic; appending stores (ClickHouse) need explicit collapsing-merge-tree configurations.</li>
+<li><strong>Source DB primary key changes.</strong> Rare but disastrous: the source DB drops a primary key column; CDC events lose the key; downstream upsert breaks.</li>
+</ul>
+<hr>
+<h2 id="16-materialize-and-risingwave-as-databases">§16. Materialize and RisingWave as databases</h2>
+<p>Materialize and RisingWave occupy a unique position: they ARE the streaming engine and the serving database. You write a SQL view; the engine maintains the view incrementally as new events arrive; clients query the view via PostgreSQL wire protocol with low-latency point lookups.</p>
+<h3 id="161-streaming-sql-that-maintains-a-query-result-as-data-arrives">16.1 Streaming SQL that maintains a query result as data arrives</h3>
+<p>The core abstraction: a materialized view over streams.</p>
+<pre><code>CREATE MATERIALIZED VIEW top_sellers_last_hour AS
+SELECT seller_id, SUM(amount) AS revenue
+FROM orders
+WHERE event_time &gt; NOW() - INTERVAL '1' HOUR
+GROUP BY seller_id
+ORDER BY revenue DESC
+LIMIT 10;
+
+-- The view's result is maintained CONTINUOUSLY:
+-- - new orders update the aggregation
+-- - the 1-hour window slides forward
+-- - the TOP 10 list re-evaluates
+
+-- Client query:
+SELECT * FROM top_sellers_last_hour;
+-- ↑ returns instantly (point lookup against materialized state)
+--   freshness: sub-second from the most recent insert
+</code></pre>
+<p>The query "TOP 10 sellers by revenue last hour" is maintained live. The view itself is a queryable relation. Dashboards refresh by polling the view at any rate (every second, every 100ms) and get up-to-date answers.</p>
+<h3 id="162-postgresql-wire-compatible">16.2 PostgreSQL-wire-compatible</h3>
+<p>Both Materialize and RisingWave speak PostgreSQL's wire protocol. From a client's perspective, they ARE Postgres:</p>
+<pre><code>psql -h materialize.example.com -p 6875 -U materialize
+materialize=&gt; SELECT * FROM top_sellers_last_hour;
+ seller_id | revenue
+-----------+---------
+       42  | 18420.50
+       17  | 14200.00
+        9  | 12001.75
+       ...
+
+-- Use any existing Postgres client, ORM, BI tool, etc.
+-- Looker, Metabase, Tableau, Grafana all connect like normal Postgres.
+</code></pre>
+<p>This is huge for adoption. Analysts and BI tools don't need to learn a new query language or driver. The streaming nature is hidden behind the SQL interface.</p>
+<h3 id="163-when-to-pick-materializerisingwave-over-flink-kv-store">16.3 When to pick Materialize/RisingWave over Flink + KV store</h3>
+<pre><code>Pattern A: Flink + Cassandra/Redis
+  Flink job computes derived data, writes to Cassandra.
+  Application reads from Cassandra.
+  Two systems to operate; two failure modes; lag between Flink output
+  and Cassandra read consistency.
+
+Pattern B: Materialize / RisingWave
+  Write a SQL view.
+  The engine IS the store; queries hit the maintained view.
+  One system; one failure mode; consistent reads.
+</code></pre>
+<p><strong>Pick Materialize/RisingWave when:</strong></p>
+<ul>
+<li>The queries are stable and expressible as SQL views (not arbitrary per-request transformations).</li>
+<li>Analysts or BI tools need to query the data with SQL.</li>
+<li>Throughput per cluster is in the 100k–1M events/sec range (above this, custom engineering on Flink scales better).</li>
+<li>The team values "one system" over "best-in-class component."</li>
+</ul>
+<p><strong>Stick with Flink + serving store when:</strong></p>
+<ul>
+<li>Custom logic that doesn't fit SQL (ML model inference, business-rule engines).</li>
+<li>Multi-million-events/sec throughput per pipeline.</li>
+<li>Polyglot sinks (Kafka, S3, REST APIs, internal systems).</li>
+<li>Need for fine-grained operator control (custom triggers, complex windowing, side outputs).</li>
+</ul>
+<h3 id="164-trade-offs">16.4 Trade-offs</h3>
+<ul>
+<li><strong>Coupling of compute and serving.</strong> A heavy query slows down view maintenance and vice versa. Materialize and RisingWave both have features (query result cache, read-replica clusters) to isolate, but it's a real concern.</li>
+<li><strong>Higher operational cost for SQL.</strong> A SQL planner running 10 incremental views over Kafka may use more memory and CPU per event than a hand-coded Flink job doing the same work.</li>
+<li><strong>Catchup time.</strong> Bootstrapping a new view from a long Kafka retention can take hours or days (the view needs to process all historical events to compute the initial state). Snapshotting at the source helps.</li>
+</ul>
+<p>The category is still emerging. Three years ago, only Materialize existed in this niche. RisingWave entered with cloud-native storage (Hummock on S3). Confluent's KSQL pull queries are a third entrant. Expect more options.</p>
+<hr>
+<h2 id="17-observability-of-stream-jobs">§17. Observability of stream jobs</h2>
+<p>A streaming job that doesn't expose its internals is unfixable. Operators, latencies, watermarks, checkpoints, state sizes — all need to be metric-emitted, dashboarded, alerted.</p>
+<h3 id="171-operator-metrics">17.1 Operator metrics</h3>
+<p>The minimum viable set:</p>
+<pre><code>Per operator instance (per slot):
+  numRecordsIn       — events consumed since start
+  numRecordsOut      — events emitted
+  numRecordsInPerSecond  — current input rate
+  numRecordsOutPerSecond — current output rate
+  currentInputWatermark  — most recent watermark on input
+  currentOutputWatermark — watermark emitted to downstream
+  idleTimeMs         — time spent waiting for input
+  busyTimeMs         — time spent processing
+</code></pre>
+<p>The diagnostic patterns:</p>
+<ul>
+<li><strong><code>numRecordsIn ≫ numRecordsOut</code> sustained</strong> for an operator other than a filter or aggregator means the operator is dropping or skipping events. Investigate filter logic.</li>
+<li><strong><code>currentInputWatermark</code> stuck</strong> means an upstream source has no progress (idle partition, or watermark strategy bug). Use <code>withIdleness</code> on the source.</li>
+<li><strong><code>currentOutputWatermark</code> &lt; <code>currentInputWatermark</code></strong> means the operator is holding back the watermark (window operator hasn't fired). Normal during accumulation; alarming if it persists past expected window size.</li>
+<li><strong><code>busyTimeMs / (busyTimeMs + idleTimeMs) &gt; 0.9</code> sustained</strong> means the operator is CPU-bound. Increase parallelism or optimize.</li>
+</ul>
+<h3 id="172-backpressure-indicator">17.2 Backpressure indicator</h3>
+<p>Flink UI samples thread stacks and counts time spent blocked on output buffers. Per-operator backpressure indicator:</p>
+<ul>
+<li><strong>OK:</strong> &lt; 10% of samples blocked.</li>
+<li><strong>LOW:</strong> 10–50%.</li>
+<li><strong>HIGH:</strong> &gt; 50%.</li>
+</ul>
+<p>Color codes propagate upstream from the bottleneck. Read the graph right-to-left (downstream to upstream) to find the operator that's actually slow.</p>
+<h3 id="173-checkpoint-duration-trend">17.3 Checkpoint duration trend</h3>
+<p><code>lastCompletedCheckpointDuration</code>, <code>lastCompletedCheckpointSize</code>, <code>numberOfFailedCheckpoints</code>. The diagnostic patterns:</p>
+<ul>
+<li><strong>Duration trend rising over weeks</strong> means state is growing. Audit state size and TTL.</li>
+<li><strong><code>Duration / Interval &gt; 0.7</code></strong> sustained means checkpoints are crowding the interval; switch to unaligned checkpoints or reduce frequency.</li>
+<li><strong><code>numberOfFailedCheckpoints &gt; 0</code></strong> indicates problems: S3 throttling, alignment timeout, sink-prepare failure. Each failure type has a specific cause; check the JobManager log.</li>
+</ul>
+<h3 id="174-the-this-jobs-p99-latency-grew-from-100ms-to-30s-investigation-playbook">17.4 The "this job's p99 latency grew from 100ms to 30s" investigation playbook</h3>
+<pre><code>Step 1: What changed?
+  - Deploys in the last 24h?
+  - Source traffic volume increase?
+  - Source schema changes?
+  - Downstream sink latency?
+  - Cluster events (TM restarts, AZ issues)?
+
+Step 2: Where is the time spent?
+  - End-to-end latency = time-to-source + per-operator processing time
+    + network shuffle + sink commit time.
+  - Drill into per-operator processing time via metrics.
+  - If one operator's busyTimeMs spiked, look at hot keys or state growth.
+
+Step 3: Is it backpressure or compute?
+  - Backpressure on the source → bottleneck downstream. Find the HIGH operator.
+  - No backpressure but high latency → genuine per-event compute increase.
+
+Step 4: Is state size the cause?
+  - state.numKeys, state.totalSizeBytes per operator → growing?
+  - RocksDB compaction stalls? (rocksdb.stall.micros metric)
+  - Block cache hit rate (rocksdb.block.cache.hit.ratio)?
+
+Step 5: Is checkpoint impact the cause?
+  - Are checkpoint durations &gt; 50% of interval?
+  - During checkpoint windows, does latency spike?
+
+Step 6: Is the sink the cause?
+  - Sink commit duration metrics (sink.numRecordsCommitted.duration)?
+  - Downstream system health (Kafka, DB, REST API)?
+
+Step 7: Is it skew?
+  - Per-slot processing time — is one slot 10× others?
+  - Per-key throughput — is one key 100× others?
+
+Common causes by frequency:
+  1. Hot key skew (60% of cases)
+  2. State growth pushed RocksDB into stalls (20%)
+  3. Sink slowdown propagating backpressure (10%)
+  4. Schema change increased per-event processing cost (5%)
+  5. Cluster events (TM churn, AZ issues) (5%)
+</code></pre>
+<p>The investigation always starts with metrics, narrows to the bottleneck operator, then identifies whether the slowness is compute, state, network, or downstream.</p>
+<hr>
+<h2 id="18-capacity-envelope-small-to-huge">§18. Capacity envelope — small to huge</h2>
+<p>Stream processors span six orders of magnitude in throughput. The same technology family works at each scale, but the right variant and configuration changes dramatically.</p>
+<h3 id="small-operational-dashboarding-1k-eventssec">Small — operational dashboarding (1k events/sec)</h3>
+<p>A startup running ksqlDB or a single Kafka Streams instance to drive an internal dashboard. State &lt; 1 GB. Latency &lt; 1 second. Operates on a single VM. No checkpointing concerns; if the job dies, restart from Kafka's last 24 hours of retention.</p>
+<p>Examples: a SaaS startup tracking "active dashboards in the last 5 minutes" for billing; a B2B company building a real-time alerting feed on customer-side events.</p>
+<h3 id="mid-scale-real-time-fraud-features-100k-eventssec">Mid scale — real-time fraud features (100k events/sec)</h3>
+<p>A team like Stripe Radar maintaining real-time risk features for card transactions. ~100k card-auth events/sec at peak. State ~50–500 GB. Latency p99 &lt; 200 ms. Flink job with ~20–60 TaskManagers, RocksDB state, S3 checkpoints. Single-job topology.</p>
+<p>Stripe Radar publicly cites sub-100ms decision latency on card authorizations, evaluating features built from streams of historical and recent activity. The pipeline mixes Kafka Streams for some feature jobs with custom infrastructure for the more complex parts.</p>
+<h3 id="large-scale-real-time-ml-feature-pipelines-1m10m-eventssec">Large scale — real-time ML feature pipelines (1M–10M events/sec)</h3>
+<p>Uber Michelangelo's real-time feature platform. ~10M events/sec across multiple Flink jobs. Backs fare estimation, ETA prediction, and fraud detection. State in RocksDB; checkpoints to HDFS. ~5,000 TaskManagers across ~200 jobs. State per job ranges from 100 GB to 100 TB.</p>
+<p>LinkedIn's real-time derived datasets — notification ranking, feed personalization, anti-abuse — flow through Samza and Flink. Trillions of events per day cumulative across the platform.</p>
+<h3 id="huge-internet-scale-aggregation-10m-eventssec-trillionsday">Huge — internet-scale aggregation (10M+ events/sec, trillions/day)</h3>
+<p>Alibaba's Singles' Day (Double Eleven) shopping event pushes 583k payments/sec at peak, with analytics dashboards updating in real time off Flink jobs aggregating across the order stream. Alibaba forked Flink as "Blink," shipped optimizations, then donated them back. Aggregate event volume across Alibaba's streaming platform is in the trillions per day.</p>
+<p>Netflix Mantis processes ~10s of millions of events/sec of operational telemetry — log lines, metric updates, system events — for real-time alerting and anomaly detection across the Netflix streaming infrastructure.</p>
+<h3 id="where-the-next-bottleneck-appears">Where the next bottleneck appears</h3>
+<table>
+<thead>
+<tr>
+<th>Scale</th>
+<th>Next bottleneck</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1k/sec</td>
+<td>None — fits on one box</td>
+<td>Stay simple</td>
+</tr>
+<tr>
+<td>100k/sec</td>
+<td>Per-operator state in heap</td>
+<td>Switch to RocksDB</td>
+</tr>
+<tr>
+<td>1M/sec</td>
+<td>Checkpoint upload bandwidth, hot keys</td>
+<td>Incremental checkpoints, key salting</td>
+</tr>
+<tr>
+<td>10M/sec</td>
+<td>Single-JobManager coordination, S3 prefix throttling</td>
+<td>Decompose into multiple jobs by feature domain; shard checkpoint paths</td>
+</tr>
+<tr>
+<td>100M/sec</td>
+<td>Kafka cluster throughput, cross-AZ network</td>
+<td>Multi-cluster federation, regional sharding</td>
+</tr>
+</tbody>
+</table>
+<p>The same Flink (or Spark, Kafka Streams) code path serves all these scales with different deployment topologies. That generality is what makes it a class of technology, not a single tool.</p>
+<hr>
+<h2 id="19-architecture-in-context-the-canonical-pattern">§19. Architecture in context — the canonical pattern</h2>
+<p>The reference topology for any non-trivial streaming job, regardless of engine:</p>
+<pre><code>   producers (services, devices, browsers, change-data-capture)
+            │
+            ▼
+   ┌────────────────────────────────────────────────────────┐
+   │ Durable event log (Kafka, Kinesis, Pulsar, Pub/Sub)    │
+   │  • partitioned by some key                             │
+   │  • retention long enough to absorb downstream outages  │
+   │  • replication for durability                          │
+   └─────────────┬──────────────────────────────────────────┘
+                 │ source consumer offsets stored in the
+                 │ stream processor's state, NOT in the log's
+                 │ own offset commit (so source rewind is
+                 │ atomic with checkpoint recovery)
+                 ▼
+   ┌────────────────────────────────────────────────────────┐
+   │ Stream processor cluster                               │
+   │ ┌────────────────────────────────────────────────────┐ │
+   │ │ Source operators (parallelism = partition count)   │ │
+   │ │   emits records + watermarks                       │ │
+   │ └─────────────┬──────────────────────────────────────┘ │
+   │               │ keyBy → shuffle                        │
+   │               ▼                                        │
+   │ ┌────────────────────────────────────────────────────┐ │
+   │ │ Stateful operators                                 │ │
+   │ │   • event-time windows / timers                    │ │
+   │ │   • keyed state in local LSM (RocksDB / Hummock)   │ │
+   │ │   • per-key processing logic                       │ │
+   │ └─────────────┬──────────────────────────────────────┘ │
+   │               │                                        │
+   │               ▼                                        │
+   │ ┌────────────────────────────────────────────────────┐ │
+   │ │ Sink operators                                     │ │
+   │ │   • 2PC commit coordinated with checkpoint         │ │
+   │ │   • OR idempotent upsert with batch-ID             │ │
+   │ └─────────────┬──────────────────────────────────────┘ │
+   └───────────────┼────────────────────────────────────────┘
+                   │
+            ┌──────┴───────────┐
+            ▼                  ▼
+   ┌─────────────────┐  ┌──────────────────────────┐
+   │ Downstream sink │  │ Checkpoint store         │
+   │   (Kafka, OLTP, │  │   (S3, HDFS, GCS, Azure  │
+   │    OLAP, cache, │  │    Blob)                 │
+   │    REST)        │  │ - operator state snapshots│
+   └─────────────────┘  │ - source offsets         │
+                        │ - sink-commit prepare    │
+                        └──────────────────────────┘
+                                  ▲
+                                  │ on TaskManager death,
+                                  │ restore from latest chk-N
+   ┌──────────────────────────────┴────────────────────────┐
+   │ Coordinator (JobManager in Flink, Driver in Spark)    │
+   │  HA via ZooKeeper or k8s lease                        │
+   │  • barrier injection / micro-batch scheduling         │
+   │  • checkpoint coordination                            │
+   │  • on failure: relaunch tasks                         │
+   └───────────────────────────────────────────────────────┘
+</code></pre>
+<p>What every deep annotation must call out:</p>
+<ul>
+<li><strong>The source partitions on the same key the stream processor will keyBy on.</strong> This makes the keyBy degenerate to a local lookup most of the time — the source already holds only the keys whose hash matches its partition. Cross-partition shuffle is the slow path.</li>
+<li><strong>Parallelism matches partition count.</strong> More parallelism than partitions wastes slots; fewer creates skew because one slot owns multiple partitions.</li>
+<li><strong>Source offsets are stored in engine state, not the log's offset machinery.</strong> Kafka's <code>__consumer_offsets</code> commit is independent of the engine's checkpoint — so on recovery, the two would disagree about where to resume. The engine commits source offsets atomically with its checkpoint.</li>
+<li><strong>Sink participates in 2PC.</strong> The transactional commit and the checkpoint commit are bound together via the coordinator.</li>
+<li><strong>Coordinator is HA.</strong> A single point of failure for checkpoint coordination is a configuration smell.</li>
+</ul>
+<hr>
+<h2 id="20-hard-problems-inherent-to-stream-processing">§20. Hard problems inherent to stream processing</h2>
+<p>Six problems that come with the technology, illustrated across different domains.</p>
+<h3 id="201-exactly-once-across-sources-and-sinks-the-canonical-one">20.1 Exactly-once across sources AND sinks (the canonical one)</h3>
+<p><strong>Domain illustration: fraud detection.</strong> A streaming feature like "declines for this card in the last 5 minutes" cannot double-count a payment after a crash — regulators audit, and double-counting drives false positives that reject good transactions.</p>
+<p><strong>Naïve fix:</strong> Kafka consumer with auto-offset-commit + write to downstream Kafka.</p>
+<p><strong>Failure walkthrough:</strong></p>
+<pre><code>T=0: consumer reads offset 100, processes event, writes to downstream Kafka
+T=1: consumer reads offset 101, processes, writes
+T=2: auto-commit commits offsets [100, 101]
+T=3: consumer reads 102, writes downstream
+T=4: ── CRASH before next auto-commit ──
+T=5: new consumer instance picks up
+T=6: reads __consumer_offsets, last committed = 101
+T=7: resumes from 102 → reprocesses, writes 102 a SECOND TIME
+
+Downstream sees event 102 twice.
+</code></pre>
+<p><strong>Real fix:</strong> stream processor stores source offsets in its own state; bind offset advance to checkpoint barriers + 2PC sink. Source rewinds to checkpoint-N offsets on recovery; sink re-emits or commits its open transaction. Both ends are atomic with the checkpoint.</p>
+<p>Kafka Streams achieves the same via a single Kafka transaction spanning offset commit, state-store-topic write, and output topic write.</p>
+<h3 id="202-out-of-order-events-and-watermark-stalls">20.2 Out-of-order events and watermark stalls</h3>
+<p><strong>Domain illustration: IoT alerting from a sensor fleet.</strong> Cloudflare's DDoS detection ingests telemetry from edge servers; Tesla's fleet sends sensor data from vehicles. Connectivity blips and regional buffering mean events arrive out of order, with skew of seconds to minutes. Computing "edge servers reporting &gt;X failed requests per minute" on processing time would falsely alert on the windows that received a backlog burst.</p>
+<p><strong>Naïve fix:</strong> window by wall-clock at the operator. Close at minute boundaries.</p>
+<p><strong>Failure walkthrough:</strong> a Tesla region has a 30-second cellular blip. 100k events arrive 35s after they were generated. They bucket into the wrong minute window. Your "vehicles reporting fault X" graph has a phantom spike 30s in the future, an actual count split between two minute windows. A safety-monitoring model trained on minute-aligned features sees garbage.</p>
+<p><strong>Real fix:</strong> event time + watermarks.</p>
+<ul>
+<li>Source assigns timestamps from the event payload, not wall clock.</li>
+<li>Watermark strategy = <code>forBoundedOutOfOrderness(60s)</code> — tolerate 60s late.</li>
+<li>Window assignment by event-time.</li>
+<li><code>allowedLateness(5 min)</code> keeps window state open for an extra 5 minutes after watermark passes, so late events update the result and re-emit.</li>
+<li>Very late events (&gt;5 min late) go to a side output for offline reconciliation.</li>
+</ul>
+<p><strong>Related sub-problem: idle partitions stall the watermark.</strong> A source has 256 partitions; one partition has zero traffic (a Tesla region with no vehicles online overnight). That source's watermark never advances. The downstream watermark = min over inputs = stuck. Event-time windows never close. From the operator's perspective, the job goes silent.</p>
+<p>Fix: <code>WatermarkStrategy.withIdleness(Duration.ofSeconds(30))</code> — if a source emits no data for 30s, mark it idle and exclude it from the min computation.</p>
+<h3 id="203-state-size-growth-the-silent-killer">20.3 State size growth (the silent killer)</h3>
+<p><strong>Domain illustration: sessionization for product analytics.</strong> A session window groups events into user sessions, closing after 30 minutes idle. Snowplow and similar pipelines run this pattern across millions of users.</p>
+<p><strong>Naïve fix:</strong> let state grow. RocksDB handles big data, right?</p>
+<p><strong>Failure walkthrough:</strong> a botnet attacker creates 10M new user IDs in an hour, generates one event each, then goes silent. Session state holds 10M × 30 min of buffered events plus ~50 features per user. State grows by 100 GB/hour. RocksDB compaction can't keep up. Checkpoints start taking 5 minutes (longer than the 60s interval). Backpressure → Kafka lag → SLO violation. Eventually local SSD fills, RocksDB throws, TaskManager crashes, recovery takes hours.</p>
+<p><strong>Real fix (layered):</strong></p>
+<ol>
+<li><strong>State TTL (Time-To-Live):</strong> every state has <code>StateTtlConfig</code> (e.g., 1h after last access, cleanup in background). This is the floor.</li>
+<li><strong>Bounded session windows:</strong> cap session duration at 24h max. Anything longer is split.</li>
+<li><strong>State backend tuning:</strong> leveled compaction with aggressive level multipliers; provision SSDs at 3× expected state size for compaction headroom.</li>
+<li><strong>Proactive monitoring:</strong> alert on state-size metric at 70% disk usage. Don't wait for compaction to fail.</li>
+<li><strong>Bot detection upstream:</strong> filter pathological keyspaces at the source.</li>
+</ol>
+<h3 id="204-slow-checkpoints">20.4 Slow checkpoints</h3>
+<p><strong>Domain illustration: real-time ML feature pipeline at Uber-style scale.</strong> A Flink job maintains 150 features across 800M entities. One feature key gets 5% of total traffic (a benchmarking account, or a corporate fleet card, or a celebrity LinkedIn profile). The slot owning that key holds 50× more state than peers. Its checkpoint upload to S3 takes 90 seconds.</p>
+<p><strong>Failure walkthrough:</strong> checkpoint interval is 60s. JobManager schedules checkpoint N+1 before N completes. Pending checkpoints stack up. Memory in the JobManager grows. Eventually the system goes into degraded mode and stops checkpointing — meaning recovery from a crash would replay hours of events.</p>
+<p><strong>Real fix:</strong></p>
+<ul>
+<li><strong>Incremental checkpoints (RocksDB):</strong> ship only changed SSTs since last checkpoint. Reduces upload from full state to delta.</li>
+<li><strong>Unaligned checkpoints:</strong> barrier propagation does not stall on slow input channels.</li>
+<li><strong>Local recovery:</strong> keep a copy of the last checkpoint on local SSD so TaskManager restart doesn't re-download from S3.</li>
+<li><strong>Address hot-key skew at the keying layer</strong> — see §23 Type 2 scaling.</li>
+<li><strong>Alert on <code>lastCompletedCheckpointDuration / checkpointInterval &gt; 0.7</code></strong> as a leading indicator.</li>
+</ul>
+<h3 id="205-job-recovery-time">20.5 Job recovery time</h3>
+<p><strong>Domain illustration: real-time dashboards (e.g., Pinterest real-time recommendations).</strong> A TaskManager dies at 3am. Latest checkpoint is in S3, 60s ago.</p>
+<p><strong>Failure walkthrough:</strong> Cold restart kicks in. JobManager downloads checkpoint metadata. All 60 TaskManagers download their RocksDB SSTs from S3. At 7 GB per TM, 60 TMs, sustained 200 MB/s/prefix even with sharded paths: ~3.5 minutes. Plus state restoration into RocksDB + rebuilding indexes: another 2 minutes. Then source rewind + replay 60s of events: another minute. Total: ~7 min before steady state. During that time, the real-time pin recommendation feature is unavailable.</p>
+<p><strong>Real fix:</strong></p>
+<ul>
+<li><strong>Local recovery:</strong> each TM keeps the last checkpoint's RocksDB files locally. On TM restart on the same machine, recovery skips S3 download. ~30s recovery.</li>
+<li><strong>Region-based restart strategy:</strong> instead of restarting the whole job on a single TM failure, only restart the affected pipeline region.</li>
+<li><strong>Standby TaskManagers:</strong> provision 10% standby capacity that can take over immediately.</li>
+<li><strong>Adaptive Scheduler:</strong> reconfigure parallelism dynamically rather than fixed-DAG restarts.</li>
+</ul>
+<h3 id="206-hot-keys-state-skew-not-throughput-skew">20.6 Hot keys (state skew, not throughput skew)</h3>
+<p><strong>Domain illustration: real-time leaderboards in a gaming platform.</strong> Compute "top 100 scores per game in the last hour." One game (a viral release) gets 1000× the traffic of others. The slot owning that game's key is pegged at 100% CPU and 50× more state than peers.</p>
+<p><strong>Naïve fix:</strong> trust the hash function.</p>
+<p><strong>Failure walkthrough:</strong> hash-partitioning by game_id sends all traffic for game G to one slot. That slot becomes a bottleneck. Backpressure propagates upstream. Total throughput collapses to 1 / (number of hot games) × per-slot capacity.</p>
+<p><strong>Real fix:</strong> two-stage aggregation with key salting. First stage: split the hot key into N salt buckets (<code>game_G#0</code>, <code>game_G#1</code>, ..., <code>game_G#N-1</code>); each handles 1/N of the traffic. Second stage: re-key without salt and aggregate the N partial results.</p>
+<pre><code>Stage 1: hot_key#salt_0, hot_key#salt_1, ..., hot_key#salt_N → partial counters
+Stage 2: re-key by base hot_key (no salt) → final aggregator
+</code></pre>
+<p>For counts, sums, and approximate-quantile algorithms, this is a linear-N reduction in stage-2 traffic.</p>
+<hr>
+<h2 id="21-failure-modes-durability-points">§21. Failure modes — durability points</h2>
+<h3 id="211-taskmanager-crash">21.1 TaskManager crash</h3>
+<pre><code>T=0     TM-17 dies (kernel panic).
+T=0+1s  K8s liveness probe fails.
+T=0+5s  JobManager loses heartbeat from TM-17.
+T=0+10s JobManager declares TM-17 failed. Triggers restart of affected region.
+T=0+15s K8s schedules replacement TM-17 on a new node.
+T=0+30s New TM boots. JM assigns it the tasks TM-17 had.
+T=0+45s Tasks download checkpoint SSTs from S3 (or local SSD if local
+        recovery enabled).
+T=0+90s Tasks restored. Source consumer rewinds to checkpoint offsets.
+T=0+120s Replay through to current head. Steady state.
+
+DURABILITY POINT: the last completed checkpoint in S3. Everything
+processed and acked before that checkpoint is durable; everything
+after is replayed from Kafka.
+
+INVARIANT PRESERVED: 2PC sink either replays the open transaction
+(commits) or aborts (rewinds and re-emits). Either way, exactly-once.
+</code></pre>
+<h3 id="212-jobmanager-coordinator-crash">21.2 JobManager (coordinator) crash</h3>
+<pre><code>T=0     JM-leader dies.
+T=0+5s  Standby JMs (HA mode via ZooKeeper or k8s lease) detect failure.
+T=0+10s New JM-leader elected.
+T=0+15s New JM reads job state from durable store (ZK + S3):
+          • job graph
+          • last completed checkpoint metadata pointer
+          • TaskManager registry
+T=0+20s New JM does NOT relaunch TMs (they're still running).
+T=0+25s New JM resumes checkpoint coordination. Next barrier scheduled.
+
+Job continues. TMs processed through the JM gap. No data loss because
+checkpoints are persisted in S3, not in JM memory.
+
+DURABILITY POINT: ZooKeeper / k8s ConfigMap holding pointer to &quot;latest
+completed checkpoint in S3.&quot;
+</code></pre>
+<h3 id="213-sink-unavailable-mid-checkpoint-subtle">21.3 Sink unavailable mid-checkpoint (subtle)</h3>
+<p>The downstream Kafka cluster goes unreachable while a 2PC sink has pre-committed.</p>
+<pre><code>T=0      Barrier_N arrives at sink. Opens Kafka txn 7, writes records,
+         flushes, acks barrier to JM.
+T=0+5s   JM collects all acks. Writes ckpt-N metadata to S3.
+T=0+5s   JM sends notifyCheckpointComplete(N) to sink.
+T=0+6s   Sink calls producer.commitTransaction()
+         ── Kafka cluster unreachable. Times out after 60s.
+T=1m+6s  Sink throws. TaskManager fails.
+T=1m+11s JM restarts the task.
+T=1m+45s New task instance recovers from ckpt-N.
+         Sink's TwoPhaseCommitSinkFunction sees state has a record of
+         &quot;pending transaction 7 needs commit.&quot;
+         Tries commitTransaction() → still fails (Kafka still down).
+         Retries with exponential backoff.
+T=5m     Kafka recovers.
+T=5m+30s Sink commits txn 7 successfully.
+         Downstream consumers see the records, exactly once.
+
+DURABILITY POINT: pending-transaction state persisted in checkpoint.
+Stable transactional.id across restarts is the trick that lets the new
+producer attach to the same Kafka coordinator state.
+</code></pre>
+<h3 id="214-network-partition-split-brain">21.4 Network partition (split-brain)</h3>
+<pre><code>Scenario: rack A holds JM-leader + 30 TMs; rack B holds 30 TMs +
+JM-standbys. Network partitions A from B.
+
+In A:  JM-leader sees 30 TMs reachable, 30 unreachable.
+       Declares 30 TMs failed. Tries to restart on the 30 surviving TMs.
+       But parallelism config requires 60 TMs. Job goes into &quot;waiting
+       for resources&quot; state.
+
+In B:  JM-standbys cannot reach the lease in ZK (assuming ZK has quorum
+       on the A side). They cannot elect a new leader. 30 TMs in B are
+       running, but cannot ack barriers. After checkpoint timeout
+       (5 min default), tasks abort their checkpoints and stall.
+
+DURABILITY POINT: ZooKeeper / k8s lease serves as the split-brain
+breaker. Only the side with quorum can elect a leader. The minority
+side never has an active JM, so it cannot make forward progress that
+conflicts with the majority side's checkpoint chain.
+
+INVARIANT: at most one JM can be making decisions. ZK / lease ensures
+this. On partition heal, B-side TMs reconnect to JM in A; any work
+they did since the partition that wasn't checkpointed is rolled back.
+</code></pre>
+<h3 id="215-permanent-loss-az-failure">21.5 Permanent loss (AZ failure)</h3>
+<p>A whole Availability Zone vanishes. 20 of 60 TMs gone. JM may or may not be on that AZ.</p>
+<pre><code>- If JM-leader was in lost AZ: standby elected (assuming cross-AZ
+  ZK quorum). Otherwise JM-leader survives.
+- 20 TMs need replacement: K8s scheduler provisions in surviving AZs.
+  Capacity headroom (e.g., 50% over-provisioning) absorbs the loss.
+- New TMs restore from S3 checkpoints (cross-AZ replicated).
+- Source offsets in checkpoint determine replay window. Kafka retention
+  (e.g., 72h) absorbs any AZ outage shorter than 3 days.
+
+DURABILITY POINT: S3 (cross-AZ replicated) holds checkpoints.
+Kafka cluster spans 3 AZs with replication=3 and min.insync.replicas=2,
+so it survives one AZ loss without data loss.
+
+INVARIANT: cross-AZ durability of BOTH checkpoints and source log.
+Single-AZ for either is a single point of catastrophic loss.
+</code></pre>
+<h3 id="216-checkpoint-storage-s3-outage-job-pauses">21.6 Checkpoint storage S3 outage (job pauses)</h3>
+<pre><code>T=0      S3 region experiences an outage (or specific bucket throttles
+         heavily for a customer that has exceeded request rate).
+T=0+60s  Next scheduled checkpoint.
+         TaskManagers begin uploading SST files; PUT requests fail with
+         S3 5xx or throttling.
+T=0+120s Checkpoint times out (default 10 min).
+T=0+10m  JobManager marks the checkpoint as failed.
+         If max-concurrent-checkpoints = 1 (default), the next checkpoint
+         starts. If S3 is still down, it also fails.
+T=0+30m  Multiple failed checkpoints. Default tolerance:
+         tolerable-checkpoint-failure-number = 0 → job FAILS immediately
+         on first failure (default in older Flink), OR
+         the job continues processing without taking new checkpoints.
+T=1h     If the job continues processing, the replay window (events
+         processed since last successful checkpoint) grows. RPO
+         (Recovery Point Objective) is now 1 hour.
+
+DURABILITY POINT: the LAST SUCCESSFUL checkpoint before the S3 outage.
+If S3 recovers and the job is still alive, the next checkpoint succeeds.
+If the job crashed during the outage, recovery from the old checkpoint
+replays an hour of events.
+
+INVARIANT: source log must retain enough history to cover the worst-case
+replay window. If Kafka retention is 24h and S3 is down for 25h, replay
+loses data.
+
+MITIGATIONS:
+- Multi-region S3 (cross-region replication for checkpoints).
+- Higher tolerable-checkpoint-failure-number (e.g., 3) to ride through
+  brief outages without job failure.
+- Alert on consecutive failed checkpoints, not just job failure.
+- Monitor S3 PUT error rate per checkpoint path.
+</code></pre>
+<h3 id="217-backpressure-causing-checkpoint-timeouts">21.7 Backpressure causing checkpoint timeouts</h3>
+<pre><code>Scenario: downstream sink is slow, backpressure propagates upstream,
+aligned checkpoints stall waiting for barriers on slow channels.
+
+T=0      Sink rate drops from 1M/sec to 100k/sec (10x slowdown).
+T=0+30s  Backpressure builds. Source consumes from Kafka at 100k/sec.
+         Kafka lag grows.
+T=0+60s  Next aligned checkpoint scheduled.
+         Barrier injected at all sources. Propagates downstream at
+         the rate of slow channels.
+T=0+5m   Checkpoint duration exceeds checkpoint-timeout (default 10 min).
+         Some operators have received the barrier on all input channels;
+         others are still waiting.
+T=0+10m  Checkpoint times out. JobManager aborts.
+         All in-flight 2PC pre-commits are aborted. Job continues
+         processing but no checkpoint progress.
+T=0+11m  Next checkpoint scheduled, same outcome.
+
+DURABILITY POINT: last successful checkpoint (from before backpressure).
+Recovery would replay all events processed since then.
+
+DIAGNOSIS:
+- Check `lastCompletedCheckpointDuration` metric — rising over time.
+- Check per-operator backpressure indicator — find the HIGH operator.
+- Check `checkpointAlignmentTime` — high values point to alignment as
+  the bottleneck (vs actual snapshot write time).
+
+MITIGATIONS:
+- Switch to unaligned checkpoints — barrier propagation does not wait
+  for input alignment.
+- Fix the slow sink.
+- Reduce checkpoint frequency until backpressure resolves.
+- Bound checkpoint timeout to fail fast and surface the issue.
+</code></pre>
+<h3 id="218-the-skewed-key-kills-one-taskmanager-diagnosis">21.8 The "skewed key kills one TaskManager" diagnosis</h3>
+<p>The textbook hot-key problem manifests as ONE TaskManager (or a small subset) showing high CPU, high state size, slow checkpoints, while the rest of the fleet is idle.</p>
+<pre><code>Symptoms:
+- Per-TM CPU graph: 5% of TMs at 100%, 95% at &lt;20%.
+- Per-TM state-size graph: same skew.
+- Checkpoint duration dominated by a small number of slow TMs.
+- Backpressure indicator HIGH on operators feeding the hot TMs.
+- Kafka lag grows on partitions whose keys hash to hot TMs.
+
+Diagnosis playbook:
+1. Identify the hot TaskManager(s) via per-TM metrics.
+2. Identify the hot operator(s) on those TMs.
+3. Dump per-key state size / per-key throughput for the hot operator.
+   Flink's State Processor API can read state offline; instrument with
+   a custom metric: numRecordsForKey histogram.
+4. The top-K keys by traffic are the culprits.
+5. Cross-reference with business logic: is one user a fleet account?
+   A bot? A celebrity profile? An internal test key that leaked into
+   production?
+
+Resolution:
+- Filter or special-case the runaway key upstream (e.g., drop events
+  with a known bot pattern at the source).
+- Apply two-stage aggregation (key salting) as in §20.6.
+- Provision the affected partition with a dedicated TaskManager
+  (custom partition assignment).
+- If the key is &quot;legitimate but extreme&quot; (e.g., the platform's biggest
+  customer), give it its own dedicated job with custom tuning.
+
+The hot-key failure mode is the most common cause of streaming job
+incidents at scale. Bake hot-key detection into the standard alert set.
+</code></pre>
+<hr>
+<h2 id="22-why-not-cron-batch-sql-every-minute">§22. Why not cron + batch SQL every minute</h2>
+<p>The naïve replacement for stream processing is "run a batch query every minute against the OLTP database (or analytical store) over the last N minutes." Five lines of SQL, no Flink, no cluster, no on-call rotation. Why doesn't it work?</p>
+<h3 id="91-the-oltp-database-melts-or-the-olap-scan-is-too-expensive">9.1 The OLTP database melts (or the OLAP scan is too expensive)</h3>
+<p>At 1M events/sec write traffic, your operational database is busy with inserts. Now you add a recurring full-scan-grouped-by-non-partition-key query every minute. Whether the data lives in MySQL, Postgres, Cassandra, or even Snowflake, the secondary access pattern fights with the primary one. The DBA pages you within an hour. You move it to a read replica → replica lag spikes → the query reads stale data anyway.</p>
+<h3 id="92-the-1-minute-latency-is-a-lie">9.2 The "1-minute latency" is a lie</h3>
+<pre><code>T = 12:03:00 — cron starts
+T = 12:03:45 — query returns
+T = 12:03:50 — your code processes results
+T = 12:03:55 — alerts written
+
+Events at T=12:03:15 are detected at T=12:03:55. 40s latency.
+Events at T=12:03:59 are detected at T=12:04:55. 56s latency.
+</code></pre>
+<p>If you promised sub-second freshness, you're missing by two orders of magnitude.</p>
+<h3 id="93-result-correctness-drifts-under-processing-time-windows">9.3 Result correctness drifts under processing-time windows</h3>
+<p>The cron query window is processing-time. A 30s ingestion delay (normal) means events at event_time = 12:03:15 might land at 12:03:45. Your cron at 12:03:00 misses them. Your cron at 12:04:00 sees them. Now they're double-counted across successive runs if windows overlap, or missed entirely if windows don't overlap. The same data is wrong in two different ways depending on window scheme.</p>
+<h3 id="94-no-exactly-once-recovery">9.4 No exactly-once recovery</h3>
+<p>The cron crashes mid-run. Restart picks up at minute boundary, missing the previous minute entirely. You build a fraud blind spot. Add idempotency via run IDs and a state table? Congratulations, you've started reimplementing Flink, badly, without checkpoint coordination.</p>
+<h3 id="95-doesnt-compose-to-many-features">9.5 Doesn't compose to many features</h3>
+<p>What about 5 features × 10 windows? Now 50 expensive aggregation queries per minute. The DB is dead before lunch. Stream processors add a feature as one more operator in an existing DAG — incremental cost is one more state entry per event.</p>
+<h3 id="why-streaming-wins">Why streaming wins</h3>
+<p>Streaming inverts the data flow. The DB is never queried for analytics. Reads happen against pre-aggregated state inside the stream processor. The aggregation is incremental: each event updates one counter. O(1) per event, not O(N) per cron run. Window logic is event-time, watermark-bounded, no overlap-double-count. Failure recovery is bounded by checkpoint interval.</p>
+<p><strong>The math:</strong> cron + batch SQL has O(N) cost per refresh and O(refresh-interval) latency. Stream processing has O(1) cost per event and O(event-processing-latency) result delay. At 100k+ events/sec, only the second one fits in a datacenter.</p>
+<hr>
+<h2 id="23-scaling-axes">§23. Scaling axes</h2>
+<h3 id="type-1-uniform-growth-more-events-more-keys">Type 1: uniform growth (more events, more keys)</h3>
+<p>Same workload, scaled by a factor. Add more producers, more partitions, more parallelism.</p>
+<ul>
+<li><strong>1×</strong> (100k events/sec, 10M keys): 16 TaskManagers, 64 Kafka partitions. Trivial.</li>
+<li><strong>2×</strong> (200k events/sec, 20M keys): scale parallelism to 128, repartition Kafka to 128. Linear scaling.</li>
+<li><strong>10×</strong> (1M events/sec, 100M keys): 256 partitions, 256 parallelism. Add incremental checkpoints. State spills to NVMe SSD. Standard.</li>
+<li><strong>100×</strong> (10M events/sec, 1B keys):</li>
+<li>Bump to 1024 partitions. Each TM owns 1–2 partitions.</li>
+<li>Higher-IOPS NVMe (gp3 io2, i4i instances).</li>
+<li>Shard S3 checkpoint prefixes per operator-instance to escape prefix throttling.</li>
+<li><strong>JobManager becomes the bottleneck.</strong> Decompose into multiple jobs by feature group. "Card features," "Merchant features," "User features" as separate jobs sharing the same Kafka source.</li>
+</ul>
+<p><strong>Inflection point:</strong> at ~5M events/sec, single-job Flink hits JobManager and S3 coordination ceilings. Above that, split by domain.</p>
+<h3 id="type-2-hotspot-intensification-state-skew">Type 2: hotspot intensification (state skew)</h3>
+<p>Same keys, but one key gets disproportionate traffic. Hash-partitioning sends all events for that key to one slot. That slot is pegged at 100% CPU and holds 50× more state than peers. Backpressure propagates. Total throughput collapses.</p>
+<p>This needs a different fix than Type 1. Adding more TMs does not help; the hot key still maps to one of them.</p>
+<p><strong>Fixes in increasing order of complexity:</strong></p>
+<ol>
+<li><strong>Pre-aggregate at the source.</strong> Combine multiple events for the same key before they cross the network. Reduces shuffle traffic for hot keys by 10–100×.</li>
+<li><strong>Two-stage aggregation (salting).</strong> Split the hot key into N salt buckets at stage 1, re-key without salt at stage 2.</li>
+<li><strong>Hot-key detection + dedicated slot.</strong> Profile the keyspace, identify the top-K hot keys, route them to a dedicated TM with extra resources. Custom partitioner.</li>
+<li><strong>Approximate algorithms.</strong> If exact counts on the hot key are not needed, use HyperLogLog for distinct-count, Count-Min Sketch for frequency. Per-slot state grows by O(precision), not O(unique values).</li>
+</ol>
+<p><strong>Inflection point:</strong> hot key crosses 50k events/sec/slot. Below that, ignore. Above, salt or pre-aggregate.</p>
+<hr>
+<h2 id="24-decision-matrix-when-stream-processing-vs-alternatives">§24. Decision matrix — when stream processing vs alternatives</h2>
+<p>When should you reach for a stream processor vs adjacent technologies?</p>
+<table>
+<thead>
+<tr>
+<th>Criterion</th>
+<th>Stream processor</th>
+<th>Batch ETL (Spark, dbt)</th>
+<th>OLAP on raw data (ClickHouse, Pinot, Druid)</th>
+<th>Complex Event Processing (Esper, Flink CEP)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Freshness</td>
+<td>Seconds (or sub-second)</td>
+<td>Minutes to hours (next batch)</td>
+<td>Seconds (query latency) on indexed data</td>
+<td>Same as stream processor (it IS one)</td>
+</tr>
+<tr>
+<td>Per-query cost</td>
+<td>O(1) per event</td>
+<td>O(N) per batch</td>
+<td>O(rows-scanned) per query</td>
+<td>O(1) per event</td>
+</tr>
+<tr>
+<td>Aggregation depth</td>
+<td>Incremental, limited window</td>
+<td>Full-history complex aggregations easy</td>
+<td>Ad-hoc queries; limited stateful pattern matching</td>
+<td>Pattern matching (X then Y within window Z)</td>
+</tr>
+<tr>
+<td>State maintenance</td>
+<td>Yes, durable across crashes</td>
+<td>No (output is the state)</td>
+<td>Storage is the state; queries are stateless</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Setup cost</td>
+<td>High (cluster + state tuning)</td>
+<td>Low (just SQL + scheduler)</td>
+<td>Medium (specialized cluster)</td>
+<td>High (stream processor + CEP library)</td>
+</tr>
+<tr>
+<td>Use when</td>
+<td>Continuous derived data, sub-minute freshness, large state</td>
+<td>Periodic refresh OK, complex joins on history</td>
+<td>Interactive analytics on time-series-ish data</td>
+<td>Sequential pattern detection (login then large withdrawal within 5 min)</td>
+</tr>
+<tr>
+<td>Avoid when</td>
+<td>Mostly batch, no freshness need; ad-hoc analyst queries</td>
+<td>Need sub-minute freshness; need exactly-once internal state</td>
+<td>Need to maintain derived state, not just answer queries</td>
+<td>Simple aggregations (overkill)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Specific thresholds:</strong></p>
+<ul>
+<li>If freshness requirement &gt; 5 minutes, batch ETL is simpler and cheaper.</li>
+<li>If freshness requirement &lt; 1 second and state per key is non-trivial, only stream processing fits.</li>
+<li>If queries are ad-hoc against raw event history with no derived state, OLAP wins.</li>
+<li>If you need "detect sequence A → B → C within 30s," use a CEP library on top of a stream processor.</li>
+</ul>
+<p><strong>The boundary case:</strong> <strong>Materialize and RisingWave blur the line between stream processor and OLAP.</strong> They maintain incremental views (stream processing) but expose Postgres-protocol query interfaces (OLAP-like access). For a SQL-shop building real-time dashboards, they replace "Flink + serving store + dashboard."</p>
+<hr>
+<h2 id="25-use-case-gallery-same-technology-different-products">§25. Use case gallery — same technology, different products</h2>
+<p>How the same class of technology powers radically different products:</p>
+<h3 id="fraud-detection-stripe-radar">Fraud detection — Stripe Radar</h3>
+<p><strong>Demands:</strong> sub-100ms decision SLO on every card auth. Tens of features per card, computed continuously. End-to-end exactly-once (regulators audit). State proportional to active cards (~100s of millions). Out-of-order events from edge auth gateways across regions.</p>
+<p><strong>Variant fit:</strong> Flink-style true streaming with event-time windows, RocksDB state, 2PC Kafka sink. Sub-second latency excludes micro-batch. End-to-end exactly-once excludes "at-least-once + dedupe downstream." Custom feature logic (Java/Scala) excludes pure SQL streaming.</p>
+<h3 id="real-time-ml-features-uber-michelangelo-linkedin">Real-time ML features — Uber Michelangelo, LinkedIn</h3>
+<p><strong>Demands:</strong> hundreds of features across hundreds of millions of entities (riders, drivers, members, restaurants). Updates within seconds. Backfill compatibility (a feature must be re-computable from historical events for model training). Feature parity between online and offline computation.</p>
+<p><strong>Variant fit:</strong> Flink or Samza for the online path; the same logic compiled to Beam or Spark for the offline backfill (or unified via Beam from the start). State per feature in RocksDB. Output to a feature store (Feast, Tecton, internal). Heavy emphasis on schema evolution because models change frequently.</p>
+<h3 id="real-time-analytics-pinterest-snapchat-twitter">Real-time analytics — Pinterest, Snapchat, Twitter</h3>
+<p><strong>Demands:</strong> 1M+ events/sec into dashboards showing user engagement, ad performance, content trends. Sub-minute freshness. Many overlapping queries; analysts authoring new ones daily.</p>
+<p><strong>Variant fit:</strong> Flink SQL for the continuous aggregation; results land in Pinot, Druid, or ClickHouse for ad-hoc OLAP queries. Increasingly, Materialize or RisingWave replace the Flink + OLAP split when the queries are stable enough to express as materialized views.</p>
+<h3 id="sessionization-snowplow-web-analytics-platforms">Sessionization — Snowplow, web analytics platforms</h3>
+<p><strong>Demands:</strong> group events into user sessions, closing after configurable idle gaps. Per-session feature computation (pages visited, conversion path, total time). Tolerate late-arriving events (mobile devices go offline).</p>
+<p><strong>Variant fit:</strong> Spark Structured Streaming or Flink with session windows. State size is the dominant concern; aggressive TTL and bounded max session duration are mandatory.</p>
+<h3 id="iot-alerting-tesla-fleet-cloudflare-ddos-detection">IoT alerting — Tesla fleet, Cloudflare DDoS detection</h3>
+<p><strong>Demands:</strong> millions of devices each emitting telemetry. Alert when anomalies exceed thresholds. Per-device state (rolling baselines, recent samples). Tolerate clock skew across devices.</p>
+<p><strong>Variant fit:</strong> Flink with event-time windows + watermark idleness handling for offline devices. Statefun (Flink's stateful functions) or Beam for the per-device state machine. Output to PagerDuty / alerting via idempotent REST writes.</p>
+<h3 id="real-time-leaderboards-gaming-platforms">Real-time leaderboards — gaming platforms</h3>
+<p><strong>Demands:</strong> top-K scoring per game, per region, per time window. Updates within seconds of a score being submitted. Hot keys (one viral game dominates traffic).</p>
+<p><strong>Variant fit:</strong> Flink with two-stage aggregation for hot keys; output to Redis for serving the leaderboard reads. Or Materialize maintaining an incremental "top-100 per game" view, queried via Postgres protocol directly.</p>
+<h3 id="cdc-processing-debezium-flink">CDC processing — Debezium → Flink</h3>
+<p><strong>Demands:</strong> ingest a database's change log (inserts, updates, deletes from Postgres / MySQL via the binlog), stream-process the row changes, materialize derived datasets in a separate store. The "outbox pattern" feeding event-driven services.</p>
+<p><strong>Variant fit:</strong> Debezium reads the database log, publishes to Kafka. Flink consumes the Kafka CDC topic, joins it with reference data, writes to OLAP / OLTP / search index. Variants: Flink SQL with <code>UPSERT-INTO</code> semantics; Materialize natively consumes Debezium and maintains derived views.</p>
+<h3 id="observability-pipelines-netflix-mantis-honeycomb-internal-at-large-companies">Observability pipelines — Netflix Mantis, Honeycomb, internal at large companies</h3>
+<p><strong>Demands:</strong> 10M+ events/sec of operational telemetry (log lines, traces, metric points). Real-time anomaly detection. Cheap storage of the long tail; expensive but fresh derived metrics.</p>
+<p><strong>Variant fit:</strong> Flink/Mantis for the live derivation path. Output to Druid/Pinot for ad-hoc querying. The streaming layer is what converts log lines into the metrics you actually graph.</p>
+<p>The point: it is the same Chandy–Lamport machinery, the same LSM state backend, the same 2PC sink protocol underneath. The product context determines window choice, state shape, and sink class — but the engine class is one.</p>
+<hr>
+<h2 id="26-real-world-implementations-with-numbers">§26. Real-world implementations with numbers</h2>
+<ul>
+<li><strong>Apache Flink at Uber (Michelangelo + AthenaX):</strong> ~10M events/sec across ~200 jobs. ~5,000 TaskManagers. Powers real-time fare estimation, ETA, fraud detection. State in RocksDB; checkpoints to HDFS. Uber publicly describes operating Flink at this scale with sub-second latencies for feature freshness.</li>
+<li><strong>Apache Flink at Alibaba (with the Blink fork → reintegrated upstream):</strong> Singles' Day peak of 583k payments/sec, with Flink jobs aggregating order-stream analytics in real time. Aggregate platform volume is trillions of events per day. Alibaba's optimizations (incremental checkpointing improvements, SQL planner enhancements) were donated back to Apache Flink.</li>
+<li><strong>Apache Flink at Stripe Radar:</strong> real-time evaluation of card-auth events with sub-100ms decision SLOs. Mix of Kafka Streams and custom infrastructure plus Flink for the heavier stateful pipelines.</li>
+<li><strong>Apache Flink at Pinterest:</strong> ~1M events/sec into Flink jobs for real-time recommendations and spam detection. Joined with stream-table lookups against Redis/HBase profile stores.</li>
+<li><strong>Apache Samza at LinkedIn:</strong> originally invented at LinkedIn (Kreps et al.) for stream processing on Kafka. Today LinkedIn runs both Samza and Flink for derived datasets, notifications, feed personalization, anti-abuse, Member Hot Lead Scoring. Trillions of events per day cumulative.</li>
+<li><strong>Netflix Mantis:</strong> streaming platform for operational telemetry. ~10s of millions of events/sec. Real-time anomaly detection across the streaming infrastructure. Uses a Flink-like compute model with Netflix-specific scheduling.</li>
+<li><strong>Apache Spark Structured Streaming at Databricks customers:</strong> the most common micro-batch streaming deployment. Used heavily for ETL-style pipelines where 1-second–1-minute latency is acceptable. Databricks publishes case studies with multi-million-events/sec deployments (e.g., HSBC, Comcast).</li>
+<li><strong>Kafka Streams at Confluent customers:</strong> lighter-weight deployments, typically ~100k events/sec per service instance, embedded in microservices. Common for stateful stream consumers inside service-oriented architectures.</li>
+<li><strong>Materialize at fintechs / SaaS:</strong> incremental SQL views over Kafka, queried via Postgres protocol. Cited deployments at firms like Ramp and several fintechs for real-time risk views and live dashboards. Throughput typically in the 100k–1M events/sec range per cluster.</li>
+<li><strong>RisingWave:</strong> PostgreSQL-protocol streaming database with cloud-native object storage (Hummock storage engine) for state. Newer; growing fast for real-time analytics replacing Flink + OLAP combos. Public benchmarks claim ~1M events/sec per cluster with sub-second latencies.</li>
+<li><strong>Apache Beam:</strong> the portability layer. Heavily used inside Google for Dataflow (the original streaming engine MillWheel was a precursor); externally used to make pipelines portable across Flink, Spark, Dataflow, and Samza runners.</li>
+</ul>
+<p>Different scales, different access patterns, different variants of the same technology class. If a candidate can name three of these with rough scale and the engine variant used, they're already in the top decile.</p>
+<hr>
+<h2 id="27-summary">§27. Summary</h2>
+<blockquote>
+<p><em>Stream processing is the always-on incremental compute layer over event logs: a continuous query graph maintaining keyed state in an LSM-backed local store, with global consistency provided by Chandy–Lamport barriers (Flink) or transactional offset+state+sink commits (Kafka Streams) or deterministic batch IDs (Spark), and end-to-end exactly-once coordinated via 2PC sinks bound to the checkpoint protocol — pick true-streaming (Flink) for sub-second latency and complex windowing, micro-batch (Spark) when you already run Spark and a second of latency is fine, embedded (Kafka Streams) for stateful consumers inside a microservice, and streaming SQL databases (Materialize, RisingWave) when the consumers are analysts; size by event throughput per slot (~30k events/sec/slot for stateful), bound replay by checkpoint interval, defend against hot keys with salting, and remember that the durability point is "checkpoint metadata persisted plus sink-transaction committed" — without both, you have at-least-once at best.</em></p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

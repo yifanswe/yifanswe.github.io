@@ -1,0 +1,1211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Message Queue & Streaming — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/backend-fundamentals/">← Back to Backend Fundamental Components</a>
+        <h1 class="article-title">Message Queue & Streaming</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Backend Fundamental Components
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p>A reference about the <strong>technology class</strong> — durable, asynchronous message transport between producers and consumers — exemplified by Apache Kafka, Apache Pulsar, RabbitMQ, AWS SQS (Simple Queue Service), AWS Kinesis, Google Pub/Sub, NATS JetStream, and the newer S3-native variants (WarpStream, AutoMQ). The reader should finish understanding the design space deeply enough to apply it to any system — payments, click-stream analytics, IoT (Internet of Things) telemetry, CDC (Change Data Capture) pipelines, microservices fan-out — and defend a pick against the obvious alternatives.</p>
+<hr>
+<h2 id="1-what-message-queues-and-distributed-logs-are">§1. What message queues and distributed logs ARE</h2>
+<p>A <strong>message queue</strong> or <strong>distributed log</strong> is a durable, asynchronous transport between producers (who publish records) and consumers (who read records), inserted between two components that would otherwise talk synchronously over RPC (Remote Procedure Call). It buys what synchronous calls cannot: <strong>temporal decoupling</strong> (consumer doesn't need to be up when producer publishes), <strong>fan-out</strong> (one publish, many consumers), and <strong>back-pressure absorption</strong> (publish spikes buffered, not crashing the consumer).</p>
+<p>The category splits into two structurally different primitives that docs and interviews often blur. Get the split right or every later choice is wrong.</p>
+<p><strong>The log model (Kafka, Pulsar, Kinesis).</strong> Broker maintains an <strong>append-only, retained, replayable log per partition</strong>. Producers append; broker never deletes individual records, only whole segments past retention. Consumers track their own read position (the "offset"). Broker doesn't know whether any consumer has read any record — it just holds the tape. Mental model: a replicated <code>tail -f</code> of an event tape. Fan-out is free (N consumer groups each track their own offset). Replay is built-in.</p>
+<p><strong>The queue model (RabbitMQ, SQS, ActiveMQ).</strong> Broker maintains a <strong>per-message state machine</strong> — each record is unacked, in-flight, acked, redelivered, or dead-lettered. On ack, broker deletes the record. Broker tracks delivery; consumer does not track position. Mental model: a shared work-stealing queue with redelivery and per-message routing. Fan-out is expensive (broker replicates into N per-subscriber queues). Replay is generally impossible.</p>
+<p>Both sit between <strong>producer services</strong> (order-service of a payments platform, activity tracker of a social feed, IMU publisher of a vehicle fleet) and <strong>consumer services</strong> (billing pipeline, feed indexer, time-series store). Infrastructure, not application logic — a self-contained broker cluster with a consensus layer for metadata.</p>
+<p><strong>What they are NOT good for:</strong> synchronous request/reply with tight latency budgets (a queue adds a hop + tens of ms — for "must respond &lt; 50 ms" use gRPC); strict global total ordering at high throughput (per-partition is achievable, cross-partition at millions/sec is not); a primary system of record needing point queries (a log is sequential — use a database, let the log be the change stream); tiny scale with rich per-message semantics (50 msg/sec with priority routing + reply-to: Postgres <code>SKIP LOCKED</code> or a single RabbitMQ exchange is simpler than a Kafka cluster).</p>
+<hr>
+<h2 id="2-inherent-guarantees-whats-provided-vs-what-must-be-layered-on">§2. Inherent guarantees — what's provided vs what must be layered on</h2>
+<p><strong>Provided by design:</strong> (1) <strong>Durability for acknowledged writes</strong> — all variants ack only after replication (or fsync, in BookKeeper-backed Pulsar) to enough nodes to survive single-node loss. (2) <strong>Per-partition/per-queue total order</strong> — within one partition or queue, records appear in the order the broker accepted them; cross-partition order is not guaranteed. (3) <strong>At-least-once delivery as the default</strong> — producer retries until ack; consumer commits only after processing; duplicates tolerated, loss is not. (4) <strong>Retention as a first-class concept (logs only)</strong> — records live for N days independent of consumption, enabling replay.</p>
+<p><strong>NOT provided (Staff-level traps):</strong> (1) <strong>Exactly-once without explicit opt-in</strong> — Kafka has a transactional protocol, Pulsar has dedup + cursors, SQS FIFO has a 5-minute dedup window. All require producer + consumer + sink to participate; none give end-to-end exactly-once across an external API call (Stripe, Postgres) without application-level idempotency keys. (2) <strong>Global ordering</strong> — per-partition only; order requirements must be encoded into the partition key (e.g., <code>account_id</code> for ledger events). (3) <strong>Atomicity with external systems</strong> — consumer-read + DB-write is not atomic; outbox or 2PC (Two-Phase Commit) must be layered on. (4) <strong>Schema evolution</strong> — broker doesn't know the payload; a Schema Registry + backward-compatible Avro/Protobuf is required. (5) <strong>Quality of service on shared clusters</strong> — a noisy-neighbor topic saturates broker IO; quotas or per-tenant clusters layered on.</p>
+<p><strong>What the system designer must add:</strong> ack/commit strategy, partition-key strategy, retention policy, schema-evolution policy, dead-letter strategy, replay procedure. A queue or log is not a "magic durable pipe" — it is a substrate; the application architecture is everything else.</p>
+<hr>
+<h2 id="3-the-design-space">§3. The design space</h2>
+<p>Five axes differentiate the named variants. The rest of the space is variation along them.</p>
+<p><strong>Axis 1: Log vs queue (storage model).</strong> Covered in §1. Log: retained segments. Queue: per-message state machine. Fan-out cost differs by orders of magnitude.</p>
+<p><strong>Axis 2: Broker-managed vs peer-to-peer.</strong> Broker-managed (Kafka, Pulsar, RabbitMQ, SQS) — dedicated broker processes own data. Peer-to-peer (NATS Core, gossip-based) — every node is a peer; lower latency, weaker durability. Mostly out of scope here — peer-to-peer is for ultra-low-latency ephemeral telemetry.</p>
+<p><strong>Axis 3: Sync vs async replication.</strong> Sync (Kafka <code>acks=all</code>, Pulsar <code>Qa=Qw</code>) — producer waits for replicas; ~5-15 ms, no loss on single-node failure. Async (Kafka <code>acks=1</code>, RabbitMQ default) — leader acks, replicas catch up later; ~1-3 ms, data-loss window on leader crash. None (<code>acks=0</code>) — fire-and-forget for non-critical telemetry. Pick is workload-driven: payments outbox always sync; click-stream analytics often async; Tesla fleet CAN-bus (Controller Area Network) telemetry sync for fault codes, async-sampled for routine sensor reads.</p>
+<p><strong>Axis 4: Local-disk vs object-storage durability.</strong> Local NVMe + replication (classic Kafka, BookKeeper bookies) — ~1 GB/sec/broker, p99 ~5-15 ms, ~$0.10/GB-month NVMe (Non-Volatile Memory express). Object storage primary (WarpStream, AutoMQ since ~2023) — brokers stateless, durability is S3's 11-nines, p99 ~200 ms (S3 multipart upload), ~$0.023/GB-month, 5-10x cheaper at high retention. This axis emerged after 2022 and is the active frontier of the field.</p>
+<p><strong>Axis 5: Single-cluster vs geo-replicated.</strong> Single cluster across 3 AZs (Availability Zones) is the default. Cross-region active-passive (MirrorMaker 2, Pulsar geo-rep) gives RPO (Recovery Point Objective) on the order of seconds. Cross-region active-active makes conflict resolution a system requirement; Pulsar supports it natively, Kafka requires careful idempotency design.</p>
+<h3 id="comparison-table">Comparison table</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Kafka</th>
+<th>Pulsar</th>
+<th>RabbitMQ</th>
+<th>SQS</th>
+<th>Kinesis</th>
+<th>WarpStream / AutoMQ</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Primitive</td>
+<td>Log</td>
+<td>Log (segregated storage)</td>
+<td>Queue</td>
+<td>Queue</td>
+<td>Log</td>
+<td>Log</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Local disk + replication</td>
+<td>BookKeeper (fsync/entry)</td>
+<td>Memory + optional disk</td>
+<td>Managed</td>
+<td>Managed</td>
+<td>S3</td>
+</tr>
+<tr>
+<td>Throughput / node</td>
+<td>~1 GB/sec</td>
+<td>~1 GB/sec</td>
+<td>~50K msg/sec/queue</td>
+<td>3K msg/sec/queue</td>
+<td>1 MB/sec/shard</td>
+<td>~600 MB/sec, latency-bound</td>
+</tr>
+<tr>
+<td>p99 produce latency</td>
+<td>5-15 ms</td>
+<td>5-15 ms</td>
+<td>1-10 ms</td>
+<td>20-100 ms</td>
+<td>20-50 ms</td>
+<td>200-500 ms</td>
+</tr>
+<tr>
+<td>Replay</td>
+<td>Yes (in retention)</td>
+<td>Yes (tiered storage)</td>
+<td>No</td>
+<td>No</td>
+<td>Yes (24h-365d)</td>
+<td>Yes (S3-native)</td>
+</tr>
+<tr>
+<td>Ordering</td>
+<td>Per-partition</td>
+<td>Per-partition</td>
+<td>Per-queue, single consumer</td>
+<td>None (FIFO variant exists)</td>
+<td>Per-shard</td>
+<td>Per-partition</td>
+</tr>
+<tr>
+<td>Exactly-once</td>
+<td>Idempotent + transactional</td>
+<td>Dedup + cursors</td>
+<td>At-least-once only</td>
+<td>FIFO 5-min dedup</td>
+<td>At-least-once</td>
+<td>Yes (Kafka API)</td>
+</tr>
+<tr>
+<td>Geo-replication</td>
+<td>MirrorMaker 2</td>
+<td>Native multi-cluster</td>
+<td>Federation (limited)</td>
+<td>Cross-region (limited)</td>
+<td>Cross-region streams</td>
+<td>S3 cross-region</td>
+</tr>
+<tr>
+<td>Best fit</td>
+<td>High-throughput event sourcing, replay-heavy</td>
+<td>Multi-tenant, geo-active-active</td>
+<td>Complex routing &lt; 50K/sec</td>
+<td>AWS-native work queues</td>
+<td>AWS streaming &lt; 1 MB/sec/shard</td>
+<td>High-retention, cost-sensitive</td>
+</tr>
+</tbody>
+</table>
+<p>The instinct is <strong>not "Kafka always wins."</strong> Match the workload's throughput, latency, retention, and fan-out shape to a point on this matrix: a payments outbox at 5K events/sec wants RabbitMQ + DLQ simplicity; a click-stream pipeline at 5M events/sec wants Kafka; a multi-tenant SaaS event bus with per-tenant isolation across regions wants Pulsar; a 30-day-retention telemetry archive on a tight budget wants WarpStream.</p>
+<hr>
+<h2 id="4-byte-level-mechanics-the-log-on-disk">§4. Byte-level mechanics — the log on disk</h2>
+<p>This is the section where the depth lives. The Kafka log, since 2010, is the canonical realization of the distributed log primitive; every later log (Pulsar segments, Kinesis shards, S3-native variants) borrows from it. We walk Kafka because it's the most documented.</p>
+<h3 id="4a-segmented-append-only-log-sparse-offset-index">4a. Segmented append-only log + sparse offset index</h3>
+<p>A single partition's on-disk layout:</p>
+<pre><code>/kafka/data/clickstream-page-views-23/        (one directory per partition)
+├── 00000000000000000000.log         closed segment, 1 GB, offsets 0..2_048_000
+├── 00000000000000000000.index       sparse offset → byte position
+├── 00000000000000000000.timeindex   sparse timestamp → offset
+├── 00000000000002048000.log         closed segment, 1 GB
+├── 00000000000002048000.index
+├── 00000000000002048000.timeindex
+├── 00000000000004096000.log         ACTIVE segment, currently appending
+├── 00000000000004096000.index
+├── 00000000000004096000.timeindex
+├── leader-epoch-checkpoint          which epoch took over at which offset
+└── partition.metadata
+</code></pre>
+<p><strong>Segment rotation rule:</strong> when the active segment hits <code>segment.bytes</code> (default 1 GB) or <code>segment.ms</code> (default 7 days), it is closed and a new active segment opens. <strong>Closed segments are immutable.</strong> That immutability is the entire foundation — it enables zero-copy reads, lock-free deletion, lock-free compaction, and tiered-storage offload.</p>
+<p><strong>File naming:</strong> filename is the zero-padded base offset. To locate offset 3,500,000 (e.g., a Tesla fleet telemetry event from 3 weeks ago an analyst wants to replay): (1) binary-search segment filenames → largest base ≤ 3,500,000 is <code>00000000000002048000.log</code>; (2) open sparse <code>.index</code> (one entry per <code>index.interval.bytes</code> = 4 KB, so ~256K entries for 1 GB segment, ~2 MB of index, kept in memory); (3) binary-search index → byte position within ~4 KB of target; (4) scan forward through <code>.log</code> parsing record-batch headers until exact offset.</p>
+<p>The index is <strong>sparse on purpose</strong> — dense index would cost 64 bytes × billions of records, doesn't fit. Sparse + scan-forward gives O(log n) locate at 0.001x the memory cost of dense indexing.</p>
+<h3 id="4b-record-batch-layout">4b. Record batch layout</h3>
+<p>The producer never sends one record at a time on the wire. It accumulates records into batches (default up to 16 KB or <code>linger.ms</code> worth), compresses the batch end-to-end with lz4 / zstd / snappy / gzip, and sends the compressed batch as one unit.</p>
+<pre><code>RecordBatch (one unit on disk):
+┌───────────────────────────────────────────────────────────────────────────┐
+│ baseOffset (8B)        batchLength (4B)        partitionLeaderEpoch (4B)  │
+│ magic (1B)             crc (4B)                attributes (2B)            │
+│   - bits: compression (none|gzip|snappy|lz4|zstd), timestamp type,        │
+│     transactional flag, control batch flag                                │
+│ lastOffsetDelta (4B)   firstTimestamp (8B)     maxTimestamp (8B)          │
+│ producerId (8B)        producerEpoch (2B)      baseSequence (4B)          │
+│ recordsCount (4B)                                                         │
+│ ┌─ compressed body ──────────────────────────────────────────────────┐    │
+│ │  record 0: length, attributes, timestampDelta, offsetDelta,        │    │
+│ │            keyLength, key, valueLength, value, headers             │    │
+│ │  record 1: ...                                                     │    │
+│ └────────────────────────────────────────────────────────────────────┘    │
+└───────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>Things that matter: (1) <strong>Broker stores compressed batch verbatim</strong> — no decompression on hot path; consumer decompresses client-side. This is why one broker sustains ~1 GB/sec — CPU never touches payload. (2) <strong><code>producerId</code> + <code>baseSequence</code></strong> — foundation of idempotent producers. Broker tracks last sequence per (producerId, partition), rejects duplicates. Retries reuse the sequence; broker silently dedups. (3) <strong>CRC (Cyclic Redundancy Check) per batch</strong> — verified on every fetch and replication; detects bit rot, partial writes, network corruption.</p>
+<h3 id="4c-why-this-structure-suits-the-workload-sequential-writes-page-cache-sendfile">4c. Why this structure suits the workload — sequential writes, page cache, sendfile</h3>
+<p>Three properties make this design hit hardware limits rather than software limits.</p>
+<p><strong>Sequential writes.</strong> Every append is to the tail of the active segment. NVMe sequential write hits 3-7 GB/sec — raw device throughput; random writes hit 100-200 MB/sec, 20-50x slower. Even on spinning rust (which LinkedIn ran for years), sequential gives ~200 MB/sec vs ~5 MB/sec random — a 40x gap. <strong>Append-only is the entire reason Kafka can use commodity disk at 1 GB/sec.</strong></p>
+<p><strong>OS page cache as the read cache.</strong> Broker <code>write()</code> puts bytes in kernel page cache and returns immediately. Kernel writeback flushes dirty pages asynchronously (every ~30s via <code>dirty_writeback_centisecs</code>). Pages stay in page cache long after they're durable. <strong>Consumers reading recent offsets</strong> — the dominant pattern, since most consumers are within seconds of the log head — <strong>hit page cache, no disk IO.</strong> 64-256 GB RAM/broker effectively serves a multi-TB hot working set from RAM with no application cache.</p>
+<p><strong><code>sendfile()</code> syscall for zero-copy reads.</strong> Broker doesn't read the file into user-space and write to socket. It calls <code>sendfile(socket_fd, log_fd, &amp;start, length)</code>; kernel copies from page cache directly to socket buffer. Modern NICs DMA (Direct Memory Access) page-cache pages straight to the wire.</p>
+<pre><code>Without sendfile (4 copies): disk → page cache → JVM heap → kernel socket → NIC
+With sendfile (2 copies):    disk → page cache → NIC
+</code></pre>
+<p>2-4x throughput multiplier at essentially zero broker CPU. <strong>Also why Kafka's broker can be JVM (Java Virtual Machine) without GC (Garbage Collection) pressure crushing the hot path</strong> — payload bytes never enter the heap. RabbitMQ cannot do this because it inspects every message to apply routing.</p>
+<h3 id="4d-durability-fsync-vs-replication">4d. Durability: fsync vs replication</h3>
+<p>Three durability points: (1) <strong>Page cache</strong> — <code>write()</code> returns; bytes in kernel memory, not disk. Kernel panic or power loss (no battery-backed cache) loses these. (2) <strong>Replication ack</strong> — followers' Fetch pulls bytes, write to their own page caches; once <code>min.insync.replicas</code> (default 2) ack, leader advances HW (High Watermark) and acks producer. (3) <strong>Disk fsync</strong> — kernel writeback flushes dirty pages, typically every ~30s.</p>
+<p><strong>Kafka's durability invariant is replication-based, not fsync-based.</strong> Default <code>log.flush.interval.messages = Long.MAX_VALUE</code> — Kafka does NOT fsync per write. Argument: correlated loss of leader + ≥1 follower's page cache (3+ machines losing power simultaneously) is rarer than per-broker fsync failure. With 3x replication across 3 AZs and independent power, this is sound.</p>
+<p><strong>Pulsar takes the opposite position.</strong> BookKeeper bookies fsync every entry before acking. Stronger per-node durability, so Pulsar can ack with fewer replicas (<code>Qw=2</code>, <code>Qa=2</code>). Trade-off: ~0.5 ms NVMe fsync, ~5 ms HDD per write.</p>
+<p><strong>Interview trap:</strong> candidates routinely say "Kafka fsyncs every write." It doesn't. For fsync-per-write semantics (financial regulation), set <code>log.flush.interval.messages=1</code> and pay ~10x throughput. Or run Pulsar.</p>
+<h3 id="4e-produce-consume-walkthrough-at-byte-level">4e. Produce + consume walkthrough at byte level</h3>
+<p>Concrete example: payments service writes <code>order_created</code> with key=<code>order_42</code>; fraud-detection consumer (different team) reads it.</p>
+<p><strong>Produce path:</strong>
+- <strong>T0:</strong> producer's <code>send()</code> buffers the record into a 16 KB batch destined for partition 7 (<code>hash(order_42) % 256 = 7</code>); lz4-compressed end-to-end.
+- <strong>T1:</strong> after <code>linger.ms</code> or batch-full, producer sends <code>Produce</code> RPC to broker B-7 (leader of partition 7).
+- <strong>T2:</strong> broker B-7 verifies CRC, appends to active segment via <code>write()</code> at current EOF. Bytes land in page cache; file position advances 16 KB. Adds sparse index entry if cumulative bytes since last index ≥ 4 KB. LEO advances 4,500,000 → 4,500,201 (201 records).
+- <strong>T3:</strong> broker does NOT yet ack — waits for ISR followers.
+- <strong>T4:</strong> followers B-31 and B-88 are long-polling <code>Fetch</code> from B-7. Next Fetch returns the batch; each follower <code>write()</code>s to its own active segment and sends a follow-up Fetch with <code>fetchOffset=4,500,201</code>, implicitly acking.
+- <strong>T5:</strong> B-7 sees both caught up; advances HW (High Watermark) 4,500,000 → 4,500,201. HW is the offset up to which records are "committed" — replicated to all ISR.
+- <strong>T6:</strong> B-7 acks producer; ~5 ms elapsed total.
+- <strong>T7 (async, ~30s later):</strong> kernel writeback daemon fsyncs dirty pages from page cache to NVMe. <strong>Disk durability achieved here, not at T2.</strong></p>
+<p><strong>What survives a crash at each step:</strong>
+- <strong>At T2 (mid-write):</strong> producer didn't get ack, retries. On restart, broker scans active segment, finds partial batch at tail (CRC fails), truncates back to last fully-written record boundary. Idempotent producer dedups the retry.
+- <strong>At T5 (leader before HW advances):</strong> producer didn't get ack. KRaft controller elects new leader from ISR (say B-31, which got the batch at T4). Producer retries against new leader; idempotent producer dedups.
+- <strong>At T6 (after ack, before T7 fsync):</strong> data in page cache on all three brokers. Simultaneous power loss on all three (regional disaster) would lose it. With 3 AZ independent power, this is the "regional event" failure mode — accepted.</p>
+<p><strong>Consume path:</strong>
+- <strong>T0:</strong> consumer sends <code>Fetch</code> RPC: partition=7, <code>fetchOffset=4,500,000</code>, <code>maxBytes=1 MB</code>, <code>maxWait=500ms</code>, <code>minBytes=1 KB</code>.
+- <strong>T1:</strong> broker binary-searches segment filenames: 4,500,000 ≥ base offset 4,096,000 → segment <code>00000000000004096000.log</code>.
+- <strong>T2:</strong> broker reads sparse <code>.index</code>: largest indexed offset ≤ 4,500,000 is 4,499,840 at byte position 67,108,000.
+- <strong>T3:</strong> broker computes byte range: start=67,108,000 (aligned to batch boundary), length=min(1 MB, HW-fetchOffset).
+- <strong>T4:</strong> broker calls <code>sendfile(socket_fd, log_fd, &amp;start, length)</code>. Kernel reads pages from page cache → DMA to NIC → wire. <strong>Bytes never enter JVM heap. ~0.3 ms broker CPU.</strong>
+- <strong>T5:</strong> consumer receives ~1 MB of compressed batches; for each batch: verify CRC, lz4 decompress, iterate records from fetchOffset, hand to application.
+- <strong>T6:</strong> consumer processes records.
+- <strong>T7:</strong> consumer commits new offset to <code>__consumer_offsets</code> topic via <code>OffsetCommit</code> RPC to group coordinator (hash <code>group.id</code> to broker). Coordinator writes <code>(group, topic, partition) → offset</code> into <code>__consumer_offsets</code>.
+- <strong>T8 (crash between T6 and T7):</strong> on restart, consumer re-fetches from last committed offset (4,500,000) and re-processes records. <strong>At-least-once. Idempotent processor must dedupe.</strong></p>
+<p>CPU cost on the broker for serving a 1 MB consume is ~0.3 ms (binary search + sendfile); disk + network dominate. <strong>A single broker on a 25 Gbps NIC can serve ~3 GB/sec of consumer fan-out</strong> before NIC saturation. This is why fan-out is "free" — adding a 10th consumer group costs zero IO unless they read the same hot offsets simultaneously.</p>
+<h3 id="4f-log-compaction-the-lsm-tree-ish-primitive">4f. Log compaction — the LSM-tree-ish primitive</h3>
+<p>For topics with <code>cleanup.policy=compact</code> (state snapshots — CDC of current row state, <code>__consumer_offsets</code> itself, feature-store online caches), a background log cleaner scans closed segments and produces a new segment keeping only the <strong>latest</strong> value per key. Tombstones (null-value records) signal deletion. Cleaner builds an in-memory hash map of <code>key → latest_offset</code>, rewrites segments, atomically swaps old segments out. Throttled by <code>log.cleaner.io.max.bytes.per.second</code>. This is the LSM (Log-Structured Merge) tree-like primitive baked into Kafka, but only for compacted topics. Most production topics use <code>cleanup.policy=delete</code> (delete whole segments past retention).</p>
+<h3 id="4g-tiered-storage-offloading-cold-segments-to-s3">4g. Tiered storage — offloading cold segments to S3</h3>
+<p>Closed segments older than <code>local.retention.ms</code> (e.g., 24h) are uploaded to S3 / HDFS / Azure Blob. Broker keeps only the local <code>.index</code> + metadata pointer; the <code>.log</code> lives in object storage. Consumer requesting an old offset: broker checks local first (~5 ms sendfile path); if not, ranged <code>GetObject</code> from S3 proxied to consumer (~100-200 ms, storage cost drops 10x). This is the bridge to S3-native designs (WarpStream, AutoMQ) that push the broker stateless and S3 to be the durable layer end-to-end. Trade-off: ~200 ms p99 produce latency vs ~5-15 ms on local disk.</p>
+<hr>
+<h2 id="5-producer-side-mechanics-the-half-of-the-protocol-clients-implement">§5. Producer-side mechanics — the half of the protocol clients implement</h2>
+<p>The broker is one half of the system; the producer client is the other half, and most of the "exactly-once," "lossless," and "high-throughput" guarantees the broker advertises depend on the producer being configured correctly. A naively configured <code>KafkaProducer</code> is fire-and-forget; a properly configured one is a small distributed protocol with its own state machine. This section covers the four knobs that must be known cold: idempotent producer, transactional producer, batching, compression, and <code>acks</code>.</p>
+<h3 id="5a-idempotent-producer-broker-side-dedup-via-pid-sequence-number">5a. Idempotent producer — broker-side dedup via PID + sequence number</h3>
+<p>Default Kafka producers, on a network blip, retry the same record. Without protection, broker writes the duplicate; payments customer charged twice (§18.1). The idempotent producer (added in Kafka 0.11, 2017) closes this hole at the broker side.</p>
+<p><strong>Protocol.</strong> On startup, the producer client sends <code>InitProducerId</code> to a broker (transaction coordinator). The broker assigns a unique <strong>PID (Producer ID, 64-bit)</strong> and <strong>producer epoch (16-bit, zeroed for non-transactional)</strong>. The producer then maintains a <strong>monotonically increasing sequence number per (PID, partition)</strong> and stamps every record-batch header with <code>producerId</code>, <code>producerEpoch</code>, <code>baseSequence</code> (§4b shows the field layout).</p>
+<p>Broker-side state: for each (PID, partition), it tracks the last 5 sequence numbers it accepted (configurable via <code>max.in.flight.requests.per.connection</code>, default 5). On every incoming Produce request:
+- If <code>incoming.sequence == lastSequence + 1</code> → accept and append.
+- If <code>incoming.sequence &lt;= lastSequence</code> (and within the 5-slot window) → <strong>duplicate</strong>, return success but do NOT append again. Producer's view: the retry "succeeded."
+- If <code>incoming.sequence &gt; lastSequence + 1</code> → <strong>out-of-order</strong>, return <code>OutOfOrderSequenceException</code>. Producer must reset and re-establish state.</p>
+<pre><code>Producer state machine (idempotent):
+   ┌─────────────────┐
+   │  Init           │── InitProducerId ──&gt; Broker assigns PID=12345, epoch=0
+   │  PID=12345      │
+   │  epoch=0        │
+   │  seq[part-7]=0  │
+   └────────┬────────┘
+            │ send(record_A)  → batch{PID:12345, epoch:0, baseSeq:0, ...}
+            ▼
+   ┌─────────────────┐
+   │  In-flight      │   network blip; no ack received
+   │  seq=0,1,2,3,4  │
+   └────────┬────────┘
+            │ retry batch{baseSeq:0}  → broker sees seq 0 already, returns success silently
+            ▼
+   ┌─────────────────┐
+   │  Acked          │   producer thinks &quot;first attempt succeeded&quot;
+   │  seq[part-7]=5  │
+   └─────────────────┘
+</code></pre>
+<p><strong>Cost.</strong> Practically free — one ID assignment per producer-process lifetime, ~24 bytes of metadata per record batch (PID + epoch + baseSequence). Broker-side state is bounded: 5 sequence numbers × ~1M PIDs × ~1K partitions = few MB. <strong>Why is it not the default?</strong> Historically it cost throughput because it forced <code>max.in.flight.requests.per.connection=1</code>; KIP-360 (2.5+) allows up to 5 in-flight with sequence-number-based reordering. Modern guidance: <code>enable.idempotence=true</code> is the production default. Confluent has made it the implicit default since 3.0.</p>
+<p><strong>What it does NOT give you.</strong> Idempotent producer dedups <em>within a single producer's lifetime, per partition</em>. It does not span producer restarts (new PID), does not span partitions (writes spanning P-7 and P-42 can each succeed independently), and does not give exactly-once into external sinks. For those, you need transactions.</p>
+<h3 id="5b-transactional-producer-atomic-writes-across-partitions-and-topics">5b. Transactional producer — atomic writes across partitions and topics</h3>
+<p>The use case: in §18.1's payments flow, the consumer reads <code>payment.request</code>, writes <code>payment.charged</code> to one topic, writes <code>ledger.entry</code> to another, then commits the source offset. If any of these three writes happens without the others, books are inconsistent. Transactional producers (Kafka 0.11+) wrap multi-partition, multi-topic writes plus consumer-offset commits in one atomic unit.</p>
+<p><strong>Protocol</strong> (two-phase commit with the <strong>transaction coordinator</strong> broker as TC):</p>
+<pre><code>Phase 0: Producer registers transactional.id=&quot;payments-tx-7&quot;
+   Producer ──InitProducerId(transactional.id)──&gt; TC
+   TC: looks up persistent (txid → PID, epoch) mapping in __transaction_state topic.
+       If exists: increment epoch (fencing — older zombie producer with prior epoch is dead).
+       Returns (PID=12345, epoch=2) to producer.
+
+Phase 1: Producer.beginTransaction()
+   Producer ──AddPartitionsToTxn([orders-7, ledger-13])──&gt; TC
+   TC: writes &quot;ongoing transaction includes orders-7, ledger-13&quot; to __transaction_state.
+
+Phase 2: Producer sends data
+   Producer ──Produce(orders-7, batch{PID:12345, epoch:2, isTxn:true})──&gt; broker B-7
+   Producer ──Produce(ledger-13, batch{PID:12345, epoch:2, isTxn:true})──&gt; broker B-23
+   Producer ──AddOffsetsToTxn(consumer-group=&quot;payments-cg&quot;)──&gt; TC
+   Producer ──SendOffsetsToTxn(payments-cg, payment-requests-3 → offset 5000)──&gt; TC
+
+Phase 3: Producer.commitTransaction()
+   Producer ──EndTxn(commit=true)──&gt; TC
+   TC writes &quot;PREPARE_COMMIT&quot; to __transaction_state (durable decision point).
+   TC writes COMMIT_MARKER (control record, isTxn=true, commit=true)
+       to orders-7 and ledger-13 and __consumer_offsets.
+   TC writes &quot;COMPLETE_COMMIT&quot; to __transaction_state.
+
+Phase 4: Cleanup
+   Consumer with isolation.level=read_committed will only see records
+   up to the latest COMMIT_MARKER for each partition.
+   Records past an ABORT_MARKER are skipped client-side (LSO &lt; HW).
+</code></pre>
+<p><strong>LSO (Last Stable Offset)</strong> is the new high watermark for transactional consumers: the highest offset at which <strong>no in-progress transaction</strong> exists below. Consumers with <code>isolation.level=read_committed</code> only read up to LSO; <code>read_uncommitted</code> reads up to HW (pre-existing behavior). Records inside aborted transactions are streamed to the consumer but <strong>filtered client-side</strong> using the broker-side aborted-transaction index — no broker-side rewriting of the log.</p>
+<p><strong>Producer fencing via epoch.</strong> The "zombie producer" problem: producer A starts a transaction, hangs (long GC pause), Kubernetes restarts the pod as producer A'. If both keep writing, you have two parallel transactions claiming the same <code>transactional.id</code>. Solution: TC bumps the epoch on every <code>InitProducerId(txid)</code>. Producer A' gets epoch=3; producer A still has epoch=2. When A's pause ends and it sends batches with epoch=2, broker rejects with <code>InvalidProducerEpochException</code>. <strong>A's transaction is forcibly aborted.</strong></p>
+<p><strong>Cost.</strong> ~50-100 ms added latency per transaction (two extra round-trips to TC, plus marker writes), ~3-5x throughput reduction vs non-transactional for small transactions. Amortize by <strong>batching many records into one transaction</strong> — Kafka Streams's default is one transaction per 100 ms commit interval. Don't open one transaction per record.</p>
+<p><strong>What it does NOT give you.</strong> Transactional producers give exactly-once <em>into Kafka topics and offsets</em>. They do NOT extend to external sinks (Postgres, Stripe API). For end-to-end exactly-once to those, you need either (a) idempotency keys at the external boundary (Stripe accepts <code>Idempotency-Key</code> header) or (b) the consumer must implement its own dedup table.</p>
+<h3 id="5c-batching-lingerms-and-batchsize">5c. Batching — <code>linger.ms</code> and <code>batch.size</code></h3>
+<p>A producer that sends one record per <code>send()</code> call hits the network 100K times/sec at 100K msg/sec. Each network round trip is ~0.5-2 ms of RPC overhead, ~50-100 bytes of TCP/Kafka header per record-batch envelope. <strong>Batching is the entire reason Kafka producers scale.</strong></p>
+<p>Two interacting knobs:
+- <strong><code>batch.size</code></strong> (default 16 KB) — maximum bytes per batch destined to one partition. When a batch fills, it ships immediately, regardless of time.
+- <strong><code>linger.ms</code></strong> (default 0) — how long to wait for more records to fill the batch before sending. <code>linger.ms=0</code> ships the first record immediately (no batching benefit unless multiple sends happen within one TCP RTT). <code>linger.ms=10</code> waits up to 10 ms for more records.</p>
+<pre><code>Latency vs throughput tradeoff:
+
+   linger.ms=0,  batch.size=16KB        linger.ms=20, batch.size=64KB
+   ─────────────────────────────         ─────────────────────────────
+   p50 produce:    2 ms                  p50 produce:   22 ms
+   p99 produce:    8 ms                  p99 produce:   28 ms
+   throughput:    50 MB/sec/producer     throughput:   800 MB/sec/producer
+   network RPCs:  hundreds/sec           network RPCs:  tens/sec
+   compression:   poor (small batches)   compression:   strong (large batches)
+</code></pre>
+<p><strong>Rule of thumb by domain.</strong> Payments outbox (small volume, latency-sensitive): <code>linger.ms=0</code>, <code>batch.size=16KB</code>. Click-stream analytics (firehose, latency-tolerant): <code>linger.ms=20-50</code>, <code>batch.size=128KB-1MB</code>. CDC pipelines (sustained mid-throughput, ordered): <code>linger.ms=5-10</code>, <code>batch.size=64KB</code>. Tesla telemetry (high-volume burst): <code>linger.ms=10</code>, <code>batch.size=256KB</code>, with batch-per-key when one car is hot.</p>
+<p>Internally, the producer maintains a <code>RecordAccumulator</code> — one buffer per (topic, partition) up to <code>buffer.memory</code> (default 32 MB) total. The <code>Sender</code> thread polls accumulators, picks batches that are full OR have aged past <code>linger.ms</code>, and ships them to brokers grouped by destination broker (one <code>ProduceRequest</code> per broker, containing batches for all partitions led by that broker). This is why partition count multiplies producer memory needs: 1000 partitions = up to 1000 batches = potentially 16 GB if all fill. <code>buffer.memory</code> is a hard cap; once full, <code>send()</code> blocks for <code>max.block.ms</code>.</p>
+<h3 id="5d-compression-gzip-vs-lz4-vs-zstd-vs-snappy">5d. Compression — gzip vs lz4 vs zstd vs snappy</h3>
+<p>Batches are compressed end-to-end by the producer (broker stores compressed, consumer decompresses — §4b). Choice trades CPU for ratio for latency.</p>
+<table>
+<thead>
+<tr>
+<th>Codec</th>
+<th>Ratio (typical JSON)</th>
+<th>Compress CPU</th>
+<th>Decompress CPU</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>none</strong></td>
+<td>1.0x</td>
+<td>0</td>
+<td>0</td>
+<td>Only for tiny / pre-compressed payloads (Protobuf, encrypted)</td>
+</tr>
+<tr>
+<td><strong>snappy</strong></td>
+<td>~2-3x</td>
+<td>very fast</td>
+<td>very fast</td>
+<td>Google's default; lowest CPU overhead; smallest ratio</td>
+</tr>
+<tr>
+<td><strong>lz4</strong></td>
+<td>~2-3x</td>
+<td>fastest</td>
+<td>fastest</td>
+<td>The Kafka default since 2.1; ~10% better ratio than snappy at similar CPU</td>
+</tr>
+<tr>
+<td><strong>gzip</strong></td>
+<td>~5-7x</td>
+<td>slow (~10x lz4)</td>
+<td>medium</td>
+<td>Best ratio, worst CPU; rare in modern Kafka</td>
+</tr>
+<tr>
+<td><strong>zstd</strong></td>
+<td>~4-6x</td>
+<td>medium</td>
+<td>fast</td>
+<td>Sweet spot since 2.1: 80% of gzip's ratio at 3-5x its CPU; <strong>the default recommendation</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>At scale, compression dominates broker cost.</strong> Cloudflare's edge log shipping (mentioned §24) was reportedly 10-15% of edge CPU before they moved from gzip to zstd; post-migration, it dropped to ~3-4%. Same wire bytes, much less producer CPU. <strong>And because the broker stores compressed batches verbatim</strong>, choosing zstd over lz4 makes the <em>broker disk footprint smaller</em>, which compounds — storage cost is dominated by retention × ingest rate × replication factor (§24).</p>
+<p><strong>Caveat:</strong> if payload is already compressed (gzipped HTTP body, JPEG, Protobuf with packed fields), additional compression buys nothing and burns CPU. Default to <code>none</code> in those cases.</p>
+<h3 id="5e-acks-the-durability-dial">5e. <code>acks</code> — the durability dial</h3>
+<p>The single most consequential producer config. Three settings, wildly different semantics:</p>
+<ul>
+<li><strong><code>acks=0</code> (fire-and-forget).</strong> Producer doesn't wait for broker ack. ~0.1-0.5 ms send latency. <strong>Loss on broker crash mid-write is silent.</strong> Use only for telemetry that's tolerant to small loss windows (metrics scraping, tracing samples, video playback heartbeats).</li>
+<li><strong><code>acks=1</code> (leader-only).</strong> Producer waits until leader has appended to its local log (page cache). ~1-3 ms latency. <strong>Data-loss window:</strong> if leader crashes after acking but before followers replicate, batch is lost. Per partition, this hits ~0.001% of writes under steady-state failures, possibly more during rolling restarts. Use for analytics workloads (click-stream §23) where 0.001% loss is acceptable.</li>
+<li><strong><code>acks=all</code> (full ISR).</strong> Producer waits until <code>min.insync.replicas</code> followers have caught up. ~5-15 ms latency. <strong>No loss tolerable under any single-node failure</strong>, and with <code>min.insync.replicas=2</code> + RF=3, can tolerate one broker loss and still serve writes. Default for payments, CDC, ledgers, audit logs.</li>
+</ul>
+<p><strong><code>min.insync.replicas</code> interaction.</strong> A common bug: set <code>acks=all</code> but leave <code>min.insync.replicas=1</code>. Now <code>acks=all</code> means "ack when the leader's lone ISR has replicated" — but the leader IS the ISR if all followers fell behind. <strong>Effectively degenerates to <code>acks=1</code> with no warning.</strong> LinkedIn standard: <code>acks=all</code>, <code>min.insync.replicas=2</code>, RF=3. Tolerates one broker loss without write outage; refuses writes if two brokers down (rather than silently lose durability).</p>
+<p><strong><code>acks=all</code> failure mode: write unavailability.</strong> If 2 of 3 ISR brokers are down and <code>min.insync.replicas=2</code>, the leader rejects writes with <code>NotEnoughReplicasException</code>. Producer-side: retry or fail. <strong>This is by design</strong> — better to fail loud than silently accept writes the system can't durably store. The "unclean leader election" knob (§11c) is the escape hatch when uptime trumps durability.</p>
+<hr>
+<h2 id="6-consumer-rebalancing-eager-vs-cooperative-incremental-static-membership-offset-commit-strategies">§6. Consumer rebalancing — eager vs cooperative incremental, static membership, offset commit strategies</h2>
+<p>The consumer group protocol is where most production Kafka outages originate. The protocol is conceptually simple — N consumers, M partitions, assign partitions to consumers, when membership changes redistribute — but the realization is a state machine with surprising latency cliffs.</p>
+<h3 id="6a-eager-rebalancing-the-legacy-default-pre-24">6a. Eager rebalancing (the legacy default, pre-2.4)</h3>
+<p>Before KIP-429 (Kafka 2.4, 2020), the only rebalance protocol was <strong>eager rebalancing</strong>, also called "stop-the-world." The protocol:</p>
+<pre><code>Eager rebalance, 64 consumers, 256 partitions:
+T0: C5 leaves the group (deploy, crash, GC pause beyond session.timeout.ms).
+T1: Group coordinator broadcasts &quot;rebalance starting&quot; to ALL 64 consumers.
+T2: EVERY consumer (not just C5) revokes its current 4 partitions, commits offsets, returns.
+T3: Coordinator collects &quot;joins&quot; from all 64; chooses one as leader.
+T4: Group leader runs PartitionAssignor; produces new (consumer → partitions) map.
+T5: Coordinator broadcasts new assignments to all 64.
+T6: Each consumer resumes consumption on its new assignments.
+
+Total stop-the-world: T2 → T6 ~ 3-10 seconds, ALL consumers idle.
+At 1M msg/sec, that's 3-10M messages of lag building up.
+</code></pre>
+<p>The pathology compounds when consumers join one-at-a-time during a rolling deploy: 64 separate rebalances of 5 seconds each = 320 seconds (5+ minutes) of intermittent stalls. <strong>This was the dominant operational pain at LinkedIn through ~2018.</strong></p>
+<h3 id="6b-cooperative-incremental-rebalancing-cooperativestickyassignor-24">6b. Cooperative incremental rebalancing (<code>CooperativeStickyAssignor</code>, 2.4+)</h3>
+<p>KIP-429 introduced cooperative incremental rebalancing — only consumers losing partitions pause, others continue.</p>
+<pre><code>Cooperative rebalance, 64 consumers, 256 partitions, C5 leaves:
+T0: C5 leaves.
+T1: Coordinator notifies all 64 of rebalance.
+T2: Each consumer reports its CURRENT assignments back.
+T3: Group leader computes new assignment based on prior assignments,
+    aiming to MINIMIZE movement (sticky principle).
+T4: Each consumer receives instruction:
+    &quot;C18 and C42, revoke partitions P-200 and P-201 (formerly C5's).&quot;
+    The other 62 consumers receive: &quot;no change, continue.&quot;
+T5: C18 and C42 revoke; THE OTHER 62 NEVER PAUSED. Coordinator reassigns.
+T6: C18 and C42 receive new partitions; consume resumes.
+
+Stop-the-world for 62/64 consumers: 0 ms.
+Stop-the-world for the 2 reassigned consumers: ~100-300 ms.
+</code></pre>
+<p>Configuration: set <code>partition.assignment.strategy = org.apache.kafka.clients.consumer.CooperativeStickyAssignor</code> (also available: <code>RangeAssignor</code>, <code>RoundRobinAssignor</code>, <code>StickyAssignor</code> — the latter is sticky but still eager). Migration to cooperative requires a rolling restart through a hybrid period; Kafka 3.0+ defaults to including the cooperative protocol but not preferring it. <strong>Stateful consumers (Kafka Streams) benefit most</strong> — local state for old partitions doesn't have to be rebuilt.</p>
+<h3 id="6c-static-group-membership-surviving-rolling-restarts-without-rebalance">6c. Static group membership — surviving rolling restarts without rebalance</h3>
+<p>The default protocol treats every consumer (re)connection as a new member with a fresh <code>member.id</code>. A rolling restart of 64 consumers triggers 64 rebalances (one per restart). KIP-345 (Kafka 2.3+) introduced <strong>static membership</strong> via <code>group.instance.id</code>:</p>
+<pre><code>Without static membership:
+   C5 restarts ─&gt; coordinator sees member 'consumer-3a7f' leave (new memberId on rejoin)
+   ─&gt; rebalance (3-10 seconds for eager, 100ms for cooperative).
+
+With group.instance.id=&quot;payments-cg-worker-5&quot;:
+   C5 restarts ─&gt; coordinator sees instance &quot;worker-5&quot; reconnect within session.timeout.ms
+   ─&gt; matches by group.instance.id, restores PRIOR assignments
+   ─&gt; NO REBALANCE TRIGGERED.
+</code></pre>
+<p>Caveat: <code>session.timeout.ms</code> (default 45s) is the budget for restart. If the consumer takes longer (slow JVM warmup, k8s pull from cold registry), session expires and rebalance triggers normally. Production guidance: bump <code>session.timeout.ms</code> to ~5 minutes for stateful consumers, ensuring restarts complete within the window.</p>
+<p>LinkedIn standard for stream processors: static membership + <code>session.timeout.ms=300000</code> (5 min) + cooperative incremental. Combined, this eliminates ~95% of rebalance pauses observed pre-2020.</p>
+<h3 id="6d-offset-commit-strategies-auto-vs-sync-vs-async-at-least-once-vs-at-most-once">6d. Offset commit strategies — auto vs sync vs async, at-least-once vs at-most-once</h3>
+<p>How the consumer tells the broker "I've processed up to offset X" determines the semantic guarantees of the whole pipeline. Three strategies, four semantic regimes.</p>
+<p><strong><code>enable.auto.commit=true</code> (default).</strong> Background thread commits the current consumer position every <code>auto.commit.interval.ms</code> (default 5 seconds). <strong>Hidden trap:</strong> the commit happens whether or not the records were <em>successfully processed</em>. If a consumer crashes 4 seconds in (between commits), the offsets are committed for records that were <code>poll()</code>d but not processed — <strong>silent at-most-once data loss</strong>. Worse, the application logic doesn't see this as an error.</p>
+<p><strong>Sync commit (<code>consumer.commitSync()</code>).</strong> Application explicitly calls <code>commitSync()</code> after processing each batch. Blocks until broker acks; throws on failure. Strong at-least-once: a crash post-commit replays nothing; a crash pre-commit replays the last batch. Latency cost: ~5-10 ms per commit. At 1M msg/sec processing through a 100-consumer fleet, that's manageable if commits happen per-batch (not per-record).</p>
+<p><strong>Async commit (<code>consumer.commitAsync()</code>).</strong> Application calls <code>commitAsync()</code> after processing; commit happens in background with callback. Lowest commit latency, but the callback must handle failures — if a commit fails and is never retried, the next commit will overwrite, losing the in-between processing window. Standard pattern: <strong><code>commitAsync()</code> after each batch, <code>commitSync()</code> only at shutdown / partition revocation</strong> (so the final state is durable).</p>
+<p><strong>Manual offset storage (consumer-side).</strong> For exactly-once into a non-Kafka sink (Elasticsearch, MySQL), the consumer writes the offset alongside the data in the SAME transaction in the external store. On restart, consumer reads the offset from the external store, calls <code>consumer.seek(offset)</code>. Now offsets and data are atomic with the external store; Kafka's <code>__consumer_offsets</code> is bypassed.</p>
+<p><strong>Semantic table:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Commit pattern</th>
+<th>After ack?</th>
+<th>Crash here ⇒</th>
+<th>Semantic</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>commitSync()</code> BEFORE processing</td>
+<td>n/a</td>
+<td>Reprocess never, lose the batch</td>
+<td><strong>At-most-once</strong></td>
+</tr>
+<tr>
+<td><code>commitSync()</code> AFTER processing</td>
+<td>Yes</td>
+<td>Reprocess once on restart</td>
+<td><strong>At-least-once</strong> (default)</td>
+</tr>
+<tr>
+<td><code>commitSync()</code> AFTER processing + idempotent consumer</td>
+<td>Yes</td>
+<td>Reprocess but idempotent dedup</td>
+<td><strong>Effectively exactly-once</strong></td>
+</tr>
+<tr>
+<td>External store atomic write + offset</td>
+<td>Yes</td>
+<td>External store source of truth</td>
+<td><strong>Exactly-once across sink</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>The rule:</strong> commits committed <em>before</em> processing = at-most-once (data loss). Commits <em>after</em> processing = at-least-once (duplicates). Exactly-once requires either transactional producer (§5b) OR external-store atomic commit. There is no "just enable exactly-once" knob.</p>
+<hr>
+<h2 id="7-schema-registry-and-data-evolution">§7. Schema Registry and data evolution</h2>
+<p>A Kafka broker has no idea what's in the byte arrays it routes. The payload is opaque bytes — a deliberate design choice (zero-copy reads depend on the broker never inspecting bytes). This is liberating until the day a producer team deploys a new schema and breaks every consumer. The Schema Registry exists to make that impossible.</p>
+<h3 id="7a-the-problem-the-deploy-producer-break-consumers-disaster">7a. The problem — the "deploy producer, break consumers" disaster</h3>
+<p>Day 1: producer publishes <code>{"user_id": 7, "event_type": "click", "url": "/foo"}</code> as JSON to topic <code>clicks</code>. All five consumer services parse with their hand-coded JSON deserializer.</p>
+<p>Day 30: producer team adds <code>referrer</code> field, accidentally removes <code>url</code> (renamed to <code>path</code>). The producer deploys at 2am. By 2:05am, every consumer is throwing <code>NullPointerException</code> on <code>event.url</code>. The consumer teams have no idea what changed; the producer team thought it was a minor rename. <strong>5 services down for 4 hours while engineering hunts for the root cause.</strong></p>
+<p>A schema registry would have rejected the producer's schema registration at deploy time because removing a field violates backward compatibility. The bug is caught at the build step, not in production.</p>
+<h3 id="7b-confluent-schema-registry-architecture">7b. Confluent Schema Registry — architecture</h3>
+<p>The Confluent Schema Registry (open-source, also Apicurio, Pulsar's built-in schema service, AWS Glue Schema Registry) is a small REST service backed by a Kafka topic (<code>_schemas</code>) for durability. It stores <strong>versioned schemas</strong> for <strong>subjects</strong> (typically <code>&lt;topic-name&gt;-value</code> and <code>&lt;topic-name&gt;-key</code>).</p>
+<pre><code>Producer write path with Schema Registry:
+   1. Producer has Avro/Protobuf/JSON-Schema definition for record class.
+   2. On first send, producer calls SR: registerSchema(subject=&quot;clicks-value&quot;, schema=...).
+      SR validates against compatibility mode; if OK, persists, returns schema ID (32-bit int).
+      Schema ID is cached in producer JVM forever.
+   3. Producer serializes record:
+      ┌─────────────────────────────────────────────────────────┐
+      │ magic_byte (1B = 0x00) │ schema_id (4B) │ Avro payload  │
+      └─────────────────────────────────────────────────────────┘
+   4. Producer ships to broker. Broker stores opaque bytes — has no idea Avro is in there.
+
+Consumer read path:
+   1. Consumer reads byte array from Kafka.
+   2. Parse first 5 bytes: magic byte = 0x00, schema_id = 12345.
+   3. Look up schema 12345 in SR (cached). Returns the Avro schema definition.
+   4. Avro deserializer uses schema to decode binary payload into a record object.
+</code></pre>
+<p>The "magic byte + schema ID + payload" format is the <strong>wire format convention</strong>, not a Kafka protocol feature — schema IDs are inserted into the user's bytes. Any client supporting the convention can interoperate (most languages have Confluent serializer libraries).</p>
+<h3 id="7c-compatibility-modes-the-rules-that-prevent-disasters">7c. Compatibility modes — the rules that prevent disasters</h3>
+<p>Schema Registry enforces a <strong>compatibility mode</strong> per subject. When a new schema is registered, SR checks it against the existing latest (or all previous) schemas and rejects incompatible changes at the API call. The producer can't even publish until the schema is accepted.</p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>What's allowed (in new schema)</th>
+<th>Use when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>BACKWARD</strong></td>
+<td>Delete fields. Add fields with defaults.</td>
+<td><strong>Default</strong> — consumers upgrade first, then producers. The most common Kafka pattern.</td>
+</tr>
+<tr>
+<td><strong>FORWARD</strong></td>
+<td>Add fields. Delete fields with defaults.</td>
+<td>Producers upgrade first, then consumers. Rare.</td>
+</tr>
+<tr>
+<td><strong>FULL</strong></td>
+<td>Both BACKWARD and FORWARD constraints.</td>
+<td>Mixed upgrade order; safest, most restrictive.</td>
+</tr>
+<tr>
+<td><strong>NONE</strong></td>
+<td>Anything.</td>
+<td>Never use in prod.</td>
+</tr>
+<tr>
+<td><strong>BACKWARD_TRANSITIVE / FORWARD_TRANSITIVE / FULL_TRANSITIVE</strong></td>
+<td>Compare against ALL prior schemas, not just latest.</td>
+<td>When old consumers can't be guaranteed to upgrade.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="7d-walk-through-backward-compatible-schema-evolution">7d. Walk-through: backward-compatible schema evolution</h3>
+<p>Starting schema (Avro, v1):</p>
+<pre><code>record ClickEvent {
+  long user_id;
+  string event_type;
+  string url;
+}
+</code></pre>
+<p><strong>Bad change (rejected):</strong> rename <code>url</code> to <code>path</code>. This is <strong>delete <code>url</code> + add required <code>path</code></strong>. Old consumers reading new data crash on missing <code>url</code>. <strong>Compatibility violation; SR rejects at registration.</strong></p>
+<p><strong>Good change (accepted):</strong> add an optional <code>referrer</code> field with default.</p>
+<pre><code>record ClickEvent {
+  long user_id;
+  string event_type;
+  string url;
+  union {null, string} referrer = null;  // new field with default
+}
+</code></pre>
+<p>This is BACKWARD-compatible:
+- Old consumer (using v1) reading new producer's (v2) data: Avro deserializer with v1 schema skips the <code>referrer</code> field (not in v1, but Avro can read v2-written-with-v1-schema because the v1 reader uses its own schema for projection). <strong>Old consumer continues to work, ignoring <code>referrer</code>.</strong>
+- New consumer (v2) reading old producer's (v1) data: <code>referrer</code> field absent in payload, default value <code>null</code> used. <strong>New consumer works on old data.</strong></p>
+<p><strong>Migration order:</strong> upgrade consumers to v2 first (they can read both v1 and v2 messages). Then upgrade producers to v2 (now publishing referrer). No outage window.</p>
+<p><strong>The bottom line.</strong> Schema Registry is not optional at scale. It is the contract layer that lets producer and consumer teams deploy independently without coordination meetings. LinkedIn has run a fork (Liquid) since ~2015; Confluent ships it; AWS embeds it in Glue. The cost is ~$0.50/sec per registry instance (3-5 instances for HA) and a few minutes of integration work. The benefit is zero "schema mismatch" outages.</p>
+<hr>
+<h2 id="8-kafka-connect-and-the-connector-ecosystem">§8. Kafka Connect and the connector ecosystem</h2>
+<p>The first time you stand up a Kafka cluster, you immediately ask: "how do I get the data INTO it from MySQL?" or "how do I write it OUT to S3?" The Kafka community's answer since 2015 is <strong>Kafka Connect</strong> — a separate cluster of workers running pre-built source and sink connectors. It exists because, by their count, ~80% of "consumers" people would otherwise write are stateless connectors moving bytes from system A to system B, and writing each from scratch is wasteful and error-prone.</p>
+<h3 id="8a-architecture-connect-workers-tasks-configs">8a. Architecture — Connect workers, tasks, configs</h3>
+<p>A Connect cluster runs alongside a Kafka cluster. Workers are JVM processes; each worker hosts one or more <strong>tasks</strong>. A task is a unit of parallel work (e.g., one MySQL table = one task; eight S3 prefixes = eight tasks). Configuration is via REST API; configs are stored in compacted Kafka topics (<code>connect-configs</code>, <code>connect-offsets</code>, <code>connect-status</code>) — Connect is self-bootstrapping.</p>
+<pre><code>┌────────────────────────────────────────────────────────────────┐
+│              Kafka Connect Cluster (3-10 workers)               │
+│                                                                 │
+│   Worker 1: ┌────────────┐ ┌────────────┐ ┌────────────┐       │
+│             │ Debezium-T1│ │ JDBC-Src-T2│ │ S3-Sink-T1 │       │
+│             └────────────┘ └────────────┘ └────────────┘       │
+│   Worker 2: ┌────────────┐ ┌────────────┐                      │
+│             │ Debezium-T2│ │ S3-Sink-T2 │                      │
+│             └────────────┘ └────────────┘                      │
+│                                                                 │
+│   Stored in Kafka:  connect-configs,  connect-offsets,         │
+│                     connect-status (compacted topics)          │
+└────────────────────────────────────────────────────────────────┘
+        │                                              │
+        ▼                                              ▼
+   ┌────────────┐                              ┌────────────┐
+   │  MySQL     │ ──Debezium tails binlog──▶   │  Kafka     │
+   └────────────┘                              │  topic     │
+                                               │  cdc.users │
+                                               └─────┬──────┘
+                                                     │
+                                                     ▼
+                                               ┌────────────┐
+                                               │ S3-Sink    │
+                                               │ writes to  │
+                                               │ s3://...   │
+                                               └────────────┘
+</code></pre>
+<h3 id="8b-source-connectors-debezium-for-cdc-jdbc-source">8b. Source connectors — Debezium for CDC, JDBC source</h3>
+<p><strong>Debezium</strong> (RedHat, OSS) is the de-facto CDC source connector. It tails the binary log of MySQL, PostgreSQL WAL via logical replication, MongoDB oplog, SQL Server transaction log, Oracle LogMiner. Output: one Kafka topic per source table (<code>&lt;server&gt;.&lt;schema&gt;.&lt;table&gt;</code>); each message is <code>{before, after, source, op}</code> (op = <code>c</code>reate / <code>u</code>pdate / <code>d</code>elete). Partition key is the row's primary key, preserving per-row order (the CDC pipeline pattern from §18.5).</p>
+<p>Why Debezium beats writing a custom consumer:
+- Handles snapshot + binlog cutover (initial snapshot of full table, then transition to streaming binlog without gaps or duplicates).
+- Tracks binlog position in Connect's offsets topic — survives restart, resumes from last position.
+- Handles MySQL master failover via GTID (Global Transaction Identifier) tracking.
+- Schema discovery: emits schema-change events to a separate topic, integrates with Schema Registry.
+- Tens of thousands of production deployments — battle-tested.</p>
+<p><strong>JDBC source connector</strong> is the more naive alternative: polls a table with <code>SELECT * WHERE updated_at &gt; &lt;last_seen&gt; ORDER BY updated_at</code> every N seconds. Pros: works on any JDBC database. Cons: misses deletes (no row visible), can miss updates if <code>updated_at</code> isn't updated, polling load on source DB. Use only when binlog access is unavailable.</p>
+<h3 id="8c-sink-connectors-s3-elasticsearch-snowflake-jdbc">8c. Sink connectors — S3, Elasticsearch, Snowflake, JDBC</h3>
+<p>Sink connectors consume from one or more Kafka topics and write to an external system. The standard ones:</p>
+<ul>
+<li><strong>S3 sink:</strong> buffers records by partition, flushes on time (<code>rotate.schedule.interval.ms</code>) or size (<code>flush.size</code>) into Parquet/JSON/Avro files at <code>s3://bucket/&lt;topic&gt;/year=2026/month=05/day=22/hour=14/&lt;file&gt;</code>. Used to build data lakes.</li>
+<li><strong>Elasticsearch sink:</strong> maps Kafka records to ES documents; supports upserts via document ID = Kafka key. Bulk-indexed in batches.</li>
+<li><strong>Snowflake sink (Snowpipe Streaming or batched):</strong> loads records directly into Snowflake tables; the Snowflake-Kafka connector handles auth, partition file naming, retries.</li>
+<li><strong>JDBC sink:</strong> writes to any JDBC database (Postgres, MySQL, ClickHouse). Standard for materializing a Kafka stream into a row-store.</li>
+</ul>
+<p><strong>Exactly-once delivery to sinks</strong> is a per-connector concern. S3 sink achieves it via "write-then-rename" + offset tracking in S3 itself. Elasticsearch sink relies on the document ID = Kafka key idempotency. JDBC sink usually relies on PK-based upsert. <strong>Not all sinks are exactly-once</strong> — read the connector docs.</p>
+<h3 id="8d-single-message-transforms-smts">8d. Single Message Transforms (SMTs)</h3>
+<p>A connector pipeline often needs light transformations: drop a PII (Personally Identifiable Information) field, route by header value, flatten a nested record, change topic name. Without SMTs, you'd need a Kafka Streams app in between. SMTs are inline, stateless, per-record transforms applied in the worker.</p>
+<p>Examples:
+- <code>ExtractField$Value</code> — pull a nested field up.
+- <code>MaskField$Value</code> — replace <code>email</code> with <code>"***@***"</code> for PII compliance.
+- <code>RegexRouter</code> — rewrite topic name (<code>cdc.prod_db.users</code> → <code>users</code>).
+- <code>TimestampConverter</code> — coerce millis/Date/Iso8601 strings.</p>
+<p><strong>Don't write a custom consumer for "Kafka → S3 with field rename and PII mask."</strong> Use S3 sink + 2 SMTs. ~10 minutes of YAML vs days of consumer code.</p>
+<h3 id="8e-why-connect-exists-vs-writing-custom-consumers">8e. Why Connect exists vs writing custom consumers</h3>
+<p>The honest answer: writing one custom consumer is fine. Writing fifty is unsustainable. Kafka Connect amortizes the costs:</p>
+<ul>
+<li><strong>Offset management</strong> — the SAME offset-commit logic for every connector, not reimplemented per consumer.</li>
+<li><strong>Restart and recovery</strong> — every connector resumes from the last committed offset; you don't write that.</li>
+<li><strong>Distributed task rebalancing</strong> — when one worker dies, tasks move to other workers automatically.</li>
+<li><strong>Schema integration</strong> — connectors integrate with Schema Registry out of the box.</li>
+<li><strong>Single Message Transforms</strong> — composable transform pipeline.</li>
+<li><strong>REST API for operations</strong> — start/stop/restart connectors via HTTP, no JVM redeploys.</li>
+</ul>
+<p>LinkedIn's Brooklin is conceptually Kafka Connect for CDC across heterogeneous sources (Espresso, MySQL, Oracle, Couchbase) — the same insight: most "consumers" are connectors, so build the connector framework once and reuse.</p>
+<hr>
+<h2 id="9-cross-region-replication">§9. Cross-region replication</h2>
+<p>A single Kafka cluster is bounded to a region — cross-AZ replication is fine (5-15 ms ISR latency), but cross-region replication via ISR is not (50-200 ms RTT collapses throughput). For multi-region setups, <strong>cross-region replication is a separate pipeline</strong> running between two single-region clusters.</p>
+<h3 id="9a-the-shape-replicator-topology-offset-translation">9a. The shape — replicator topology, offset translation</h3>
+<p>The basic shape (active-passive):</p>
+<pre><code>        REGION A (us-east-1)                    REGION B (us-west-2)
+   ┌─────────────────────────┐             ┌─────────────────────────┐
+   │   Kafka cluster A       │             │   Kafka cluster B       │
+   │                         │             │                         │
+   │   orders.created  ──┐   │             │   ┌──&gt; orders.created   │
+   │   payments.charged  │   │             │   │    payments.charged │
+   │                     │   │             │   │                     │
+   └─────────────────────┼───┘             └───┼─────────────────────┘
+                         │                     │
+                         ▼                     │
+                  ┌─────────────────────────────┐
+                  │  Cross-Region Replicator   │
+                  │  (MirrorMaker 2 / Brooklin │
+                  │   / Confluent Replicator / │
+                  │   Cluster Linking)         │
+                  │                            │
+                  │  Reads from A, writes to B │
+                  │  ~30-200 ms replication lag│
+                  └────────────────────────────┘
+</code></pre>
+<h3 id="9b-tools-mirrormaker-2-brooklin-confluent-replicator-cluster-linking">9b. Tools — MirrorMaker 2, Brooklin, Confluent Replicator, Cluster Linking</h3>
+<p><strong>MirrorMaker 2 (MM2)</strong> is Kafka's built-in, runs as Kafka Connect connectors. Topic-renaming convention: source topic <code>orders</code> in cluster A becomes <code>A.orders</code> in cluster B (prefix with source cluster alias). Offsets are NOT preserved (different cluster = different offsets). MM2 maintains a <code>__consumer_offsets-translation</code> topic in B mapping <code>(source_offset → target_offset)</code> for migration scenarios.</p>
+<p><strong>Brooklin</strong> (LinkedIn, open-sourced 2019) replaced LinkedIn's first-gen replicator. Designed for heterogeneous sources (not just Kafka — also Espresso, Oracle, MySQL). Decoupled controller for orchestration, datastream-per-pipeline abstraction, runs at LinkedIn-scale across hundreds of source/destination pairs.</p>
+<p><strong>Confluent Replicator</strong> is the proprietary equivalent of MM2 with offset translation as a service and integrated with Schema Registry. Used widely in Confluent Cloud.</p>
+<p><strong>Cluster Linking</strong> (Confluent Platform 6.0+, 2020) is the newest model: instead of running connectors, brokers in cluster B directly mirror partitions from cluster A via the same ISR-fetch protocol used internally. <strong>Offsets are preserved 1:1</strong>, eliminating offset translation entirely. Lower operational complexity; tighter coupling. This is where the industry is moving.</p>
+<h3 id="9c-active-passive-vs-active-active">9c. Active-passive vs active-active</h3>
+<p><strong>Active-passive</strong> (one cluster serves writes, the other is read-only):
+- Producer writes go to A.
+- B is a read-only mirror; reads can happen there for geo-locality.
+- DR (Disaster Recovery): on A's failure, redirect producers to B; consumers continue from B (using offset translation if running MM2).
+- RPO (Recovery Point Objective) = replication lag, typically 30-200 ms.
+- RTO (Recovery Time Objective) = depends on producer reconnect logic, typically 30s-5min.</p>
+<p><strong>Active-active</strong> (both clusters accept writes; replicate to each other):
+- More complex: must avoid replication loops (B writes a copy of A's data, which then mirrors back).
+- Solution: source-cluster prefix or a header <code>replicated.from=A</code> that the replicator filters on.
+- Conflict resolution: typically last-write-wins by timestamp, but if two regions both write to the same key, <strong>order is impossible to reconcile globally</strong>. Either accept the conflict (eventual consistency) or route producers by key (e.g., users in EU write to EU, users in US write to US, no cross-region writes to the same key).
+- Pulsar's native geo-replication is the cleanest active-active story; Kafka requires careful application-level design.</p>
+<h3 id="9d-offset-translation-and-the-topic-renaming-pattern">9d. Offset translation and the topic-renaming pattern</h3>
+<p>The painful detail: offset 5,000,000 in topic <code>orders</code> on cluster A does NOT correspond to offset 5,000,000 in topic <code>A.orders</code> on cluster B. They might differ wildly because B was created later, retains less data, or had different batching.</p>
+<p><strong>MM2's translation:</strong> every replicated batch produces a <code>(source_topic, source_partition, source_offset) → (target_offset)</code> mapping written to <code>&lt;cluster&gt;.checkpoints.internal</code>. A consumer migrating from A to B reads the translation topic to compute "I was at offset 5M on A; on B that's offset 4,827,331." Then <code>consumer.seek(target_offset)</code> and resume.</p>
+<p>The topic-renaming pattern (<code>A.orders</code> in B) is the industry standard for unambiguous identification. <strong>Don't replicate <code>orders</code> from A onto <code>orders</code> in B without a prefix</strong> — if B later runs its own producer onto <code>orders</code>, the merge is irreversible.</p>
+<p><strong>RPO/RTO budgets for cross-region:</strong>
+- High-availability service (consumer app): RPO ~seconds, RTO ~minute. MM2 + automated failover.
+- Compliance-grade backup: RPO ~minutes, RTO ~hours. Daily snapshot to S3 + MM2 streaming.
+- True active-active (e.g., global multi-tenant SaaS): RPO ~0 (both regions take writes), but expect ~0.01% conflict rate to resolve.</p>
+<hr>
+<h2 id="10-security-sasl-mtls-acls-encryption">§10. Security — SASL, mTLS, ACLs, encryption</h2>
+<p>A Kafka cluster carrying payments events or PII traffic without authentication is a CVE waiting to happen. Production security has four orthogonal axes: authentication (who you are), authorization (what you can do), encryption in transit (wire), encryption at rest (disk). Mix and match.</p>
+<h3 id="10a-authentication-sasl-variants-and-mtls">10a. Authentication — SASL variants and mTLS</h3>
+<p>Kafka brokers accept authenticated connections via the <strong>SASL (Simple Authentication and Security Layer)</strong> framework, layered atop SSL/TLS. Variants:</p>
+<ul>
+<li><strong>SASL/PLAIN.</strong> Username + password in cleartext over the TLS channel. Easiest to set up; passwords live in <code>jaas.conf</code> on brokers and clients. Acceptable behind a private network, audited credential storage. The "PLAIN" refers to the wire-format, not the security level — credentials are encrypted by the underlying TLS.</li>
+<li><strong>SASL/SCRAM (Salted Challenge Response Authentication Mechanism, RFC 5802).</strong> Challenge-response so the password is never sent on the wire. SCRAM-SHA-256, SCRAM-SHA-512. Credentials managed via <code>kafka-configs.sh</code> and stored in ZooKeeper/KRaft. Better than PLAIN because brokers never see the plaintext password.</li>
+<li><strong>SASL/OAUTHBEARER.</strong> OAuth2 / OIDC (OpenID Connect) tokens. Client obtains a JWT (JSON Web Token) from an identity provider (Okta, Auth0, internal SSO), passes it to broker; broker validates signature and claims. Standard in cloud-native deployments where service identities are managed centrally.</li>
+<li><strong>SASL/GSSAPI (Kerberos).</strong> Enterprise-grade, integrates with Active Directory / corporate Kerberos. Heaviest setup; common in large traditional enterprises.</li>
+<li><strong>mTLS (mutual TLS).</strong> Client certificate-based authentication. Each producer/consumer/broker has a certificate signed by a corporate CA (Certificate Authority); broker validates client cert on TLS handshake. <strong>No password traffic at all.</strong> Common in cloud-native (mTLS at the service-mesh layer extended to Kafka).</li>
+</ul>
+<p>Brokers can offer multiple mechanisms simultaneously via separate <strong>listeners</strong> — e.g., internal traffic over mTLS, external traffic over SASL/SCRAM. Broker-to-broker traffic typically uses mTLS or SASL/SCRAM for the simplest mutual authentication.</p>
+<h3 id="10b-authorization-acls-per-topic-per-principal">10b. Authorization — ACLs per topic, per principal</h3>
+<p>After authentication establishes identity, <strong>ACLs (Access Control Lists)</strong> determine what that identity can do. Kafka's ACL model:</p>
+<pre><code>ACL = (principal, resource, operation, host, permission)
+
+principal:   User:CN=payments-service.prod (from cert) or User:payments-svc (from SASL)
+resource:    Topic:orders.created
+operation:   Read | Write | Create | Delete | Alter | Describe | ClusterAction | ...
+host:        wildcard or specific IP
+permission:  Allow | Deny
+</code></pre>
+<p>Example ACL setup:
+- Producer <code>payments-service.prod</code> can <code>Write</code> to <code>Topic:orders.*</code> (prefix match).
+- Consumer <code>fraud-detector.prod</code> can <code>Read</code> from <code>Topic:orders.*</code> AND <code>Read/Describe</code> on <code>Group:fraud-detector</code>.
+- Admin <code>kafka-ops.prod</code> has <code>*</code> operations on <code>Cluster:kafka-cluster-prod</code>.
+- Default <code>allow.everyone.if.no.acl.found=false</code> → unknown principals are denied.</p>
+<p>Stored in ZooKeeper (legacy) or KRaft metadata. Managed via <code>kafka-acls.sh</code> CLI or programmatic admin API. <strong>Per-topic, per-principal isolation is the standard for multi-tenant clusters.</strong></p>
+<h3 id="10c-encryption-tls-in-transit-at-rest-options">10c. Encryption — TLS in transit, at-rest options</h3>
+<p><strong>In transit:</strong> TLS for client-broker AND broker-broker. Inter-broker traffic crosses AZs and replicates data — must be encrypted at minimum at corporate-network boundary. Choice: TLS 1.2 or 1.3, with corporate CA-signed certs. Performance cost: ~5-10% throughput hit pre-AES-NI (Advanced Encryption Standard New Instructions) hardware acceleration, ~1-3% modern. Not a real cost.</p>
+<p><strong>At rest:</strong> Kafka itself does not encrypt log segments on disk. Three approaches:
+- <strong>Disk-level encryption (LUKS on Linux, BitLocker on Windows, AWS EBS encryption).</strong> Transparent to Kafka; encrypts everything on disk including pages, indexes, KRaft logs. <strong>Most common production setup.</strong> Cost: ~1% performance with AES-NI.
+- <strong>Filesystem encryption (eCryptfs, fscrypt).</strong> Per-directory; finer-grained but less common.
+- <strong>Application-level encryption.</strong> Producer encrypts payload before publishing; consumer decrypts. <strong>Brokers see only ciphertext.</strong> Strongest model; keys managed by KMS (Key Management Service — AWS KMS, HashiCorp Vault, GCP KMS). Compatible with multi-tenant brokers where ops shouldn't see payload. Cost: producer/consumer CPU; complicates Kafka Streams (can't filter on encrypted fields without per-message decryption).</p>
+<h3 id="10d-pii-redaction-strategies">10d. PII redaction strategies</h3>
+<p>Even with encryption, PII (Personally Identifiable Information) regulations (GDPR, CCPA, HIPAA) demand additional handling:</p>
+<ul>
+<li><strong>Field-level masking via SMT or producer logic.</strong> Strip or hash <code>email</code>, <code>ssn</code>, <code>credit_card</code> before publish. Keeps PII out of Kafka entirely.</li>
+<li><strong>Tokenization.</strong> Replace PII with stable tokens (<code>user_email → user_token_a3f9</code>); tokens map back to real values via a separate vault service. Kafka holds only tokens.</li>
+<li><strong>TTL (Time-To-Live)-bounded retention.</strong> Set <code>retention.ms</code> to GDPR deletion budget (e.g., 30 days) so personal data ages out. Avoid compacted topics for PII — compacted topics retain forever.</li>
+<li><strong>Right-to-be-forgotten (RTBF) handling.</strong> Hard problem for immutable logs — you can't surgically delete one record. The standard pattern: encrypt PII per-user with user-specific keys, then <strong>destroy the user's key on RTBF request, making historical encrypted records permanently unreadable</strong> ("crypto-shredding"). LinkedIn, Twilio, and others use this pattern.</li>
+</ul>
+<hr>
+<h2 id="11-monitoring-operations-and-the-unclean-leader-election-dilemma">§11. Monitoring, operations, and the unclean leader election dilemma</h2>
+<p>The infrastructure team's day-to-day. Knowing which metrics matter and what they imply is table stakes for any data-platform conversation.</p>
+<h3 id="11a-broker-jmx-metrics-the-canonical-signals">11a. Broker JMX metrics — the canonical signals</h3>
+<p>Kafka brokers expose hundreds of metrics via JMX (Java Management Extensions, the JVM's standard monitoring interface). The ones operations teams alert on:</p>
+<ul>
+<li><strong><code>BytesInPerSec</code> / <code>BytesOutPerSec</code> (per broker, per topic).</strong> Wire throughput. Trends drive capacity planning.</li>
+<li><strong><code>RequestQueueSize</code> / <code>NetworkProcessorAvgIdlePercent</code>.</strong> Inbound request queue depth and network thread idle. High queue / low idle = broker bottlenecked on CPU.</li>
+<li><strong><code>UnderReplicatedPartitions</code>.</strong> Count of partitions where one or more replicas have fallen out of ISR. <strong>Should be 0 in steady state.</strong> Non-zero indicates replication lag, broker disk/network saturation, or broker failure.</li>
+<li><strong><code>UnderMinIsrPartitions</code>.</strong> Partitions where ISR size has dropped below <code>min.insync.replicas</code>, meaning <code>acks=all</code> writes are being rejected. Critical alert.</li>
+<li><strong><code>IsrShrinksPerSec</code> / <code>IsrExpandsPerSec</code>.</strong> Rate at which ISRs change. A high shrink rate without matching expand rate is bad; high steady rate of both indicates marginally unhealthy followers.</li>
+<li><strong><code>LeaderElectionRateAndTimeMs</code>.</strong> Frequency of leader elections. Spikes during broker restarts, network issues, controller failover.</li>
+<li><strong><code>ProduceRequestRateAndTimeMs</code> p99.</strong> End-to-end produce latency for clients. The user-visible SLA metric.</li>
+<li><strong><code>FetchRequestRateAndTimeMs</code> p99.</strong> Consumer fetch latency.</li>
+<li><strong><code>LogFlushRateAndTimeMs</code>.</strong> How often and how long page cache flushes take. Spikes correlate with disk pressure.</li>
+<li><strong>JVM heap usage and GC pause time.</strong> GC pause &gt; 1s is a partition leadership stability risk.</li>
+</ul>
+<h3 id="11b-consumer-lag-monitoring-burrow-cruise-control">11b. Consumer lag monitoring — Burrow, Cruise Control</h3>
+<p>The single most important metric for downstream teams: <strong>consumer lag</strong> = <code>log_end_offset - committed_offset</code> per (consumer group, partition). Tells you "is the consumer keeping up with the producer?"</p>
+<p>Naive monitoring: poll <code>__consumer_offsets</code>, compare to broker offset. Problems: doesn't scale to 1000s of groups; stale committed offsets when consumer pauses but isn't broken (e.g., between batches); doesn't differentiate "consumer fell behind 10K messages and is catching up" from "consumer has been at 10K lag for 30 minutes."</p>
+<p><strong>Burrow</strong> (LinkedIn, OSS) addresses this with <strong>statefulness over the window</strong>:
+- Tracks the trend of committed offsets per (group, partition).
+- Distinguishes "lag is high but decreasing" (consumer catching up) from "lag is high and stable" (consumer stuck).
+- Emits status: OK / WARNING / ERR / STALL / STOP.
+- Used to set up alerts that don't fire on benign lag spikes.</p>
+<p><strong>Cruise Control</strong> (also LinkedIn, OSS) is broader: it's the auto-balancer for the cluster. Monitors broker resource utilization, runs partition reassignments to rebalance disk, network, CPU when brokers are skewed. Without Cruise Control, balancing is manual via <code>kafka-reassign-partitions.sh</code> — painful and error-prone at LinkedIn scale.</p>
+<h3 id="11c-the-unclean-leader-election-dilemma">11c. The unclean leader election dilemma</h3>
+<p>The big operational decision: when all in-sync replicas fail, do you sacrifice durability for availability?</p>
+<pre><code>Scenario: Topic 'payments' partition 7. ISR was {B-7, B-31, B-88}.
+T0: B-7 (leader) has offset 5,000,000. B-31 and B-88 caught up.
+T1: B-88 falls behind. ISR shrinks to {B-7, B-31}.
+T2: B-31 falls behind. ISR shrinks to {B-7}.
+T3: B-7 hard-crashes (disk failure, kernel panic).
+T4: Controller looks at ISR = {} (empty — leader was alone).
+
+OPTION A: &quot;Clean&quot; — wait for B-7 to come back.
+   - Partition is UNAVAILABLE until B-7 (or another ISR-tracked replica) returns.
+   - If B-7's disk is dead, partition might be down for hours.
+   - Guarantees: no data loss; offsets remain consistent.
+
+OPTION B: &quot;Unclean leader election&quot; — elect from non-ISR replicas (B-31, B-88).
+   - Partition becomes AVAILABLE quickly.
+   - Cost: B-31 was behind by some N messages; those messages are LOST.
+   - Producers and consumers see offset rollback: HW was 5,000,000, now 4,990,000.
+</code></pre>
+<p>The config: <code>unclean.leader.election.enable</code> per topic. Default since Kafka 0.11: <strong>false</strong> (prefer correctness over availability). Pre-0.11 default: <strong>true</strong> (prefer availability over correctness).</p>
+<p><strong>The bottom line:</strong> payments / ledgers / CDC = <code>false</code>. Ad-impressions / heartbeats / non-critical analytics = <code>true</code>. The decision is per-topic, per-data-criticality. There is no single right answer; it's a business-driven durability vs availability tradeoff.</p>
+<h3 id="11d-operational-rhythms">11d. Operational rhythms</h3>
+<ul>
+<li><strong>Rolling broker restarts</strong> — patch broker, restart, wait for ISR to catch up, repeat. With 4000 brokers at LinkedIn, this takes weeks; automation is required.</li>
+<li><strong>Partition reassignment</strong> — move partitions between brokers (capacity rebalancing, decommissioning). Cruise Control automates; manual <code>kafka-reassign-partitions.sh</code> is dangerous because throttling is per-broker not per-partition, easy to saturate network.</li>
+<li><strong>Topic creation</strong> — must respect cluster-wide partition count budgets. KRaft scales past 1M, but rebalance and metadata propagation still cost.</li>
+<li><strong>Capacity planning</strong> — projection: <code>daily_msg_rate × avg_size × RF × retention_days</code>. Add 30% headroom for hot-key skew. Add 50% for replica catch-up burst capacity.</li>
+</ul>
+<hr>
+<h2 id="12-cost-economics-storage-network-s3-native">§12. Cost economics — storage, network, S3-native</h2>
+<p>Cost analysis is half the conversation in real designs and rarely on the slide deck of younger engineers. Kafka's two dominant costs at scale: storage and cross-AZ bandwidth.</p>
+<h3 id="12a-storage-retention-dominates-replication-multiplies">12a. Storage — retention dominates, replication multiplies</h3>
+<p>The arithmetic: storage cost = <code>daily_ingest × retention_days × replication_factor / compression_ratio</code>.</p>
+<p>LinkedIn-scale example: 7T msg/day × 1 KB avg × 7-day retention × RF=3 / 3x compression = ~49 PB of raw on-disk data. At ~$0.10/GB-month on local NVMe, that's ~$5M/month just for the disks holding the message log. (LinkedIn's real cost is lower because they own hardware; cloud equivalents are 2-3x higher.)</p>
+<p><strong>Knobs to attack storage cost:</strong>
+- <strong>Shorter retention.</strong> Default 7 days; can it be 3? 1? Tradeoff: shorter replay window. Many production workloads only need 2-3 days for operational replay; longer retention is "just in case" cruft.
+- <strong>Better compression.</strong> lz4 → zstd typically gives 30-40% additional reduction. Free win.
+- <strong>Tiered storage (§4g).</strong> Local NVMe for recent (24h) data, S3 for the rest. S3 ~$0.023/GB-month vs $0.10 NVMe → 4x cheaper on the offloaded data. At 7-day retention with 24h local, ~85% of data moves to S3 — ~70% cost reduction overall.
+- <strong>Drop RF from 3 to 2 for non-critical topics.</strong> Saves 33% but gives up single-broker-loss tolerance. Rarely worth it.</p>
+<h3 id="12b-cross-az-traffic-the-hidden-expense">12b. Cross-AZ traffic — the hidden expense</h3>
+<p>Cloud providers charge ~$0.01/GB for cross-AZ traffic. Every ISR replication crosses AZs (replicas spread across 3 AZs intentionally). Every consumer fetching from a leader in another AZ does too.</p>
+<p>Worked example: 500 MB/sec sustained write to a topic, RF=3 across 3 AZs.
+- Leader is in AZ-1. Followers in AZ-2 and AZ-3.
+- Replication traffic: 500 MB/sec × 2 followers = 1 GB/sec cross-AZ on the replication path.
+- 1 GB/sec × 86400 sec × 30 days = ~2.6 PB/month of cross-AZ traffic.
+- At $0.01/GB = ~$26K/month just for replication egress.</p>
+<p>Then consumers: if a consumer in AZ-2 fetches from a leader in AZ-1, every fetch crosses AZ ($0.01/GB). Same scale of cost.</p>
+<p><strong>Mitigations:</strong>
+- <strong>Rack awareness.</strong> Configure brokers with <code>broker.rack=us-east-1a</code> etc. Kafka's <code>RackAwareReplicaSelector</code> (consumer-side) prefers reading from a replica in the SAME rack/AZ. Cuts consumer cross-AZ traffic in half or better.
+- <strong>AWS announced free cross-AZ for MSK in 2024.</strong> Changes the calculus dramatically for AWS users. Not universal.
+- <strong>Compress harder.</strong> Same <code>BytesIn</code> reduction reduces both storage AND cross-AZ proportionally.</p>
+<h3 id="12c-s3-native-economics-warpstream-automq">12c. S3-native economics — WarpStream / AutoMQ</h3>
+<p>The S3-native variants (WarpStream, AutoMQ, RedPanda's BYOC) restructure the cost equation entirely:</p>
+<pre><code>Classic Kafka cost split (LinkedIn-style):
+   45% NVMe storage   (replicated 3x)
+   30% Cross-AZ networking (replication + consumer fetch)
+   20% Compute (brokers)
+    5% Operations + control plane
+
+S3-native Kafka cost split (WarpStream-style):
+    5% Local cache (small, ephemeral)
+   55% S3 storage (single-copy durability, 11-nines)
+   10% S3 PUT/GET costs
+   25% Compute (stateless brokers, smaller and elastic)
+    5% Operations + control plane
+
+Net: 30-50% cost reduction at high retention; 200ms p99 produce latency (vs 5-15ms).
+</code></pre>
+<p>The trade is latency for cost: S3 multipart upload is ~150-300ms p99 vs ~5-15ms for local NVMe ISR replication. If your workload tolerates 200-500ms produce p99 (most analytics, log shipping, telemetry archive), S3-native is dramatically cheaper. If you need &lt;50ms (payments, real-time bidding), classic NVMe-replicated Kafka is still the answer.</p>
+<p><strong>The bottom line:</strong> the S3-native frontier is real and rapidly evolving (WarpStream acquired by Confluent in 2024). Expect "classic" Kafka and S3-native to coexist on different workloads through the late 2020s; new high-retention deployments default to S3-native.</p>
+<hr>
+<h2 id="13-kraft-mode-life-after-zookeeper">§13. KRaft mode — life after ZooKeeper</h2>
+<p>The single biggest architectural change in Kafka since the original 2011 release. Worth understanding deeply because the migration is ongoing across most production clusters as of 2026.</p>
+<h3 id="13a-the-problem-zookeeper-created">13a. The problem ZooKeeper created</h3>
+<p>Pre-KRaft Kafka used ZooKeeper for cluster metadata: broker membership, topic configs, partition leadership, ACLs, controller election. ZooKeeper was an external dependency — separate cluster, separate ops team, separate failure modes.</p>
+<p>ZooKeeper's pain points at scale:
+- <strong>ZNode count limit ~200K.</strong> LinkedIn approached the limit at ~7M partitions across clusters; each partition needed multiple ZNodes (leader, ISR, config).
+- <strong>Watcher fan-out scaled poorly.</strong> Every broker watched dozens of ZNodes; 4000 brokers watching the same parent ZNode caused thundering-herd issues.
+- <strong>Controller failover took minutes.</strong> On controller broker death, new controller reloaded ALL partition state from ZooKeeper — at 7M partitions, this was ~5-15 minutes of metadata-change unavailability.
+- <strong>Operational complexity.</strong> Separate ZK cluster to provision, monitor, upgrade, secure. Common source of incidents.</p>
+<h3 id="13b-kraft-architecture-controller-quorum-metadata-log">13b. KRaft architecture — controller quorum, metadata log</h3>
+<p>KRaft (Kafka Raft, KIP-500) replaces ZooKeeper with a Raft-based controller quorum <strong>embedded in Kafka itself</strong>. Architecture:</p>
+<pre><code>┌──────────────────────────────────────────────────────────────────┐
+│                     KRaft-based Kafka Cluster                     │
+│                                                                   │
+│   ┌──────────────────────────────────────────────────────────┐   │
+│   │  Controller Quorum (3 or 5 nodes, Raft-replicated)       │   │
+│   │  ┌──────────┐  ┌──────────┐  ┌──────────┐                │   │
+│   │  │ Ctlr-1   │  │ Ctlr-2   │  │ Ctlr-3   │                │   │
+│   │  │ (leader) │  │ (follower│  │ (follower│                │   │
+│   │  └──────────┘  └──────────┘  └──────────┘                │   │
+│   │                                                          │   │
+│   │  Metadata stored in: __cluster_metadata topic            │   │
+│   │  (the controller quorum IS the Raft log holding metadata)│   │
+│   └──────────────────────────────────────────────────────────┘   │
+│                            │ MetadataFetch RPC                    │
+│                            ▼ (brokers tail the metadata log)      │
+│   ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐                    │
+│   │ B-1    │ │ B-2    │ │ B-3    │ │ B-4    │ ... brokers        │
+│   └────────┘ └────────┘ └────────┘ └────────┘                    │
+└──────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>Key shifts:
+- <strong>The metadata log is a regular Kafka topic</strong> (<code>__cluster_metadata</code>). Every metadata change is an append; controllers are the producers; brokers are consumers tailing this topic. Eats own dogfood.
+- <strong>Controller failover via Raft.</strong> The 3 or 5 controllers hold a Raft quorum; if the leader dies, a follower wins the next election in ~1-3 seconds.
+- <strong>Brokers no longer connect to ZooKeeper.</strong> They tail the metadata topic from the controllers via the standard fetch protocol.
+- <strong>Modes:</strong> controllers can be combined with brokers in small clusters (<code>process.roles=broker,controller</code>) or split off in large clusters (<code>process.roles=controller</code> for dedicated controller nodes).</p>
+<h3 id="13c-why-kraft-matters-controller-failover-partition-scaling">13c. Why KRaft matters — controller failover, partition scaling</h3>
+<p><strong>Controller failover from minutes to seconds.</strong> Old: controller broker dies → new controller broker reads ALL metadata from ZooKeeper → takes 5-15 minutes at 7M partitions. New: new controller leader has already replicated metadata via Raft → instantly takes over.</p>
+<p><strong>Scales past 1M partitions.</strong> ZooKeeper's ZNode limit was the hard wall; KRaft's controller quorum scales with regular Kafka topic semantics (compacted, segmented). Confluent reports KRaft handling 2M+ partitions per cluster in benchmarks.</p>
+<p><strong>Operational simplification.</strong> No more ZooKeeper cluster to operate. Faster cluster spinup (no ZK cluster to provision first). Tighter security model (one auth/ACL system, not two). Smaller surface area for incidents.</p>
+<h3 id="13d-migration-from-zookeeper-to-kraft">13d. Migration from ZooKeeper to KRaft</h3>
+<p>Migration is <strong>not</strong> a flag flip — it's a multi-step process:</p>
+<ol>
+<li><strong>Upgrade brokers to 3.4+</strong> which supports both ZK and KRaft (dual-write mode).</li>
+<li><strong>Provision KRaft controller quorum</strong> (3 or 5 nodes) alongside the existing ZooKeeper cluster.</li>
+<li><strong>Migrate metadata.</strong> Controllers read existing metadata from ZooKeeper, write it to <code>__cluster_metadata</code>. Both ZK and KRaft hold the same metadata for the migration window.</li>
+<li><strong>Rolling restart brokers</strong> in <code>migration</code> mode — each broker switches from ZK-based metadata to KRaft-based.</li>
+<li><strong>Cut over.</strong> Disable ZooKeeper dependency in broker configs; ZK cluster is now decommissioned.</li>
+</ol>
+<p>Kafka 4.0 (released 2024) removed ZooKeeper support entirely; KRaft is the only mode. The migration path is well-documented but operationally significant — most large production clusters were mid-migration through 2024-2025.</p>
+<hr>
+<h2 id="14-poison-pill-messages-and-dead-letter-queues">§14. Poison pill messages and Dead Letter Queues</h2>
+<p>§18.2 covers the basic idea of a DLQ. This section drills into the patterns, the failure modes of naive DLQ implementations, and the alternatives.</p>
+<h3 id="14a-the-poison-pill-what-makes-a-message-unprocessable">14a. The poison pill — what makes a message unprocessable</h3>
+<p>A "poison pill" is a record that the consumer cannot successfully process, no matter how many times it retries. Sources:
+- <strong>Malformed payload.</strong> Schema-mismatch (e.g., producer wrote v2 schema before consumer upgraded), corrupted bytes, encoding bugs.
+- <strong>Logical violation.</strong> Foreign key reference to a deleted entity, invalid state transition, business rule violation that wasn't caught upstream.
+- <strong>External system failure.</strong> Stripe API returning <code>400 Bad Request</code> because of a stale ID; Postgres returning constraint violations.
+- <strong>Resource exhaustion.</strong> Record too large to process, requires N hops of enrichment that have permanently failed.</p>
+<p>The pathology: consumer poll() returns the poison pill; processor throws; consumer retries; same exception; <strong>partition lag grows indefinitely</strong> while every consumer in the group waits on this one bad record. Backpressure to producers, eventually broker-side disk fills as retention extends.</p>
+<h3 id="14b-dlq-basics-bounded-retry-redirect">14b. DLQ basics — bounded retry + redirect</h3>
+<p>The standard pattern:</p>
+<pre><code>for record in consumer.poll():
+    try:
+        process(record)
+        commit_offset(record.offset)
+    except RetriableError as e:
+        if retries(record) &lt; MAX_RETRIES:
+            sleep(backoff(retries(record)))
+            retry
+        else:
+            dlq_producer.send(&quot;orders.dlq&quot;, record, headers={&quot;error&quot;: str(e)})
+            commit_offset(record.offset)  # source partition moves on
+    except PermanentError as e:
+        dlq_producer.send(&quot;orders.dlq&quot;, record, headers={&quot;error&quot;: str(e)})
+        commit_offset(record.offset)
+</code></pre>
+<p>Operators monitor <code>orders.dlq</code>; on triage they can fix the data (correct the row, fix Stripe ID), re-publish to <code>orders.created</code>, and processing resumes. <strong>DLQ is an essential ops surface.</strong></p>
+<h3 id="14c-why-dlqs-are-sometimes-wrong-order-loss-and-the-parking-lot-pattern">14c. Why DLQs are sometimes wrong — order loss and the "parking lot" pattern</h3>
+<p>The downside the basic DLQ pattern hides: <strong>DLQs lose per-key ordering forever.</strong></p>
+<p>Example: CDC pipeline (per-key ordered). Record 1: <code>update user_42 set email=...</code>. Record 2: same user, <code>update user_42 set name=...</code>. Record 1 fails (transient Postgres outage), goes to DLQ. Record 2 succeeds normally. Operator later replays Record 1 from DLQ. <strong>User-42's row now reflects record 1 applied AFTER record 2 — wrong order, wrong final state.</strong></p>
+<p>For order-sensitive workloads (CDC, event sourcing), DLQ-and-skip is incorrect. Alternatives:</p>
+<p><strong>Parking-lot pattern.</strong> Instead of routing to DLQ-and-continue, the consumer <strong>pauses the partition</strong> (<code>consumer.pause(partition)</code>) and parks the bad record in a side store (Redis, a status DB, or a manual review queue). The partition holds at that offset. <strong>Order is preserved</strong>; downstream processing of other partitions continues. Ops fixes the bad record; consumer resumes (<code>consumer.resume(partition)</code>) and re-tries.</p>
+<pre><code>   Partition order-events-7 stalls at offset 5_000_000 (bad record):
+
+   Pre-bad-record:   5_000_000 (committed)  ──&gt; continuous flow
+   Bad record:       5_000_001 (parked in Redis, partition paused)
+   Post-bad-record:  5_000_002 ─ 5_000_500   (queued in broker, not consumed)
+
+   Other partitions (0, 1, 2, ..., 6, 8, ..., N) continue processing normally.
+   Operator review of parked record → fix → resume partition → records 5_000_001 onward.
+</code></pre>
+<p><strong>Cost.</strong> Lag on the parked partition grows; SLA on partition-7 records is broken; partition-7's consumer is functionally idle. <strong>Worth it for ordered workloads;</strong> wrong choice for unordered (DLQ-and-skip is fine for telemetry, click-stream, etc.).</p>
+<p><strong>Retry topics with cascading TTL.</strong> Spring's pattern: <code>orders.retry.5min</code>, <code>orders.retry.30min</code>, <code>orders.retry.2hr</code>, <code>orders.dlq</code>. Failed records cascade through retry topics with increasing delays. Useful when failures are mostly transient (external service flapping) and order doesn't matter — gets to "wait then retry without blocking the source partition" semantics. <strong>Loses order</strong>, like DLQ; differs only in the retry shape.</p>
+<p><strong>The bottom line.</strong> "DLQ" is shorthand; the right design depends on ordering requirements. Ordered workloads use parking-lot. Unordered workloads use DLQ. Mixing them without thought leads to silent data corruption — the worst kind.</p>
+<hr>
+<h2 id="15-the-transactional-outbox-pattern-solving-the-dual-write-problem">§15. The transactional outbox pattern — solving the dual-write problem</h2>
+<p>Mentioned in §20 (DB-as-queue) and §23 use-cases. This section covers the canonical version because the pattern is a recurring building block.</p>
+<h3 id="15a-the-dual-write-problem">15a. The dual-write problem</h3>
+<p>The naive approach when a service needs to update its database AND publish to Kafka:</p>
+<pre><code class="language-python">def create_order(order):
+    db.insert(&quot;orders&quot;, order)         # write to DB
+    kafka.send(&quot;orders.created&quot;, order) # publish event
+</code></pre>
+<p>The failure modes:
+- DB write succeeds; Kafka send fails (broker down, network blip). DB has the row, but no event. Downstream consumers (billing, fraud, search) NEVER see the order.
+- Kafka send succeeds; DB write rolls back (constraint violation, transaction failure). Downstream consumers process a "created" event for an order that doesn't exist in the DB. <strong>They'll fail trying to look it up later.</strong>
+- Both succeed; service crashes between them; some duplicate write logic now has to reconcile.</p>
+<p><strong>There is no way to make two writes to two independent systems atomic</strong> without 2PC (Two-Phase Commit), and 2PC across Kafka and Postgres is not supported and would be unreasonably slow if it were. The right answer is to make it ONE write, not two.</p>
+<h3 id="15b-the-outbox-pattern">15b. The outbox pattern</h3>
+<p>The atomic write is to the database only. The outbox table sits in the same database, written in the same transaction as the business data:</p>
+<pre><code class="language-sql">BEGIN;
+  INSERT INTO orders (id, customer_id, total, ...) VALUES (42, ..., ...);
+  INSERT INTO outbox (event_id, aggregate_type, aggregate_id, event_type, payload, created_at)
+       VALUES (uuid_v4(), 'order', 42, 'order.created',
+               '{&quot;order_id&quot;:42, &quot;customer_id&quot;:..., &quot;total&quot;:...}',
+               NOW());
+COMMIT;
+</code></pre>
+<p>Both rows commit atomically because they're in the same Postgres transaction. <strong>The outbox row is now a durable record that an event must be published.</strong> It cannot be lost without losing the order itself.</p>
+<p>Then a separate process — typically Debezium (§8b) — tails the binary log of the database and publishes outbox rows to Kafka:</p>
+<pre><code>   ┌──────────┐         ┌──────────┐       ┌────────────────┐
+   │  App     │──BEGIN──│ Postgres │       │   Kafka topic  │
+   │          │ INSERT  │          │       │  orders.created│
+   │          │ orders  │ ┌──────┐ │       │                │
+   │          │ INSERT  │ │ WAL  │ │       └────────▲───────┘
+   │          │ outbox  │ │      │ │                │
+   │          │ COMMIT  │ └───┬──┘ │                │
+   └──────────┘         └─────┼────┘                │
+                              │                     │
+                              │ tails WAL           │
+                              ▼                     │
+                       ┌────────────┐               │
+                       │ Debezium   │──publishes────┘
+                       │ CDC        │
+                       └────────────┘
+</code></pre>
+<p>After publish, Debezium commits its WAL position to its own Kafka offsets topic. On restart, it resumes from the last published WAL position — at-least-once delivery (idempotent producer + Kafka transactions get to exactly-once-into-Kafka).</p>
+<h3 id="15c-why-outbox-beats-write-to-db-then-write-to-kafka">15c. Why outbox beats "write to DB then write to Kafka"</h3>
+<p>The dual-write problem disappears because there is no dual write. Concretely:
+- If the order INSERT fails, the outbox INSERT is in the same transaction and rolls back. <strong>No phantom events.</strong>
+- If the order INSERT succeeds but the service crashes before "writing to Kafka," it doesn't matter — the outbox row is durable, Debezium will pick it up on its own schedule.
+- If Kafka is down for an hour, the outbox grows but nothing is lost. When Kafka recovers, Debezium catches up.</p>
+<p><strong>Latency cost:</strong> the event reaches Kafka ~50-500ms after the business write (Debezium's polling lag + WAL append delay). For event-driven architectures where consumers process asynchronously, this is invisible.</p>
+<p><strong>Operational cost:</strong> Debezium is a piece of infrastructure to operate (Connect cluster, plugin, schema management). Worth it because the alternative is permanent data inconsistency.</p>
+<p><strong>Storage cost:</strong> the outbox table grows. Standard practice: a separate process (or Debezium's built-in <code>outbox.event.deletion.strategy=delete</code>) deletes outbox rows after publish-acknowledgment, keeping the table bounded.</p>
+<h3 id="15d-variations-and-alternatives">15d. Variations and alternatives</h3>
+<ul>
+<li><strong>Outbox with built-in Debezium support</strong> — Debezium has an <code>outbox</code> SMT that extracts <code>aggregate_id</code> as Kafka key, routes to the right topic, drops the outbox-table envelope. Saves boilerplate.</li>
+<li><strong>Polling-based outbox</strong> — without Debezium, a worker polls <code>SELECT * FROM outbox WHERE published=false ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED</code>, publishes, sets <code>published=true</code>. Simpler ops; misses the binlog-tailing efficiency; can produce duplicates on poll-then-crash without idempotent producer.</li>
+<li><strong>Listen/Notify channels (Postgres LISTEN/NOTIFY)</strong> — DB pushes notifications to a listener that publishes to Kafka. Lower latency than polling, but no durability guarantee on notify (if listener is down, notify is lost). Combine with outbox table as the source of truth.</li>
+<li><strong>Saga pattern alternative</strong> — instead of outbox + events, the saga executes a workflow: each step writes a "pending" record, dispatches the next step. Cleaner for long-running multi-service workflows; outbox is cleaner for "atomic write + event publish" semantics.</li>
+</ul>
+<p><strong>Used by:</strong> Stripe (mentioned §24), Shopify, Airbnb, LinkedIn (Brooklin is essentially a managed outbox infrastructure across all services). <strong>The bottom line:</strong> the outbox pattern is the canonical, no-debate solution to "write to DB + publish event" atomicity. Any production system that does both must have an outbox or equivalent; the alternative is silent data drift.</p>
+<hr>
+<h2 id="16-capacity-envelope-across-scales">§16. Capacity envelope across scales</h2>
+<p>Throughput, latency, and storage envelope varies by 6+ orders of magnitude. The bottleneck shifts at each tier.</p>
+<p><strong>Small team — 10K msg/sec (3-broker cluster).</strong> Startup logging activity events for search + billing. 3 brokers across 3 AZs, RF=3. 500 B avg → 5 MB/sec write, 15 MB/sec with replication. 7-day retention = ~9 TB. p99 produce 5-10 ms. <strong>Bottleneck: nothing technical.</strong> Operating Kafka at 10K msg/sec costs the same as 1M; below ~100K msg/sec the right answer is usually "use managed (MSK, Confluent Cloud)."</p>
+<p><strong>Mid-scale event bus — 1M msg/sec (15-30 brokers).</strong> E-commerce microservices on Black Friday, 12 consumer groups. 500 MB/sec write, 1.5 GB/sec with replication, ~3.5 GB/sec broker traffic at 5x fan-out. 30-day retention via tiered storage. p99 produce 5-15 ms. <strong>Bottleneck: partition count discipline + schema registry.</strong></p>
+<p><strong>LinkedIn scale — 80M msg/sec (4,000 brokers, ~100 clusters).</strong> Public numbers (2019-2024): ~7T msg/day, ~18 GB/sec write, ~70 GB/sec read, ~100K topics, ~7M partitions, p99 ~10 ms. Hot volume ~32 PB. <strong>Bottleneck shifts to storage and partition metadata.</strong> Pre-KRaft, ZooKeeper hit a ceiling at ~200K partitions/cluster; KRaft + tiered storage pushed it.</p>
+<p><strong>Hyperscale — Netflix Keystone, 10 PB/day.</strong> ~700B events/day, ~8M events/sec, multiple regional clusters with cross-region replication, strict Protobuf via Schema Registry. <strong>Bottleneck: stream-processing layer (Flink state, sink backpressure), not Kafka itself.</strong></p>
+<p><strong>S3-native frontier — WarpStream / AutoMQ (2023-2024).</strong> ~1 GB/sec sustained on small clusters (10-30 nodes), p99 ~200-500 ms, 30-50% cost reduction at high retention. <strong>Bottleneck: S3 prefix throughput (~5,500 GET / 3,500 PUT per prefix per second)</strong> drives aggressive 1-2 second batching to amortize S3 PUT cost.</p>
+<p>The bottleneck moves: NIC at small scale, partition metadata at mid-scale, storage volume at LinkedIn-scale, S3 PUT rate at S3-native scale. At every tier the limit is different.</p>
+<hr>
+<h2 id="17-architecture-in-context">§17. Architecture in context</h2>
+<p>The canonical integration pattern, independent of product. Every variant fits this shape with names swapped.</p>
+<pre><code>   ┌──────────────────────────────────────────────────────────┐
+   │                      PRODUCERS                            │
+   │   Services publishing events (payments-service, tracker,  │
+   │   vehicle-uplink). Batch by partition key, compress, retry│
+   └────────────────────────┬─────────────────────────────────┘
+                            │ binary protocol (Kafka wire, AMQP,
+                            │ Pulsar binary, HTTP for SQS)
+                            ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │                     BROKER CLUSTER                        │
+   │                                                           │
+   │   Topic: orders.created                                   │
+   │   ┌───────────────────────────────────────────────────┐  │
+   │   │ Partition 0 (leader B-7,  replicas {B-31,B-88})   │  │
+   │   │ Partition 1 (leader B-42, replicas {B-58,B-91})   │  │
+   │   │ ... Partition N (leader B-119, replicas {...})    │  │
+   │   └───────────────────────────────────────────────────┘  │
+   │   Leaders serve writes; followers replicate via Fetch.    │
+   │                                                           │
+   │   ┌──────────────────┐  ┌─────────────────────────────┐  │
+   │   │ Metadata Layer   │  │ Offset / Cursor Storage     │  │
+   │   │ (KRaft, ZooKeeper│  │ (__consumer_offsets, Pulsar │  │
+   │   │  Pulsar mDB,     │  │  cursors, RabbitMQ acks)    │  │
+   │   │  RabbitMQ Mnesia)│  │                             │  │
+   │   └──────────────────┘  └─────────────────────────────┘  │
+   │                                                           │
+   │   ┌─────────────────────────────────────────────────────┐│
+   │   │ Tiered Storage (S3 / HDFS / Azure Blob)             ││
+   │   │ Closed segments offloaded; broker keeps metadata    ││
+   │   └─────────────────────────────────────────────────────┘│
+   └────────────────────────┬─────────────────────────────────┘
+                            ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │                   CONSUMER GROUPS                         │
+   │                                                           │
+   │   Group &quot;billing&quot;     Group &quot;fraud&quot;      Group &quot;search&quot;   │
+   │   ┌──┐ ┌──┐ ┌──┐      ┌──┐ ┌──┐ ┌──┐     ┌──┐ ┌──┐        │
+   │   │C1│ │C2│ │C3│      │C1│ │C2│ │C3│     │C1│ │C2│        │
+   │   └──┘ └──┘ └──┘      └──┘ └──┘ └──┘     └──┘ └──┘        │
+   │                                                           │
+   │   Each group reads the SAME log independently.            │
+   │   Within a group, each partition is assigned to one       │
+   │   consumer — that's how parallelism scales.               │
+   └──────────────────────────────────────────────────────────┘
+</code></pre>
+<p>Key annotations: <strong>Partition key on every write</strong> (<code>hash(key) % num_partitions</code>) — for an order event key is <code>order_id</code>, for vehicle telemetry <code>vehicle_id</code>, for click-stream <code>user_id</code> or <code>session_id</code>; the key choice determines what is ordered and where hot keys land. <strong>Replication factor 3 is standard</strong> — survives any single-node loss; single-AZ loss with replicas spread across AZs. <strong>Consumer groups are independent</strong> — new analytics team subscribes as its own group, reads from offset 0, doesn't disturb anyone. <strong>The metadata layer is small but critical</strong> — owns broker membership, partition leadership, topic config; if it goes down, steady-state IO continues but cluster changes pause.</p>
+<hr>
+<h2 id="18-hard-problems-inherent-to-logs-and-queues">§18. Hard problems inherent to logs and queues</h2>
+<p>Six problems any non-trivial deployment hits, illustrated with different domains.</p>
+<h3 id="181-exactly-once-semantics-payments-outbox">18.1 Exactly-once semantics — payments outbox</h3>
+<p>In a payments platform, every <code>payment.charged</code> event must trigger exactly one customer charge and exactly one ledger update.</p>
+<p><strong>Naive fix:</strong> producer retries until ack, consumer commits offset after processing.</p>
+<p><strong>Why it breaks:</strong> at T0 Stripe service publishes <code>payment.charged{order=42}</code>; broker writes, replicates, acks. At T1 producer's TCP connection drops before receiving ack; producer retries. Without idempotent producer, broker writes the duplicate — offsets 100 and 101 now hold the same event; customer charged twice. Separately, consumer reads offset 100, charges, crashes before committing offset. On restart, last committed offset is 99; consumer re-reads, charges again. <strong>Customer charged three times.</strong></p>
+<p><strong>Real fix:</strong> three pieces required: (1) <strong>Idempotent producer</strong> (<code>enable.idempotence=true</code>) — broker tracks (producerId, partition) → highest sequence, rejects duplicates. (2) <strong>Transactional producer</strong> (<code>transactional.id</code>) — atomically writes to N partitions and commits consumer offsets in one transaction. (3) <strong>Consumer <code>isolation.level=read_committed</code></strong> — skip aborted or in-progress transactions.</p>
+<p><strong>Caveat:</strong> this is exactly-once <em>within Kafka</em>. End-to-end to Stripe's external API requires Stripe to accept an idempotency key. The bottom line: "Kafka exactly-once gives exactly-once into a Kafka sink; external boundaries still need application-level idempotency."</p>
+<h3 id="182-head-of-line-blocking-click-stream-analytics">18.2 Head-of-line blocking — click-stream analytics</h3>
+<p>Click-stream ingests web events. One event at offset 5,000,000 has a malformed payload; consumer throws on every retry; entire partition stalls.</p>
+<p><strong>Naive fix:</strong> exponential backoff retry.</p>
+<p><strong>Why it breaks:</strong> retries forever on a poison message. All records after offset 5,000,000 on that partition are starved. Lag grows linearly.</p>
+<p><strong>Real fix:</strong> <strong>Dead Letter Queue (DLQ) + bounded retry.</strong> After N retries, publish failed record to <code>clickstream.dlq</code> with error in headers, commit source offset, move on. Operator-driven flow triages the DLQ.</p>
+<p>Kafka has no DLQ primitive — application logic (or Kafka Connect's built-in DLQ). RabbitMQ has DLX (Dead Letter eXchange) first-class. SQS has per-queue DLQ. <strong>Forgetting DLQ is one of the most common Kafka production outages.</strong></p>
+<h3 id="183-hot-partition-iot-telemetry">18.3 Hot partition — IoT telemetry</h3>
+<p>A Tesla-style fleet telemetry topic has 256 partitions keyed by <code>vehicle_id</code>. One car has a bug emitting 1000x normal rate. One partition does 50K msg/sec; the other 255 do hundreds.</p>
+<p><strong>Naive fix:</strong> add more partitions.</p>
+<p><strong>Why it breaks:</strong> the hot key still hashes to one partition. Repartitioning a live keyed topic is painful — existing data stays on old partitions, consumers must handle both.</p>
+<p><strong>Real fix — three options:</strong> (1) <strong>Salt the key</strong> — <code>vehicle_id || ":" || (event_seq % 8)</code> spreads one vehicle across 8 partitions. Lose strict per-vehicle order; downstream timestamp-sorts. (2) <strong>Two-tier topic</strong> — raw partitioned coarsely (geo), stream processor re-keys with dynamic shard suffixes for hot keys. (3) <strong>Carve out hot keys to dedicated pipelines</strong> — power-law distributions are common; top 100 of 1M vehicles often emit 50% of events.</p>
+<p>The instinct: "what's the actual order requirement?" Usually "order per vehicle" is over-specified; "eventually consistent per vehicle with timestamps for reconciliation" works.</p>
+<h3 id="184-consumer-rebalance-pauses-microservices-fan-out">18.4 Consumer rebalance pauses — microservices fan-out</h3>
+<p>An Airbnb-style booking-events consumer group has 64 consumers reading 256 partitions. One dies. Group coordinator triggers rebalance: all 64 stop, return assignments, get reassigned, resume. Old-style "eager" rebalance is stop-the-world for 5-10 seconds. At 1M msg/sec, that's 5-10M messages of lag.</p>
+<p><strong>Naive fix:</strong> make consumers more reliable. Doesn't help — scaling events (deploy, autoscaling) cause rebalances regardless.</p>
+<p><strong>Real fix:</strong> <strong>cooperative incremental rebalance</strong> (KIP-429) — only partitions that need to move actually move; other consumers don't pause. Pause time per consumer drops from seconds to ~100 ms.</p>
+<p>Deeper fix: <strong>static group membership</strong> (<code>group.instance.id</code>). Stable identity; restart within <code>session.timeout.ms</code> (default 45s) gets <em>the same partitions back</em>. Critical for stateful consumers (stream processors with local state).</p>
+<h3 id="185-ordering-vs-scaling-tension-cdc-pipelines">18.5 Ordering vs scaling tension — CDC pipelines</h3>
+<p>A CDC pipeline (Debezium → Kafka → warehouse) needs row changes applied in order so the warehouse row matches the source DB row.</p>
+<p><strong>Naive fix:</strong> "one partition, one consumer."</p>
+<p><strong>Why it breaks:</strong> single partition ~100 MB/sec write, single consumer ~50-200K msg/sec. A DB doing 1M row-changes/sec is 5-10x too fast.</p>
+<p><strong>Real fix:</strong> <strong>partition by primary key</strong> — all changes for one row land on one partition, preserving per-row order. Cross-row order isn't needed; the warehouse reconstructs rows independently. The reality: "what is the actual ordering scope?" — almost always per-key, not global.</p>
+<p>LinkedIn's Brooklin partitions by source-table PK so per-row order is preserved across hundreds of partitions.</p>
+<h3 id="186-producer-back-pressure-log-shipping">18.6 Producer back-pressure — log shipping</h3>
+<p>Cloudflare-style edge log shipping: 200 POPs producing 500K msg/sec each into central Kafka. The cluster has a brownout (controller GC pause).</p>
+<p><strong>Naive fix:</strong> "producer send is async, it'll buffer locally."</p>
+<p><strong>Why it breaks:</strong> producer's <code>buffer.memory</code> (default 32 MB) fills. Then <code>send()</code> blocks or throws. OOM (Out-Of-Memory) is minutes away.</p>
+<p><strong>Real fix — four layers:</strong> (1) Producer: cap <code>buffer.memory</code>, set <code>max.block.ms</code> to ~100 ms, back-pressure upstream caller on block. (2) Broker quotas (<code>quota.producer.default</code>) throttle exceeding producers via response delays. (3) Upstream circuit breaker — if p99 produce &gt; 100 ms for 30s, skip Kafka (fail open/closed by data class). (4) <strong>Outbox pattern</strong> as durable fallback — write events to DB outbox in same transaction as business write; CDC tails binlog to Kafka. If Kafka is down, outbox accumulates; nothing is lost.</p>
+<hr>
+<h2 id="19-failure-mode-walkthroughs">§19. Failure mode walkthroughs</h2>
+<p><strong>Broker crash mid-write (mid-batch).</strong> Leader B-7 has written half of a 16 KB batch; followers haven't pulled. Controller detects B-7 down (~10s timeout), elects new leader from ISR (say B-31, which hadn't pulled the partial). Producer's in-flight to B-7 times out, retries against B-31; idempotent producer dedups. B-7 restarts, scans active segment, finds partial record at tail (CRC fails), <strong>truncates to last fully-written record boundary</strong>, becomes follower, catches up. <strong>Durability point:</strong> last fully-written batch before the partial.</p>
+<p><strong>Crash between produce ack and replication.</strong> With <code>acks=all</code> this shouldn't happen — leader doesn't ack until ISR replicates. With <code>acks=1</code> it's the classic data-loss window: leader writes, acks, crashes before replicating; new leader from a follower that didn't see the batch; batch lost. <strong>Defense:</strong> never use <code>acks=1</code> for important data; <code>acks=all</code> + <code>min.insync.replicas=2</code> is the LinkedIn default.</p>
+<p><strong>Metadata leader death (KRaft / ZooKeeper / Pulsar metadata).</strong> 5-node KRaft quorum, controller leader dies. Remaining 4 controllers hold a Raft election; new leader emerges in ~5-10s, replays metadata log, broadcasts to brokers. <strong>Durability point:</strong> Raft log on controller quorum — Raft majority guarantees committed entries (≥3 of 5 ack'd) survive any minority failure. During the gap, brokers continue serving in-progress produces and consumes — controller is only needed for metadata <em>changes</em>.</p>
+<p><strong>Network partition (split-brain potential).</strong> AZ-1 has leader B-7 + ISR {B-7, B-31} + controller majority (3 of 5). AZ-2 has B-88 + 2 controllers. Network partitions. AZ-1 continues serving writes; ISR shrinks to {B-7, B-31}. AZ-2's B-88 can't fetch from B-7; after 30s controller removes it from ISR. AZ-2's 2 controllers are minority — cannot elect new leader. <strong>No split-brain possible.</strong> <strong>Durability point:</strong> Raft majority on controller quorum — why 5-node quorums across 3+ AZs is standard.</p>
+<p><strong>Permanent participant loss (broker disk dies).</strong> B-7 dies, disk unrecoverable. New broker B-7' provisioned with same ID. Controller sees B-7 absent; leadership shifts to other ISR members. B-7' joins with no data. For each partition where B-7 was follower, leader sends Fetch from offset 0 — B-7' replays entire log. <strong>Multi-TB partitions take hours of network IO.</strong> Tiered storage helps — only local-tier data copies; old data lives in S3 and is accessible to all brokers (Confluent reports 5-10x faster broker replacement with tiered storage).</p>
+<p><strong>Consumer group rebalance during failure.</strong> Consumer C5 hangs. Group coordinator initiates rebalance. Cooperative incremental rebalance: only C5's partitions reassign; others continue. <strong>Subtle issue:</strong> if C5 was processing a record but hadn't committed offset, the new consumer re-reads from C5's last committed offset → duplicate processing. <strong>Idempotent consumer is mandatory; you cannot architect this away.</strong></p>
+<hr>
+<h2 id="20-why-not-just-use-a-database-table-as-a-queue">§20. Why not just use a database table as a queue?</h2>
+<p>The most common L4/L5 design suggestion; the failure modes show <em>exactly</em> what message queues exist to prevent.</p>
+<pre><code class="language-sql">CREATE TABLE events (
+  id BIGSERIAL PRIMARY KEY, type TEXT, payload JSONB, created_at TIMESTAMPTZ,
+  consumed_by_billing BOOLEAN DEFAULT FALSE,
+  consumed_by_fraud BOOLEAN DEFAULT FALSE
+);
+-- Consumer polls:
+SELECT * FROM events WHERE consumed_by_billing = FALSE
+  ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED;
+-- ... process ... then:
+UPDATE events SET consumed_by_billing = TRUE WHERE id IN (...);
+</code></pre>
+<p><strong>Failure 1: Write throughput cap.</strong> At 1M msg/sec × 5 consumer groups = 5M state updates/sec. Postgres tops out ~50K writes/sec on a single primary — 20-100x too slow. Sharded at 100 shards still 5x too slow.</p>
+<p><strong>Failure 2: Index bloat from in-place updates.</strong> Postgres MVCC creates a new tuple version per update; autovacuum can't keep up at high rates. Table becomes mostly dead tuples; queries scan 100x more pages; performance collapses within hours. Kafka avoids this entirely — broker doesn't track per-message consumption. Consumer offset is one integer per (group, topic, partition), updated once per second. State is O(groups × partitions), not O(messages).</p>
+<p><strong>Failure 3: No replay.</strong> Delete rows after consumption → new consumer can't read old data; bug in consumer logic can't be fixed by replay. Keep rows forever → table grows unboundedly, index doesn't fit in RAM. Kafka stores 1000x more data with no degradation because reads are sequential and old data lives on cheap storage.</p>
+<p><strong>Failure 4: No fan-out.</strong> Five consumers = five <code>consumed_by_x</code> columns. New consumer = schema migration. In Kafka, new consumer group is one <code>subscribe()</code> call.</p>
+<p><strong>Failure 5: Locking under competing consumers.</strong> <code>FOR UPDATE SKIP LOCKED</code> (added to Postgres precisely because people kept trying this) gives mutual exclusion but row-level locks at 100K/sec cause contention. Kafka's "one partition per consumer in a group" eliminates locking.</p>
+<p><strong>When DB-as-queue actually works:</strong> modest scale (&lt; 1K msg/sec), single consumer, no replay, no fan-out. Small SaaS outbound webhook queue with <code>FOR UPDATE SKIP LOCKED</code> + simple worker is fine. <strong>This is exactly why Kafka exists</strong> — past ~10K msg/sec or multi-consumer, the mismatch becomes fatal.</p>
+<p>The <em>related</em> pattern — outbox: events written to a DB outbox table in the same transaction as the business write, then CDC tails the binlog to Kafka — is good and standard. Outbox is transactional staging, not the queue itself. Distinguish in interviews.</p>
+<hr>
+<h2 id="21-scaling-axes">§21. Scaling axes</h2>
+<p>Two structurally different growth modes with different fixes; conflating them is a common mistake.</p>
+<p><strong>Type 1 (uniform growth): more topics, more groups, more partitions.</strong> New product feature → new event type → new topic. Progression: 10K msg/sec on 3 brokers → 100K msg/sec same cluster with more partitions → 1M msg/sec dedicated cluster of 15-30 brokers + schema registry → 10M msg/sec multiple clusters split by domain + KRaft + tiered storage → 80M msg/sec (LinkedIn) dozens of clusters with fleet-wide control plane, self-service onboarding, quota enforcement.</p>
+<p><strong>Inflection points:</strong> ~1K partitions → ZooKeeper struggles, move to KRaft. ~50 brokers/cluster → rebalance takes hours, split by domain. 10x storage growth → tiered storage essential. Cross-region → MirrorMaker 2 or Pulsar geo-rep; conflict resolution becomes a system requirement.</p>
+<p><strong>Type 2 (hotspot intensification): one topic ramps 10-100x.</strong> A viral feature, a runaway bug, Black Friday. Baseline: 10K msg/sec on 32 partitions = ~300 msg/sec/partition, fine. 10x uniform = ~3K/partition, fine. <strong>10x with skew (top 1% of keys = 50%):</strong> one partition does 50K msg/sec, others idle. <strong>Adding partitions does NOT help</strong> — hot key still hashes to one. Fix: re-key with salt, sacrifice strict per-key order. <strong>100x uniform</strong> approaches per-partition ceiling; fix is more partitions, but repartitioning a live keyed topic requires creating a new topic + dual-write + cutover — painful. <strong>Inflection point:</strong> over-provision partitions at topic creation 4-10x what you think you need; treat partition count as a one-shot decision.</p>
+<p>The asymmetry: <strong>Type 1 is solved by adding capacity. Type 2 is solved by re-engineering the partition key.</strong></p>
+<hr>
+<h2 id="22-decision-matrix-vs-adjacent-technology-categories">§22. Decision matrix vs adjacent technology categories</h2>
+<table>
+<thead>
+<tr>
+<th>Technology</th>
+<th>When to pick</th>
+<th>When NOT to pick</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Distributed log (Kafka/Pulsar/Kinesis)</strong></td>
+<td>Fan-out &gt; 1 consumer group. Replay needed (audit, backfill). Throughput &gt; 50K msg/sec. Per-partition order is sufficient.</td>
+<td>Sub-ms latency. &lt; 1K msg/sec with no replay (overkill). Strict global order at high throughput (impossible).</td>
+</tr>
+<tr>
+<td><strong>Queue (RabbitMQ/SQS)</strong></td>
+<td>&lt; 50K msg/sec. Rich per-message semantics (priority, TTL, headers). RPC-style request/reply. Acked = gone is acceptable.</td>
+<td>High throughput. Fan-out &gt; 1. Need replay.</td>
+</tr>
+<tr>
+<td><strong>DB outbox (<code>SKIP LOCKED</code>)</strong></td>
+<td>&lt; 1K msg/sec. Single consumer. Already have the DB. No fan-out, no replay.</td>
+<td>Multi-consumer. &gt; 10K msg/sec. Need replay.</td>
+</tr>
+<tr>
+<td><strong>Synchronous RPC (gRPC, HTTP)</strong></td>
+<td>&lt; 50 ms latency required. Caller needs response value. Few hops.</td>
+<td>Async fire-and-forget. Fan-out. Back-pressure absorption. Publish even if consumer is down.</td>
+</tr>
+<tr>
+<td><strong>Workflow engine (Temporal, Cadence)</strong></td>
+<td>Multi-step processes with retries, timers, human-in-the-loop, compensations. Days-to-weeks workflows.</td>
+<td>Simple fan-out (over-engineered). Sub-second latency between steps.</td>
+</tr>
+<tr>
+<td><strong>Stream processor (Flink, Kafka Streams)</strong></td>
+<td>Stateful computation across events (windowing, joins, aggregation).</td>
+<td>Pure transport (log alone). Stateless transforms (consumer is enough).</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Thresholds:</strong> Log vs queue — fan-out ≥ 2 or replay needed or &gt; 50K msg/sec → log; otherwise queue is simpler. Log vs DB outbox — multi-consumer or &gt; 10K msg/sec → log; otherwise outbox is cheaper. Queue vs RPC — caller doesn't need response or must succeed when consumer is down → queue; otherwise RPC.</p>
+<hr>
+<h2 id="23-use-case-gallery-six-domains-different-variants">§23. Use case gallery — six domains, different variants</h2>
+<p>Same primitive, wildly different demands.</p>
+<p><strong>Event sourcing in payments (Stripe outbox).</strong> Payments service writes <code>payments</code> row inside a transaction + an <code>outbox</code> row in the same transaction. Debezium tails the binlog and publishes <code>payment.charged</code> to Kafka. Downstream: ledger, notifications, fraud, reporting. Demands: strict atomicity (no lost events), replay for ledger reconciliation. Fit: Kafka <code>acks=all</code>, transactional consumers, <code>read_committed</code>. Not a queue because ledger + reporting need replay.</p>
+<p><strong>Real-time analytics (Uber click-stream).</strong> Mobile clients emit clicks tagged with session ID. Kafka partitioned by <code>session_id</code>. Flink computes session metrics; sinks to Druid (dashboards) + S3 (long-term). Demands: 1-10M events/sec, sub-second freshness, tolerates 0.1% loss, per-session order. Fit: Kafka <code>acks=1</code>, lz4 compression — async replication accepted because analytics is loss-tolerant.</p>
+<p><strong>CDC pipelines (LinkedIn Brooklin → Iceberg).</strong> Brooklin tails MySQL/Espresso binlogs, writes change events to Kafka, consumed by Iceberg lake tables, search index updates, Espresso secondary indices. Demands: lossless row-change transport, per-row order, multi-sink fan-out. Fit: Kafka log + per-PK (Primary Key) partitioning + <code>acks=all</code> + compacted topics for snapshot state.</p>
+<p><strong>Microservices async (Airbnb booking events).</strong> <code>booking.created</code> triggers payment, calendar, notifications, search update, host notification. Demands: ~50K msg/sec, each consumer its own bounded context. Fit: Kafka or Pulsar. RabbitMQ viable but adding a 6th consumer requires a new queue; with a log it's a <code>subscribe()</code> call.</p>
+<p><strong>IoT telemetry (Tesla fleet uplink).</strong> Millions of vehicles emit CAN-bus events, GPS, sensors, fault codes. Uplinked to regional brokers, forwarded to central Kafka for analytics, predictive maintenance, OTA (Over-The-Air) tracking. Demands: burst-tolerant, loss tolerable for routine sensor reads but NOT for fault codes, geo-distributed. Fit: Kafka central + regional clusters with cross-region rep, or MQTT (Message Queuing Telemetry Transport) at edge bridging to Kafka. Safety-critical uses <code>acks=all</code>, bulk uses <code>acks=1</code>.</p>
+<p><strong>Log shipping (Cloudflare edge logs).</strong> 200+ POPs (Points of Presence) emit request logs, security events, edge worker logs to central Kafka. Downstream: SIEM (Security Information and Event Management), warehouses, customer log delivery. Demands: 1T+ msg/day, 30+ day retention, cost-sensitive, ~100 ms latency tolerated. Fit: Kafka + tiered storage to S3/R2, aggressive zstd; evaluating WarpStream-style S3-native.</p>
+<p>Same primitive — durable, partitioned, replayable log — serves all six. The knobs (replication mode, compression, partition key, retention, tiered storage) move; the structure is the same.</p>
+<hr>
+<h2 id="24-real-world-implementations-with-numbers">§24. Real-world implementations with numbers</h2>
+<ul>
+<li><strong>LinkedIn (Kafka origin, 7T msg/day).</strong> Kafka was invented at LinkedIn in 2010 to replace ActiveMQ. ~7T msg/day, peak ~80M msg/sec, ~4,000 brokers across ~100 clusters, ~100K topics, ~7M partitions, p99 ~10 ms. Brooklin (CDC) feeds Iceberg, Espresso secondary indices, derived stores.</li>
+<li><strong>Netflix Keystone (10 PB/day).</strong> Unified telemetry. ~700B events/day, ~8M events/sec sustained, multiple regional clusters, Flink stream processing. Feeds S3, Druid, Elasticsearch, ML feature pipelines.</li>
+<li><strong>Cloudflare (1T+ msg/day).</strong> Edge log shipping (2023 blog). Aggressive zstd compression. Driver behind their evaluation of S3-native log designs.</li>
+<li><strong>Uber (4T msg/day Cherami → Kafka).</strong> Initially built Cherami (custom queuing); migrated to Kafka for replay + throughput. uReplicator (open-sourced) for cross-region. uForwarder + Flink.</li>
+<li><strong>Stripe (~5M events/sec).</strong> Outbox pattern: business write paired with outbox row; CDC publishes to Kafka. Multi-region with strict exactly-once into ledger via transactional producers + <code>read_committed</code>.</li>
+<li><strong>Confluent Cloud benchmarks.</strong> Single c5n.4xlarge broker sustains ~605 MB/sec write at <code>acks=all</code>, RF=3, lz4. End-to-end p99 ~5 ms at moderate load.</li>
+<li><strong>WarpStream (acquired Confluent 2024) / AutoMQ.</strong> S3-native Kafka-compatible. ~1 GB/sec on 10-30 node clusters, p99 ~200-500 ms, 30-50% cost reduction at high retention.</li>
+<li><strong>Pulsar at Tencent.</strong> 10M msg/sec across a single cluster claimed. Multi-tenant isolation as the differentiator. BookKeeper fsync-per-entry, fewer replicas than Kafka.</li>
+</ul>
+<p>Steady-state production across wildly different access patterns — activity events (LinkedIn), telemetry firehose (Netflix), edge logs (Cloudflare), task graphs (Uber), transactional outbox (Stripe), high-retention cost-sensitive (WarpStream/AutoMQ), multi-tenant SaaS (Pulsar). Same primitive, tuned differently.</p>
+<hr>
+<h2 id="25-summary">§25. Summary</h2>
+<blockquote>
+<p><em>The distributed log is the substrate primitive that converts "send this message" into "append this byte range to a replicated, segmented file" — and the rest of the design space (queue vs log, sync vs async replication, local-disk vs S3-native, broker-managed vs peer-to-peer) is variation on how aggressively you optimize that one operation. Pick log when fan-out and replay matter at scale; pick queue when per-message semantics matter at modest scale; pick S3-native when retention dominates cost; pick DB outbox when you're below the scale where introducing a broker pays for itself.</em></p>
+</blockquote>
+<hr>
+<h2 id="appendix-a-acronyms-expanded">Appendix A: Acronyms expanded</h2>
+<p>ACL (Access Control List), AES-NI (Advanced Encryption Standard New Instructions), AMQP (Advanced Message Queuing Protocol), AZ (Availability Zone), BookKeeper (Pulsar's distributed durable storage layer), BYOC (Bring Your Own Cloud), CA (Certificate Authority), CAN-bus (Controller Area Network bus), CDC (Change Data Capture), CRC (Cyclic Redundancy Check), DLQ/DLX (Dead Letter Queue / Dead Letter eXchange), DMA (Direct Memory Access), DR (Disaster Recovery), FIFO (First-In-First-Out), GC (Garbage Collection), GTID (Global Transaction Identifier), HW (High Watermark — highest offset replicated to all ISR members), IoT (Internet of Things), ISR (In-Sync Replica), JMX (Java Management Extensions), JWT (JSON Web Token), JVM (Java Virtual Machine), KIP (Kafka Improvement Proposal), KMS (Key Management Service), KRaft (Kafka Raft, post-ZooKeeper metadata layer), LEO (Log End Offset), LSM (Log-Structured Merge tree), LSO (Last Stable Offset — transactional consumer's high-watermark equivalent), LUKS (Linux Unified Key Setup, disk encryption), MM2 (MirrorMaker 2), MQTT (Message Queuing Telemetry Transport), MSK (AWS Managed Streaming for Kafka), mTLS (mutual TLS), MVCC (Multi-Version Concurrency Control), NIC (Network Interface Card), NVMe (Non-Volatile Memory express), OIDC (OpenID Connect), OOM (Out-Of-Memory), OTA (Over-The-Air), PID (Producer ID — idempotent producer), PII (Personally Identifiable Information), PK (Primary Key), POP (Point of Presence), RPC (Remote Procedure Call), RPO (Recovery Point Objective), RTBF (Right To Be Forgotten), RTO (Recovery Time Objective), RTT (Round Trip Time), SASL (Simple Authentication and Security Layer), SCRAM (Salted Challenge Response Authentication Mechanism), SIEM (Security Information and Event Management), SMT (Single Message Transform — Kafka Connect), SQS (AWS Simple Queue Service), SR (Schema Registry), SSO (Single Sign-On), TC (Transaction Coordinator), TTL (Time-To-Live), WAL (Write-Ahead Log), 2PC (Two-Phase Commit).</p>
+<h2 id="appendix-b-companion-patterns-worth-a-name-check">Appendix B: Companion patterns worth a name-check</h2>
+<ul>
+<li><strong>Transactional outbox:</strong> events to a DB outbox table in the same transaction as the business write; CDC reads the binlog and publishes to Kafka. Eliminates dual-write atomicity. Used by Stripe, Shopify.</li>
+<li><strong>Idempotency key at the API boundary:</strong> client-facing API accepts idempotency-key headers (Stripe-style). Defends against retries above the queue layer.</li>
+<li><strong>Compacted state topics:</strong> <code>cleanup.policy=compact</code> + key per state object = materialized current-state snapshot. Used for <code>__consumer_offsets</code>, CDC of current row values, feature-store online caches, stream-processor state backing.</li>
+<li><strong>MirrorMaker 2 / uReplicator:</strong> cross-cluster replication for DR or geo. Offset translation is the tricky bit — offsets don't transfer 1:1 across clusters.</li>
+<li><strong>Stream processing on top:</strong> Kafka is the substrate; Flink / Kafka Streams / Spark Structured Streaming are the compute layer. Exactly-once typically lives here, not in raw consumers.</li>
+<li><strong>Schema Registry (Confluent, Apicurio, Pulsar built-in):</strong> every topic has a registered schema (Avro / Protobuf / JSON Schema). Backward-compatibility enforcement prevents producer changes from breaking consumers.</li>
+</ul>
+<p>End of doc.
+</content>
+</invoke></p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

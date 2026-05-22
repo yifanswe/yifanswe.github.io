@@ -1,0 +1,1842 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CDN — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/backend-fundamentals/">← Back to Backend Fundamental Components</a>
+        <h1 class="article-title">CDN</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Backend Fundamental Components
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p>A reference on CDN (Content Delivery Network) / edge caching as a technology class. Covers the design space, internal mechanics, capacity envelope, hard problems, and failure modes — applicable whether the workload is static images for a SaaS, a global API like Stripe's, a Linux package mirror, 4K video like Netflix, or ML model artifacts. Same primitive, very different consumption patterns; this doc unpacks the primitive.</p>
+<hr>
+<h2 id="1-what-cdns-are-and-what-they-are-not">§1. What CDNs ARE — and what they are NOT</h2>
+<p>A <strong>CDN is a distributed edge cache plus a global routing layer that brings content geographically (and topologically) close to the user.</strong> Two ideas fused into one product:</p>
+<ol>
+<li>A <strong>caching tier</strong> — many small, fast, read-optimized object stores running at the network edge, each holding a working set of recently/frequently requested objects.</li>
+<li>A <strong>request-steering layer</strong> — anycast IPs advertised via BGP (Border Gateway Protocol), GeoDNS (Geographic DNS), and RUM (Real User Monitoring) feedback that route a user's TCP/QUIC connection to the topologically nearest cache.</li>
+</ol>
+<p>Either alone is something else. Caching without steering is a reverse proxy cache (Varnish or nginx in one datacenter — useful but limited by the speed of light from one region to the rest of the planet). Steering without caching is a global L4/L7 load balancer (AWS Global Accelerator before you put anything behind it). The CDN is the fusion, deployed at every major exchange point on the internet.</p>
+<p><strong>Where it sits.</strong> From the user's perspective, the CDN <em>is</em> the origin — TLS terminates at the CDN, HTTP requests are served by the CDN, only on miss does anything reach your servers. From the origin's perspective, the CDN is a single (large, distributed) client doing a lot of conditional GETs.</p>
+<p><strong>What CDNs are NOT good for</strong>:</p>
+<ul>
+<li><strong>Source of truth.</strong> Cache entries are derived state. Lose a PoP (Point of Presence), lose the bytes there — they refetch from origin. If origin lost the bytes, the CDN cannot resurrect them. Object storage (S3, GCS) is the durability layer; the CDN is the latency layer.</li>
+<li><strong>Strong consistency.</strong> Cache freshness is eventual. A purge propagates over hundreds of milliseconds to seconds. Reading your own writes through a CDN requires bypass on writes or URL versioning on reads.</li>
+<li><strong>General-purpose database.</strong> Even CDN-hosted KV products (Cloudflare KV, Fastly KV Store) are eventually consistent caches with TTLs, not OLTP (Online Transaction Processing) systems. Excellent for feature flags and edge config; not for billing ledgers.</li>
+<li><strong>Universal accelerator.</strong> Some CDNs limit what they cache. Video CDNs only cache segment-shaped HTTP. Dynamic personalized content (your logged-in homepage with your name) is uncacheable without edge compute or per-bucket cache-key strategy.</li>
+</ul>
+<p>The mental model: <strong>CDN = derived edge state for latency + offload + DDoS dilution, sitting in front of an immutable-or-versioned source of truth.</strong></p>
+<hr>
+<h2 id="2-inherent-guarantees-vs-what-must-be-layered-on">§2. Inherent guarantees vs what must be layered on</h2>
+<p>A CDN provides by construction:</p>
+<ul>
+<li><strong>Hit-rate-driven origin offload.</strong> Push hit rate from 90% to 99% and origin load drops 10x. The unit of guarantee: "an object cached at edge serves up to 1/TTL requests per object per PoP before refetch."</li>
+<li><strong>Topological proximity via anycast.</strong> A user's SYN lands on the nearest PoP within ~1 RTT, typically 5-30 ms anywhere on the populated planet. Mechanism is BGP — "topologically nearest by AS-path." Usually correlates with physically nearest; not always.</li>
+<li><strong>DDoS dilution by capacity arbitrage.</strong> A 5 Tbps L3 flood from a worldwide botnet, being worldwide, distributes across the CDN's PoPs. A CDN with 280 Tbps of egress (Cloudflare's number) doesn't have to <em>filter</em> most attacks — it just has more wire than the attacker.</li>
+<li><strong>TLS offload close to user.</strong> TLS terminates at the PoP. Sydney users hit a Sydney PoP at ~30 ms instead of ~300 ms to us-east-1.</li>
+</ul>
+<p>What a CDN does NOT give you — must be layered on:</p>
+<ul>
+<li><strong>Read-your-writes / strong consistency.</strong> Bounded staleness is bounded but not zero. Bypass cache on writes, version URLs on reads, or invalidate via edge compute.</li>
+<li><strong>Durability.</strong> Cache bytes are evictable at any time per the engine's policy. Origin keeps the canonical copy.</li>
+<li><strong>Schema/protocol awareness.</strong> Most CDNs see HTTP requests as opaque GETs. They don't know <code>/api/users/123/posts</code> and <code>/api/posts?user=123</code> are the same entity. Cache-key normalization and surrogate-key tagging are the designer's job.</li>
+<li><strong>Per-user privacy isolation.</strong> A misconfigured cache key can serve user A's authenticated content to user B. The CDN doesn't enforce that contract — <code>Cache-Control: private</code>, cookie-based bucketing, and custom VCL (Varnish Configuration Language) / Worker code do.</li>
+<li><strong>Compute.</strong> A vanilla CDN serves bytes; edge compute (Cloudflare Workers, Fastly Compute@Edge, Lambda@Edge) is an additional product on top.</li>
+</ul>
+<p>Stated plainly: <strong>"I will reduce your origin load by 10-100x and place your bytes 5-30 ms from any user, as long as you tell me what is cacheable, give me well-formed cache keys, and accept eventual freshness."</strong></p>
+<hr>
+<h2 id="3-the-design-space">§3. The design space</h2>
+<p>The CDN class splits along <strong>third-party / commodity vs purpose-built / private</strong>, with a third category for <strong>specialized variants</strong>.</p>
+<h3 id="third-party-shared-cdn">Third-party / shared CDN</h3>
+<p>SaaS (Software as a Service) offerings where many tenants share PoPs, separated by hostname / customer ID / configuration. Economics work because diverse tenant traffic amortizes fixed PoP cost across hundreds of thousands of customers.</p>
+<ul>
+<li><strong>Cloudflare</strong> — ~300 PoPs, anycast-first, integrated DDoS + WAF (Web Application Firewall), edge compute via V8 isolates (Workers). Best DDoS profile in the industry.</li>
+<li><strong>Akamai</strong> — ~4,200 PoPs (often single-rack installs inside ISPs). Oldest CDN; deepest enterprise feature set; streaming and gaming industries lean heavily on it.</li>
+<li><strong>Fastly</strong> — ~70 high-capacity "superPOPs." VCL programmability is the differentiator — request-handling logic written in a Varnish-derived DSL, pushed globally in seconds.</li>
+<li><strong>CloudFront</strong> — ~450 edge locations + ~13 regional edge caches. Tightly integrated with AWS origins (S3, ALB).</li>
+<li><strong>BunnyCDN</strong> — ~120 PoPs, indie / cost-focused. ~$0.01/GB vs CloudFront's $0.085/GB list. Trades enterprise features and DDoS guarantees for raw cost.</li>
+<li><strong>Google Cloud CDN, Azure Front Door</strong> — hyperscaler CDNs mirroring the CloudFront-vs-AWS-origin pattern for their own clouds.</li>
+</ul>
+<h3 id="private-purpose-built-cdn">Private / purpose-built CDN</h3>
+<p>Some workloads are large enough that running your own is cheaper than buying one. The economics tip around 100+ Tbps of sustained traffic with a workload uniform enough to skip general-purpose features.</p>
+<ul>
+<li><strong>Netflix Open Connect</strong> — ~17,000 cache appliances embedded <em>inside</em> ISP networks. Each: ~250 TB SSD, 100 Gbps NICs (Network Interface Cards), optimized for sequential reads of 4K video segments. ~95% of Netflix traffic served from inside the user's own ISP — never traverses the public internet backbone. This architecture (in-ISP, not at-IX) is viable because video files are immutable and the popular set fits on disk.</li>
+<li><strong>Google's Google Global Cache (GGC)</strong> — analogous in-ISP appliances for YouTube, Drive, Play Store.</li>
+<li><strong>Meta's edge POPs</strong> — internal CDN for Facebook/Instagram static assets and WhatsApp media.</li>
+<li><strong>Apple's edge cache</strong> — iOS / macOS updates, App Store, iCloud. Multi-tier with significant Akamai overflow for surge events.</li>
+</ul>
+<p>Trade-off: third-party CDNs share fixed costs but charge per-GB; private CDNs are huge capex but ~zero marginal cost. Below ~10 Tbps the third-party model wins; above ~100 Tbps the math flips. In between is mix-and-match (Apple Edge Cache + Akamai contracts).</p>
+<h3 id="edge-compute-as-a-variant">Edge compute as a variant</h3>
+<p>Edge compute turned CDNs from byte caches into thin application platforms. Cloudflare Workers (V8 isolates, ~1-5 ms cold-start), Fastly Compute@Edge (WASM-only, ~1 ms cold-start), AWS Lambda@Edge (Node/Python/Java, ~100 ms cold-start), Akamai EdgeWorkers. These run code <em>between</em> cache lookup and response — JWT (JSON Web Token) validation, A/B routing, image resize, header rewriting, personalization. Not a substitute for origin durability; an extension of the cache plane with programmable behavior.</p>
+<h3 id="specialized-cdn-variants">Specialized CDN variants</h3>
+<ul>
+<li><strong>Video CDN</strong> — optimized for HLS (HTTP Live Streaming) / DASH (Dynamic Adaptive Streaming over HTTP) segment caching, multi-bitrate variants, manifest manipulation. Segments are 500 KB - 5 MB; dozens of bitrate variants per stream.</li>
+<li><strong>Gaming CDN</strong> — patch distribution dominated. AAA releases are 100 GB across 100M users in 24 hours. Steam, Epic Games, Battle.net hybrid commercial CDN + their own peer-assist layers.</li>
+<li><strong>Software-distribution CDN</strong> — Linux mirrors (Ubuntu on Cloudflare), Docker registry pull-through (Hub on Cloudflare, ECR on CloudFront), apt/yum mirrors.</li>
+<li><strong>DNS-only / steering-only CDNs</strong> — NS1, Cedexis. Don't cache HTTP; steer traffic at DNS to optimal endpoints. Often used as multi-CDN front-end.</li>
+</ul>
+<p>Comparison along named dimensions:</p>
+<table>
+<thead>
+<tr>
+<th>Variant</th>
+<th>PoP topology</th>
+<th>Workload assumption</th>
+<th>Programmability</th>
+<th>Best fit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cloudflare-style</td>
+<td>300 mid-sized PoPs</td>
+<td>General web + APIs</td>
+<td>V8 isolates</td>
+<td>Default for most web</td>
+</tr>
+<tr>
+<td>Akamai-style</td>
+<td>4,200 small + edge</td>
+<td>Enterprise + streaming</td>
+<td>EdgeWorkers</td>
+<td>Big-media, gov, banking</td>
+</tr>
+<tr>
+<td>Fastly-style</td>
+<td>70 super-PoPs</td>
+<td>API + dynamic</td>
+<td>VCL (very flexible)</td>
+<td>High-config-velocity teams</td>
+</tr>
+<tr>
+<td>CloudFront-style</td>
+<td>450 + regional</td>
+<td>AWS-fronted workloads</td>
+<td>Lambda@Edge</td>
+<td>AWS-native shops</td>
+</tr>
+<tr>
+<td>Netflix Open Connect</td>
+<td>17k in-ISP</td>
+<td>Immutable video segments</td>
+<td>None</td>
+<td>Single workload at &gt;100 Tbps</td>
+</tr>
+<tr>
+<td>BunnyCDN-style</td>
+<td>120 PoPs, low cost</td>
+<td>Small/medium static</td>
+<td>Minimal</td>
+<td>Indie / cost-driven</td>
+</tr>
+<tr>
+<td>Specialized video</td>
+<td>Custom or overlay</td>
+<td>Adaptive segments</td>
+<td>Manifest manipulation</td>
+<td>Live + VOD streaming</td>
+</tr>
+</tbody>
+</table>
+<p>Same primitive; very different tunings.</p>
+<hr>
+<h2 id="4-underlying-data-structure-and-storage-engine">§4. Underlying data structure and storage engine</h2>
+<p>This is the section that separates Staff candidates. Every CDN runs <em>some</em> cache engine at every PoP, and the engine has a fairly standard shape because the access pattern is so consistent.</p>
+<h3 id="a-in-ram-hash-table-over-log-structured-ssd-segments">(a) In-RAM hash table over log-structured SSD segments</h3>
+<p>A cache node has two physical storage tiers: RAM for hot lookups, NVMe (Non-Volatile Memory Express) SSD for the bulk working set. Logically one keyed object store; physically hot in RAM, long tail on SSD.</p>
+<pre><code>                    Cache box (one PoP shard for hash(URL) % N)
+
+  +----------------------------------------------------------------+
+  |  In-RAM hash table                                              |
+  |                                                                  |
+  |   index_entry = {                                                |
+  |     u64 key_hash;            // 8 bytes, partial cache key       |
+  |     u32 ssd_offset;          // 4 bytes                          |
+  |     u32 length;              // 4 bytes                          |
+  |     u64 last_access_tick;    // for eviction policy              |
+  |     u32 ttl_expiry_epoch;                                        |
+  |     u8  vary_fingerprint[8]; // for variant disambiguation       |
+  |   }                                                              |
+  |                                                                  |
+  |   chained buckets — ~3 entries per bucket at 70% load factor    |
+  +----------------------------------------------------------------+
+                          |
+                          |  ssd_offset
+                          v
+  +----------------------------------------------------------------+
+  |  SSD: log-structured object store                                |
+  |  (Cloudflare &quot;tincan&quot;, Fastly storage layer, CloudFront engine,  |
+  |   Akamai NetStorage variants)                                    |
+  |                                                                  |
+  |  +---------+---------+---------+---------+---------+              |
+  |  | segment | segment | segment | segment | active  | ...          |
+  |  |   0     |   1     |   2     |   3     | segment |              |
+  |  | (1 GB)  | (1 GB)  | (1 GB)  | (1 GB)  | (write) |              |
+  |  +---------+---------+---------+---------+---------+              |
+  |                                                                  |
+  |  Each segment is append-only.                                    |
+  |  Writes (cache fills) append to the active segment.              |
+  |  When active fills (1 GB), it seals; a new active opens.         |
+  |  Evictions pick a victim segment, copy still-hot survivors to    |
+  |  active, then erase the victim segment (whole-segment discard    |
+  |  — friendly to SSD endurance).                                   |
+  +----------------------------------------------------------------+
+</code></pre>
+<p>This is fundamentally <strong>LSM-flavored (Log-Structured Merge)</strong> even though we don't call it that: writes are purely sequential, the index is in RAM (O(1) lookup), "compaction" is segment-level eviction (no sorted-run merge because there's no ordering invariant).</p>
+<table>
+<thead>
+<tr>
+<th>Approach</th>
+<th>Random write IOPS</th>
+<th>SSD endurance</th>
+<th>Lookup</th>
+<th>Used by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Per-file on filesystem</td>
+<td>~50k IOPS, fsync per write</td>
+<td>Bad</td>
+<td>O(1)</td>
+<td>Naive nginx setups</td>
+</tr>
+<tr>
+<td>B+ tree keyed object DB</td>
+<td>Random writes, write amplification</td>
+<td>Mediocre</td>
+<td>O(log n)</td>
+<td>RocksDB-as-cache attempts</td>
+</tr>
+<tr>
+<td><strong>Log-structured segments</strong></td>
+<td>Sequential — line-rate</td>
+<td>Excellent</td>
+<td>O(1)</td>
+<td>Cloudflare, Fastly, Akamai</td>
+</tr>
+</tbody>
+</table>
+<p>Log-structured is non-negotiable at scale because SSD write endurance limits sustained random writes. Sequential append at 3 GB/s per NVMe is cheap; equivalent random 4 KB writes would burn cells in months.</p>
+<h3 id="b-why-this-fits-the-access-pattern">(b) Why this fits the access pattern</h3>
+<p>Across all CDN workloads — static web, API responses, video segments, gaming patches, software downloads, ML model artifacts — the access pattern is identical:</p>
+<ul>
+<li><strong>Read-dominant</strong> (~99% reads even on miss-heavy workloads).</li>
+<li><strong>Working set Zipfian / power-law</strong> — 1% of keys serve 80%+ of requests.</li>
+<li><strong>Writes bursty and externally driven</strong> (cache fills on miss).</li>
+<li><strong>No range scans or sorted iteration.</strong></li>
+</ul>
+<p>The in-RAM hash table + log-structured SSD wins: ~100 ns RAM hit, ~100 us SSD hit, sequential writes at line rate, whole-segment eviction with no fragmentation, naturally fits "hot in RAM, warm on SSD, cold to origin."</p>
+<h3 id="c-eviction-the-heart-of-cache-hit-rate">(c) Eviction — the heart of cache hit rate</h3>
+<p>Naive LRU (Least Recently Used) is wrong at CDN scale. Two problems:</p>
+<ol>
+<li><strong>Scan pollution</strong>: one large crawler walks 100k cold URLs; all displace hot entries. Shows up universally — Googlebot, archive.org, security scanners.</li>
+<li><strong>Lock contention</strong>: at 1M rps per box, the LRU list head becomes a global lock.</li>
+</ol>
+<p><strong>LFU (Least Frequently Used)</strong>: counters grow stale; once-popular keys dominate forever. Rarely used pure.</p>
+<p><strong>ARC (Adaptive Replacement Cache)</strong>: IBM's classic; two LRU lists, ghost list, adaptive ratio. Better; patent-encumbered until 2024 so not in widely used systems for years.</p>
+<p><strong>W-TinyLFU (Window TinyLFU)</strong>: the modern answer. Used by Caffeine, Cloudflare in parts of its stack, serious caches generally.</p>
+<pre><code>W-TinyLFU layout:
+
+  +--------------+   admission     +----------------------------------+
+  | window LRU   | ---filter----&gt;  | main cache (SLRU = Segmented LRU)|
+  | (1% of cache)|                  |  +----------+ +-------------+    |
+  |              |                  |  | protected| |  probation  |    |
+  | new entries  |                  |  |   80%    | |    20%      |    |
+  | get a chance |                  |  +----------+ +-------------+    |
+  +--------------+                  +----------------------------------+
+                                          ^
+                                          |
+                            +-------------+--------------+
+                            | Count-Min Sketch (4-bit    |
+                            | counters, 4 hash funcs)    |
+                            | — tracks key frequency     |
+                            |   approximately            |
+                            +----------------------------+
+</code></pre>
+<p>Each access:</p>
+<ol>
+<li>New entry enters the <strong>window</strong> (small LRU). New entries always get a chance.</li>
+<li>When window evicts, the victim hits the <strong>admission filter</strong>: count-min sketch compares its estimated frequency to the would-be victim from main. Higher-freq wins.</li>
+<li><strong>Main cache</strong> is SLRU (Segmented LRU): protected (80%) and probation (20%). New items enter probation; promotion to protected on second access.</li>
+<li>The count-min sketch is <strong>aged</strong> (halve all counters every N accesses) so once-hot items don't dominate forever.</li>
+</ol>
+<p>Why it wins across very different workloads:</p>
+<ul>
+<li><em>Static-asset CDN</em> for an e-commerce catalog: filter rejects one-hit-wonder product variants from displacing the perpetually-hot homepage carousel.</li>
+<li><em>API CDN</em> (Stripe, GitHub Pages): keeps <code>/api/v1/health</code> and other high-frequency low-cost endpoints in cache, even when one-off <code>/api/v1/customers/{rare_id}</code> calls flood through.</li>
+<li><em>Video CDN</em>: popular shows dominate frequency; one-off rare-language subtitle requests get filtered.</li>
+</ul>
+<p>Empirically W-TinyLFU achieves ~5-10 percentage points higher hit rate than LRU on the same memory budget. At 95% baseline, going to 99% halves origin load. Multi-million-dollar engineering at scale.</p>
+<h3 id="d-cache-key-composition-the-hidden-axis">(d) Cache-key composition — the hidden axis</h3>
+<p>A naive cache key is <code>(method, host, path)</code>. Real keys need more:</p>
+<pre><code>cache_key = SHA1(
+    method
+    || &quot;:&quot; || host
+    || &quot;:&quot; || path
+    || &quot;:&quot; || canonicalize_query(query_params)
+    || &quot;:&quot; || vary_fingerprint(req_headers, response_vary)
+    || &quot;:&quot; || ( bucket(cookies, allowed_cookies) )
+)
+</code></pre>
+<p>Each component is a footgun, with consequences differing by workload:</p>
+<ul>
+<li><strong>Query params</strong>: should <code>?utm_source=twitter</code> fragment the cache? No — strip it. Should <code>?w=400</code> (image width) fragment? Yes. The CDN config must know which params are content-bearing. A bad UTM rule can blow hit rate by 50 percentage points in an afternoon.</li>
+<li><strong>Vary headers</strong>: <code>Vary: Accept-Encoding</code> is fine (~3 variants). <code>Vary: User-Agent</code> is catastrophic (~10k variants per URL, cache collapse). API CDNs see this when <code>Vary</code> accidentally lists a per-client correlation header.</li>
+<li><strong>Cookies</strong>: <code>Cookie: session=...</code> in cache key = per-user fragments = useless. Strip irrelevant cookies before hashing; bucket meaningful ones (logged-in vs anonymous, country bucket) and key on the bucket.</li>
+</ul>
+<p>Auditing cache keys is the highest-leverage optimization any CDN customer ever does — across image hosting, API gateways, news sites, anywhere.</p>
+<h3 id="e-consistent-hashing-for-shard-by-url-within-a-pop">(e) Consistent hashing for shard-by-URL within a PoP</h3>
+<p>Within a PoP with N cache boxes, each URL should go to the same box (so it's cached once, not N times). Naive <code>hash(URL) % N</code> fails when boxes are added/removed — all keys remap. <strong>Consistent hashing</strong> with ~150 virtual nodes per box:</p>
+<pre><code>0 -------------------- ring ----------------------&gt; 2^32
+
+[B0 vnode1][B2 vnode1][B1 vnode1][B0 vnode2][B3 vnode1][B1 vnode2]...
+
+hash(URL) lands on the ring; first vnode clockwise wins.
+
+If B2 dies: only B2's vnodes are removed; keys formerly on B2 vnodes
+            go to the next vnode. ~1/N of keys remap; the rest are
+            unaffected.
+
+If a new box B4 is added: vnodes inserted; ~1/N of keys move to B4.
+</code></pre>
+<p>Graceful scaling. Cache misses on remap are bounded; the rest stays warm. Rendezvous hashing (HRW) is a variant — slightly more deterministic with weighted boxes, marginally more CPU. Same shape.</p>
+<h3 id="f-bloom-filter-for-l2-existence-probes">(f) Bloom filter for L2 existence probes</h3>
+<p>When L1 misses and considers asking L2 (mid-tier), an option is a <strong>Bloom filter</strong> of "keys that exist in L2."</p>
+<ul>
+<li>Definitively absent → skip L2, go straight to shield/origin (save a hop).</li>
+<li>Possibly present → query L2.</li>
+</ul>
+<p>Useful for cold long-tail content; ~1% false-positive rate at ~10 bits per L2 key. Many CDNs skip this — L2 probe cost is small enough that the complexity isn't always worth it.</p>
+<h3 id="g-walk-through-one-request-byte-level">(g) Walk through one request, byte level</h3>
+<p>A user in Berlin requests <code>https://cdn.example.com/asset.bin?v=400</code> over HTTPS. The walk is identical whether the asset is a JPEG, JSON API response, video segment, or ML model file — the cache plane doesn't care.</p>
+<pre><code>1. DNS — 8 ms
+   - Client resolves cdn.example.com.
+   - 1.1.1.1 returns 104.16.x.x (anycast IP) within ~10ms (often cached).
+
+2. TCP / TLS handshake — 30 ms
+   - BGP routes the SYN to Frankfurt PoP (5 ms one-way).
+   - SYN/SYN-ACK/ACK ~10 ms RTT.
+   - TLS 1.3 1-RTT handshake — 5 more ms.
+   - Session resumption → 0-RTT, skip handshake; gain ~20 ms.
+
+3. HTTP/2 stream open — 1 ms
+   - Client opens stream 1; sends GET /asset.bin?v=400 with headers.
+
+4. PoP receives request — 0 ms (now)
+   - L4 LB (XDP/eBPF on the receiving box) inspects SNI (Server Name
+     Indication) or unencrypted Host header, then hashes the URL.
+   - hash(URL) -&gt; cache box B17.
+   - L4 LB forwards (single hop within PoP — sub-ms).
+
+5. Cache box B17, edge cache layer — 0.5 ms
+   - Strip irrelevant query params; keep ?v=400 (declared content-bearing).
+   - Compute cache_key = SHA1(&quot;GET:cdn.example.com:/asset.bin:v=400::&quot;).
+   - Lookup in in-RAM hash table.
+     +-- HIT (RAM): return bytes in ~0.1 ms (memcpy + framing).
+     +-- HIT (SSD): RAM index -&gt; ssd_offset -&gt; 4 KB sector read ~100 us;
+     |              larger objects -&gt; multiple sequential reads.
+     +-- MISS: proceed to step 6.
+
+6. On miss, ask L2 (mid-tier cache) — 2 ms
+   - hash(URL) -&gt; mid-tier shard M3.
+   - Cross-PoP RPC in the same region — ~1 ms RTT.
+   - HIT -&gt; return; B17 writes object to active segment + index.
+   - MISS -&gt; proceed to step 7.
+
+7. On L2 miss, ask shield — 5 ms (or skip if no shield)
+   - Request coalescing: if another concurrent request already has
+     an outstanding fetch for this key, attach to that promise.
+   - Shield issues conditional GET (If-None-Match) if it has stale.
+
+8. On shield miss, go to origin — 50–200 ms
+   - Frankfurt shield to us-east-1 origin ~90 ms RTT TLS-warmed.
+   - Origin responds with Cache-Control: max-age=86400, immutable.
+
+9. Propagate down the hierarchy
+   - Shield caches -&gt; L2 caches -&gt; L1 (B17) caches.
+   - Each tier writes to its active log-structured segment and updates
+     in-RAM index.
+   - Index update is in-memory only; no fsync (reconstructible from
+     segment headers on restart).
+
+10. Respond to client — 1 ms
+    - HTTP/2 DATA frame(s); zero-copy via sendfile() where possible.
+
+Total cache HIT:    ~ 12-15 ms (DNS + TLS + cache read).
+Total cache MISS:   ~ 100-300 ms (depending on origin distance).
+</code></pre>
+<p>The <strong>durability point</strong> is the segment write on SSD; once it returns, the cache survives a process restart. The in-RAM index is rebuilt by scanning segment headers on startup (~1 s per TB of cache). No fsync on most writes — we accept that a node crash loses a few seconds of cache fills. <strong>The cache is a cache; the origin is the source of truth.</strong> That contract repeats throughout the doc.</p>
+<hr>
+<h2 id="5-cache-key-normalization-in-depth">§5. Cache key normalization in depth</h2>
+<p>§4(d) named cache-key composition as a footgun; this section unpacks it. Cache-key hygiene is the single highest-leverage knob between you and a healthy hit rate, and it is the single most common source of CDN-induced outages. The reason: a cache key is the <strong>only thing</strong> the CDN uses to identify equivalent requests. Two URLs that should hit the same cache entry but produce different keys mean two cache misses. Two URLs that should be different but produce the same key means user A sees user B's response.</p>
+<h3 id="a-url-normalization">(a) URL normalization</h3>
+<p>The naive cache key uses the raw URL as the user sent it. That is wrong because URLs have multiple syntactic variants that should hash to the same bucket:</p>
+<ul>
+<li><strong>Case sensitivity.</strong> <code>/Products/123</code> and <code>/products/123</code> are usually the same resource — but the URL spec allows path case-sensitivity, so the CDN must be told. Hosts must always be lowercased; paths usually should be unless the origin explicitly differentiates.</li>
+<li><strong>Trailing slash.</strong> <code>/about</code> vs <code>/about/</code> — typically the same page. If the CDN doesn't normalize, both variants cache independently and a popular page has two cache entries each at half the hit rate.</li>
+<li><strong>Default ports.</strong> <code>https://example.com/path</code> and <code>https://example.com:443/path</code> — same resource. Strip default ports before hashing.</li>
+<li><strong>Percent-encoding.</strong> <code>/foo%20bar</code> and <code>/foo+bar</code> and <code>/foo bar</code> should usually canonicalize the same way. RFC 3986 normalization (case-fold hex digits in percent-encoded sequences, decode unreserved characters).</li>
+<li><strong>Query parameter order.</strong> <code>?a=1&amp;b=2</code> and <code>?b=2&amp;a=1</code> are the same query. Canonicalize by sorting alphabetically before hashing. If the CDN doesn't do this, a client that orders params differently than the typical client misses cache for every request.</li>
+<li><strong>Tracking-only parameters.</strong> <code>utm_source</code>, <code>utm_medium</code>, <code>utm_campaign</code>, <code>fbclid</code>, <code>gclid</code> should be <strong>stripped before hashing</strong> (but preserved when forwarding to origin if origin needs them for analytics). A single bad rule that includes UTM in the cache key shatters hit rate: every link clicked from a different campaign is a new cache entry. A Twitter-driven product launch can drop hit rate from 99% to 30% in an afternoon because of this.</li>
+<li><strong>Content-bearing parameters.</strong> Conversely, <code>?size=large</code>, <code>?w=400</code>, <code>?lang=fr</code>, <code>?v=42</code> are content-bearing and <strong>must</strong> stay in the cache key. The CDN configuration is essentially an allowlist of which params count.</li>
+</ul>
+<p>A correct normalization pipeline:</p>
+<pre><code>raw_url
+  -&gt; lowercase host
+  -&gt; strip default port
+  -&gt; RFC 3986 path normalize (case-fold hex, decode unreserved)
+  -&gt; resolve relative segments (. and ..)
+  -&gt; trailing-slash policy (strip or canonicalize per route)
+  -&gt; parse query string
+  -&gt; drop params not in content-bearing allowlist
+  -&gt; sort remaining params alphabetically by name
+  -&gt; stable-encode values
+  -&gt; emit canonical_url
+  -&gt; feed canonical_url into the cache_key hash
+</code></pre>
+<p>This is the kind of code that should be one function, audited, tested, and shared across every PoP. When it diverges across tiers (L1 normalizes one way, L2 another), you get keys that hit at one layer and miss at the next — cache hierarchy effectively disabled.</p>
+<h3 id="b-vary-header-handling">(b) Vary header handling</h3>
+<p>The <code>Vary</code> response header tells the cache: "this response varies based on request header X; key on X." It is correct in principle, catastrophic in practice if used carelessly.</p>
+<ul>
+<li><strong><code>Vary: Accept-Encoding</code></strong> is fine. ~3 values in the wild (<code>gzip</code>, <code>br</code>, identity). Three cache variants per URL is acceptable.</li>
+<li><strong><code>Vary: Accept-Language</code></strong> is borderline. Tens of values; if the origin actually serves localized content this is the price of correctness. Better: bucket Accept-Language to a small set (en, es, fr, de, ja, "other") in CDN config and key on the bucket.</li>
+<li><strong><code>Vary: User-Agent</code></strong> is catastrophic. Tens of thousands of UA strings per major site. Each variant means an independent cache entry. A URL with <code>Vary: User-Agent</code> has a cache hit rate approaching zero. The origin developer who added it probably wanted to serve different HTML to mobile vs desktop and reached for the wrong tool. The right tool is a UA classifier at edge (Workers / VCL) that buckets UAs and uses a synthetic header in the cache key.</li>
+<li><strong><code>Vary: Cookie</code></strong> is even worse if the cookie includes session ID. Every user gets their own cache entry. The whole CDN devolves into a per-user store with no hits.</li>
+<li><strong><code>Vary: *</code></strong> (literally an asterisk) means "this response is unique per request; never cache." Servers emit this sometimes; CDNs honor it by bypassing cache entirely.</li>
+</ul>
+<p>The right operational discipline: <strong>the CDN owner reviews every Vary header coming from origin</strong> and either restricts it via config (force the list to known-safe values) or works with the origin team to remove it. Vary should be a deliberate decision, never accidental.</p>
+<p>Internally, the cache implements Vary as a two-level lookup:</p>
+<pre><code>1. URL-canonical key  -&gt; &quot;variant map&quot; entry
+   Variant map records which request headers Vary on (per response)
+   plus a list of stored variants, each tagged by a fingerprint of
+   the relevant request header values.
+
+2. For each request, compute the variant fingerprint from the
+   listed Vary headers, then look up the matching variant.
+
+Lookup is still O(1) on a hit but two hash steps. The variant map
+itself is small; the cost is the variant fragmentation when Vary is
+on a high-cardinality header.
+</code></pre>
+<h3 id="c-cookie-based-bypass-and-bucketing">(c) Cookie-based bypass and bucketing</h3>
+<p>Cookies are the most dangerous input to a cache key because they often carry session identity. Three policies:</p>
+<ol>
+<li><strong>Strip all cookies before key hash.</strong> Default for purely static content. The origin response should set <code>Cache-Control: public</code> and contain no per-user data; the CDN doesn't include cookies in the key.</li>
+<li><strong>Bypass cache when sensitive cookies are present.</strong> For mixed pages (logged-in and anonymous served by the same URL), CDN config: "if <code>Cookie: session=...</code> is set, set cache mode to bypass; serve origin directly without caching the response." This sacrifices hit rate on logged-in traffic but guarantees no cross-user contamination.</li>
+<li><strong>Bucket cookies and key on the bucket.</strong> When you want logged-in vs anonymous caching separately: extract whether the user is authenticated (presence of session cookie → "logged_in_v1" else "anon_v1"); use that string in the cache key, not the cookie value. Each variant caches once.</li>
+</ol>
+<p>Bad configurations:
+- Including <code>Cookie:</code> header verbatim in the cache key. Every session is a unique key — useless and PII-leaking simultaneously.
+- Stripping the cookie from the cache key but <strong>not</strong> from the response variant — the cached response contains user A's data; user B's request matches the key; user B gets user A's data. The "we accidentally cached PII" disaster.</p>
+<p>The classic incident pattern: a developer adds personalization to a page (small per-user widget). They forget to add <code>Cache-Control: private</code> or <code>no-store</code>. The CDN's default is "cache everything." The CDN does not include the auth cookie in the cache key (correct — would shatter hit rate). Now every request to that URL gets the response cached for the <strong>first user who hit it</strong>. If that first user was logged in, every subsequent user — logged in or not — sees that user's name, balance, possibly more. Multiple major sites have had this exact incident publicly; it's the canonical CDN configuration disaster.</p>
+<p>Mitigations:
+- Default-deny on dynamic responses: only paths or content types explicitly marked cacheable get cached at all.
+- Origin must always set <code>Cache-Control: private</code> or <code>no-store</code> on per-user responses.
+- WAF rules: if response body contains common per-user markers (Set-Cookie, user-specific HTML patterns) and the request had no auth, flag as suspicious and refuse to cache.
+- Synthetic monitoring that pulls "anonymous" and "logged-in" variants and diff-checks them.</p>
+<h3 id="d-cache-key-explosion">(d) Cache key explosion</h3>
+<p>The opposite failure mode of cache poisoning is <strong>cache key explosion</strong> — too many variants, no hits. Symptoms: hit rate collapses below 50% for no obvious reason; cache fill rate spikes (every request causes a fill); origin load climbs.</p>
+<p>Common causes:
+- Vary on high-cardinality header (User-Agent).
+- Tracking params in cache key.
+- Cookie included.
+- Request-ID or correlation-ID accidentally hashed.
+- Random query params from broken clients (Chrome's <code>?_=12345</code> cache busters, ad SDK <code>?ab_segment=...</code>).
+- The URL itself contains a per-request token (signed URLs with unique signature per call).</p>
+<p>Detection: dashboards on <strong>cache-key-to-URL ratio</strong> per host. If a host has 10x more cache keys than distinct URLs, something is fragmenting the key. Per-host hit-rate trend dashboards catch this in hours rather than days.</p>
+<p>The "every user has unique cache key = no hits" pathology is, statistically, <strong>the most common single cause of bad CDN bills</strong>. Every miss costs origin egress + compute; a 99% hit rate site dropping to 50% misses is doing ~50x more origin work, often with no other visible change.</p>
+<hr>
+<h2 id="6-cache-invalidation-protocols">§6. Cache invalidation protocols</h2>
+<p>CDNs cache aggressively; the harder problem is making them stop. Invalidation lives on a spectrum from "expensive but immediate" to "free but slow."</p>
+<h3 id="a-purge-by-url-the-atomic-primitive">(a) Purge by URL — the atomic primitive</h3>
+<p>The simplest API: <code>PURGE https://cdn.example.com/path/asset.json</code> against the CDN's control plane. Goes through:</p>
+<ol>
+<li>Customer API call (or origin webhook).</li>
+<li>Control-plane validation (auth, rate limits, surrogate key resolution).</li>
+<li>Fanout to regions, then PoPs, then individual cache boxes.</li>
+<li>Each box removes the entry from its in-RAM index. The on-disk segment isn't rewritten — the entry is just unreferenced and eventually GC'd (garbage collected) with the segment.</li>
+</ol>
+<p>End-to-end latency targets:
+- Cloudflare: &lt;150 ms p99 globally to all PoPs (via Quicksilver, see (e)).
+- Fastly: &lt;150 ms p99 worldwide ("instant purge").
+- Akamai: ~5-10 s for legacy CCU (Content Control Utility); ~150 ms for newer Fast Purge.
+- CloudFront: minutes (because their invalidation propagates through their less-aggressive control plane).</p>
+<p>Cost model: most CDNs include 1000-10000 free purges per day; bulk purges are metered. Purge volume is a knob — overuse signals architectural smell (you should be versioning URLs instead).</p>
+<h3 id="b-surrogate-keys-tagged-invalidation">(b) Surrogate keys — tagged invalidation</h3>
+<p>Purging by URL doesn't scale when "all 50,000 product pages for category electronics" must invalidate together. <strong>Surrogate keys</strong> solve this: the origin tags each response with one or more keys; the customer purges by tag; the CDN's tag index iterates affected URLs.</p>
+<pre><code>Origin response:
+   GET /product/123
+   Cache-Tag: product:123 category:electronics brand:apple
+   Cache-Control: public, max-age=300
+
+CDN indexes:
+   product:123       -&gt; { &quot;/product/123&quot; }
+   category:electronics -&gt; { &quot;/product/123&quot;, &quot;/product/456&quot;, ... 50,000 entries }
+   brand:apple       -&gt; { &quot;/product/123&quot;, &quot;/product/789&quot;, ... 1200 entries }
+
+Customer purges:
+   PURGE-TAG category:electronics
+   -&gt; CDN walks the index, purges all 50,000 URLs
+
+   PURGE-TAG product:123
+   -&gt; CDN purges just /product/123 plus any other URLs that referenced it
+</code></pre>
+<p>Cloudflare calls these "Cache-Tag" headers; Fastly calls them "Surrogate-Key" (per RFC 5861 conventions). Akamai supports them as "Edge-Cache-Tag." The pattern is the same; the inverted index per PoP (or globally) is the implementation detail.</p>
+<p>Operationally, surrogate keys are how every commerce site handles category updates, every CMS handles tag/topic changes, every API handles "this customer's data changed across N endpoints." Without surrogate keys you would need to enumerate every URL touched by a logical entity update — impossible for anything dynamic.</p>
+<p>Implementation cost: the tag index. ~10 bytes per (tag, URL) pair. A site with 10M URLs, 5 tags average, costs ~500 MB of index per PoP — non-trivial but manageable.</p>
+<h3 id="c-purge-by-prefix-the-bulk-hammer">(c) Purge by prefix — the bulk hammer</h3>
+<p>Sometimes you need "everything under <code>/blog/</code>." Cloudflare supports prefix purges on Enterprise plans. Fastly supports glob-style purge. The implementation is a range walk over the prefix in the URL-keyed index.</p>
+<p>Caveat: prefix purges are expensive because they don't have a precomputed index. The CDN walks all URLs at every PoP. For sites with millions of URLs under a prefix this is minutes-to-hours; surrogate keys are usually better.</p>
+<h3 id="d-versioned-urls-the-purge-by-deploy-trick">(d) Versioned URLs — the "purge by deploy" trick</h3>
+<p>The most important pattern, mentioned in §15's Problem 1, deserves its own treatment.</p>
+<pre><code>Bad pattern (TTL + purge):
+   /static/app.js                  (TTL 1 hour, requires purge on deploy)
+   Deploy new version -&gt; purge /static/app.js across 300 PoPs
+   Race: some users get old version for up to 150 ms after deploy
+   Race: misconfigured PoP serves old version indefinitely
+
+Good pattern (immutable + versioned):
+   /static/app.abc123.js           (TTL 1 year, immutable)
+   /static/app.def456.js           (next deploy)
+   No purge ever required. The HTML simply references the new URL.
+</code></pre>
+<p>The bytes never change. The URL changes per build (typically a content hash). Old URLs continue to be served from cache (for any clients that still reference them — old HTML cached at edge or in browsers). New URLs are referenced by the new HTML, are uncached at first request, fill on demand, and cache forever.</p>
+<p>Why this is the right answer:
+- No coordination problem. Deploy is atomic per HTML reference.
+- No purge fanout. Saves the control-plane bandwidth.
+- No race condition. A given URL refers to one set of bytes forever.
+- Far longer TTLs are safe. <code>max-age=31536000, immutable</code> (1 year, immutable) is fine.
+- Browser caches benefit identically. Round trip eliminated entirely.</p>
+<p><code>Cache-Control: immutable</code> (RFC 8246) tells the browser: "even on user-initiated refresh, don't revalidate this." Without <code>immutable</code>, a hard refresh re-fetches every asset; with it, only the HTML refetches.</p>
+<p>The versioned-URL pattern applies to almost all static assets: JS, CSS, images, fonts, video segments. It does <strong>not</strong> apply to HTML itself (URL must remain <code>/about</code>) — for HTML you rely on short TTL + purge. The split is: short-lived HTML with surrogate-key purges; long-lived assets with content-hashed immutable URLs.</p>
+<h3 id="e-cloudflare-quicksilver-the-propagation-network">(e) Cloudflare Quicksilver — the propagation network</h3>
+<p>The mechanism behind &lt;150 ms global purge needs its own description because most candidates have never thought through what it takes.</p>
+<p>Quicksilver is Cloudflare's globally-distributed key-value store specifically for <strong>config and purge propagation</strong>. ~hundreds of GB of state per PoP, replicated to every PoP within ~150 ms p99.</p>
+<p>Mechanism:
+- Writes go to a small leader cluster.
+- Leaders fanout to regional sub-leaders.
+- Sub-leaders fanout to all PoPs in the region in parallel.
+- Each PoP applies the write to local state; subscribers (the cache process, the WAF process) receive a notification.</p>
+<p>The protocol is fundamentally gossip-with-leader: writes are linearizable to the leader, eventually consistent at the PoPs, with a tight p99 propagation SLO measured continuously. Failures are tolerated by the gossip retrying through alternate paths. Faulty PoPs are detected by heartbeat lag and depooled.</p>
+<p>Fastly's equivalent ("Service Configuration Distribution," sometimes called SCD) is architecturally similar with somewhat different leader topology. CloudFront's invalidation is slower partly because it's a different beast — they invalidate via the CloudFront management plane and don't have a comparable purpose-built propagation network.</p>
+<h3 id="f-cache-control-immutable-and-stale-while-revalidate">(f) Cache-Control: immutable and stale-while-revalidate</h3>
+<p>The HTTP standards include first-class support for the patterns above:</p>
+<ul>
+<li><code>Cache-Control: max-age=N</code> — TTL in seconds.</li>
+<li><code>Cache-Control: s-maxage=N</code> — TTL for shared caches (CDN); browser uses max-age.</li>
+<li><code>Cache-Control: public</code> — explicitly cacheable by shared caches.</li>
+<li><code>Cache-Control: private</code> — only browser may cache; CDN must not.</li>
+<li><code>Cache-Control: no-store</code> — must not be cached.</li>
+<li><code>Cache-Control: no-cache</code> — may cache but must revalidate before reuse.</li>
+<li><code>Cache-Control: must-revalidate</code> — when stale, revalidate; do not serve stale.</li>
+<li><code>Cache-Control: immutable</code> — bytes will not change for this URL; skip revalidation.</li>
+<li><code>Cache-Control: stale-while-revalidate=N</code> — for N seconds past TTL, serve stale and refresh in background.</li>
+<li><code>Cache-Control: stale-if-error=N</code> — for N seconds past TTL, serve stale if origin is unreachable.</li>
+</ul>
+<p>The hidden gem is <strong><code>stale-while-revalidate</code></strong>: serves a stale response immediately while triggering a background refresh. Reduces tail latency to zero on revalidation. Combined with surrogate-key purges it gives "always-fresh-but-fast" behavior.</p>
+<p><code>stale-if-error</code> is a resilience primitive: when origin is unreachable (504), serve stale rather than 503. Bounded staleness is better than an outage for most workloads.</p>
+<hr>
+<h2 id="7-capacity-envelope">§7. Capacity envelope</h2>
+<p>A few real-world anchors at different scales:</p>
+<ul>
+<li><strong>Cloudflare</strong>: ~280 Tbps network capacity. ~300 PoPs across 120+ countries. Sustained ~50M rps; peak crossing 1 billion req/min during DDoS events.</li>
+<li><strong>Akamai</strong>: ~4,200 PoPs across 1,000+ networks. Served 250+ Tbps during major NFL events. ~30% of web traffic.</li>
+<li><strong>Netflix Open Connect</strong>: ~17,000 in-ISP appliances. ~200 Tbps peak during popular releases.</li>
+<li><strong>Fastly</strong>: ~70 superPOPs, each with petabyte-class storage.</li>
+<li><strong>CloudFront</strong>: ~450 edge locations + ~13 regional edge caches. Theoretical 600+ Tbps.</li>
+<li><strong>BunnyCDN</strong>: ~120 PoPs, ~$0.01/GB pricing. Limited DDoS protection.</li>
+</ul>
+<p>Where the next bottleneck appears as you scale traffic through the same architecture:</p>
+<pre><code>Edge RPS              10M rps     ← physical: ~30 Tbps wire, ~3000 cache boxes
+TLS handshakes / sec  100k/sec    ← ~30k CPU cores doing TLS, mitigated by
+                                    session resumption (&gt;90% of conns resume)
+Origin RPS            500k rps    ← scary; needs origin shielding
+DNS QPS (queries/sec) ~2M qps     ← anycast DNS resolvers absorb; not bottleneck
+Purge fanout          ~100/sec    ← could be 1000/sec at peak, must propagate
+                                    to all PoPs in &lt;150 ms
+</code></pre>
+<p>Bottleneck migration: at small scale (one PoP, ~10k rps) it's per-server CPU for TLS. At medium scale (10s of PoPs, ~100k rps) it's cross-PoP bandwidth and L2 hit rate. At large scale (~10M rps) it's BGP convergence and anycast pathology; control-plane gossip propagation dominates.</p>
+<p>The <strong>hit rate is THE metric</strong> at every tier. 95% at 10M rps means 500k rps to origin — likely a meltdown without shielding. 99% means 100k rps — trivially serviceable. 99.9% means 10k rps — boring. Every architectural choice in §4 traces to "what keeps hit rate &gt;95% in steady state and &gt;99% with shielding."</p>
+<p>For private CDNs like Netflix Open Connect, the math is different: video files are immutable and the popular subset fits on disk. Hit rate is ~99%+ trivially because the workload has been engineered around the cache.</p>
+<hr>
+<h2 id="8-video-cdn-segment-caching">§8. Video CDN segment caching</h2>
+<p>Video is the largest single workload class on the planet's CDNs (Netflix + YouTube + Twitch + TikTok + the rest of streaming combined are &gt;70% of total internet bytes). The protocols and caching patterns are different from general web caching enough to justify their own section.</p>
+<h3 id="a-hls-http-live-streaming-apple">(a) HLS — HTTP Live Streaming (Apple)</h3>
+<p>Introduced by Apple in 2009; the de facto standard for iOS, macOS, Safari, and a major chunk of the rest. The trick: instead of streaming a single video file over a custom protocol, the video is <strong>chopped into ~2-10 s segments</strong>, each segment is a separate HTTP-accessible object, and a manifest file (<code>.m3u8</code>) lists the segments in order.</p>
+<pre><code>manifest.m3u8 (master playlist — multi-bitrate)
+   #EXTM3U
+   #EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=640x360
+   low/index.m3u8
+   #EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+   med/index.m3u8
+   #EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1920x1080
+   high/index.m3u8
+
+high/index.m3u8 (media playlist — segment list for one bitrate)
+   #EXTM3U
+   #EXT-X-TARGETDURATION:6
+   #EXT-X-VERSION:3
+   #EXT-X-MEDIA-SEQUENCE:0
+   #EXTINF:6.0,
+   segment-0000.ts
+   #EXTINF:6.0,
+   segment-0001.ts
+   ...
+   #EXT-X-ENDLIST
+</code></pre>
+<p>The client polls the manifest, downloads segments sequentially, and switches bitrate variants based on network speed (ABR — Adaptive Bitrate). Each segment is typically 500 KB - 5 MB.</p>
+<p>Why this is <strong>perfect</strong> for HTTP caching:</p>
+<ul>
+<li>Each segment is an immutable HTTP object. URL never changes. <code>Cache-Control: max-age=31536000, immutable</code>.</li>
+<li>Segments are small enough to fit in cache memory or NVMe trivially; many can stream in parallel.</li>
+<li>Popular video → segments hit a CDN cache box; one cache fill serves millions of viewers.</li>
+<li>The 95-99% hit-rate target is achievable because the popular catalog is small relative to the cache (the long tail of obscure videos misses cache, but they aren't the byte-volume driver).</li>
+</ul>
+<p>The manifest itself is the only thing that's not trivially cacheable: for <strong>VOD (Video On Demand)</strong> the manifest is immutable too (entire segment list fixed); for <strong>live</strong> the manifest is updated every few seconds with new segments appended (and old ones aging out for sliding-window live).</p>
+<h3 id="b-dash-dynamic-adaptive-streaming-over-http">(b) DASH — Dynamic Adaptive Streaming over HTTP</h3>
+<p>MPEG-DASH, ISO/IEC 23009-1. Conceptually identical to HLS — manifest plus segments — but uses XML-based <code>.mpd</code> manifest instead of <code>.m3u8</code>, supports a wider range of codecs and container formats (segments may be <code>.mp4</code> instead of <code>.ts</code>), and has more extensible metadata. Used heavily outside the Apple ecosystem: YouTube, Netflix (with internal extensions), most Android players, Smart TVs.</p>
+<p>From a CDN cache plane perspective: identical to HLS. Manifests are small files, segments are independent HTTP objects keyed on URL. The same segment-caching mechanism works for both.</p>
+<p>Many CDNs serve <strong>both formats from the same origin</strong> — origin packages once, distributes both manifest formats and a shared segment store. CMAF (Common Media Application Format) is the standard for this: a single segment file (fMP4 fragmented MP4) usable by both HLS and DASH players.</p>
+<h3 id="c-manifest-file-cache-strategy">(c) Manifest file cache strategy</h3>
+<p>Manifests are tiny (a few KB) but request volume is huge — every viewer pulls one per session, plus refreshes for live. The strategy diverges by mode:</p>
+<ul>
+<li><strong>VOD manifests</strong>: immutable for the life of the video. <code>Cache-Control: max-age=86400</code> is fine. Hit rate near 100%. Effectively static assets.</li>
+<li><strong>Live manifests</strong>: change every ~1-10 s as new segments are added. <code>Cache-Control: max-age=1</code> or even <code>no-cache</code>. The CDN caches for one second; on each tick, all PoPs simultaneously refetch. With request collapsing + tight TTL jitter this is fine — the origin sees ~1 manifest request per PoP per second.</li>
+<li><strong>Low-latency HLS (LL-HLS — Low-Latency HTTP Live Streaming)</strong> and <strong>Low-Latency DASH (LL-DASH)</strong> are extensions that reduce live latency from ~30 s to ~3 s by using chunked transfer encoding within a segment. The CDN must handle partial segment caching — caching the first 500 ms of a 2 s segment while the next 1.5 s is still being produced. Implementation is a streaming proxy + cache fill in one pass.</li>
+</ul>
+<p>Twitch, YouTube Live, and the major sports streamers all use LL-HLS or LL-DASH in production now. The "we shaved 25 s off live latency" engineering effort across the industry happened 2020-2024.</p>
+<h3 id="d-live-vs-vod-as-different-cache-shapes">(d) Live vs VOD as different cache shapes</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>VOD</th>
+<th>Live</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Manifest mutability</td>
+<td>Immutable for video lifetime</td>
+<td>Mutates every 1-10 s</td>
+</tr>
+<tr>
+<td>Segment mutability</td>
+<td>Immutable forever</td>
+<td>Immutable once produced</td>
+</tr>
+<tr>
+<td>Concurrent viewers</td>
+<td>Spread across content</td>
+<td>Often concentrated on one stream</td>
+</tr>
+<tr>
+<td>Per-PoP working set</td>
+<td>"Popular catalog"</td>
+<td>"Currently airing event"</td>
+</tr>
+<tr>
+<td>Cold start</td>
+<td>Long tail, gradual</td>
+<td>Bursty (event starts at announced T0)</td>
+</tr>
+<tr>
+<td>TTL strategy</td>
+<td>max-age=year + immutable</td>
+<td>max-age=segment-duration</td>
+</tr>
+<tr>
+<td>Most common failure</td>
+<td>Long-tail miss to origin</td>
+<td>Manifest stampede at segment boundary</td>
+</tr>
+</tbody>
+</table>
+<p>For live sports / major events, the failure mode is <strong>manifest stampede</strong>: 10M viewers all hitting the manifest at the same 1 s boundary. Per-PoP coalescing reduces this to 1 fetch per PoP per second; per-region shield further reduces to 1 per region per second; origin sees a few requests per second instead of millions.</p>
+<h3 id="e-netflix-open-connect-the-full-fat-approach">(e) Netflix Open Connect — the full-fat approach</h3>
+<p>Netflix's design is qualitatively different from third-party video CDNs:</p>
+<ul>
+<li>~17,000 cache appliances deployed <strong>inside ISP networks</strong> (rather than at internet exchange points).</li>
+<li>Each appliance: ~250 TB of SSD, 100 Gbps NICs, single-purpose (video only).</li>
+<li><strong>Pre-fill at off-peak hours.</strong> Netflix knows what's popular tomorrow (releases, recommendations). It pushes the popular set to every appliance overnight. Daytime traffic is almost all from local SSD — never traverses the internet backbone.</li>
+<li>Hit rate is effectively 100% on popular content (since it's pre-fetched). Long-tail content backs up to a fill chain: appliance → regional Netflix POP → origin.</li>
+<li>Each ISP gets free hardware (Netflix ships the appliances) in exchange for hosting and providing power + bandwidth within the ISP.</li>
+<li>The aggregate is the world's largest CDN by bytes-moved-per-day, but it serves only Netflix. Single-customer, single-workload, in-ISP, immutable content, predictable demand.</li>
+</ul>
+<p>This works because:
+- Video files are <strong>immutable</strong> (no purge problem).
+- The popular subset is <strong>small relative to disk</strong> (the top 5000 titles is ~petabyte; an appliance holds the relevant fraction).
+- Demand is <strong>predictable</strong> (recommendation engine knows tomorrow's popular content tonight).
+- Single workload = no need for general programmability, WAF, edge compute. Netflix optimizes the stack end to end.</p>
+<p>The architectural lesson: <strong>when your workload is uniform enough, building your own beats buying one</strong>. Same lesson holds for Google's GGC (Google Global Cache), Meta's edge POPs, Apple's edge cache. The economic crossover is around 100 Tbps sustained; Netflix is 5-10x past that.</p>
+<h3 id="f-drm-and-signed-segments">(f) DRM and signed segments</h3>
+<p>Premium video adds DRM (Digital Rights Management): segments are encrypted; clients fetch decryption keys separately. The encrypted segments are cacheable normally (the encrypted bytes are the same for everyone with that license); the key requests are per-user and uncacheable. CDN serves segments; a separate license server handles key issuance.</p>
+<p>Signed URLs (HMAC or RSA signatures embedded in the URL with expiry timestamps) are another premium-video pattern. The cache key strips the signature (otherwise every signed URL is unique). The CDN validates the signature at the edge — Workers / VCL — and serves from cache on valid signatures, rejects on invalid or expired.</p>
+<hr>
+<h2 id="9-image-optimization-at-edge">§9. Image optimization at edge</h2>
+<p>Images are 50-70% of typical web page bytes. Edge image optimization — converting, resizing, recompressing images at the PoP — is one of the highest-ROI features modern CDNs offer.</p>
+<h3 id="a-format-conversion-jpeg-to-webp-to-avif">(a) Format conversion (JPEG to WebP to AVIF)</h3>
+<p>Image formats have evolved with substantial compression gains at each step:</p>
+<table>
+<thead>
+<tr>
+<th>Format</th>
+<th>Year</th>
+<th>Typical compression vs JPEG</th>
+<th>Browser support</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JPEG</td>
+<td>1992</td>
+<td>baseline</td>
+<td>Universal</td>
+</tr>
+<tr>
+<td>PNG</td>
+<td>1996</td>
+<td>lossless; large for photos</td>
+<td>Universal</td>
+</tr>
+<tr>
+<td>WebP</td>
+<td>2010</td>
+<td>~25-35% smaller</td>
+<td>All modern browsers</td>
+</tr>
+<tr>
+<td>AVIF</td>
+<td>2019</td>
+<td>~50% smaller</td>
+<td>Most modern; not Safari &lt; 16</td>
+</tr>
+<tr>
+<td>JPEG XL</td>
+<td>2021</td>
+<td>~40-60% smaller</td>
+<td>Limited (Chrome dropped, Safari adopting)</td>
+</tr>
+</tbody>
+</table>
+<p>Naive serving: origin stores JPEG; everyone gets JPEG. Modern serving: origin stores one source image; CDN reads <code>Accept</code> header from client, converts on the fly, caches the converted variant.</p>
+<p>Implementation at edge:
+- Cloudflare Polish / Cloudflare Image Resizing: feature flag turns on; origin remains JPEG; CDN serves WebP/AVIF to capable browsers.
+- Fastly Image Optimizer: similar, configurable via VCL.
+- AWS CloudFront via Lambda@Edge functions: write a Lambda that calls a Sharp/Pillow library on the origin image and returns the converted variant.
+- ImageKit, imgproxy, Imgix: third-party SaaS that lives between origin and CDN, or runs as origin.</p>
+<p>Cache key includes a format token (<code>format=webp</code>) so each format is cached separately. Negotiation pattern:</p>
+<pre><code>1. Browser sends GET /photo.jpg with Accept: image/avif, image/webp, image/*
+2. CDN edge inspects Accept, picks best format the browser supports.
+3. CDN cache key includes the chosen format -&gt; cache lookup.
+4. On miss: CDN fetches origin's JPEG (cached separately under a &quot;source&quot; key),
+            converts to AVIF, caches the AVIF variant.
+5. Subsequent requests with same Accept profile hit the AVIF variant directly.
+</code></pre>
+<p>This effectively triples the cache entries per image (JPEG + WebP + AVIF) but each is still cacheable forever (immutable per source image hash).</p>
+<h3 id="b-automatic-resizing">(b) Automatic resizing</h3>
+<p>A single source image can serve dozens of sizes:
+- Mobile thumbnail: 150x150
+- Tablet thumbnail: 300x300
+- Article header: 1200x630
+- Hero image: 2400x1200
+- Retina variants (2x, 3x)</p>
+<p>Without edge resizing, origin must store every variant (storage explosion) or the page loads the largest variant and the browser shrinks it (bandwidth waste). Edge resizing: origin stores <strong>one</strong> master image; the CDN URL includes resize parameters (<code>?w=1200&amp;h=630&amp;fit=cover</code>); cache key includes the parameters; each variant caches independently.</p>
+<p>Cloudflare Image Resizing URL pattern: <code>/cdn-cgi/image/width=400,quality=85/path/to/source.jpg</code>. Fastly: query parameters or VCL-injected. AWS: Lambda@Edge with parameter parsing.</p>
+<p>Storage on origin drops 10x or more. Hit rate stays high because the actual variants users request is a small set (a dozen sizes covers 95% of requests).</p>
+<h3 id="c-quality-reduction-based-on-connection-speed">(c) Quality reduction based on connection speed</h3>
+<p>Clients send <code>Save-Data: on</code> (Chrome) or <code>ECT</code> (Effective Connection Type — <code>slow-2g</code>, <code>2g</code>, <code>3g</code>, <code>4g</code>) in client hints. Edge code adjusts quality:</p>
+<pre><code>if (request.headers.get(&quot;Save-Data&quot;) === &quot;on&quot;) {
+  return convertImage({ format: &quot;webp&quot;, quality: 50, width: limit });
+} else {
+  return convertImage({ format: &quot;avif&quot;, quality: 80 });
+}
+</code></pre>
+<p>The cache key extends to include a "connection quality bucket" so each bucket caches separately. Most CDN image services do this implicitly.</p>
+<h3 id="d-economics">(d) Economics</h3>
+<p>The pitch: <strong>"save 50% of image bytes at the edge."</strong> Concrete math:</p>
+<ul>
+<li>Site serves 100 TB/month of images at JPEG quality 80.</li>
+<li>Enable edge optimization: format negotiation (AVIF for 70% of traffic, WebP for 25%, JPEG for 5%).</li>
+<li>New byte volume: 70% × 50% + 25% × 70% + 5% × 100% = 35% + 17.5% + 5% = ~57.5% of original = ~57 TB/month.</li>
+<li>Saved 43 TB/month of egress.</li>
+<li>At CloudFront's $0.085/GB egress: 43 TB × 1024 GB/TB × $0.085 = ~$3,742/month savings.</li>
+<li>Cloudflare Image Resizing adds ~$1/million requests = a few hundred dollars/month for that traffic profile.</li>
+<li>Net: thousands per month of egress saved against hundreds of edge compute cost.</li>
+</ul>
+<p>For sites with 1 PB/month of images (large publishers, Shopify storefronts at scale), the savings are tens of thousands per month. The feature pays for itself in days.</p>
+<p>Bonus: smaller images load faster, improving Core Web Vitals (LCP — Largest Contentful Paint, in particular) — directly impacting SEO ranking and conversion.</p>
+<h3 id="e-the-cache-plane-sees-a-cartesian-product">(e) The cache plane sees a Cartesian product</h3>
+<p>The downside: cache entries explode. One source image now has format × size × quality × connection-bucket variants. The CDN provider's storage cost goes up, and they pass it through (per-image-transform fees). The arithmetic still favors transformation, but it's not free.</p>
+<p>Mitigations:
+- Limit configurable sizes via allowlist (only the 12 sizes the design system uses; not arbitrary <code>?w=N</code>).
+- Use content-hashed URLs to make the variant set explicit per image.
+- Monitor variant count per source; alert on runaways.</p>
+<hr>
+<h2 id="10-edge-compute">§10. Edge compute</h2>
+<p>A vanilla CDN serves bytes. Edge compute lets you run <strong>code</strong> in the cache plane — between request arrival and response, or instead of a cache lookup. This evolved from CDN providers realizing that "auth check before serving cache" or "JSON transform on the response" were obvious extensions of their cache box.</p>
+<h3 id="a-cloudflare-workers-v8-isolates">(a) Cloudflare Workers — V8 isolates</h3>
+<p>Workers run JavaScript / WebAssembly in V8 isolates (the same engine as Chrome's tab isolation). One isolate per Worker per request, but <strong>shared V8 process</strong> with thousands of other workers — startup is just allocating an isolate, ~1-5 ms cold start typically. Memory ~128 MB per request, CPU ~30-50 ms per request on the "Bundled" plan (more on "Unbound").</p>
+<p>The key architectural choice: <strong>V8 isolates instead of containers/VMs.</strong> A Docker container starts in hundreds of milliseconds. A V8 isolate starts in single-digit milliseconds because it shares process memory with the runtime; the isolation is at the language-VM level. This gives Cloudflare the ability to run code on the request path without latency penalty.</p>
+<p>Tradeoff: no native binaries, no syscalls, restricted I/O. You can fetch over HTTP, you can call KV / R2 / Durable Objects, you can do CPU work. You can't bind a socket, mmap a file, fork a process. The sandbox is JavaScript-language-level.</p>
+<h3 id="b-fastly-computeedge-webassembly-zero-cold-start">(b) Fastly Compute@Edge — WebAssembly, zero cold start</h3>
+<p>Fastly compiles WebAssembly (compiled from Rust, Go, AssemblyScript, etc.) ahead of time and runs it in their Lucet/Wasmtime runtime. <strong>Cold start is sub-millisecond</strong> because the WebAssembly module is mmap'd from disk on first request and the JIT'd code is shared across instances.</p>
+<p>The pitch: lower-level language choice (Rust performance), no cold start at all. Tradeoff: smaller ecosystem than JavaScript, you have to compile + deploy. Best fit for performance-sensitive transforms.</p>
+<h3 id="c-aws-lambdaedge-full-lambda-slow-cold-start">(c) AWS Lambda@Edge — full Lambda, slow cold start</h3>
+<p>CloudFront's edge compute. Runs Node.js, Python, Java, etc. — a full Lambda runtime. Cold start: ~100-500 ms (multi-hundred-ms even at best). Memory and CPU much larger than Workers.</p>
+<p>The cold start matters: a CloudFront viewer-request Lambda@Edge adds 100+ ms to the first request after a deploy or scaling event. That's catastrophic for latency-sensitive paths. Mitigated by:
+- Caching the Lambda result at edge so subsequent requests skip the Lambda entirely.
+- Using <strong>CloudFront Functions</strong> instead — a much more restricted runtime (JavaScript only, very limited APIs, ~5 ms cold start) suitable for header rewriting and simple URL transforms.</p>
+<p>The split: Lambda@Edge for heavyweight logic that's OK with cold-start; CloudFront Functions for fast path.</p>
+<h3 id="d-what-you-can-do-at-edge">(d) What you can do at edge</h3>
+<ul>
+<li><strong>Authentication / authorization.</strong> Validate JWT tokens, check session cookies, reject unauthorized requests at edge without burdening origin. A JWT validation takes ~100 us; even a busy edge node can do millions per second.</li>
+<li><strong>A/B routing.</strong> "If user is in cohort B, route to a different origin / set a different cache key." Cohort assignment in deterministic JS code (hash the user ID, threshold).</li>
+<li><strong>Personalization buckets.</strong> Add a header like <code>X-User-Bucket: logged-in-en-US</code> based on cookies / geo; use that header in the cache key. Each bucket caches once.</li>
+<li><strong>Header rewriting.</strong> Add security headers (CSP — Content Security Policy, HSTS — HTTP Strict Transport Security, X-Frame-Options), remove leaking server headers, normalize between origin variants.</li>
+<li><strong>URL rewriting.</strong> Redirect old URLs to new, rewrite paths for backend routing, implement clean URLs in front of legacy origins.</li>
+<li><strong>Bot detection.</strong> TLS fingerprinting (JA3 / JA4), behavior analysis, rate limiting per fingerprint.</li>
+<li><strong>Origin selection.</strong> Multiple origins for the same hostname; edge picks based on user geo, A/B cohort, origin health.</li>
+<li><strong>Lightweight personalization rendering.</strong> Serve a cached HTML skeleton; the worker inlines per-user data from a KV lookup (e.g., username). Cache hit + KV read + template fill in ~5 ms total.</li>
+<li><strong>Image / asset transforms</strong> (see §9).</li>
+<li><strong>GraphQL persisted queries.</strong> Cache GraphQL by query hash even though the request body varies.</li>
+</ul>
+<h3 id="e-what-you-cant-do-at-edge">(e) What you can't do at edge</h3>
+<ul>
+<li><strong>Heavy compute.</strong> Edge runtimes typically cap CPU per request at 30-50 ms. Anything ML-inference-shaped (transformer forward pass on a large model) doesn't fit. Smaller models (a few MB of weights for tabular models, simple embedding lookups) may fit.</li>
+<li><strong>Large state.</strong> Worker KV is eventually-consistent and best for config / feature flags. Cloudflare Durable Objects give you stateful actors at edge but with a global routing layer (Durable Object lookups go to the worker hosting the object, not the local PoP). State that doesn't fit "shared eventually consistent or a single Durable Object" doesn't belong at edge.</li>
+<li><strong>Long-running connections.</strong> Some platforms support WebSockets at edge (Cloudflare does); long-lived connections may pin to a single PoP and have failover quirks.</li>
+<li><strong>Direct database access</strong> to typical relational databases. Edge runtimes don't have efficient connection pools for traditional databases — every cold start would need a new connection. Workarounds: HTTP API in front of database (Hyperdrive on Cloudflare), or compute moves to origin.</li>
+<li><strong>Anything requiring source-of-truth durability.</strong> Edge is a cache plane; durability is at origin or in cloud object storage.</li>
+</ul>
+<h3 id="f-the-edge-compute-is-the-new-server-overclaim">(f) The "edge compute is the new server" overclaim</h3>
+<p>Around 2021-2023 there was hype that edge compute would replace traditional regional servers. The reality settled at: edge compute is a <strong>complement</strong> to origin compute, not a replacement. The right partition:</p>
+<ul>
+<li><strong>Edge</strong>: caching, auth, routing, simple transforms, personalization buckets, fast path.</li>
+<li><strong>Origin (regional)</strong>: business logic, database access, expensive compute, source of truth.</li>
+</ul>
+<p>The vast majority of "edge functions" deployed in production today are &lt;100 lines of JavaScript doing routing, auth, or header logic. Heavy lifting stays at origin.</p>
+<hr>
+<h2 id="11-architecture-in-context">§11. Architecture in context</h2>
+<p>Canonical end-to-end pattern, vendor-agnostic:</p>
+<pre><code>                                     CDN integration pattern
+                                     -----------------------
+
+  Client (somewhere on the planet)
+     |
+     |  1. DNS resolve &quot;cdn.example.com&quot;
+     v
+  +-------------------------------------------------------+
+  |  Recursive resolver                                    |
+  |  asks authoritative DNS                                |
+  +-------------------------------------------------------+
+     |
+     |  2. CDN's authoritative DNS — GeoDNS or anycast IP
+     v
+  +-------------------------------------------------------+
+  |  Authoritative DNS (anycast)                           |
+  |  - Returns CDN anycast IP, OR                          |
+  |  - Returns region-specific IP (older models)           |
+  |  - EDNS Client Subnet for resolver-vs-client locality  |
+  +-------------------------------------------------------+
+     |
+     |  3. TCP/QUIC handshake to anycast IP. BGP picks the
+     |     topologically nearest PoP.
+     v
+  +-------------------------------------------------------+
+  |  PoP — nearest                                         |
+  |                                                        |
+  |  +------------------+                                  |
+  |  | L4 LB (XDP/eBPF) |  ← consistent-hash by URL        |
+  |  +--------+---------+                                  |
+  |           |                                            |
+  |  +--------v---------+                                  |
+  |  | TLS terminator   |  ← shares session ticket key     |
+  |  |                  |    with sibling PoPs              |
+  |  +--------+---------+                                  |
+  |           |                                            |
+  |  +--------v---------+    cache_key =                   |
+  |  | Edge cache (L1)  |      hash(method || host || path |
+  |  |  RAM + NVMe      |           || vary headers || ...)|
+  |  |  hit -&gt; return   |                                  |
+  |  |  miss -&gt; ↓       |                                  |
+  |  +--------+---------+                                  |
+  |           |                                            |
+  |  +--------v---------+                                  |
+  |  | Mid-tier (L2)    |  ← regional cache shared across  |
+  |  |  larger SSD pool |    PoPs in a region              |
+  |  +--------+---------+                                  |
+  |           |                                            |
+  +-----------+--------------------------------------------+
+              |
+              |  Cross-region request collapsing — multiple
+              |  PoPs converge on the same shield instance
+              v
+        +-----------------------+
+        |  Origin Shield         |  ← single regional bastion;
+        |  per continent or      |    deduplicates the entire
+        |  globally              |    region's misses into one
+        |  - request coalescing  |    origin fetch
+        |  - cache-control       |
+        |    honored             |
+        +-----------+-----------+
+                    |
+                    |  Single fetch per key per TTL window
+                    v
+        +-----------------------+
+        |  Origin                |
+        |  (S3, ALB, your boxes) |
+        +-----------------------+
+
+  Annotations:
+    - L1 shard key: hash(URL) % N_local_boxes
+    - L2 shard key: hash(URL) % N_regional_boxes
+    - Shield shard key: hash(URL) % N_shield_instances
+    - Same hash function across tiers -&gt; tiered hit rate compounds.
+    - Purge propagation: pub/sub on a control plane bus, fanned out
+      to all PoPs from origin -&gt; mid-tier -&gt; edge.
+</code></pre>
+<p>Specifics this diagram hides:</p>
+<ul>
+<li><strong>DNS resolution itself is anycast</strong> to the CDN's authoritative DNS. &lt;10 ms anywhere on the planet because DNS responders live at the PoPs.</li>
+<li><strong>EDNS Client Subnet (ECS)</strong> matters: lets the authoritative DNS see the client subnet, so the right PoP is returned even when the resolver is far away. Without ECS, a user in Germany using a US resolver gets routed to a US PoP.</li>
+<li><strong>Anycast routing is BGP-driven</strong> — topological not geographic. Usually correlates. Anycast islands (misconfigured ISP sending traffic to the wrong PoP) are a real failure mode.</li>
+<li><strong>Mid-tier and origin shield are the most underrated components.</strong> Without them, every L1 miss goes straight to origin. With them, all PoPs in a region funnel through a small set of shield nodes — origin sees <code>N_regions</code> of misses, not <code>N_pops × N_boxes_per_pop</code>.</li>
+<li><strong>Edge compute lives between L4 LB and cache lookup.</strong> Workers / Compute@Edge / Lambda@Edge handlers run on the cache box itself.</li>
+</ul>
+<hr>
+<h2 id="12-anycast-pathology-in-detail">§12. Anycast pathology in detail</h2>
+<p>§2 introduced anycast as "the client's SYN lands on the nearest PoP within ~1 RTT." That's the marketing version. The engineering reality has corner cases that every CDN team eventually trips on.</p>
+<h3 id="a-route-changes-mid-tcp-flow">(a) Route changes mid-TCP-flow</h3>
+<p>The fundamental problem: TCP is a <strong>flow</strong> with state distributed between client and server. Anycast routes are <strong>per-packet</strong>, decided by BGP at each hop. If a route changes mid-flow — say, a transit provider's session flaps and BGP reconverges — packets from the same TCP connection start arriving at a <strong>different PoP</strong>. The new PoP has never seen this connection; it has no TCP state for it; it sends a RST (reset). The user's connection breaks.</p>
+<p>This is rare in practice — BGP routes are usually stable for hours to days. But during BGP convergence events (large peering changes, transit outages, occasional internet weather), tens of thousands of in-flight connections can break simultaneously. The user sees "connection reset"; some retry seamlessly, some give up.</p>
+<h3 id="b-the-stable-routing-within-a-flow-requirement">(b) The "stable routing within a flow" requirement</h3>
+<p>CDN engineering solves this by enforcing <strong>flow stability at the L4 level inside the PoP</strong>, combined with router-level flow stability:</p>
+<ul>
+<li><strong>ECMP (Equal-Cost Multi-Path) hash stability.</strong> Within a PoP, multiple cache boxes share the anycast IP via ECMP. The router picks a box based on a hash of <code>(src_ip, src_port, dst_ip, dst_port)</code>. <strong>Critical</strong>: the hash must be <strong>stable</strong> for the duration of any flow. If a box is added/removed, the hash function must remap as few flows as possible (consistent ECMP). Naïve modulo hashing fails — adding one box remaps every flow.</li>
+<li><strong>Router-level flow tracking.</strong> Modern routers track flow → next-hop mappings and keep them stable even as the path's underlying ECMP set changes.</li>
+<li><strong>Cross-PoP failover requires explicit handling.</strong> If a PoP fails entirely, the BGP route withdraws and traffic flows to another PoP. Connections to the failed PoP are lost; clients retry; new connections land on the new PoP. No magic continuation — TCP doesn't survive endpoint failure.</li>
+</ul>
+<h3 id="c-flow-aware-anycast-cloudflares-unimog">(c) Flow-aware anycast — Cloudflare's Unimog</h3>
+<p>Cloudflare published their L4 load balancer "Unimog" in 2020. The key innovation: maintain a <strong>distributed flow table</strong> across the cache boxes in a PoP, replicated via Cloudflare's internal pub-sub. When a cache box receives a packet for a flow it doesn't own, it forwards (using ECMP) to the box that does. New flows are assigned to boxes via consistent hashing.</p>
+<p>Effect: even if ECMP routes a packet to "the wrong" box (because the box set changed), the box detects this and forwards. Flow continuity is preserved.</p>
+<p>Other CDNs have analogous designs (Maglev at Google was the public predecessor). The pattern is <strong>L4 load balancer with distributed flow tables</strong>, not raw ECMP.</p>
+<h3 id="d-anycast-islands">(d) Anycast islands</h3>
+<p>Sometimes a single ISP's BGP path selection sends all anycast traffic to the wrong PoP for hours. The CDN sees: "users in this ASN have high latency, suggest they're routing to a PoP 5000 miles away instead of the one across town." Causes:</p>
+<ul>
+<li>The ISP's transit provider has a bad path for the CDN's anycast IPs.</li>
+<li>A misconfigured BGP filter at an exchange point drops the CDN's announcement.</li>
+<li>A flapping BGP session causes oscillation between two valid paths, neither optimal.</li>
+</ul>
+<p>Detection: RUM (Real User Monitoring) data aggregated per ASN. Mitigation: AS-path prepending or community manipulation to make the desired PoP more attractive; manual NOC outreach to the ISP. Not solvable purely at the CDN's layer because the problem is in the ISP's autonomous decision-making.</p>
+<p>Honest acknowledgement: ~0.5-2% of users globally are on a sub-optimal PoP at any moment. You measure, alert, route-engineer; you don't promise zero.</p>
+<h3 id="e-ecs-edns-client-subnet-and-dns-routed-alternatives">(e) ECS (EDNS Client Subnet) and DNS-routed alternatives</h3>
+<p>For DNS-based steering (older CDN architectures, or hybrid anycast + DNS), the CDN's authoritative DNS needs to know the <strong>client's IP subnet</strong>, not the resolver's. Without ECS, a German user using 8.8.8.8 (Google DNS in the US) gets routed to a US PoP.</p>
+<p>ECS (RFC 7871) lets the authoritative DNS see the client subnet (privacy-preserving by being a /24 or /48, not the full address). Most modern resolvers (Google DNS, Cloudflare 1.1.1.1, Quad9) support ECS. Corporate resolvers often don't, leading to mis-routing for enterprise users.</p>
+<p>This is one reason <strong>anycast is preferred over DNS-routing</strong> at modern CDNs: anycast doesn't need ECS because the BGP path itself implies the user's location.</p>
+<hr>
+<h2 id="13-origin-shield-mechanics-in-detail">§13. Origin shield mechanics in detail</h2>
+<p>§11's architecture diagram mentions origin shield in passing. It is one of the most important components for protecting origin under load, and it deserves a section.</p>
+<h3 id="a-request-coalescing-at-shield">(a) Request coalescing at shield</h3>
+<p>The shield's primary job: <strong>deduplicate cache misses for the same key into a single origin fetch</strong>.</p>
+<pre><code>Time t=0:   1000 PoPs around the world have cache miss on /api/trending
+            (TTL just expired, popular endpoint).
+Time t=1ms: 1000 requests arrive at the shield (mid-tier or per-region).
+Time t=2ms: Shield sees &quot;first request for /api/trending, no cache entry,
+            need to fetch from origin.&quot; Marks the key as &quot;in-flight.&quot;
+            Issues ONE origin fetch.
+            All 999 subsequent requests for the same key check &quot;is there
+            an in-flight fetch?&quot; Yes → they attach to the same promise,
+            wait for the origin response.
+Time t=50ms: Origin responds.
+Time t=51ms: Shield writes to its cache, then fans out the response to
+             all 1000 waiting PoPs.
+
+Origin saw: 1 request. Without shield: 1000 requests.
+</code></pre>
+<p>The implementation: a hash map keyed on cache key, value is "in-flight promise + list of waiters." First request creates the promise; subsequent requests block on it. When the origin response arrives, all waiters get the same response.</p>
+<p>Nginx implements this as <code>proxy_cache_lock</code> + <code>proxy_cache_lock_timeout</code>. Varnish has it built in as request coalescing on the same hash. Custom CDN cache engines all have an equivalent.</p>
+<h3 id="b-coalescing-scope">(b) Coalescing scope</h3>
+<p>The hierarchy matters:
+- <strong>Per-cache-box coalescing</strong>: requests within one box dedupe. Effective at small scale.
+- <strong>Per-PoP coalescing</strong>: typically handled by sharding (each URL maps to one box per PoP) plus per-box coalescing.
+- <strong>Cross-PoP coalescing at shield</strong>: this is the real value. The shield collapses misses from <code>N</code> PoPs into 1.</p>
+<p>The shield is sometimes called a "tier 2" or "tier 3" cache; the structure depends on the CDN:
+- Cloudflare: regional tier (~30 regions) + optional Argo Smart Routing for path optimization.
+- Fastly: "shielding" — a single specific POP designated as the upstream for a given service.
+- CloudFront: "Origin Shield" — explicit regional shield you enable per origin.
+- Akamai: SureRoute + tiered distribution.</p>
+<h3 id="c-shield-to-origin-connection-pool">(c) Shield-to-origin connection pool</h3>
+<p>Origins typically can't handle thousands of TLS handshakes per second from a CDN. The shield maintains a <strong>persistent connection pool</strong> to each origin:</p>
+<ul>
+<li>Long-lived HTTP/2 connections (or HTTP/3) reused across requests.</li>
+<li>TLS session resumption to avoid full handshakes.</li>
+<li>Configurable concurrency limits per origin.</li>
+<li>Health checks to detect origin failure quickly.</li>
+</ul>
+<p>Concretely: origin sees a small set of established connections (10-100) from the shield, each carrying multiplexed requests. From the origin's perspective, the entire CDN looks like a single (large) client with persistent connections.</p>
+<h3 id="d-the-shield-warms-up-new-pop">(d) The shield warms up new PoP</h3>
+<p>Problem 3 in §15 (cold start) is the case where a new PoP comes online with empty cache. The shield helps here:</p>
+<pre><code>1. New PoP P_new opens; BGP routes ~5% of regional traffic to it (staged).
+2. Cache misses on P_new flow to the regional shield.
+3. Shield has the popular set already cached (it serves all PoPs in the region).
+4. P_new gets responses quickly from shield (warm-cache hit at shield).
+5. P_new fills its local cache; over hours its hit rate climbs.
+6. Origin sees almost no extra load during P_new's warmup, because the
+   shield absorbed the misses.
+</code></pre>
+<p>Without shield: P_new misses → straight to origin → 100x normal origin load during warmup. With shield: ~1x normal load on shield; ~0% extra on origin.</p>
+<h3 id="e-shield-outage-handling">(e) Shield outage handling</h3>
+<p>Shield is a single point in the hierarchy. CDNs run shields as HA (High Availability) clusters (3-5 nodes typically) with health-checked failover. When the active shield fails:</p>
+<ol>
+<li>PoPs detect connection failure (health checks or TCP RST).</li>
+<li>PoPs reroute to a backup shield (different node in the cluster or different region).</li>
+<li>The backup shield's cache may be colder, but it's still warmer than origin.</li>
+<li>Restored shield rejoins; eventually traffic balances back.</li>
+</ol>
+<p>The 2-5 s during failover sees elevated origin load (some PoPs may hit origin before backup shield kicks in). Within SLO for most CDNs but visible in metrics.</p>
+<h3 id="f-when-you-do-and-dont-want-shield">(f) When you do (and don't) want shield</h3>
+<p>Shield is on by default for most enterprise CDN customers. You don't want it when:
+- Origin is in the same datacenter as the shield (shield is just a hop with no benefit).
+- Origin is itself a CDN or already coalesces (e.g., S3 already deduplicates).
+- Workload is so low-volume that shield's bandwidth is wasted.</p>
+<p>You always want it when:
+- Origin is regional (single datacenter) and traffic is global.
+- Workload includes popular dynamic content (where misses cluster on keys).
+- TTLs are short enough that re-fetches are common.
+- Origin is fragile under load.</p>
+<hr>
+<h2 id="14-http3-at-edge">§14. HTTP/3 at edge</h2>
+<p>HTTP/3 (RFC 9114) runs HTTP over QUIC (RFC 9000) over UDP. The transition is happening now: as of 2026, ~30% of web requests on major CDNs are over HTTP/3, climbing.</p>
+<h3 id="a-why-quic-briefly">(a) Why QUIC, briefly</h3>
+<p>TCP + TLS has fundamental shortcomings on mobile, lossy networks:</p>
+<ul>
+<li><strong>3-RTT (Round Trip Time) connection setup</strong> in worst case (TCP 1.5 RTT + TLS 1.3 1-RTT, mostly bypassable with TFO and session resumption but they're not universal).</li>
+<li><strong>Head-of-line blocking in TCP</strong>: one lost packet stalls all streams above it. HTTP/2 multiplexed streams over a single TCP connection inherit this — a single packet drop blocks all streams.</li>
+<li><strong>No mid-connection migration</strong>: TCP connection is identified by <code>(src_ip, src_port, dst_ip, dst_port)</code>. Change any of those (WiFi to cellular) and the connection breaks.</li>
+</ul>
+<p>QUIC fixes all three:</p>
+<ul>
+<li><strong>0-RTT connection setup</strong> for repeat visitors (using a cached session ticket).</li>
+<li><strong>Per-stream loss recovery</strong>: a lost packet on stream 5 doesn't block streams 1-4.</li>
+<li><strong>Connection ID independent of IP/port</strong>: a connection can survive a NAT (Network Address Translation) rebinding, a WiFi-to-cellular handover, or a corporate VPN reconnect.</li>
+</ul>
+<h3 id="b-0-rtt-for-repeat-visitors">(b) 0-RTT for repeat visitors</h3>
+<p>A returning client with a valid session ticket sends the GET request <strong>in the very first packet</strong> to the server. The server can begin processing the request before any RTT has occurred.</p>
+<pre><code>First visit:
+  Client SYN+ClientHello -&gt; Server SYN-ACK+ServerHello+EncryptedExtensions -&gt; Client GET
+  (~1 RTT before request)
+
+Repeat visit with cached ticket:
+  Client SYN+ClientHello+GET (encrypted with cached key) -&gt; Server processes immediately
+  (~0 RTT before request)
+</code></pre>
+<p>For sites visited frequently — banking apps, social feeds, anything mobile and personal — 0-RTT shaves ~100 ms off the first-byte time on every revisit. Cumulative across a session, multi-hundred ms saved on user-perceived latency.</p>
+<p>Caveat: 0-RTT data can be replayed by an attacker. Servers must accept only <strong>idempotent</strong> requests as 0-RTT data. GET is fine; POST is not. CDNs typically allow 0-RTT for GETs only.</p>
+<h3 id="c-connection-migration">(c) Connection migration</h3>
+<p>A user opens a page on WiFi at home; halfway through reading, they leave home and switch to cellular. Under TCP, every connection breaks; the browser re-establishes them. Under QUIC, the <strong>connection ID</strong> identifies the connection independent of IP/port. The client sends a packet from its new IP; the server sees a new IP with a known connection ID; it continues the session.</p>
+<p>For mobile users in transit (subway, walking), connection migration eliminates a class of stalls. CDN-level metric: mobile p99 time-to-interactive drops by ~50-150 ms after enabling QUIC.</p>
+<p>The "we shaved 100 ms off mobile p99" result is the typical real-world report from a major CDN customer post-QUIC. Stripe, Reddit, Cloudflare itself have all reported this magnitude of improvement.</p>
+<h3 id="d-cdn-adoption-status">(d) CDN adoption status</h3>
+<ul>
+<li><strong>Cloudflare</strong>: HTTP/3 GA since 2019; enabled for all customers by default; &gt;40% of Cloudflare traffic over HTTP/3 as of 2025.</li>
+<li><strong>Fastly</strong>: HTTP/3 GA; enabled via feature flag for most customers.</li>
+<li><strong>CloudFront</strong>: HTTP/3 GA since 2022; opt-in per distribution.</li>
+<li><strong>Akamai</strong>: HTTP/3 GA; varies by product.</li>
+<li><strong>Google Cloud CDN</strong>: HTTP/3 GA.</li>
+</ul>
+<p>Some networks (mostly enterprise / school WiFi) block UDP egress to port 443, preventing HTTP/3. Clients fall back to HTTP/2 over TCP automatically. The CDN serves both; the client picks.</p>
+<h3 id="e-operational-implications">(e) Operational implications</h3>
+<ul>
+<li><strong>UDP path differs from TCP path.</strong> Edge load balancers (XDP/eBPF) need to handle UDP+QUIC; new code paths.</li>
+<li><strong>Stateful UDP</strong>: connection IDs are server-assigned; the load balancer needs to track connection-ID-to-server mapping (otherwise packets from a migrated client land on the wrong server). Solved by encoding the server identity in the connection ID itself.</li>
+<li><strong>DDoS surface is different.</strong> UDP amplification attacks are a real concern; QUIC has specific anti-amplification guards (the server can only send 3x the bytes it has received until it has validated the client). Edge filters tuned for QUIC traffic patterns.</li>
+<li><strong>Observability changes.</strong> Tools like <code>tcpdump</code> work on UDP packets but you need QUIC-aware decoders to inspect protocol details. Wireshark has good support.</li>
+</ul>
+<hr>
+<h2 id="15-hard-problems-inherent-to-the-technology">§15. Hard problems inherent to the technology</h2>
+<h3 id="problem-1-purge-propagation-at-scale">Problem 1: Purge propagation at scale</h3>
+<p><strong>Naive</strong>: when origin updates, call a purge API broadcasting "drop key X" to all PoPs.</p>
+<p><strong>How it breaks</strong>: 300 PoPs × 100 boxes = 30,000 nodes per purge. A surge of 1000 purges/sec → 30M RPCs (Remote Procedure Calls)/sec on the control plane. Partition isolates a PoP — stale forever. Purge-by-tag ("all 50,000 product pages for category X") requires inverted indices per PoP. Failures rhyme across content types: <em>e-commerce static assets</em> missing a sale-start purge show wrong prices for hours; <em>API response cache</em> missing a feature-flag flip serves old response shapes and clients crash on parsing; <em>video segment cache</em> serves a takedown-ordered clip — legal exposure.</p>
+<p><strong>Real fix</strong>:</p>
+<ul>
+<li><strong>Hierarchical fanout via pub-sub.</strong> Origin → control plane → region → PoP → box. Cloudflare's "Quicksilver" KV distributes config + purge metadata globally within ~150 ms p99 by gossip/fanout.</li>
+<li><strong>Surrogate keys / tags.</strong> "Cache-Tag" (Cloudflare) or "Surrogate-Key" (Fastly): origin emits <code>Cache-Tag: post-123 category-electronics</code>; CDN indexes tag → key set; purge-by-tag iterates the index.</li>
+<li><strong>Soft purge as default.</strong> Mark stale; serve <code>stale-while-revalidate</code>; converge lazily. Hard purge only for legal takedowns and breaches.</li>
+<li><strong>Versioned URLs as the actual fix.</strong> <code>app.abc123.js</code>. New version = new URL = no purge. The right answer for &gt;90% of invalidation problems.</li>
+</ul>
+<h3 id="problem-2-cache-stampede-thundering-herd">Problem 2: Cache stampede / thundering herd</h3>
+<p><strong>Naive</strong>: TTL expires; next request misses; PoP fetches origin.</p>
+<p><strong>How it breaks</strong>: <code>/api/trending</code> cached at all PoPs with TTL=60s. At second 60 it expires everywhere simultaneously. 300 PoPs × 100 boxes = 30,000 simultaneous origin fetches in the same millisecond — origin falls over. Hits viral image, popular API endpoint, hot video segment, frequently-pulled ML model equally.</p>
+<p><strong>Real fix</strong>:</p>
+<ul>
+<li><strong>Request coalescing at every tier.</strong> If a key is "being fetched," incoming requests attach to the in-flight promise. Nginx has <code>proxy_cache_lock</code>; Varnish has it built in; Fastly's VCL does it natively.</li>
+<li><strong>Origin shield as coalescing point.</strong> Each PoP collapses its requests to one; shield collapses <code>N_pops</code> requests to one. Origin sees a single fetch per region.</li>
+<li><strong>Stale-while-revalidate.</strong> <code>Cache-Control: max-age=60, stale-while-revalidate=3600</code>. First miss triggers a single async revalidation.</li>
+<li><strong>Jittered TTLs.</strong> Random ±5% so expirations don't align.</li>
+</ul>
+<p>Effect: even at 10M rps, origin sees <strong>single-digit RPS for hot keys</strong> because everything collapses through the hierarchy.</p>
+<h3 id="problem-3-cold-start-at-a-new-pop">Problem 3: Cold start at a new PoP</h3>
+<p><strong>Naive</strong>: bring up the new PoP; let it warm naturally.</p>
+<p><strong>How it breaks</strong>: New São Paulo PoP opens; BGP routes Brazilian traffic to it; for the first hour hit rate is ~0%. Local origin shield doesn't exist yet, so most misses go to origin — 100x traffic spike during warm-up. Same shape whether the workload is images, video, API, or downloads.</p>
+<p><strong>Real fix</strong>:</p>
+<ul>
+<li><strong>Staged BGP advertisement</strong> — longer AS path initially so the PoP gets ~5% of traffic; ramp up.</li>
+<li><strong>Cache pre-warming</strong> — replay top-1000 requests for the region from a production log tap before opening; brings hit rate to ~50% at launch.</li>
+<li><strong>Tiered cache makes cold PoPs cheap</strong> — cold L1 hitting a warm L2 mid-tier is fine.</li>
+<li><strong>Steal-from-neighbors</strong> — some CDNs replicate keys from neighbor PoPs via gossip.</li>
+</ul>
+<h3 id="problem-4-geo-correctness-anycast-pathology">Problem 4: Geo correctness (anycast pathology)</h3>
+<p><strong>Naive</strong>: anycast routes to the nearest PoP. Trust BGP.</p>
+<p><strong>How it breaks</strong>: "Nearest" is AS-path nearest, not physically nearest. <strong>Anycast islands</strong>: a misconfigured router in some ISP sends all anycast traffic to the wrong PoP for hours because BGP doesn't notice. ECS fails when the resolver doesn't pass it (older corporate resolvers, some VPNs). Indian ISP traffic routed to Singapore for a morning because their transit has a BGP issue — 250 ms RTT instead of 15 ms; conversion drops.</p>
+<p><strong>Real fix</strong>:</p>
+<ul>
+<li><strong>RUM data feeds routing decisions.</strong> Per-ASN latency aggregated; CDN adjusts BGP advertisements (AS-path prepending) or DNS responses to push traffic right.</li>
+<li><strong>Multi-PoP healthchecks</strong> + <strong>BGP route-reflector tuning</strong> to prefer specific peers per ASN.</li>
+<li><strong>GeoDNS as a fallback steering layer</strong> — different anycast IPs for different regions.</li>
+<li><strong>Honest acknowledgement</strong>: at scale you live with ~0.5-2% of users on a sub-optimal PoP. Measure, alert, don't promise zero.</li>
+</ul>
+<h3 id="problem-5-ddos-absorption">Problem 5: DDoS absorption</h3>
+<p><strong>Naive</strong>: detect attack, rate-limit at firewall, block source IPs.</p>
+<p><strong>How it breaks</strong>: 5 Tbps L3 SYN flood saturates any single origin wire in seconds — you can't block what you can't receive. L7 (Layer 7) floods look like real traffic; per-IP rate limits get evaded by million-IP botnets.</p>
+<p><strong>Real fix</strong>:</p>
+<ul>
+<li><strong>Anycast itself is the first absorption layer.</strong> 5 Tbps from a worldwide botnet distributes across ~300 PoPs → ~17 Gbps per PoP — within capacity. <strong>Passively</strong> diluted.</li>
+<li><strong>L3/L4 scrubbing at edge.</strong> XDP/eBPF programs drop garbage (malformed SYNs, ICMP floods, unrelated UDP) at line rate before any TCP socket exists.</li>
+<li><strong>Challenge-response for L7.</strong> JS challenge ("I'm Under Attack Mode"), TLS fingerprinting, behavioral analysis.</li>
+<li><strong>WAF rules</strong> + <strong>ML-based anomaly detection</strong> (Cloudflare Bot Management, Akamai Bot Manager Premier).</li>
+<li><strong>Origin IP secrecy.</strong> Real origin IP never published; all traffic ingresses through the CDN.</li>
+</ul>
+<p>DDoS economics: attacker must outbid defender's wire capacity. 280 Tbps forces a 280 Tbps botnet — possible in theory, never seen in practice.</p>
+<h3 id="problem-6-cache-key-sensitivity-and-cache-poisoning">Problem 6: Cache-key sensitivity and cache poisoning</h3>
+<p><strong>Naive</strong>: include all request headers in the cache key to avoid Vary mistakes.</p>
+<p><strong>How it breaks</strong>: Attacker sends <code>Host: evil.com</code> with URL <code>/app.js</code>. CDN caches <code>app.js</code> under attacker's host. Next legitimate request: served attacker's variant if hashing is wrong. <strong>Web cache poisoning</strong> — PortSwigger has a whole library. Including arbitrary headers → cache fragmentation → hit-rate collapse. Independent of content type — any CDN-fronted endpoint is vulnerable.</p>
+<p><strong>Real fix</strong>:</p>
+<ul>
+<li><strong>Normalize the cache key</strong> before hashing: strip headers not in an allowlist, lowercase host, canonicalize query params.</li>
+<li><strong>Vary header allowlist</strong> — only <code>Vary: Accept-Encoding</code> and known-safe variants. <code>Vary: User-Agent</code> normalized to UA classes.</li>
+<li><strong>Web cache poisoning audits</strong> (PortSwigger Cache Deception scanner).</li>
+<li><strong>Never trust user-controlled headers in cache key</strong> unless explicitly whitelisted and content-bearing.</li>
+</ul>
+<hr>
+<h2 id="16-web-cache-poisoning-attacks-in-depth">§16. Web cache poisoning attacks in depth</h2>
+<p>Problem 6 in §15 mentioned web cache poisoning at a high level. The attack class is interesting enough — and dangerous enough — to deserve a deeper treatment. PortSwigger researcher James Kettle popularized the class with a series of papers starting 2018; multiple major CVEs (Common Vulnerabilities and Exposures) have followed.</p>
+<h3 id="a-the-general-pattern">(a) The general pattern</h3>
+<p>The attacker crafts a request whose response can be controlled — typically by exploiting a header that the origin reflects into the response but the CDN doesn't include in the cache key. The poisoned response is cached and served to subsequent legitimate users.</p>
+<p>Concretely:</p>
+<pre><code>1. Attacker observes that `/welcome` reflects an X-Forwarded-Host header
+   into the rendered HTML (e.g., the origin generates absolute URLs
+   like https://X-Forwarded-Host-value/...).
+2. Attacker sends:
+     GET /welcome HTTP/1.1
+     Host: example.com
+     X-Forwarded-Host: evil.com
+3. Origin renders the page with evil.com baked into all link URLs and
+   asset paths.
+4. CDN caches the response under the URL key. X-Forwarded-Host is NOT
+   in the cache key (the CDN is unaware it's content-bearing).
+5. Next legitimate user requests /welcome.
+6. CDN serves the poisoned cached response.
+7. User's browser loads scripts from evil.com.
+8. Attacker has script execution in legitimate user's context.
+</code></pre>
+<p>The general formula: <strong>unkeyed input → keyed output</strong>. Any input that affects the response but isn't in the cache key is a poisoning vector.</p>
+<h3 id="b-common-variants">(b) Common variants</h3>
+<ul>
+<li><strong>X-Forwarded-Host reflected in absolute URLs.</strong> Origin uses <code>X-Forwarded-Host</code> to construct canonical URLs in HTML / redirects. Attacker sets it to a hostile domain.</li>
+<li><strong>X-Forwarded-Scheme reflected in absolute URLs.</strong> Switch HTTPS to HTTP, downgrade-attack.</li>
+<li><strong>X-Rewrite-URL or X-Original-URL.</strong> Some frameworks parse these to determine the "real" URL. Attacker rewrites to a different path; response cached under the original URL but reflecting the rewritten path's content.</li>
+<li><strong>Referer header reflected in CSRF tokens or canonical URLs.</strong> Long shot, but seen.</li>
+<li><strong>Cookie reflected without being in cache key.</strong> If the cookie is included in the body (e.g., to display the username) but not in the cache key, the body of one user's response gets cached for everyone.</li>
+<li><strong>Cache-key normalization mismatch between layers.</strong> If the CDN strips a query param but the origin uses it, the origin response (varying by param) gets cached under a single key (without the param). Different param values get different responses, only one of which is cached for everyone.</li>
+</ul>
+<h3 id="c-the-x-forwarded-host-in-cache-key-cve-pattern">(c) The "X-Forwarded-Host in cache key" CVE pattern</h3>
+<p>A standard CDN config has <code>Host</code> in the cache key but not <code>X-Forwarded-Host</code>. When an origin uses <code>X-Forwarded-Host</code> for canonical URL construction, the attacker exploits the mismatch.</p>
+<p>The fix: <strong>strip headers not in an allowlist</strong> before forwarding to origin. If origin shouldn't be making decisions based on <code>X-Forwarded-Host</code> (and shouldn't trust it from the client), don't pass it at all.</p>
+<p>This CVE pattern has hit:
+- Multiple production sites' search-result and listing pages.
+- Single-page-app routes that compute API base URLs from request headers.
+- Documentation sites that render absolute links based on the host.</p>
+<h3 id="d-defenses">(d) Defenses</h3>
+<ul>
+<li><strong>Header allowlist at CDN.</strong> Only pass headers the origin needs; strip everything else. Cache key includes only declared content-bearing headers.</li>
+<li><strong>Normalize the cache key after stripping.</strong> Cache key derives from URL + allowlisted headers, normalized canonically.</li>
+<li><strong>Origin doesn't trust headers.</strong> Origin should never use <code>X-Forwarded-Host</code> or similar attacker-controllable inputs for canonical URL construction. If origin needs to know its public hostname, the CDN should inject it as a server-managed header (set by CDN config, not passed through).</li>
+<li><strong>Vary correctly when origin response varies.</strong> If origin's response really does depend on a header, set <code>Vary: Header-Name</code> and include it in the cache key explicitly.</li>
+<li><strong>WAF rules for known poisoning patterns.</strong> Block X-Forwarded-Host with hostile domains, headers that don't match expected format, etc.</li>
+<li><strong>Cache poisoning DoS variant.</strong> Attacker sends weird <code>User-Agent</code> values to force cache fragmentation and exhaust the cache. Defense: bucket UA before keying; cap distinct variants per URL.</li>
+<li><strong>Cache deception (the inverse).</strong> Attacker tricks CDN into caching a private response (e.g., user's profile page) by requesting <code>/profile/.css</code> — origin returns user's profile HTML but CDN sees <code>.css</code> and caches it as public. Future requests for <code>/profile/.css</code> get the cached private data. Defense: strict URL path validation; never cache a response whose content type doesn't match its URL extension.</li>
+</ul>
+<h3 id="e-detection">(e) Detection</h3>
+<p>Synthetic monitoring that checks for poisoning:
+- Periodically issue normal request; capture response.
+- Issue request with hostile header (X-Forwarded-Host: synthetic-test-only.com); capture response.
+- Issue normal request again; compare to first.
+- If hostile-influenced response is served on the second normal request, poisoning vector exists. Alert.</p>
+<p>Most CDN-aware security tools (PortSwigger's Param Miner, Burp's cache deception scanner, OWASP testing guides) automate this.</p>
+<hr>
+<h2 id="17-security-at-edge">§17. Security at edge</h2>
+<p>Beyond cache poisoning, the edge is the place where most of an internet-facing security stack runs. CDNs have evolved to incorporate DDoS mitigation, WAF, bot management, and TLS / certificate operations as first-class features.</p>
+<h3 id="a-ddos-l3l4-volumetric-absorption-via-anycast">(a) DDoS L3/L4 — volumetric absorption via anycast</h3>
+<p>§2 and §15 mentioned this: anycast is the first absorption layer. 5 Tbps from a worldwide botnet distributes across 300 PoPs, becoming 17 Gbps per PoP — within any modern PoP's wire capacity. The CDN doesn't have to filter most of the attack; it just has more wire than the attacker.</p>
+<p>Beyond passive dilution:
+- <strong>XDP/eBPF programs at line rate</strong> at each PoP drop garbage packets — malformed SYNs, ICMP floods, unrelated UDP, SYN floods. eBPF runs in the kernel before sockets are created; ~100 Mpps (million packets per second) drop rate per server.
+- <strong>SYN cookies</strong> to handle SYN floods without allocating state per half-open connection.
+- <strong>Per-source-IP rate limits</strong>, optionally per-ASN, applied at L4 in kernel.
+- <strong>Geographic / ASN-based filtering</strong>: if an attack is sourced almost entirely from one ASN, drop traffic from that ASN at edge.</p>
+<p>Cloudflare absorbed a 71M rps DDoS in 2023 (publicly disclosed); the attack was almost entirely absorbed at L4 without disrupting customer traffic.</p>
+<h3 id="b-ddos-l7-application-layer-floods">(b) DDoS L7 — application-layer floods</h3>
+<p>Layer-7 attacks look like real HTTP requests. Per-IP rate limits get evaded by botnets with millions of IPs. The defense stack:</p>
+<ul>
+<li><strong>WAF rules</strong> for known attack signatures (OWASP top 10 — SQL injection, XSS, etc.).</li>
+<li><strong>Rate limiting</strong> by path, by source, by fingerprint, by combinations.</li>
+<li><strong>Challenge pages</strong>: JS challenge ("solve this challenge to prove you're a browser"), CAPTCHA, Cloudflare Turnstile, hCaptcha. Reduce bot traffic by ~99% with minimal user friction.</li>
+<li><strong>Behavior analysis</strong>: track request patterns per source — sites visited, time-of-day, header distribution. Anomalies (one IP requesting only <code>/login</code> 1000 times) trigger blocks.</li>
+<li><strong>ML-based detection</strong>: Cloudflare Bot Management, Akamai Bot Manager Premier, Fastly Next-Gen WAF. Trained on the CDN's global traffic; identifies emerging bot patterns.</li>
+<li><strong>"I'm Under Attack" mode</strong>: aggressive challenge for everyone. Sacrifices some user experience for total bot rejection during active attacks.</li>
+</ul>
+<h3 id="c-bot-management">(c) Bot management</h3>
+<p>Bot management has become a substantial category. Major techniques:</p>
+<ul>
+<li><strong>TLS fingerprinting (JA3 / JA4 / JA4+)</strong>: hash of the TLS ClientHello (cipher suites, extensions, ALPN values). Different clients (Chrome, Firefox, curl, Python requests, Go net/http) produce different fingerprints. JA3 was the original; JA4 (Foxio's update from 2023) is more robust against minor library changes. Used to identify automation tools posing as browsers.</li>
+<li><strong>HTTP/2 fingerprinting</strong>: similar to TLS but on the HTTP/2 SETTINGS frame and pseudo-header order. Reveals impersonation.</li>
+<li><strong>Behavior analysis</strong>: mouse movement, scroll patterns, click timing. Bots scroll mechanically; humans don't. Cloudflare's Bot Management uses on-page beacons.</li>
+<li><strong>Reputation databases</strong>: known-bot IP lists (datacenter ranges, Tor exit nodes, residential proxy services).</li>
+<li><strong>Challenge cascades</strong>: simple challenges (JS computation) for likely-legit clients; harder challenges (CAPTCHA) for suspicious.</li>
+</ul>
+<p>The arms race: bot writers use real browsers (via Playwright, Puppeteer), residential proxies (rotating real consumer IPs), and human solvers for CAPTCHAs. Detection moves up the behavior stack.</p>
+<h3 id="d-waf-web-application-firewall-rules">(d) WAF (Web Application Firewall) rules</h3>
+<p>A WAF inspects HTTP requests and blocks ones that match attack signatures. OWASP top 10 mitigations:</p>
+<ul>
+<li><strong>A01: Broken Access Control</strong> — WAF can enforce URL access rules.</li>
+<li><strong>A02: Cryptographic Failures</strong> — TLS enforcement at edge.</li>
+<li><strong>A03: Injection</strong> — SQL injection patterns (<code>UNION SELECT</code>, <code>' OR '1'='1</code>), command injection, OS injection. WAF rules match patterns in path, query, body, headers.</li>
+<li><strong>A04: Insecure Design</strong> — WAF can enforce specific schemas (e.g., parameter must match expected regex).</li>
+<li><strong>A05: Security Misconfiguration</strong> — out of WAF scope but related (e.g., strip Server header).</li>
+<li><strong>A06: Vulnerable Components</strong> — virtual patching: WAF rule blocks specific exploit signatures for known CVEs before origin is patched.</li>
+<li><strong>A07: Auth Failures</strong> — rate limit on login endpoints.</li>
+<li><strong>A08: Software and Data Integrity</strong> — content-type and signature checks.</li>
+<li><strong>A09: Logging and Monitoring</strong> — WAF logs feed SIEM (Security Information and Event Management).</li>
+<li><strong>A10: SSRF (Server-Side Request Forgery)</strong> — block requests that contain internal IP ranges in path/body.</li>
+</ul>
+<p>Cloudflare's "Managed Rules" (formerly OWASP Core Rule Set integration) and Fastly Next-Gen WAF (formerly Signal Sciences) are the dominant managed WAF offerings. Each ships rule packs updated continuously.</p>
+<p>WAF rules have false positives. Tuning involves: paranoia levels (low / medium / high false-positive rate), per-route exemptions, learning mode (log but don't block initially), gradual enforcement rollout.</p>
+<h3 id="e-tls-termination-and-certificate-management">(e) TLS termination and certificate management</h3>
+<p>The CDN terminates TLS at the edge for almost all customer hostnames. This means:</p>
+<ul>
+<li>The CDN holds the <strong>private key</strong> for the customer's domain. Trust matters; CDNs have aggressive operational security around key storage (HSM — Hardware Security Module, key sealing, audit logs).</li>
+<li><strong>Certificate provisioning</strong> is automated. Customer points the domain at CDN nameservers; CDN provisions a Let's Encrypt or DigiCert certificate; ACME (Automated Certificate Management Environment, RFC 8555) handles validation and rotation.</li>
+<li><strong>SNI (Server Name Indication)</strong> lets the CDN host thousands of customer hostnames on a single anycast IP. The TLS handshake's SNI extension tells the CDN which cert to present.</li>
+<li><strong>TLS 1.3</strong> is now the default; TLS 1.2 is supported for compatibility; TLS 1.0/1.1 are deprecated.</li>
+<li><strong>OCSP stapling</strong> (Online Certificate Status Protocol) is on by default — CDN fetches OCSP responses from the CA and serves them stapled to the TLS handshake. Saves the client an OCSP round trip.</li>
+<li><strong>Certificate Transparency</strong> logging is mandatory; all issued certs are public.</li>
+</ul>
+<p>For customers who don't want to give the CDN their private key, options exist:
+- <strong>Cloudflare Keyless SSL</strong>: CDN does the bulk of the TLS handshake but RSA private-key operations happen at the customer's own key server. Adds ~30-50 ms to the handshake but the CDN never sees the key.
+- <strong>Encrypted Client Hello (ECH)</strong>: emerging standard to encrypt the SNI itself, hiding which hostname the client is requesting.</p>
+<p>Cert rotation: typically every 90 days for Let's Encrypt, automated. CDN handles renewal transparently.</p>
+<hr>
+<h2 id="18-failure-mode-walkthrough">§18. Failure mode walkthrough</h2>
+<p><strong>Single cache box crashes mid-fetch.</strong> Box B17 kernel-panics mid-fetch. Other boxes unaffected; consistent hashing remaps B17's vnodes; each neighbor sees ~1/(N-1) extra load. Health checks drop B17 from the L4 LB ring within sub-seconds. Inflight origin request is orphaned; client times out and retries; retry hits a different box → cache MISS → re-fetches. B17 reboots, rebuilds its index from on-disk segments (~1 s per TB), rejoins. <em>Durability point</em>: on-disk segments survive the crash; the in-RAM index is reconstructible from segment metadata.</p>
+<p><strong>Shield crashes during a popular asset's cold fetch.</strong> Shield runs as a small HA (High Availability) cluster (3-5 nodes per region). L2 detects connection failure, retries to a sibling shield node, which re-fetches from origin. Another request-collapse cycle dedupes within the new node. Gap ~2 s; some L2 requests see elevated latency or 503 if retries fail. <em>Durability point</em>: origin is the durability layer; shield is a cache.</p>
+<p><strong>Control-plane death (purge propagation halts).</strong> Quicksilver-equivalent loses leadership during a major purge campaign. Purges queue locally at the previous leader; Raft elects a new leader; outstanding purges replay from the durable log. Gap ~5-30 s; some PoPs serve stale longer than the SLO. <strong>The data plane is unaware of control plane outage</strong> — request-path serving SLO unaffected. This separation is load-bearing. <em>Durability point</em>: Raft-replicated purge log.</p>
+<p><strong>Network partition splits a region.</strong> Submarine cable cut isolates a continent from the control plane and origin. PoPs continue serving cached content. Misses to origin fail open (<code>stale-if-error</code>) or fail closed (503). Purges queue locally and deliver when connectivity restores. Bounded staleness SLO violated during partition. <em>Durability point</em>: TTLs — content eventually expires and re-fetches once partition heals.</p>
+<p><strong>Permanent PoP loss.</strong> Earthquake destroys a PoP. BGP withdraws routes; traffic flows to the next-best PoP; affected users see ~20-50 ms more latency but service continues. New PoP provisioned over months, brought online with the staged rollout from Problem 3. <em>Durability point</em>: PoPs are stateless w.r.t. origin truth; cache state is reconstructable.</p>
+<p><strong>BGP misroute (the 2008 YouTube-Pakistan incident type).</strong> A misconfigured ISP announces a BGP route claiming the CDN's anycast IPs; bad route propagates; traffic blackholes or routes to misadvertiser. RPKI (Resource Public Key Infrastructure) rejects unauthorized announcements at well-configured peers (increasingly deployed). NOC (Network Operations Center) calls the misadvertiser's upstream and demands withdrawal — painful, manual, hours. <em>Durability point</em>: the cache architecture provides no help here; mitigation is at the routing layer.</p>
+<p><strong>Partial cache corruption.</strong> Bad SSD firmware causes silent corruption. <strong>Checksums on every cache object</strong>: verify before returning; on mismatch treat as miss, re-fetch, evict the offending segment. Per-box monitoring of mismatch rate triggers depooling. Cache is <strong>self-healing</strong>. <em>Durability point</em>: origin is the source of truth.</p>
+<hr>
+<h2 id="19-failure-modes-not-covered-by-the-baseline">§19. Failure modes not covered by the baseline</h2>
+<p>The walkthrough in §18 covers the canonical failures. Some that don't fit there but are common enough to know:</p>
+<h3 id="a-origin-ddos-via-cache-stampede-on-a-deploy">(a) Origin DDoS via cache stampede on a deploy</h3>
+<p>Pattern: site deploys a new version. The deploy purges all cached pages. Within seconds, the entire global PoP fleet has no cache for the homepage and other popular pages. Traffic continues at normal levels — but all of it is misses. Origin sees ~10,000x normal request rate.</p>
+<p>Real example: a popular news site deploys at 9 AM EST during morning traffic. They purged-by-tag the homepage and top-50 article pages. Within 5 seconds, 1M requests hit origin (where steady-state was 100). Origin database fell over; site was down 20 minutes.</p>
+<p>Mitigations:
+- <strong>Stagger purges.</strong> Don't purge everything at once. Group into batches purging over 60+ seconds; the cache fills happen gradually.
+- <strong>Use versioned URLs, not purges.</strong> New deploys produce new asset URLs; old cached responses are still served until the HTML referencing them updates.
+- <strong>Cache pre-warming</strong>. Before purging, fetch the new responses to populate cache; then purge old (or simply let old TTL out). Origin sees the warming traffic from one source, not a global stampede.
+- <strong><code>stale-while-revalidate</code></strong>. After purge, serve stale; refresh in background. Origin sees coalesced revalidations, not raw misses.</p>
+<h3 id="b-cdn-provider-outage">(b) CDN provider outage</h3>
+<p>CDN providers are themselves single points of failure. Notable incidents:
+- <strong>Cloudflare June 21, 2022</strong>: bad BGP configuration change took down 19 PoPs for ~30 minutes. Discord, Shopify, many others affected.
+- <strong>Cloudflare July 2, 2019</strong>: bad WAF rule (regex going exponential) consumed 100% CPU on every Cloudflare server worldwide for ~30 minutes. Half the internet's accessible-via-Cloudflare went down.
+- <strong>Fastly June 8, 2021</strong>: bad customer VCL push triggered a latent service bug; downed the data plane globally for ~49 minutes. BBC, Reddit, NYT, Amazon, gov.uk all dark.
+- <strong>AWS CloudFront occasional regional outages</strong>: less impactful per incident; more frequent than Cloudflare/Fastly's global ones.
+- <strong>Akamai July 22, 2021</strong>: DNS service outage took down many enterprise customers for ~1 hour.</p>
+<p>Mitigation: <strong>multi-CDN</strong> (covered in §20). Cost: complexity and 2x egress contracts. Benefit: a 49-minute outage doesn't take you down.</p>
+<h3 id="c-dns-resolver-issues">(c) DNS resolver issues</h3>
+<p>CDNs depend heavily on DNS:
+- <strong>Authoritative DNS at the CDN</strong>: when Cloudflare's authoritative DNS fails, every Cloudflare-fronted site's DNS resolution fails. Cloudflare had this in October 2019 (Quad9 cascading issue).
+- <strong>Resolver cache poisoning at ISPs</strong>: a misbehaving ISP resolver caches a wrong answer; users get sent to wrong PoP or non-PoP for hours until the cache TTL expires.
+- <strong>DNS over HTTPS / DNS over TLS (DoH / DoT) changing visibility</strong>: when clients use DoH, the CDN's ECS visibility drops; routing becomes less accurate.
+- <strong>Long DNS TTLs become a liability during outages</strong>: a 24-hour TTL on a CNAME means failover takes 24 hours to propagate. CDN customer DNS records typically have very short TTLs (~60 s).</p>
+<p>Mitigation: short TTLs on customer DNS records; monitor authoritative DNS uptime as a separate SLO from CDN data plane; have a DNS failover plan (Route 53 health checks, NS1 traffic management).</p>
+<h3 id="d-ipv6-edge-cases">(d) IPv6 edge cases</h3>
+<p>IPv6 deployment is complete enough to matter (~40% of US traffic, ~50% of Indian traffic, varies by region) but not uniform:
+- Some PoPs have IPv6 transit issues unrelated to IPv4.
+- Customer origins on IPv6-only sometimes get unreachable from older IPv4-only PoPs.
+- ECS support over IPv6 is sometimes worse than over IPv4 (resolvers strip ECS on AAAA queries).
+- Anycast pathology can differ between v4 and v6 — same client may take a different path on v6 vs v4.</p>
+<p>Mitigations: dual-stack everywhere; per-AFI (Address Family Identifier) monitoring; some CDN customers explicitly disable IPv6 if reliability matters more than the modest latency gain.</p>
+<h3 id="e-long-tail-content-overwhelming-a-small-pop">(e) Long-tail content overwhelming a small PoP</h3>
+<p>A new PoP comes online; immediately a content scraper / archive bot decides to walk the entire site, hitting cold long-tail URLs. The PoP's small cache fills with one-hit-wonder URLs, evicting the popular set, hit rate plummets to 30%, origin load spikes.</p>
+<p>Mitigations:
+- W-TinyLFU admission filter (§4(c)) — exactly the pattern it defends against.
+- Rate limit per source IP / ASN at edge before cache lookup.
+- Identify and bypass known crawlers if they don't represent normal user traffic.</p>
+<h3 id="f-cache-hierarchy-inversion">(f) Cache hierarchy inversion</h3>
+<p>Sometimes L2 / shield becomes the bottleneck because all L1 misses converge there. If L1 hit rate drops (cache key fragmentation, deploy purge), L2 sees a sudden burst it can't handle. L2 starts dropping requests; L1 starts proxying directly to shield; shield falls over; origin starts seeing all the load.</p>
+<p>Mitigations: per-tier capacity provisioning; circuit breakers between tiers; observability on per-tier hit rates so degradation is visible early.</p>
+<h3 id="g-slow-loris-and-slow-read-attacks">(g) Slow-loris and slow-read attacks</h3>
+<p>Attacker opens many connections, sends bytes very slowly to keep them alive, exhausting CDN connection pool. Modern CDN edge defends with: connection rate limits per source, idle-connection timeouts, HTTP/2 / HTTP/3 (multiplexed streams are less vulnerable than dedicated TCP connections).</p>
+<hr>
+<h2 id="20-multi-cdn-strategies">§20. Multi-CDN strategies</h2>
+<p>Single-CDN outages happen (§19). For a high-availability site, the answer is <strong>multi-CDN</strong>: contracts with two or more CDN providers, traffic shifted between them via DNS or some routing layer.</p>
+<h3 id="a-when-multi-cdn-is-worth-the-complexity">(a) When multi-CDN is worth the complexity</h3>
+<p>Cost: double egress contracts (typically less than 2x because volume tiers — but more than 1x), engineering complexity, surrogate-key purging on multiple providers, configuration drift risk.</p>
+<p>Benefit: provider-outage resilience, ability to negotiate (your CDN knows you can shift to competitor), regional performance optimization (some CDNs are better in some regions), regulatory (China requires a domestic CDN; sometimes Russia, Iran, etc.).</p>
+<p>Worth it when:
+- Site availability SLO is high (4 nines or better) and you've measured that CDN outages can violate it.
+- Egress is large enough that the multi-vendor price drives down per-GB rates more than complexity costs.
+- You have a global footprint with regional performance variance.
+- You need vendor independence (regulatory, business risk).</p>
+<p>Not worth it when:
+- Site uptime requirements are relaxed (small SaaS, internal apps).
+- Traffic is small (single-vendor minimums make multi-vendor uneconomic).
+- You don't have the engineering capacity to maintain two configurations.</p>
+<h3 id="b-dns-based-steering-ns1-cedexis-aws-route-53">(b) DNS-based steering — NS1, Cedexis, AWS Route 53</h3>
+<p>The classic multi-CDN front-end: a "traffic management" DNS service decides per query which CDN to route the user to. The user resolves <code>cdn.example.com</code>; the traffic manager returns the CDN-A or CDN-B CNAME based on:</p>
+<ul>
+<li>Per-CDN health (active healthchecks; route away from unhealthy).</li>
+<li>Per-region latency (RUM data; route to the CDN with better p50 latency in this region).</li>
+<li>Cost weighting (route 80% to cheaper CDN; 20% to expensive for warm-keeping).</li>
+<li>Per-customer-tier (paying customers get the better CDN).</li>
+</ul>
+<p>Vendors:
+- <strong>NS1</strong> (now part of IBM): rich traffic management; per-query decisions.
+- <strong>Cedexis</strong> (Citrix Intelligent Traffic Management): RUM-driven; large dataset.
+- <strong>AWS Route 53</strong>: simple weighted / latency-based / healthcheck routing.
+- <strong>Cloudflare Load Balancing</strong>: their own multi-origin LB; can balance across non-Cloudflare backends.</p>
+<p>DNS-based steering has limits: DNS TTL is the bound on failover speed. A 60 s TTL means up to 60 s of users sent to a dead CDN after the manager detects failure. Some resolvers cache longer than TTL (especially older corporate resolvers).</p>
+<h3 id="c-http-level-steering-origin-side-fallback">(c) HTTP-level steering — origin-side fallback</h3>
+<p>A second pattern: the user always hits CDN-A first (DNS points there). If CDN-A is down, the client / browser falls back to CDN-B via some signaling. Implementations:</p>
+<ul>
+<li><strong><code>&lt;picture&gt;</code> / <code>&lt;img srcset&gt;</code> fallback</strong> at HTML level: include multiple URLs; browser tries in order. Works for images but not for the HTML page itself.</li>
+<li><strong>Service worker</strong> intercepts fetch failures and retries on alternate domain. Works for everything but requires the service worker to be already installed (cold visits don't have it).</li>
+<li><strong>Client-side smart routing libraries</strong> that probe and choose. Used by some video players.</li>
+</ul>
+<p>These work for parts of a site but not the whole thing (the initial HTML must come from somewhere).</p>
+<h3 id="d-if-cdn-a-fails-route-to-cdn-b-auto-failover">(d) "If CDN A fails, route to CDN B" auto-failover</h3>
+<p>The most common production pattern combines DNS + healthchecks:</p>
+<pre><code>1. Traffic manager (NS1, Cedexis) healthchecks CDN-A and CDN-B
+   from multiple vantage points worldwide.
+2. Normal: 80% to CDN-A, 20% to CDN-B (or 100% to CDN-A, 0% to B
+   with B kept warm by synthetic load).
+3. CDN-A fails healthcheck globally.
+4. Traffic manager flips: 100% to CDN-B.
+5. DNS TTL controls how fast clients see the change (60 s typical).
+6. CDN-B serves; possibly degraded (its cache wasn't warm for all
+   of CDN-A's URLs, so origin sees increased load).
+7. CDN-A recovers; traffic manager flips back gradually.
+</code></pre>
+<h3 id="e-operating-concerns">(e) Operating concerns</h3>
+<ul>
+<li><strong>Configuration drift.</strong> Two CDNs need the same WAF rules, cache settings, surrogate keys, redirects. Use Infrastructure-as-Code; deploy to both from a single source.</li>
+<li><strong>Purge fanout.</strong> Surrogate-key purges must hit both CDNs. Custom tooling typically.</li>
+<li><strong>Observability.</strong> Need a unified view of traffic across both CDNs; per-CDN dashboards alone leave gaps.</li>
+<li><strong>Cost reporting.</strong> Two contracts; reconcile usage across both monthly.</li>
+</ul>
+<h3 id="f-vendor-lock-in-mitigation">(f) Vendor lock-in mitigation</h3>
+<p>Even without active multi-CDN, having a tested fallback CDN gives:
+- Leverage in contract negotiation.
+- Validated alternative if primary CDN raises prices unsustainably.
+- Continuity plan if primary CDN goes out of business (rare but real — smaller CDNs have).</p>
+<p>Many enterprises run "warm standby": all configuration on CDN-B; ~1% of traffic going there to keep it warm; ready to flip to 100% in minutes.</p>
+<hr>
+<h2 id="21-why-not-just-nginx-in-front-of-origin">§21. Why not just nginx in front of origin</h2>
+<p>The most common pushback. The answer is layered.</p>
+<p><strong>Step 1</strong>: "Just put nginx in front of origin, cache there."</p>
+<p>Why it doesn't work:</p>
+<ol>
+<li><strong>No anycast, no global presence.</strong> A single nginx in us-east-1 is still 150 ms from Tokyo. Caching without proximity solves only half the problem.</li>
+<li><strong>Scaling by adding regional nginx</strong>: how does a user reach the right one? DNS-based steering requires GeoIP infrastructure (you've started building a CDN); anycast IPs require BGP advertisement (definitely building a CDN).</li>
+<li><strong>DDoS absorption impossible.</strong> A single nginx absorbs maybe 50-100 Gbps; modern attacks exceed 1 Tbps.</li>
+<li><strong>Per-region cache state independent.</strong> Five nginx instances warm independently; origin sees 5x cold-cache fetches; without a mid-tier shield every miss hits origin — thundering herd unbounded.</li>
+<li><strong>No edge TLS termination optimization.</strong> Sydney users eat ~300 ms just for TLS setup.</li>
+<li><strong>No global traffic engineering.</strong> Can't shift load between regions; CDN providers have global SDN (Software-Defined Networking) layers for that.</li>
+<li><strong>Operational primitives don't exist.</strong> Centralized purge, surrogate-key tagging, real-time analytics across PoPs, RUM-driven routing — you'd have to build them all.</li>
+</ol>
+<p><strong>Step 2 — concrete failure</strong>: 100M-user site, multi-region nginx, celebrity tweets a link at 8 PM UTC. 5M concurrent users land via DNS-based steering across 5 nginx instances. Homepage is cached (100% hit). But the link has unique tracking params → 5M cache misses → 5M origin fetches. Origin is 100 servers, 50,000 rps per server — dead in 5 seconds. A CDN-bought competitor has 300 PoPs absorbing the same traffic: 17k rps per PoP, 340 rps per box, origin sees ~10 rps after shield coalescing. Their site stays up.</p>
+<p>You haven't built a CDN. You've built a fragile single-region cache that breaks the moment something goes viral. Nginx is a <em>component</em> in a CDN, not a substitute — the architecture (PoPs + anycast + tiered cache + shield + control plane) is what nginx fronts at each layer.</p>
+<hr>
+<h2 id="22-scaling-axes">§22. Scaling axes</h2>
+<h3 id="type-1-uniform-expansion-more-users-same-per-user-behavior">Type 1 — uniform expansion (more users, same per-user behavior)</h3>
+<pre><code>1x   -&gt;  10 PoPs, 1 region, 1M rps
+2x   -&gt;  20 PoPs, 2 regions, 2M rps          ← add capacity uniformly
+10x  -&gt;  50 PoPs, 5 regions, 10M rps         ← add origin shield per region
+100x -&gt;  300 PoPs, all continents, 100M rps  ← RUM-driven routing, gossip-based
+                                              purge, multi-tier cache hierarchy
+</code></pre>
+<p>Inflection points:</p>
+<ul>
+<li><strong>~5M rps</strong>: per-region origin starts cracking. Add origin shield.</li>
+<li><strong>~20M rps</strong>: per-box cache starts churning. Add mid-tier cache between PoP and shield.</li>
+<li><strong>~50M rps</strong>: BGP convergence and anycast pathology dominate tail latency. Move from pure anycast to anycast + RUM-driven DNS steering hybrid.</li>
+<li><strong>~100M rps</strong>: control plane purge fanout is the bottleneck. Hierarchical pub-sub, gossip-based propagation, surrogate-key tagging.</li>
+</ul>
+<h3 id="type-2-hotspot-intensification-one-url-going-viral">Type 2 — hotspot intensification (one URL going viral)</h3>
+<pre><code>Baseline:   homepage.html at 100 rps globally
+Viral:      same URL at 10M rps globally for 1 hour, then back to normal
+</code></pre>
+<p>Fundamentally different problem. More PoPs don't help if everyone is hitting one URL.</p>
+<pre><code>Per-PoP rps for the viral URL:
+  10M rps / 300 PoPs = ~33k rps per PoP
+
+Within a PoP:
+  hash(URL) -&gt; one box. That ONE BOX takes 33k rps.
+  Normal box ceiling: ~50-100k rps. → fine, barely.
+
+But: if cache misses (TTL expires, cold), every PoP's hot box
+     simultaneously asks the shield. Shield sees 300 simultaneous
+     requests, collapses to a single origin fetch.
+</code></pre>
+<p>Inflection points for Type 2:</p>
+<ul>
+<li><strong>Sharding the hot URL across multiple boxes in a PoP.</strong> Replicated keying: <code>hash(URL || random_in_K) → K boxes</code>. Each request gets a random K, distributing the hot URL across K boxes. K=10 turns 33k rps/box into 3.3k rps/box.</li>
+<li><strong>Mid-tier coalescing for very hot keys.</strong> Push coalescing all the way down to per-box above a threshold.</li>
+<li><strong>CPU saturation, not network</strong>, at extreme rps on tiny objects. Fix: <strong>TLS offload to hardware NICs</strong> (Mellanox ConnectX or equivalent).</li>
+</ul>
+<p>Type 1 and Type 2 have <strong>completely different fixes</strong>. Type 1 scales topologically (more boxes). Type 2 scales by replicating the hot key locally. Saying "add more PoPs" to Type 2 is wrong — it increases the hot URL rate everywhere uniformly, exactly the wrong direction.</p>
+<hr>
+<h2 id="23-decision-matrix-cdn-vs-adjacent-technologies">§23. Decision matrix — CDN vs adjacent technologies</h2>
+<p>The CDN isn't always the right answer. Depends on workload shape.</p>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>CDN / Edge Cache</th>
+<th>Object storage public read</th>
+<th>In-app cache (Redis)</th>
+<th>API gateway (Kong)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Geographic distribution</td>
+<td>Global (300+ PoPs)</td>
+<td>Per-region buckets</td>
+<td>Per-region cluster</td>
+<td>Per-region</td>
+</tr>
+<tr>
+<td>Cache invalidation</td>
+<td>&lt;150 ms global</td>
+<td>None — direct read</td>
+<td>Application-controlled</td>
+<td>Application-controlled</td>
+</tr>
+<tr>
+<td>Hit rate optimization</td>
+<td>Tuned engine + admission</td>
+<td>N/A</td>
+<td>Application-tuned</td>
+<td>Limited (per-route TTL)</td>
+</tr>
+<tr>
+<td>DDoS absorption</td>
+<td>Built-in, planetary</td>
+<td>Limited</td>
+<td>None</td>
+<td>Per-instance, limited</td>
+</tr>
+<tr>
+<td>Programmability at edge</td>
+<td>Workers / Functions</td>
+<td>None</td>
+<td>None</td>
+<td>Plugin model</td>
+</tr>
+<tr>
+<td>Read latency</td>
+<td>5-30 ms anywhere</td>
+<td>50-100 ms region</td>
+<td>0.1-1 ms in-region</td>
+<td>5-20 ms regional</td>
+</tr>
+<tr>
+<td>Origin offload ratio</td>
+<td>95-99.9%</td>
+<td>0% (direct read)</td>
+<td>90%+</td>
+<td>50-90%</td>
+</tr>
+<tr>
+<td>Cost model</td>
+<td>$ per GB or contract</td>
+<td>$ per GB stored + egress</td>
+<td>Fixed infra</td>
+<td>$ per request</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Decision thresholds</strong>:</p>
+<ul>
+<li><strong>Use a CDN when</strong>: public-internet traffic with global users; cacheable content (static, GET APIs, video, downloads); need DDoS protection without engineering it; origin egress &gt; a few TB/month; sustained edge RPS exceeds what one region's origin can serve.</li>
+<li><strong>Use object storage with public read when</strong>: single-region users (B2B SaaS in one country); &lt;100 GB/month total egress; no DDoS profile; direct S3/GCS public buckets are simpler and cheaper.</li>
+<li><strong>Use in-app cache when</strong>: private per-user session data; sub-ms latency; cache key is internal (not URL-derived); data isn't HTTP-shaped.</li>
+<li><strong>Use an API gateway when</strong>: routing, auth, rate-limiting are primary; caching is a side benefit; per-route TTL granularity matters more than global distribution.</li>
+</ul>
+<p>A mature stack has all four: CDN for public traffic + object storage as canonical store + in-app cache for hot internal state + API gateway for auth/routing. They compose; they don't substitute.</p>
+<hr>
+<h2 id="24-use-case-gallery">§24. Use case gallery</h2>
+<p><strong>Static asset hosting</strong> — the classic CDN workload. Images, JS, CSS, fonts, HTML. Long TTL (days to forever, with content-hash URLs). Origin typically S3. Hit rate ~99.9% in steady state. Every major site does this — LinkedIn, Pinterest, Etsy, Shopify storefronts. Cloudflare for indie web, CloudFront for AWS-native, Akamai for enterprise tail.</p>
+<p><strong>API response caching</strong> — Stripe and GitHub canonical. Public-ish data (rate cards, GitHub Pages, package metadata) at TTLs of seconds-to-minutes. Cache keys include API version + path + query params; auth headers stripped. Stripe's docs are entirely CDN-served; GitHub Pages is fronted by Fastly; package registries (npm via Cloudflare, PyPI via Fastly) spike to millions of requests per minute on a popular release.</p>
+<p><strong>Video streaming</strong> — Netflix Open Connect at the extreme. Video files split into ~10 s segments at multiple bitrates; segment files are the cacheable units; adaptive bitrate clients pull variable quality. YouTube uses Google's Global Cache + in-ISP. Twitch (live) uses a hybrid of multiple commercial CDNs. A few thousand titles account for 90% of viewing at any moment.</p>
+<p><strong>Gaming patch distribution</strong> — Steam ships 100 GB+ patches via own infrastructure + CDN. Epic delivers Fortnite updates to &gt;100M users via Cloudflare + their own peer-assist layer. Pure Type-2 scaling from §22: split the patch into many CDN-cacheable chunks, parallel download, optional P2P (peer-to-peer) assist between clients on the same network.</p>
+<p><strong>Software downloads</strong> — Linux ISOs (Ubuntu via mirror network + Cloudflare), Docker registry pull-through (Hub via Cloudflare, ECR via CloudFront), apt/yum/Homebrew. Public Docker registries serve billions of pulls per day; CDN hit rate ~99% on popular images.</p>
+<p><strong>DDoS protection (the inverse use case)</strong> — some customers buy CDN service primarily for DDoS absorption, not caching. Cloudflare's core business is arguably this — small sites with low traffic but high attack profile (gaming forums, journalists in repressive regions). Caching is incidental; the value is wire capacity. Project Galileo is the most public example.</p>
+<p><strong>Edge compute / personalization at edge</strong> — CDN runs code per request to customize the response. Workers serving Stripe Press, Compute@Edge hosting parts of the NYT site, Lambda@Edge resizing images for Shopify storefronts. Cache key extends to "user bucket" (logged-in vs anonymous, A/B cohort, geo) so each bucket is cached but per-user state isn't.</p>
+<p><strong>ML model and data artifact distribution</strong> — ML model files (10 MB - 10 GB) pulled by inference workers worldwide fit "cacheable immutable blob" perfectly. HuggingFace hosts models on CloudFront. Cloudflare R2 + Workers serve LLM (Large Language Model) weights and embeddings at edge for some customers.</p>
+<p>The point: <strong>same primitive, very different consumption</strong>. A static-image CDN at 99.99% hit rate looks operationally different from a video CDN at 99% hit rate on petabyte working sets, which differs from a DDoS-focused CDN at 30% hit rate on uncacheable traffic. Knowing which shape your workload is determines provider, tier, cache-key strategy, and TTL discipline.</p>
+<hr>
+<h2 id="25-real-world-implementations-with-numbers">§25. Real-world implementations with numbers</h2>
+<ul>
+<li><strong>Cloudflare</strong>: ~20% of web traffic. 280 Tbps capacity. ~300 PoPs, 120+ countries. Sustained ~50M rps; peak crossing 1 billion req/min in DDoS events. Record largest DDoS absorbed: 71M rps in 2023.</li>
+<li><strong>Akamai</strong>: ~30% of web traffic. ~4,200 PoPs, often single-rack inside ISPs. Served 250+ Tbps during major NFL Thursday Night Football events. Enterprise streaming and gaming dominate.</li>
+<li><strong>Netflix Open Connect</strong>: ~17,000 cache appliances in ISPs. ~200 Tbps peak during popular releases. ~95% of streaming from inside the user's own ISP. Each appliance: ~250 TB SSD, 100 Gbps NICs, optimized for sequential 4K reads. World's largest CDN by bytes-moved-per-day, but invisible because it serves one customer.</li>
+<li><strong>Fastly</strong>: ~70 superPOPs with petabyte-class storage. VCL programmability. June 8, 2021 outage — one customer's VCL push hit a latent bug; downed data plane globally for ~49 minutes; took down BBC, Reddit, NYT, Amazon, gov.uk. Recovered in &lt;1 hour. Classic study in CDN blast radius. Purge SLO: &lt;150 ms global p99.</li>
+<li><strong>CloudFront</strong>: ~450 edge locations + ~13 regional edge caches. Theoretical 600+ Tbps. Tightly coupled to AWS origins; free egress to S3/ALB via specific patterns. Powers Twitch catalog, much of Amazon retail's public surface, Netflix's metadata APIs.</li>
+<li><strong>BunnyCDN</strong>: ~120 PoPs, ~$0.01/GB pricing — ~1/8 of CloudFront's list. Indie game patches, blog hosting, small SaaS.</li>
+<li><strong>Google Global Cache (GGC)</strong>: in-ISP appliances for YouTube, Drive, Play Store. YouTube delivers &gt;1 Pbps globally during peak; majority via in-ISP layer.</li>
+</ul>
+<p>Latency budget for a typical cache-hit request:</p>
+<pre><code>DNS resolve (cached at resolver)        :   2-10 ms
+TCP handshake to anycast IP             :  10-15 ms (1 RTT)
+TLS 1.3 1-RTT handshake (or 0-RTT)      :  10-15 ms (5 ms if resumed)
+HTTP/2 request frame                    :  &lt;1 ms
+Edge cache lookup (RAM hit)             :  &lt;1 ms
+Cache response framing + send           :   1-2 ms
+Network back to client                  :  5-15 ms
+----------------------------------------------------------
+Total p99 cache hit                     :  30-50 ms
+
+On miss (add):
+PoP -&gt; L2 mid-tier                      :  1-3 ms
+L2 -&gt; shield                            :  5-20 ms
+Shield -&gt; origin                        :  50-200 ms (geography)
+----------------------------------------------------------
+Total p99 cache miss                    : 100-300 ms
+</code></pre>
+<p>The cache-hit budget is dominated by TLS handshake. Halving it requires session resumption (free, widely deployed), 0-RTT, or QUIC's faster handshake. Beyond that, the next bottleneck is mobile network jitter — uncontrollable.</p>
+<hr>
+<h2 id="26-specialized-cdns">§26. Specialized CDNs</h2>
+<p>The mainstream CDN landscape (Cloudflare, Akamai, Fastly, CloudFront) handles general web + API + image + video. But several workloads have specialized variants worth knowing about.</p>
+<h3 id="a-gaming-patch-and-asset-distribution">(a) Gaming patch and asset distribution</h3>
+<p>Gaming patches are huge (100 GB for AAA titles), released simultaneously to tens of millions of users in narrow windows ("launch day"). A pure CDN approach works but is expensive; the gaming industry has built hybrids.</p>
+<ul>
+<li><strong>Steam Content Server Network</strong>: Valve's own CDN; ~100+ PoPs globally; ~150 Tbps peak. Augmented by <strong>Steam Pipe</strong>, which is essentially BitTorrent-with-trackers: clients download chunks from Steam servers <strong>and</strong> from peers on the same network. ISP-friendly because LAN downloads minimize WAN traffic.</li>
+<li><strong>Epic Games (Fortnite)</strong>: Cloudflare CDN for distribution; their <strong>Easy Anti-Cheat</strong> infrastructure for in-game services. Patches use chunked CDN distribution.</li>
+<li><strong>Battle.net (Blizzard)</strong>: in-house CDN + Akamai + their own peer-to-peer client (the "Battle.net update agent" used to torrent patches, since reduced as bandwidth costs dropped).</li>
+<li><strong>Riot Games</strong>: uses Akamai + their own infrastructure; recently moved more to public cloud.</li>
+<li><strong>Microsoft (Xbox + Game Pass)</strong>: Xbox Live distribution via Azure CDN + their own in-ISP appliances analogous to Netflix Open Connect.</li>
+</ul>
+<p>Pattern: <strong>immutable chunks + parallel downloads + peer-assist when LAN peers have what you need</strong>. Pure BitTorrent dropped out of favor (NAT complexity, anti-piracy concerns) but the structural ideas persist.</p>
+<h3 id="b-software-downloads-linux-distros-docker-registries">(b) Software downloads — Linux distros, Docker registries</h3>
+<p>Linux distribution mirrors have been a thing since the 90s. Today:</p>
+<ul>
+<li><strong>Ubuntu / Debian / Fedora mirrors</strong>: traditional volunteer-run mirror networks (universities, companies) plus CDN augmentation. Ubuntu uses Cloudflare for <code>releases.ubuntu.com</code>. Debian has hundreds of mirrors; meta-tools like <code>apt-fast</code> and <code>mirrorbits</code> pick the fastest.</li>
+<li><strong>Docker Hub</strong>: served via Cloudflare (Docker Inc. as Cloudflare customer); aggressive caching at edge since images are immutable by digest.</li>
+<li><strong>AWS ECR (Elastic Container Registry)</strong>: served via CloudFront with regional edge caches.</li>
+<li><strong>GitHub Container Registry</strong>: served via Azure / Fastly.</li>
+<li><strong>Homebrew (macOS package manager)</strong>: bottles served via Cloudflare and GitHub LFS; archives via the GitHub CDN.</li>
+<li><strong>PyPI / npm / Maven Central</strong>: served via Fastly (PyPI), Cloudflare (npm), CloudFront (Maven Central). Single-package downloads can spike to millions per minute on a popular release (e.g., new React major version).</li>
+</ul>
+<p>Pull-through caches deserve mention: a corporate environment might run a <strong>registry proxy</strong> (e.g., Sonatype Nexus, JFrog Artifactory) that caches from upstream. The proxy is itself a CDN for the corporate network — same primitive, smaller scale.</p>
+<h3 id="c-live-streaming-twitch-youtube-live-ll-hls">(c) Live streaming — Twitch, YouTube Live, LL-HLS</h3>
+<p>Live streaming is the latency-sensitive sibling of VOD streaming. Twitch and YouTube Live target ~3-5 s end-to-end latency from streamer to viewer; sports streaming targets ~10-20 s.</p>
+<p>The protocol evolution:</p>
+<ul>
+<li><strong>RTMP (Real-Time Messaging Protocol)</strong>: Flash-era protocol; still used for <strong>ingest</strong> from streamers to CDN, but not for delivery.</li>
+<li><strong>HLS / DASH with 2-10 s segments</strong>: 30+ s of end-to-end latency. Too slow for live.</li>
+<li><strong>LL-HLS (Low-Latency HTTP Live Streaming)</strong>: Apple's spec; chunked transfer of partial segments; ~2-5 s latency. CDN handles partial-segment caching.</li>
+<li><strong>LL-DASH</strong>: equivalent for DASH.</li>
+<li><strong>WebRTC delivery</strong>: sub-second latency; some platforms use it for interactive live (Twitch's beta low-latency mode, YouTube's "ultra-low latency" mode). Doesn't use traditional CDN caching — uses SFUs (Selective Forwarding Units) in a media-server architecture.</li>
+</ul>
+<p>Twitch's architecture: ingest via RTMP at ingest PoPs; transcoded to multiple bitrates; segmented; distributed via their own CDN (formerly heavily Akamai, now significant in-house). Recent additions of LL-HLS.</p>
+<p>YouTube Live: similar pipeline; uses Google's global infrastructure; LL-HLS and ultra-low-latency WebRTC modes.</p>
+<h3 id="d-dns-only-steering-only-cdns">(d) DNS-only / steering-only CDNs</h3>
+<p>NS1 and Cedexis were mentioned in §20. They don't cache HTTP at all — they just steer. Their role in the CDN ecosystem:</p>
+<ul>
+<li><strong>Multi-CDN front end</strong>: pick which CDN to route to per query.</li>
+<li><strong>GeoDNS for legacy architectures</strong> (one origin per region; DNS picks the nearest).</li>
+<li><strong>Failover orchestration</strong>: monitor backends; route around failures.</li>
+</ul>
+<p>NS1's pricing model: per query + per traffic management feature. For sites with 100M queries/month and multi-CDN, the cost is a few thousand dollars/month — small relative to CDN egress.</p>
+<h3 id="e-private-cloud-on-prem-cdns">(e) Private-cloud / on-prem CDNs</h3>
+<p>For workloads that can't use public CDN (regulatory, data residency, ultra-low-latency on internal networks):</p>
+<ul>
+<li><strong>VMware vSAN + edge nodes</strong>: enterprise customers deploy mini-PoPs in their own datacenters.</li>
+<li><strong>Telco edge</strong> (5G MEC — Multi-access Edge Computing): mobile carriers offer edge compute and caching co-located with cell towers / base stations. AT&amp;T, Verizon, and other carriers have such offerings.</li>
+<li><strong>Specialized CDNs for HFT (High-Frequency Trading)</strong>: where shaving microseconds matters; not really "CDN" in the public sense but the same architecture (geographically-distributed cache + fast routing) for market data.</li>
+</ul>
+<h3 id="f-specialty-ad-tech-and-analytics-cdns">(f) Specialty: ad-tech and analytics CDNs</h3>
+<p>Ad networks and analytics platforms have specialized CDN needs:</p>
+<ul>
+<li><strong>Google Ad Manager / Doubleclick</strong>: serves ad creative via Google's CDN; latency budget is single-digit ms.</li>
+<li><strong>Cloudflare for ad-tech</strong>: many ad-tech companies use Cloudflare's edge to lower per-request latency.</li>
+<li><strong>Snowplow / Segment</strong>: analytics SDKs need a CDN to host the tracking JS; per-event collection often via CDN proxy to a backend.</li>
+</ul>
+<p>The constraint: ad-tech requires both <strong>very low latency</strong> (auction time budgets are 100 ms) and <strong>flexible programmability</strong> (frequent A/B tests, real-time bidding logic). Edge compute fits well; raw cache plane often doesn't.</p>
+<hr>
+<h2 id="27-cost-economics-deep-dive">§27. Cost economics deep dive</h2>
+<p>CDN cost is opaque until you've signed a contract or three. The cost model has several axes, each with its own pricing curve.</p>
+<h3 id="a-egress-cost-per-gb-pricing">(a) Egress cost (per-GB pricing)</h3>
+<p>The dominant cost. Pricing in the wild (list prices; enterprise discounts can be 50-90% off):</p>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>Region</th>
+<th>Price per GB (list, 2025)</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CloudFront</td>
+<td>US, Europe</td>
+<td>$0.085 (first 10 TB)</td>
+<td>Tiers down to $0.020 at high volume</td>
+</tr>
+<tr>
+<td>CloudFront</td>
+<td>Asia, Australia</td>
+<td>$0.114</td>
+<td>Geographic premium</td>
+</tr>
+<tr>
+<td>Cloudflare</td>
+<td>Most regions</td>
+<td>Bundled (Pro/Biz plans)</td>
+<td>Pay flat per month; egress unmetered</td>
+</tr>
+<tr>
+<td>Cloudflare</td>
+<td>Enterprise</td>
+<td>Custom, often &lt;$0.005/GB</td>
+<td>Volume contracts</td>
+</tr>
+<tr>
+<td>Fastly</td>
+<td>US, Europe</td>
+<td>$0.12 (first 10 TB)</td>
+<td>Cheaper after volume</td>
+</tr>
+<tr>
+<td>Akamai</td>
+<td>Custom</td>
+<td>Negotiated</td>
+<td>Typically $0.005-0.02 at scale</td>
+</tr>
+<tr>
+<td>BunnyCDN</td>
+<td>All</td>
+<td>$0.01</td>
+<td>Indie pricing; limited features</td>
+</tr>
+<tr>
+<td>Google Cloud</td>
+<td>US</td>
+<td>$0.08 (first 10 TB)</td>
+<td>Tiers down</td>
+</tr>
+</tbody>
+</table>
+<p>The trend: egress prices have <strong>declined ~50% over the last decade</strong>. AWS announced ~free egress to the internet for customers leaving AWS in 2024 (long-overdue concession). Hyperscalers have higher list prices; specialty CDNs (Cloudflare, BunnyCDN) have lower.</p>
+<p>Cloudflare's pricing model is unusual: most plans bundle egress (you pay a flat per-month rate for Pro / Business / Enterprise; no separate per-GB charges). This is enabled by their network economics (bandwidth-bundled peering) and is the reason many bandwidth-heavy sites move to Cloudflare even from enterprise CDNs.</p>
+<h3 id="b-request-cost-per-million-requests">(b) Request cost (per-million-requests)</h3>
+<p>Separate from bytes. Typical:</p>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>Per 10K HTTPS requests</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CloudFront</td>
+<td>$0.0100</td>
+<td>Plus egress</td>
+</tr>
+<tr>
+<td>Cloudflare</td>
+<td>Bundled</td>
+<td>Most plans</td>
+</tr>
+<tr>
+<td>Fastly</td>
+<td>$0.0100</td>
+<td>Plus egress</td>
+</tr>
+<tr>
+<td>BunnyCDN</td>
+<td>$0.0004</td>
+<td>Indie</td>
+</tr>
+</tbody>
+</table>
+<p>For sites with high request volume but small response bodies (API CDN), request cost can dominate egress cost. A site doing 1B requests/month at $0.01/10K = $1000/month just in request fees.</p>
+<h3 id="c-edge-compute-cost">(c) Edge compute cost</h3>
+<p>Compute pricing:</p>
+<ul>
+<li><strong>Cloudflare Workers</strong>: $5/month base + $0.50 per million requests (Bundled plan); $0.30 per million CPU-ms (Unbound plan, beyond first 10M).</li>
+<li><strong>Fastly Compute@Edge</strong>: $50/month base + $0.50 per million requests.</li>
+<li><strong>AWS Lambda@Edge</strong>: $0.60 per million requests + $0.0000050001 per GB-second of duration. Cold starts contribute to billed duration.</li>
+<li><strong>AWS CloudFront Functions</strong>: $0.10 per million requests; very cheap; very restricted (~1 ms CPU budget).</li>
+</ul>
+<p>For sites that do 10M edge-compute requests/day: ~$50/month on Workers, ~$60/month on CloudFront Functions, more on Lambda@Edge.</p>
+<h3 id="d-the-static-is-cheap-dynamic-is-expensive-math">(d) The "static is cheap, dynamic is expensive" math</h3>
+<p>The economic shape of CDN cost:</p>
+<ul>
+<li><strong>Static, immutable, content-hashed asset, no edge compute</strong>: ~$0.005-0.02/GB egress, ~zero request cost (since bundled), no compute. The cheapest possible.</li>
+<li><strong>Dynamic-ish, short-TTL, with header logic at edge</strong>: above + edge compute per request. Still cheap per request but adds up.</li>
+<li><strong>Personalized at edge, heavy compute</strong>: large edge-compute bills. Often comparable to running the equivalent at origin.</li>
+<li><strong>Uncacheable</strong> (Cache-Control: no-store, or auth-bearing every request): pure pass-through; you pay both edge bandwidth and origin compute. The worst case.</li>
+</ul>
+<p>The optimization pattern: <strong>make as much cacheable as possible</strong>. Edge compute to convert dynamic to cacheable (e.g., GraphQL persisted queries, A/B bucket assignment for cacheable bucket variants) often pays for itself in offloaded origin compute.</p>
+<h3 id="e-free-tiers">(e) Free tiers</h3>
+<p>Major CDN free tiers:</p>
+<ul>
+<li><strong>Cloudflare Free</strong>: free TLS, DDoS protection, basic WAF, unlimited bandwidth. The most generous free tier; the reason many indie sites use Cloudflare.</li>
+<li><strong>CloudFront Free Tier</strong>: 1 TB egress, 10M requests/month for 12 months on AWS Free Tier.</li>
+<li><strong>Netlify, Vercel</strong>: edge serving included with hosting; limits on bandwidth per month.</li>
+<li><strong>BunnyCDN</strong>: no free tier, but $1/month minimum is close enough.</li>
+<li><strong>GitHub Pages</strong>: free hosting on GitHub's Fastly-fronted CDN.</li>
+</ul>
+<p>Free tiers have limits — DDoS protection on Cloudflare Free is unlimited L3/L4 but with rate-limited L7 features; CloudFront free tier is single-year. For a side project, Cloudflare Free + Vercel covers almost everything.</p>
+<h3 id="f-cost-surprises">(f) Cost surprises</h3>
+<p>Common ways customers blow their CDN budget:</p>
+<ul>
+<li><strong>Cache key fragmentation collapses hit rate.</strong> A bad config drops hit rate from 99% to 50%; egress + request volume to origin spikes 50x; the CDN bill grows because more "miss" responses pass through (egress) and origin costs explode.</li>
+<li><strong>Egress to other regions.</strong> Multi-region serving with cross-region replication can add unexpected egress between hyperscaler regions; some CDN providers charge premium for serving from certain geographies (Asia, South America).</li>
+<li><strong>Premium feature creep.</strong> Adding bot management ($50/month), image optimization (~$0.10/1000 transformations), Workers (~$5/month per service) accumulates. Many enterprises end up paying 5-10x their bandwidth bill in features.</li>
+<li><strong>Negotiated rate vs list rate.</strong> Until you have a contract, you pay list. An enterprise commitment ($10K/month minimum) usually unlocks 50-80% discount.</li>
+</ul>
+<hr>
+<h2 id="28-observability">§28. Observability</h2>
+<p>Running a CDN integration without observability is flying blind. Modern CDN providers offer rich telemetry; using it well is half of operating a CDN-fronted service.</p>
+<h3 id="a-log-streaming-from-edge">(a) Log streaming from edge</h3>
+<p>The basic primitive: every request at every PoP can be logged, and those logs can be streamed to your S3 / GCS / Splunk / Datadog. Implementations:</p>
+<ul>
+<li><strong>Cloudflare Logpush</strong>: stream HTTP request logs (and Workers logs, firewall logs, etc.) to S3 / GCS / Azure / Splunk / Datadog. Sub-minute lag from request to log.</li>
+<li><strong>Fastly Real-Time Log Streaming</strong>: HTTP / TCP / syslog endpoints; log every request as it happens. Sub-second lag possible.</li>
+<li><strong>CloudFront access logs</strong>: written to S3 with a few-minute lag. Real-time logs (CloudFront Real-time Logs) available with Kinesis Data Streams, sub-second lag.</li>
+<li><strong>Akamai DataStream</strong>: similar streaming.</li>
+</ul>
+<p>Log volume can be huge: a site with 10M rps generates ~10M log lines per second; at ~500 bytes per line that's 5 GB/s. Most customers sample (1% of requests) or aggregate at edge.</p>
+<h3 id="b-the-per-pop-visibility-problem">(b) The per-PoP visibility problem</h3>
+<p>Aggregate metrics across all PoPs hide PoP-specific failures. A PoP serving 1% of global traffic could be entirely failing (errors, high latency, bad cache hit rate) and the global metric would barely move.</p>
+<p>Mitigation: <strong>per-PoP dashboards</strong>. Cloudflare's analytics is per-PoP (or "colo" in their language); Fastly's per-POP analytics is similar; CloudFront's per-edge-location analytics is more limited.</p>
+<p>Common per-PoP anomalies:
+- Hit rate drops on one PoP — suggests cache eviction storm or local hardware issue.
+- p99 latency spikes on one PoP — suggests local network saturation or hot spot.
+- Error rate climbs on one PoP — suggests problem with that PoP's origin connectivity.</p>
+<p>Alerting on per-PoP anomalies (when one PoP deviates from the global mean by N standard deviations) catches issues that global aggregates miss.</p>
+<h3 id="c-real-user-monitoring-rum">(c) Real User Monitoring (RUM)</h3>
+<p>CDN-measured metrics are server-side: how long did the CDN take to serve? Real user latency includes the network path back to the client (often dominant on mobile), browser rendering time, page load time. RUM captures this:</p>
+<ul>
+<li><strong>Cloudflare Web Analytics</strong>: privacy-friendly RUM via a tiny JS beacon.</li>
+<li><strong>Akamai mPulse</strong>: enterprise RUM, very comprehensive.</li>
+<li><strong>Google Analytics / GA4 with Core Web Vitals</strong>: not CDN-specific but commonly used.</li>
+<li><strong>SpeedCurve, New Relic Browser, DataDog RUM</strong>: third-party RUM products.</li>
+</ul>
+<p>What RUM reveals:
+- <strong>Real user p99 latency</strong> (vs server-side p99, which only includes CDN-side time).
+- <strong>Conversion impact of latency</strong> (each 100 ms increase in p99 → N% conversion drop).
+- <strong>Per-region performance variance</strong>: one region's users see much higher latency, suggesting routing issues, peering issues, or local network problems.
+- <strong>Mobile vs desktop</strong>: mobile users see ~3x higher p99 typically.
+- <strong>CDN provider comparison</strong>: in multi-CDN, RUM data shows which CDN performs better in each region — feeding back into routing decisions.</p>
+<h3 id="d-synthetic-monitoring">(d) Synthetic monitoring</h3>
+<p>Complement to RUM: continuously probe the site from many vantage points; alert on failures or latency degradations. Vendors:</p>
+<ul>
+<li><strong>Catchpoint, ThousandEyes, Pingdom, Uptrends</strong>: synthetic monitoring services with many probe locations.</li>
+<li><strong>Datadog Synthetic Monitoring</strong>: integrated with their observability stack.</li>
+<li><strong>AWS CloudWatch Synthetics</strong>: AWS-native.</li>
+</ul>
+<p>What synthetic catches that RUM doesn't:
+- <strong>Outages during low traffic</strong> (RUM only fires when users hit the site).
+- <strong>Specific user-flow correctness</strong> (synthetic can simulate a complex multi-step flow; RUM is per-page).
+- <strong>Specific PoP / region health</strong> (synthetic probes specific PoPs; RUM is whatever users do).</p>
+<h3 id="e-cdn-side-metrics">(e) CDN-side metrics</h3>
+<p>Beyond logs, CDN providers expose aggregate metrics:</p>
+<ul>
+<li><strong>Hit rate</strong>: by host, path, region, time. The most important single metric.</li>
+<li><strong>Bandwidth out</strong>: by host, region, content-type.</li>
+<li><strong>Request count</strong>: by status code, by path.</li>
+<li><strong>Error rate</strong>: 4xx, 5xx breakdown.</li>
+<li><strong>Origin response time</strong>: how long does the shield wait for origin.</li>
+<li><strong>DDoS attack metrics</strong>: traffic / requests blocked, attack types observed.</li>
+<li><strong>WAF rule hits</strong>: which rules are triggering, on which paths.</li>
+</ul>
+<p>Cloudflare Analytics, Fastly Insights, CloudFront CloudWatch metrics, Akamai mPulse — all expose these. They're typically the first dashboard a CDN operator looks at.</p>
+<h3 id="f-tracing-across-cdn-and-origin">(f) Tracing across CDN and origin</h3>
+<p>A request that crosses CDN → shield → origin should be traceable end-to-end. Patterns:</p>
+<ul>
+<li><strong><code>X-Request-ID</code> header propagation</strong>: CDN injects a request ID; origin logs include it; client gets it in response (optionally). Cross-correlation possible.</li>
+<li><strong>W3C Trace Context (<code>traceparent</code> header)</strong>: standardized distributed tracing context. CDN propagates from client to origin (or generates if absent).</li>
+<li><strong>Cloudflare's <code>cf-ray</code> header</strong>: every Cloudflare request has a unique ray ID; logs include it; customer can correlate with their origin logs.</li>
+</ul>
+<p>For complex incidents (slow request, intermittent error), tracing across CDN + origin + downstream services is essential. Without trace propagation, the CDN logs and origin logs are independent and you must guess the correlation.</p>
+<h3 id="g-the-shadow-traffic-pattern">(g) The "shadow traffic" pattern</h3>
+<p>Some operators send a copy of production traffic to a shadow origin to validate changes:
+- CDN Worker forks the request; sends to both real origin and shadow origin.
+- Returns the real origin's response to the user.
+- Compares the shadow's response asynchronously; alerts on differences.</p>
+<p>Used for canary deployments of new origin versions, regression testing, A/B comparisons. Cheap to implement at edge.</p>
+<hr>
+<h2 id="29-summary">§29. Summary</h2>
+<blockquote>
+<p><em>A CDN is a planet-scale distributed read-through cache fronted by anycast routing: each PoP runs a log-structured object store with W-TinyLFU admission, sharded by consistent hashing within the PoP, tiered through a regional mid-cache into an origin shield that collapses misses so origin sees single-digit RPS even at 10M rps at the edge. The technology contract is hit-rate-driven origin offload + topological proximity + DDoS dilution; durability, strong consistency, schema awareness, and per-user privacy isolation must be layered above. Whether the workload is static assets, API responses, video segments, gaming patches, software downloads, or ML model files, the same primitive applies; the differences live in cache-key hygiene, TTL discipline, and which corner of the design space — third-party shared, private in-ISP, programmable edge, specialized media — you choose.</em></p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>
