@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Background Job Queue — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Background Job Queue</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p>A reference about the <strong>technology class</strong> that dispatches discrete units of work — "jobs" — to worker processes for asynchronous execution. Exemplified by Sidekiq (Ruby + Redis), Celery (Python + Redis/RabbitMQ), BullMQ (Node.js + Redis), Resque (older Ruby + Redis), Que and GoodJob (Ruby + Postgres), river (Go + Postgres), AWS SQS (Simple Queue Service), Google Cloud Tasks, Azure Service Bus Queue, and Hangfire (.NET + SQL Server). The reader should finish understanding the design space deeply enough to apply it to commerce checkouts, media transcoding pipelines, payment retry budgets, notification fan-out, ML (Machine Learning) batch inference, and webhook delivery — and defend a pick against the obvious alternatives.</p>
+<hr>
+<h2 id="1-what-background-job-queues-are">§1. What background job queues ARE</h2>
+<p>A <strong>background job queue</strong> is a substrate for <strong>dispatching work-to-be-performed</strong> asynchronously: a producer (typically a web request handler or another job) enqueues a job descriptor, a pool of worker processes pulls jobs off the queue and executes them, and the broker tracks the lifecycle of each job from enqueue through completion or terminal failure. The unit of currency is a <strong>job</strong> — a typed descriptor of work to do, with arguments — not a generic event or a stream record. The broker's job is to deliver each job to exactly one worker (best effort), make sure crashed workers don't lose work, and let jobs schedule, retry, and dead-letter cleanly. Mental model: an HTTP server with deferred execution — the request becomes durable, executes minutes or hours later, and the result lands in a database.</p>
+<p>The category overlaps in popular vocabulary with two adjacent primitives. Disambiguating them is the entire first half of choosing the right tool.</p>
+<p><strong>Job queue vs message queue / distributed log.</strong> Both move bytes from one place to another asynchronously. The distinction is who owns delivery state. A <strong>message queue / log (Kafka, Pulsar, Kinesis)</strong> transports <em>events</em> — facts that happened — for <em>many</em> consumers, replayable, retained for days. Each consumer maintains its own read position; the broker doesn't track per-consumer per-message state. The producer publishes once, ten different downstream pipelines each get their own copy via offset tracking. A <strong>job queue (Sidekiq, Celery, SQS)</strong> transports <em>work-to-be-performed</em> — instructions to execute — for <em>one</em> worker, <strong>non-replayable</strong>, deleted on completion. The broker tracks per-job state: enqueued, in-flight (claimed by a worker), completed, failed, retrying, dead-lettered. There is no concept of "fan-out to N consumer groups" or "replay last 7 days of jobs" — once a job runs successfully and is acked, it is gone. The mental separation: <strong>events are nouns (the past), jobs are verbs (the future).</strong> A Kafka topic of <code>order_created</code> events is a log of facts. A Sidekiq queue of <code>SendOrderConfirmation</code> jobs is a list of work to do. The same business operation often produces both — the order service writes <code>order_created</code> to Kafka (audit, analytics, downstream consumers) and enqueues <code>SendOrderConfirmation</code> to Sidekiq (one-time side effect with retries). Use both for what they are.</p>
+<p><strong>Job queue vs workflow engine.</strong> Both handle "do something later, retry on failure." The distinction is the shape of the work. A <strong>workflow engine (Temporal, Cadence, AWS Step Functions, Airflow)</strong> owns <strong>multi-step, long-running, stateful processes</strong> — a 30-day KYC (Know Your Customer) onboarding workflow that calls four services, waits for human approval, branches on results, and durably remembers what it has done. State is persisted between steps; replay reconstructs progress. A <strong>job queue</strong> owns <strong>short, atomic, stateless units of work</strong> — "send this email," "resize this image," "retry this webhook." A job is a one-shot function call with retries on failure; it doesn't remember intermediate state. If your "job" calls three services with rollback logic between them, you've outgrown a job queue and you want a workflow engine. The crossover comes in volume: workflow engines run ~10k-100k workflows/sec at the high end; job queues run millions of jobs/sec. <strong>For high-volume short atomic work, job queues win on throughput. For low-volume multi-step stateful work, workflow engines win on correctness.</strong> The boundary is around "does the work fit in one function under a few minutes."</p>
+<p><strong>Job queue vs cron.</strong> Cron is <strong>scheduling</strong> — "run this at midnight" — with no concept of distribution, retry, durability, or backlog. A cron task is a process invocation from a clock daemon. A job queue is <strong>dispatching and execution</strong> — the queue holds pending work, workers consume, the broker tracks state. Most modern systems combine: cron-style triggers (Sidekiq Cron, Celery beat, Hangfire RecurringJob) enqueue jobs into the job queue, and the queue handles the actual execution and retry. You almost never want raw cron in a multi-server backend — cron has no way to ensure exactly one of your three application servers runs the task, and it has no retry. Cron triggers + a job queue is the canonical pattern.</p>
+<p><strong>Job queue vs synchronous request execution.</strong> This is the comparison the job queue is built to win — see §9.</p>
+<p><strong>Where the job queue sits in the stack:</strong></p>
+<pre><code>   ┌──────────────────────────────────────────────────────┐
+   │   Web / API tier (request handlers)                   │
+   │   Enqueue jobs, return immediately                    │
+   └──────────────────────────────────────────────────────┘
+                              │
+                              ▼ enqueue
+   ┌──────────────────────────────────────────────────────┐
+   │  ★ BACKGROUND JOB QUEUE (this layer)                  │
+   │     - durable job storage                             │
+   │     - delayed / scheduled jobs                        │
+   │     - priority queues, DLQ (Dead-Letter Queue)        │
+   │     - visibility timeout / heartbeat                  │
+   │     - retry-with-backoff machinery                    │
+   └──────────────────────────────────────────────────────┘
+                              │
+                              ▼ dequeue
+   ┌──────────────────────────────────────────────────────┐
+   │   Worker fleet (executes job bodies)                  │
+   │   Sidekiq workers, Celery workers, SQS consumers, ... │
+   └──────────────────────────────────────────────────────┘
+                              │
+                              ▼ side effects
+   External systems: Postgres, Redis, Stripe API, S3, SES,
+                     SMTP, Twilio, Push Notification gateways
+</code></pre>
+<p><strong>What job queues are NOT good for.</strong> (1) <strong>Strict global ordering at high throughput</strong> — FIFO (First-In-First-Out) queues sacrifice throughput for order; per-group ordering caps at ~300 TPS (Transactions Per Second) per group in SQS FIFO. (2) <strong>Sub-millisecond latency dispatch</strong> — a job queue adds ~1-5 ms enqueue + dequeue overhead, plus polling intervals; not suitable for "respond in 10 ms" paths. (3) <strong>Replayable history of past work</strong> — once a job is acked, it is deleted; you cannot ask "show me all jobs that ran yesterday" without a separate audit log. (4) <strong>Long-running stateful workflows</strong> — see workflow-engine distinction above. (5) <strong>Streaming continuous data</strong> — a Kafka log is the right shape for a click-stream firehose; a job queue is wrong because jobs aren't replayable and per-message state machine overhead doesn't pay off at sustained millions/sec. (6) <strong>Exactly-once external side effects without idempotency</strong> — see §2.</p>
+<hr>
+<h2 id="2-inherent-guarantees-whats-provided-vs-what-must-be-layered-on">§2. Inherent guarantees — what's provided vs what must be layered on</h2>
+<p><strong>Provided by design.</strong></p>
+<ol>
+<li>
+<p><strong>At-least-once delivery.</strong> Every accepted job runs at least once. If the worker crashes mid-job, the broker returns the job to the queue (via visibility timeout or heartbeat loss); another worker re-runs it. <strong>The contract is: your job body must be idempotent.</strong> This is non-negotiable. Sidekiq, Celery, BullMQ, SQS, Cloud Tasks, Hangfire — all of them at-least-once by default.</p>
+</li>
+<li>
+<p><strong>Priority and ordering within a queue.</strong> Most job queues support multiple named queues with worker-side priority weights (Sidekiq's <code>--queue critical,5 default,3 low,1</code> syntax weights pulls). Within a single queue, default ordering is FIFO (Redis LIST is a FIFO queue if you LPUSH on one end and BRPOP the other).</p>
+</li>
+<li>
+<p><strong>Delayed execution.</strong> Schedule a job to run at a future timestamp. "Send reminder in 24h," "retry webhook in 30 seconds." Implemented under the hood as a sorted set keyed by execute-at timestamp (Sidekiq, BullMQ) or as a row with <code>run_at</code> (Que, river, Hangfire), with a scheduler that polls for due jobs.</p>
+</li>
+<li>
+<p><strong>Retry with backoff.</strong> When a job raises, the broker re-enqueues it with a delay computed from an exponential backoff curve (Sidekiq default: <code>(retry_count^4) + 15 + (random_jitter * 30)</code> seconds, capped at ~30 attempts over ~21 days). Configurable per-job.</p>
+</li>
+<li>
+<p><strong>Dead-letter queue (DLQ) after N attempts.</strong> Jobs that exhaust their retry budget land in a DLQ for manual inspection — preventing a single poison-pill job from looping forever and starving the queue.</p>
+</li>
+</ol>
+<p><strong>NOT provided. Must be layered on.</strong></p>
+<ol>
+<li>
+<p><strong>Exactly-once delivery.</strong> No job queue gives you exactly-once across worker crashes and broker failures. Even SQS FIFO's "exactly-once messages within 5 minutes" applies only to deduplication of the <em>enqueue</em> event, not the <em>processing</em> — if a worker claims a FIFO job, partially processes it, then crashes before acking, the visibility timeout returns it and another worker re-processes. <strong>You must layer idempotency at the job-execution level</strong>: an idempotency key checked against a Postgres table, a conditional UPDATE that no-ops on retry, or an upsert with deterministic primary key.</p>
+</li>
+<li>
+<p><strong>Strict total ordering across queues.</strong> Within one queue and one consumer, FIFO holds. Across multiple queues, across multiple workers per queue, or across retries (a retry of job 2 may execute after job 3 was already processed), there is no global order. Ordering requirements must be encoded into a partition key + single-consumer-per-key model (SQS FIFO's <code>MessageGroupId</code>).</p>
+</li>
+<li>
+<p><strong>Transactional execution with external state.</strong> When a job updates Postgres AND sends an email, those two side effects are not atomic. If the email send fails after the DB update, the retry will update the DB twice (unless idempotent) and the user gets two emails. The <strong>transactional outbox pattern</strong> (§13) is the standard fix: write to DB + write to outbox table in one transaction, separate worker tails the outbox.</p>
+</li>
+<li>
+<p><strong>Exactly-once side effects to external APIs.</strong> Calling Stripe in a job + worker crash + retry = potentially two charges. Stripe's <code>Idempotency-Key</code> header (the canonical example, §15) is how you bridge this: the client (your job) generates a deterministic key per job-attempt-group; Stripe dedupes server-side. Without this, no job queue can give you "charge exactly once."</p>
+</li>
+<li>
+<p><strong>Backpressure into the producer.</strong> When workers fall behind, the queue grows unboundedly. Most job queues don't push back on the producer; the producer just keeps enqueueing. If you don't alert on queue depth and limit producer rate, the queue can swallow gigabytes of jobs and the broker degrades. Backpressure is the system designer's job.</p>
+</li>
+<li>
+<p><strong>Job-level observability beyond basic metrics.</strong> Most queues track in-flight, retry count, DLQ size. End-to-end job tracing — "this job for user 42 was enqueued at T0, picked up at T1, completed at T2, called Stripe at T1.5" — must be added via OpenTelemetry, custom metrics, or structured logging.</p>
+</li>
+</ol>
+<p><strong>The contract:</strong> the broker owns durability, retry machinery, scheduling, and DLQ; the application owns job-body idempotency, external-side-effect dedup, and queue-depth backpressure.</p>
+<hr>
+<h2 id="3-the-design-space">§3. The design space</h2>
+<p>Four implementation backends differentiate the named systems. Plus single-region vs multi-region.</p>
+<p><strong>Backend A — Redis-backed broker (Sidekiq, Celery on Redis, BullMQ, Resque).</strong> Jobs are JSON blobs in Redis data structures. The pending queue is a Redis LIST (LPUSH to enqueue, BRPOP to claim — blocking pop is what makes worker polling efficient). Delayed and scheduled jobs are in a sorted set (ZADD with score = unix epoch of execute-at; ZRANGEBYSCORE polled by a scheduler thread). Workers are external processes (Ruby/Python/Node) that connect to Redis and run business logic. <strong>Strengths:</strong> sub-millisecond enqueue + dequeue latency (Redis is in-memory), millions of jobs/sec sustainable on one well-tuned Redis, mature ecosystems (Sidekiq has ~13 years of patterns). <strong>Costs:</strong> Redis is your durability story — Redis persistence (RDB snapshots + AOF) is good but not as bulletproof as a transactional DB; Redis memory caps total queue depth; single-instance Redis is a single point of failure (Sentinel or Cluster mitigates). For most rails-shaped apps, this is the default and correct choice.</p>
+<p><strong>Backend B — Database-backed broker (Que, GoodJob, river, Hangfire SQL Server, Skiff).</strong> Jobs are rows in a database table (typically Postgres or MySQL 8). Workers claim rows atomically using <code>SELECT ... FOR UPDATE SKIP LOCKED LIMIT N</code>. <strong>Strengths:</strong> transactional consistency with your application data — you can write to Postgres + enqueue job in one transaction (the holy grail of dual-write avoidance, §13); no separate broker to operate; no separate durability story. <strong>Costs:</strong> lower peak throughput (~10k-50k jobs/sec on Postgres, vs ~1M/sec on Redis), more load on the application database. Has become competitive since Postgres 9.5 (2015) added <code>SKIP LOCKED</code>. River (Go, 2023+) is the modern flag-bearer; GoodJob (Ruby, 2020) is the rails-friendly variant; Que (Ruby, 2014) was first.</p>
+<p><strong>Backend C — Managed broker (SQS, Cloud Tasks, Azure Service Bus Queue).</strong> Cloud-provider-managed queue with no servers to run. Producers POST messages; workers poll. Broker handles durability, scaling, retries, DLQ. <strong>Strengths:</strong> zero operational overhead, transparent multi-region (SQS is regional but the abstraction is clean), pay-per-use ($0.40 per million SQS requests as of 2024), virtually unlimited throughput in Standard mode. <strong>Costs:</strong> vendor lock-in, ~20-100 ms minimum latency (vs ~1 ms Redis), per-job cost adds up at scale. AWS-heavy shops default here.</p>
+<p><strong>Backend D — In-memory (BullMQ in-memory mode for dev, NATS).</strong> Pure RAM, no persistence. Suitable only for dev or for genuinely ephemeral work where loss is acceptable.</p>
+<h3 id="comparison-table">Comparison table</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Sidekiq (Redis)</th>
+<th>Celery (Redis/RMQ)</th>
+<th>BullMQ (Redis)</th>
+<th>Que / GoodJob / river (PG)</th>
+<th>AWS SQS</th>
+<th>Cloud Tasks</th>
+<th>Hangfire (SQL Server)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Language ecosystem</td>
+<td>Ruby</td>
+<td>Python</td>
+<td>Node.js / TypeScript</td>
+<td>Ruby (Que/GoodJob), Go (river)</td>
+<td>Any (HTTP / SDK)</td>
+<td>Any (HTTP)</td>
+<td>.NET</td>
+</tr>
+<tr>
+<td>Broker storage</td>
+<td>Redis LIST + Sorted Set</td>
+<td>Redis / RabbitMQ / SQS</td>
+<td>Redis Streams + ZSET</td>
+<td>Postgres rows</td>
+<td>Managed</td>
+<td>Managed</td>
+<td>SQL Server rows</td>
+</tr>
+<tr>
+<td>Persistence</td>
+<td>Redis RDB + AOF</td>
+<td>Broker-dependent</td>
+<td>Redis</td>
+<td>DB durability</td>
+<td>11-nines</td>
+<td>11-nines</td>
+<td>SQL Server</td>
+</tr>
+<tr>
+<td>Throughput / instance</td>
+<td>~10k-50k jobs/sec</td>
+<td>~5k-20k jobs/sec</td>
+<td>~10k-50k jobs/sec</td>
+<td>~5k-20k jobs/sec</td>
+<td>~100k+ Standard (per acct)</td>
+<td>~500 / sec / queue</td>
+<td>~5k-20k jobs/sec</td>
+</tr>
+<tr>
+<td>Enqueue latency</td>
+<td>&lt; 1 ms</td>
+<td>1-2 ms</td>
+<td>&lt; 1 ms</td>
+<td>1-5 ms</td>
+<td>20-50 ms</td>
+<td>50-100 ms</td>
+<td>1-5 ms</td>
+</tr>
+<tr>
+<td>Delayed jobs</td>
+<td>Sorted set scheduler</td>
+<td>beat (separate process)</td>
+<td>Sorted set</td>
+<td><code>run_at</code> column</td>
+<td>DelaySeconds (≤ 15 min)</td>
+<td>scheduleTime (any future)</td>
+<td>Native</td>
+</tr>
+<tr>
+<td>Recurring / cron</td>
+<td>Sidekiq Cron (gem)</td>
+<td>Celery beat</td>
+<td>bullmq Repeat</td>
+<td>Quartz-style schedulers</td>
+<td>EventBridge → SQS</td>
+<td>Cloud Scheduler → Tasks</td>
+<td>Native RecurringJob</td>
+</tr>
+<tr>
+<td>Priority</td>
+<td>Per-queue weights</td>
+<td>Per-queue weights</td>
+<td>Per-queue priority</td>
+<td>Per-queue / priority column</td>
+<td>Multiple queues</td>
+<td>Multiple queues</td>
+<td>Multiple queues</td>
+</tr>
+<tr>
+<td>DLQ</td>
+<td>Sidekiq Pro (or manual)</td>
+<td>Standard</td>
+<td>Standard (failed events)</td>
+<td>Manual table</td>
+<td>RedrivePolicy native</td>
+<td>Native</td>
+<td>Native</td>
+</tr>
+<tr>
+<td>FIFO</td>
+<td>No (Sidekiq Enterprise has Strict Order)</td>
+<td>No</td>
+<td>No</td>
+<td>Yes (single worker per group)</td>
+<td>FIFO queue variant</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Visibility timeout</td>
+<td>Heartbeat + reservation</td>
+<td>Reservation</td>
+<td>Lock with TTL</td>
+<td><code>locked_at</code> + heartbeat</td>
+<td>30s default, configurable</td>
+<td>10 min default, ≤ 30 min</td>
+<td>Heartbeat</td>
+</tr>
+<tr>
+<td>Best fit</td>
+<td>Rails apps</td>
+<td>Python apps</td>
+<td>Node apps</td>
+<td>"I already use Postgres"</td>
+<td>AWS-native, no-server</td>
+<td>GCP-native, HTTP targets</td>
+<td>.NET apps</td>
+</tr>
+</tbody>
+</table>
+<p>The instinct is <strong>not "Sidekiq always wins."</strong> Pick by ecosystem (Ruby? Sidekiq. Python? Celery. .NET? Hangfire.) + scale + durability requirements + operational appetite. A Rails shop running 10k jobs/sec wants Sidekiq on Redis. A Postgres-centric Go service running 5k jobs/sec wants river. A team that doesn't want to run any infrastructure wants SQS or Cloud Tasks. A team running monthly cron-style data exports wants Hangfire's recurring jobs.</p>
+<hr>
+<h2 id="4-byte-level-mechanics-the-broker-on-disk-and-in-memory">§4. Byte-level mechanics — the broker on disk and in memory</h2>
+<p>This is the section where the depth lives. Three different storage models give three different byte-level realizations. We cover all three: Redis-backed (Sidekiq is canonical), database-backed (Postgres <code>SKIP LOCKED</code> pattern), and SQS internals.</p>
+<h3 id="4a-sidekiq-redis-the-list-and-sorted-set-choreography">4a. Sidekiq + Redis — the LIST and sorted set choreography</h3>
+<p>Sidekiq's broker is Redis. A Sidekiq deployment with three queues (<code>critical</code>, <code>default</code>, <code>low</code>) maps to Redis keys like this:</p>
+<pre><code>Redis key                          | Type         | Contents
+-----------------------------------|--------------|---------------------------------
+queue:critical                     | LIST         | JSON job blobs, FIFO order
+queue:default                      | LIST         | JSON job blobs
+queue:low                          | LIST         | JSON job blobs
+queues                             | SET          | { &quot;critical&quot;, &quot;default&quot;, &quot;low&quot; }
+schedule                           | ZSET         | (score=execute_at_unix, member=JSON job)
+retry                              | ZSET         | (score=retry_at_unix, member=JSON job)
+dead                               | ZSET         | (score=died_at_unix, member=JSON job)
+processes                          | SET          | { &quot;hostname:pid:nonce&quot; }
+hostname:pid:nonce                 | HASH         | worker process heartbeat metadata
+hostname:pid:nonce:workers         | HASH         | jid -&gt; JSON of currently running job
+stat:processed                     | STRING       | counter
+stat:failed                        | STRING       | counter
+</code></pre>
+<p>A job blob is a small JSON document:</p>
+<pre><code class="language-json">{
+  &quot;class&quot;: &quot;SendOrderConfirmationEmail&quot;,
+  &quot;args&quot;: [12345, &quot;user@example.com&quot;],
+  &quot;queue&quot;: &quot;default&quot;,
+  &quot;jid&quot;: &quot;b4a577edbccf1d805744efa9&quot;,
+  &quot;retry&quot;: 25,
+  &quot;created_at&quot;: 1716393600.5,
+  &quot;enqueued_at&quot;: 1716393600.6
+}
+</code></pre>
+<p><strong>Enqueue.</strong> <code>Sidekiq::Client.push(class: "...", args: [...], queue: "default")</code> becomes a single Redis <code>LPUSH queue:default '{...}'</code>. ~50 microseconds in Redis. The list grows at the head; workers pop from the tail. Default Redis MAXMEMORY is unlimited until the OOM (Out Of Memory) killer arrives.</p>
+<p><strong>Dequeue with blocking pop.</strong> The worker process runs a loop:</p>
+<pre><code>while (running) {
+  job_json = BRPOP queue:critical queue:default queue:low 2
+  if (job_json) {
+    record_in_progress(job_json)
+    execute(job_json)
+    remove_from_in_progress(job_json)
+    INCR stat:processed
+  }
+}
+</code></pre>
+<p><code>BRPOP queue1 queue2 queue3 2</code> is a Redis primitive: "block for up to 2 seconds; return the first available element from the first listed non-empty queue." It scans queues left-to-right (so <code>critical</code> is checked before <code>default</code>), pops one item, returns it. If all queues are empty, it blocks until one gets a <code>LPUSH</code>, then immediately returns the new item. <strong>No polling — the broker is push-driven.</strong> This is the entire reason a Redis-backed queue can sustain millions of jobs/sec with low CPU: workers are not spinning on poll loops; they are parked in a blocking Redis call.</p>
+<p><strong>Priority across queues.</strong> Strict priority (always drain <code>critical</code> before touching <code>default</code>) can starve lower queues if <code>critical</code> is always non-empty. Sidekiq's mitigation is <strong>weighted random pull</strong> — <code>--queues critical,5 default,3 low,1</code> means: at each pull, pick a queue weighted by its weight, so over time, <code>critical</code> gets 5/9 of the pulls, <code>default</code> gets 3/9, <code>low</code> gets 1/9. Strict priority is opt-in.</p>
+<p><strong>Delayed jobs and scheduled jobs.</strong> A job to run "in 30 seconds" is added to the <code>schedule</code> sorted set with score = <code>Time.now.to_f + 30</code>. Redis sorted sets are skip-list backed (since Redis 2.0); <code>ZADD schedule 1716393630.0 '{...}'</code> is O(log N). Sidekiq has a background <strong>Poller thread</strong> in each worker process that runs every ~5 seconds:</p>
+<pre><code>loop every 5 seconds {
+  due = ZRANGEBYSCORE schedule -inf now LIMIT 0 100
+  for each job in due:
+    LPUSH queue:default job
+    ZREM schedule job
+}
+</code></pre>
+<p>(The actual implementation uses MULTI/EXEC for atomicity — <code>ZREM</code> and <code>LPUSH</code> happen in one round-trip so a job is never lost or duplicated.) <strong>The sorted set + poller is the canonical delayed-job implementation.</strong> Same structure for <code>retry</code> (retry-after-N-seconds) and for cron-triggered jobs.</p>
+<p><strong>Why a sorted set, not a sorted list?</strong> A sorted list (Redis LIST sorted by score) doesn't exist as a primitive; you'd insert in order via LINSERT, which is O(N) per insert. A sorted set is a skip list with O(log N) insertions and O(log N + M) range queries (M = elements in range). At 100k scheduled jobs, the skip list has ~17 levels, range query for "due now" is essentially instant.</p>
+<p><strong>Retry with backoff.</strong> When a job raises an exception, the worker catches it, increments the retry counter in the JSON, computes the backoff delay (<code>(count^4) + 15 + jitter</code>), and does:</p>
+<pre><code>ZADD retry (now + backoff) '{...updated job json with retry_count++ ...}'
+</code></pre>
+<p>The retry sorted set is polled the same way as <code>schedule</code>. After ~25 attempts (~21 days of backoff), Sidekiq moves the job to the <code>dead</code> set — the DLQ — via:</p>
+<pre><code>ZADD dead now '{...}'
+</code></pre>
+<p>Operators inspect <code>dead</code> via the Sidekiq Web UI, fix the root cause, and either delete or replay the job.</p>
+<p><strong>In-progress tracking — "I claimed this job, I'm working on it."</strong> When a worker pops a job, it immediately writes to its own heartbeat hash:</p>
+<pre><code>HSET hostname:pid:nonce:workers &lt;jid&gt; '{&quot;payload&quot;: &lt;job&gt;, &quot;run_at&quot;: &lt;ts&gt;}'
+</code></pre>
+<p>The worker process also updates <code>hostname:pid:nonce</code> with a heartbeat timestamp every 5 seconds. If a worker crashes (no heartbeat for &gt;60 seconds), Sidekiq's <strong>reaper</strong> detects the dead worker and re-enqueues its in-flight jobs back to their respective queues. <strong>This is the at-least-once recovery mechanism.</strong> Without the heartbeat reaper, a crashed worker would silently swallow its in-flight job.</p>
+<p><strong>Memory cost.</strong> A job blob is typically ~200-500 bytes JSON. A queue depth of 1 million pending jobs occupies ~500 MB of Redis. The schedule sorted set scales the same. Sidekiq's recommended Redis sizing rule: provision for peak queue depth × 3 (working set + retry + scheduled).</p>
+<p><strong>Failure mode: Redis is down.</strong> Sidekiq client raises <code>Redis::CannotConnectError</code> on enqueue. The application MUST handle this — either fail the request, buffer to a local fallback, or accept loss. Production setups run Redis Sentinel (auto-failover from primary to replica) or Redis Cluster. <strong>The single point of failure of the Redis instance is the dominant operational risk of Redis-backed queues.</strong></p>
+<h3 id="4b-que-river-goodjob-postgres-skip-locked">4b. Que / river / GoodJob — Postgres SKIP LOCKED</h3>
+<p>The DB-backed approach treats jobs as rows.</p>
+<pre><code class="language-sql">CREATE TABLE jobs (
+  id           bigserial PRIMARY KEY,
+  queue        text NOT NULL,
+  job_class    text NOT NULL,
+  args         jsonb,
+  priority     smallint DEFAULT 100,
+  run_at       timestamptz DEFAULT now(),
+  attempts     smallint DEFAULT 0,
+  max_attempts smallint DEFAULT 25,
+  last_error   text,
+  locked_at    timestamptz,
+  locked_by    text,
+  created_at   timestamptz DEFAULT now()
+);
+
+CREATE INDEX idx_jobs_claim
+  ON jobs (queue, priority, run_at)
+  WHERE locked_at IS NULL;
+</code></pre>
+<p><strong>Enqueue.</strong> <code>INSERT INTO jobs (queue, job_class, args, run_at) VALUES (...) RETURNING id;</code> — a single SQL statement. In the <strong>same transaction</strong> as your business INSERT/UPDATE if needed (this is the killer feature — see outbox pattern §13).</p>
+<p><strong>Claim.</strong> A worker pops a job using <code>SELECT ... FOR UPDATE SKIP LOCKED</code>:</p>
+<pre><code class="language-sql">WITH job AS (
+  SELECT id
+  FROM jobs
+  WHERE queue = 'default'
+    AND run_at &lt;= now()
+    AND locked_at IS NULL
+  ORDER BY priority, run_at
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs SET
+  locked_at = now(),
+  locked_by = 'worker-host-1234'
+FROM job
+WHERE jobs.id = job.id
+RETURNING jobs.*;
+</code></pre>
+<p>The <code>FOR UPDATE</code> acquires a row-level lock on the matching row. The <code>SKIP LOCKED</code> is the magic: if N workers run this query concurrently, <strong>each one gets a different row</strong> — workers don't block on each other, they just skip rows that another worker has already claimed. Without <code>SKIP LOCKED</code>, the workers would serialize on the lock and throughput would collapse.</p>
+<p><strong>Postgres <code>SKIP LOCKED</code> deserves a moment.</strong> Added in Postgres 9.5 (January 2016), it's the feature that made DB-backed queues competitive. Before 9.5, claiming a job required either:
+- A row-level lock with <code>FOR UPDATE</code> (workers block on each other; throughput is single-worker).
+- An advisory lock with <code>pg_try_advisory_xact_lock</code> (works but awkward — you have to map row IDs to lock IDs).
+- A "claim by UPDATE" pattern using <code>UPDATE jobs SET locked_at = now() WHERE id = (SELECT id FROM jobs WHERE locked_at IS NULL LIMIT 1) AND locked_at IS NULL RETURNING *;</code> — works but contention causes most UPDATEs to claim nothing because someone else just won the race.</p>
+<p><code>SKIP LOCKED</code> collapses all of that into one clean primitive. MySQL 8.0 (2018) added equivalent semantics. Que (Ruby, 2014) initially used advisory locks because it predated <code>SKIP LOCKED</code>; modern systems use <code>SKIP LOCKED</code>. River (Go, 2023) is the cleanest current realization.</p>
+<p><strong>Why is DB-backed competitive?</strong> A Postgres instance on NVMe (Non-Volatile Memory Express) can sustain ~30k-50k transactions/sec on commodity hardware. Each job-claim is one transaction (one SELECT-FOR-UPDATE + one UPDATE). Throughput of 30k-50k jobs/sec is enough for the vast majority of apps. Modern Postgres with logical replication and read replicas can run an order of magnitude higher. <strong>What you get in exchange for the throughput cap:</strong> all the durability and transactional guarantees of Postgres, no separate broker to run, and the killer-feature transactional outbox.</p>
+<p><strong>Ack on completion.</strong> When a job succeeds:</p>
+<pre><code class="language-sql">DELETE FROM jobs WHERE id = $1;
+</code></pre>
+<p>When it fails:</p>
+<pre><code class="language-sql">UPDATE jobs
+SET attempts = attempts + 1,
+    last_error = $error_text,
+    run_at = now() + interval '&lt;backoff&gt;',
+    locked_at = NULL,
+    locked_by = NULL
+WHERE id = $1;
+</code></pre>
+<p>When it exceeds <code>max_attempts</code>, it's moved to a <code>failed_jobs</code> table or left in the table with a sentinel state. The DLQ is just another table.</p>
+<p><strong>Visibility timeout / orphan reclamation.</strong> If a worker crashes mid-job, <code>locked_at</code> remains set forever. A background reaper periodically:</p>
+<pre><code class="language-sql">UPDATE jobs
+SET locked_at = NULL, locked_by = NULL
+WHERE locked_at IS NOT NULL
+  AND locked_at &lt; now() - interval '5 minutes';
+</code></pre>
+<p>The 5-minute threshold is the visibility timeout; long-running jobs must heartbeat (update <code>locked_at = now()</code> every minute) to avoid reclamation.</p>
+<h3 id="4c-sqs-internals-visibility-timeout-messagegroupid-fifo-vs-standard">4c. SQS internals — visibility timeout, MessageGroupId, FIFO vs Standard</h3>
+<p>SQS is the canonical managed job queue. The internals are not public but the contract is precise.</p>
+<p><strong>Standard queue.</strong> Unlimited throughput (well, "unlimited" — practically billions of messages/day per queue). At-least-once delivery; best-effort ordering (no FIFO guarantee). Each message has:</p>
+<ul>
+<li><code>MessageId</code> — globally unique UUID, generated by SQS at send.</li>
+<li><code>ReceiptHandle</code> — opaque token specific to one receive of one message. Used to delete or extend visibility.</li>
+<li><code>MessageBody</code> — up to 256 KB string payload (typically JSON).</li>
+<li><code>MessageAttributes</code> — typed metadata (string, number, binary).</li>
+<li><code>VisibilityTimeout</code> — default 30 seconds.</li>
+</ul>
+<p><strong>Send + receive lifecycle:</strong></p>
+<pre><code>T0: Producer calls SendMessage(QueueUrl, MessageBody, DelaySeconds=0).
+    SQS replicates to multiple AZs (Availability Zones) within the region, returns MessageId. ~20-50 ms.
+T1: Worker calls ReceiveMessage(QueueUrl, MaxNumberOfMessages=10, WaitTimeSeconds=20).
+    Long poll: SQS holds the connection open up to 20 sec waiting for messages.
+T2: Worker receives the message + ReceiptHandle. Visibility timeout starts ticking (30 s default).
+    During the visibility window, the message is INVISIBLE to other workers.
+T3a: Worker processes successfully, calls DeleteMessage(QueueUrl, ReceiptHandle).
+     SQS deletes. Job acked.
+T3b: Worker crashes. Visibility timeout (30 s) expires. SQS makes the message visible again.
+     Another worker receives it via ReceiveMessage. Re-processing. At-least-once.
+T3c: Worker is still working but the 30-s window is about to expire.
+     Worker calls ChangeMessageVisibility(QueueUrl, ReceiptHandle, VisibilityTimeout=60)
+     to extend the window. Heartbeat pattern for long jobs.
+</code></pre>
+<p><strong>Visibility timeout is the at-least-once mechanism.</strong> It is conceptually identical to the <code>locked_at + reaper</code> pattern in §4b and the heartbeat pattern in §4a. The broker doesn't trust the worker is alive; it makes the message visible to others after a timeout unless the worker explicitly extends or deletes.</p>
+<p><strong>FIFO queue.</strong> Strict per-<code>MessageGroupId</code> ordering + exactly-once messaging within a 5-minute deduplication window. The cost: throughput cap of <strong>300 send TPS per group</strong> (3,000 with high-throughput mode for the queue as a whole). Each message has a <code>MessageGroupId</code> (the partition key — <code>user_id</code>, <code>order_id</code>, etc.) and a <code>MessageDeduplicationId</code> (the dedup key). SQS guarantees:</p>
+<ul>
+<li>Messages with the same <code>MessageGroupId</code> are delivered in the order they were sent and processed by exactly one consumer at a time.</li>
+<li>Within 5 minutes, a second <code>SendMessage</code> with the same <code>MessageDeduplicationId</code> is silently deduped (returns success but does not enqueue).</li>
+</ul>
+<p><strong>FIFO under the hood (inferred from contract).</strong> Each <code>MessageGroupId</code> has an internal lock — only one in-flight message per group at a time. Other workers receiving from the queue skip messages whose group has an in-flight receive. This is what enforces ordering. When the in-flight message is deleted (success) or visibility expires (failure), the next message in the group becomes eligible. <strong>For ordered processing of N independent groups (e.g., N users), FIFO scales horizontally by group count, not by worker count.</strong></p>
+<p><strong>DLQ via RedrivePolicy.</strong> The queue is configured with <code>RedrivePolicy = {"deadLetterTargetArn": "arn:...DLQ", "maxReceiveCount": 5}</code>. After 5 failed receives (visibility expired without delete = 1 receive), SQS moves the message to the DLQ. Operators monitor DLQ depth and inspect / replay.</p>
+<p><strong>Long polling vs short polling.</strong> Short polling (<code>WaitTimeSeconds=0</code>) returns immediately even if no messages — generates lots of empty responses, burns money. Long polling (up to 20 seconds) holds the connection open until a message arrives or timeout expires — efficient, what you always want. <strong>Empty receives count against your bill.</strong> Long polling is the cost-optimization switch.</p>
+<p><strong>AWS Lambda + SQS event source.</strong> A Lambda function configured with an SQS event source is auto-polled by AWS (your Lambda receives batches of 1-10 messages per invocation). Lambda concurrency scales automatically — empty queue → 0 invocations → no cost; busy queue → up to your account concurrency limit. <strong>No worker fleet to run.</strong> This is the serverless job queue pattern, dominant in AWS-heavy shops.</p>
+<h3 id="4d-one-job-lifecycle-end-to-end-sidekiq-canonical">4d. One job lifecycle, end-to-end (Sidekiq canonical)</h3>
+<p>Concrete example: user submits a checkout; the order service writes the order to Postgres and enqueues a <code>SendOrderConfirmationEmail</code> job; a worker picks it up, calls SendGrid, marks the order as <code>confirmation_sent=true</code>.</p>
+<p><strong>T0 (enqueue):</strong> Order handler in Rails calls <code>SendOrderConfirmationEmail.perform_async(order_id: 42)</code>. Sidekiq client serializes to JSON, calls <code>LPUSH queue:default '{"class":"SendOrderConfirmationEmail","args":[42],"jid":"b4a5...","queue":"default",...}'</code> on Redis. Request returns to user in ~5 ms. <strong>Job is durable in Redis.</strong></p>
+<p><strong>T1 (claim):</strong> Worker process is parked in <code>BRPOP queue:critical queue:default queue:low 2</code>. Redis hands it the JSON blob. Worker spawns a thread, hands the JSON to the dispatcher.</p>
+<p><strong>T2 (in-progress record):</strong> Worker writes <code>HSET hostname:pid:nonce:workers b4a5... '{...}'</code>. This is the visibility marker.</p>
+<p><strong>T3 (execute):</strong> Worker calls <code>SendGrid::Mail.deliver(...)</code>. Network call takes ~200 ms.</p>
+<p><strong>T4a (success):</strong> SendGrid returns 200. Worker:
+- <code>UPDATE orders SET confirmation_sent = true WHERE id = 42</code> (Postgres update).
+- <code>HDEL hostname:pid:nonce:workers b4a5...</code> (clear in-progress).
+- <code>INCR stat:processed</code>.
+- Returns to <code>BRPOP</code>.</p>
+<p><strong>T4b (worker crashes mid-execute):</strong> Process is killed by OOM or the host loses power. The in-progress hash entry remains until another worker's heartbeat reaper sees <code>hostname:pid:nonce</code>'s heartbeat is stale (&gt;60 sec). The reaper:
+- Reads <code>hostname:pid:nonce:workers</code> hash for orphaned jobs.
+- For each orphan, <code>LPUSH</code> back to its source queue.
+- Removes <code>hostname:pid:nonce</code> and its sub-hashes.</p>
+<p>The job is now visible to the next worker; <strong>the email may be sent twice</strong> (worker called SendGrid, crashed before HDEL, retry calls SendGrid again). <strong>This is why job bodies must be idempotent.</strong> For email specifically, idempotency is often "accepted loss" — sending two confirmation emails is annoying but not catastrophic. For payments, idempotency is non-negotiable (§7).</p>
+<p><strong>T4c (worker raises an exception):</strong> Worker catches it, increments retry count, computes backoff, <code>ZADD retry (now + backoff) '{...updated...}'</code>. Removes from in-progress. Another worker's poller will move it back to <code>queue:default</code> at <code>now + backoff</code>.</p>
+<p><strong>T4d (worker exhausts retry budget):</strong> After 25 attempts, Sidekiq moves to the <code>dead</code> ZSET. Manual inspection / replay required.</p>
+<p><strong>End-to-end:</strong> broker sees the job atomically enqueued, atomically dequeued, atomically removed. No two workers ever own the same job at once except briefly during a crash-recovery race. Durability point: Redis AOF (Append-Only File) flush, default <code>appendfsync everysec</code> — up to 1 second of writes can be lost on Redis crash. For stronger durability, set <code>appendfsync always</code> (per-write fsync) at ~10x throughput cost, or run a replicated Redis (Sentinel / Cluster) so a primary loss falls over to a replica with sub-second RPO (Recovery Point Objective).</p>
+<hr>
+<h2 id="5-capacity-envelope">§5. Capacity envelope</h2>
+<p>Background job queues cover a huge range. Quantifying by deployment scale:</p>
+<p><strong>Small.</strong> A single-server Rails app, single Redis, single Sidekiq process with 25 threads. <strong>1,000-5,000 jobs/sec sustained.</strong> Plenty for most early-stage SaaS, internal tools, mid-volume marketplaces. Operational burden: one Redis to keep alive, occasional spot-check of the Sidekiq Web UI. Total memory: ~2-4 GB Redis. This is where most apps live for years before needing to scale.</p>
+<p><strong>Mid.</strong> A typical Rails monolith at the 100-engineer scale — GitHub circa 2012, Shopify circa 2015, mid-stage SaaS today. Redis Cluster or Redis Sentinel for HA (High Availability), 20-50 worker processes across a worker fleet, 3-5 named queues (<code>critical</code>, <code>default</code>, <code>low</code>, <code>mailers</code>, <code>webhooks</code>). <strong>10,000-50,000 jobs/sec sustained, peaks to 100k.</strong> Total Redis ~10-30 GB. Operational burden moderate: queue-depth alerts, worker scaling automation, DLQ monitoring.</p>
+<p><strong>Large.</strong> Shopify's Sidekiq Enterprise deployment is the canonical large-scale Sidekiq example, reported in their engineering blogs as running thousands of worker pods across pod-isolated worker fleets (pods of workers per merchant tier), with <strong>peak job rates in the hundreds of thousands per second across the fleet</strong>. During Black Friday Cyber Monday peaks, Shopify reportedly processes hundreds of millions of jobs in a 24-hour window. Total Redis is sharded across many clusters. They use Sidekiq Enterprise features (Periodic, Rate Limiting, Encryption, Unique Jobs) and have built internal tooling on top.</p>
+<p><strong>Giant.</strong> Major e-commerce platforms or game backends that process event-driven side effects at the scale of the platform's user actions. Amazon SQS reportedly handles <strong>billions of messages per day</strong> across all customers. A single high-volume customer (consumer game backend, news media aggregation, log delivery) can hit a few billion messages/month on one SQS account. The architecture splits into many queues by purpose (one per microservice tier, often), with autoscaling worker fleets behind each. At this scale the cost shifts from "broker capacity" to "worker compute" — workers are the dominant infrastructure spend, and queue sharding becomes a multi-team operational concern.</p>
+<p><strong>Where the next bottleneck appears at each scale:</strong>
+- <strong>Small (1k jobs/sec):</strong> Redis CPU is fine, worker concurrency is the limit. Add threads or workers.
+- <strong>Mid (50k jobs/sec):</strong> Redis CPU starts to climb (Redis is single-threaded for command execution). Solutions: split into multiple Redis instances by queue, or use Redis Cluster.
+- <strong>Large (millions/sec):</strong> Per-queue Redis is saturated. Shard by tenant / region / queue purpose. Move ultra-high-volume queues to Kafka-as-job-queue (using a topic + consumer group as the job stream — niche but valid).
+- <strong>Giant:</strong> Cost optimization dominates. Move to S3-backed durable streams (warpstream-like) or to managed serverless (SQS + Lambda).</p>
+<hr>
+<h2 id="6-architecture-in-context">§6. Architecture in context</h2>
+<p>The canonical pattern — <strong>fire and forget</strong> — where a request handler enqueues a job and returns immediately:</p>
+<pre><code>   User Browser / Mobile Client
+              │
+              │ POST /orders
+              ▼
+   ┌──────────────────────────────┐
+   │   Web tier (Rails / Django / │
+   │   Express / Spring / ASP.NET)│
+   │                              │
+   │   begin_db_transaction       │
+   │   INSERT order INTO db       │
+   │   enqueue SendConfirmation   │
+   │   enqueue ChargePayment      │
+   │   enqueue ReindexSearch      │
+   │   commit_db_transaction      │
+   │                              │
+   │   return 200 to user (~5 ms) │
+   └──────────────────────────────┘
+                │
+                │ JSON job blobs
+                ▼
+   ┌──────────────────────────────┐
+   │  ★ JOB QUEUE BROKER          │
+   │   Redis / Postgres / SQS     │
+   │                              │
+   │   queue:default   [j1,j2,j3] │
+   │   queue:critical  [...]      │
+   │   queue:low       [...]      │
+   │   schedule (ZSET) {...}      │
+   │   retry (ZSET)    {...}      │
+   │   dead (ZSET / DLQ)          │
+   └──────────────────────────────┘
+                │
+                │ BRPOP / SELECT FOR UPDATE / ReceiveMessage
+                ▼
+   ┌──────────────────────────────────────────────────────┐
+   │   Worker fleet (autoscaled)                          │
+   │                                                       │
+   │   Worker 1: SendConfirmation -&gt; SendGrid API         │
+   │   Worker 2: ChargePayment   -&gt; Stripe API            │
+   │   Worker 3: ReindexSearch    -&gt; Elasticsearch        │
+   │   Worker N: ...                                       │
+   └──────────────────────────────────────────────────────┘
+                │            │            │
+                ▼            ▼            ▼
+            SendGrid       Stripe      Elasticsearch
+              (SMTP)      (Payment)     (Search)
+</code></pre>
+<p><strong>What this pattern buys:</strong> the user's POST returns in 5 ms instead of 5 seconds (SendGrid + Stripe + ES would have been synchronous). The user doesn't wait for the network calls. The browser doesn't time out if Stripe is slow. The worker can retry transient failures without the user knowing. If the web tier crashes after enqueue, the jobs are still in the queue — they will run when workers come back.</p>
+<p><strong>Partition key / sharding placement.</strong> Most job queues don't shard at the broker (Redis is one logical instance). Sharding happens at the queue level — name your queues by tenant ID modulo N, route enqueues to the right Redis cluster, route workers to the right queue. This is the manual sharding model. SQS Standard hides this — it's transparently partitioned across the AZ-internal storage.</p>
+<p><strong>The replication boundary.</strong> Redis Sentinel or Cluster: one primary + N replicas, async replication. Postgres job tables: streaming replication, async or sync depending on durability target. SQS: multi-AZ replication is part of the contract, no operator config needed.</p>
+<hr>
+<h2 id="7-hard-problems-inherent-to-this-technology">§7. Hard problems inherent to this technology</h2>
+<p>The fundamental challenges anyone using a job queue will encounter, in roughly the order they bite at scale.</p>
+<h3 id="7a-idempotency-retries-with-the-same-arguments-must-be-safe">7a. Idempotency — retries with the same arguments must be safe</h3>
+<p><strong>Naïve solution:</strong> "I'll just retry on failure. The job is small, retries are fine."</p>
+<p><strong>How it breaks:</strong> Worker pulls <code>ChargePayment(order_id: 42, amount: 100)</code>. Calls Stripe; Stripe charges the card; the worker crashes before acking. Visibility timeout expires. Another worker pulls the same job. Calls Stripe again. <strong>Customer charged $200 for a $100 order.</strong> Now the customer service team has to issue a refund, but in the meantime the customer has filed a chargeback, and the chargeback adds a $15 dispute fee on top of the duplicate. Multiplied by 0.01% of jobs that hit this race, at 1M payment jobs/day, you have 100 incidents/day.</p>
+<p><strong>The actual fix:</strong> make the job idempotent by encoding a deterministic key into the external call. For Stripe:</p>
+<pre><code class="language-ruby">def perform(order_id, amount)
+  idempotency_key = &quot;charge:order:#{order_id}&quot;
+  Stripe::Charge.create(
+    amount: amount,
+    currency: &quot;usd&quot;,
+    source: token,
+    idempotency_key: idempotency_key
+  )
+end
+</code></pre>
+<p>Stripe's server checks if it has seen this <code>Idempotency-Key</code> in the last 24 hours; if yes, returns the cached response of the original request. Two attempts → one charge. The idempotency key is <strong>deterministic</strong> — same job arguments give the same key — so retries hit it. Many APIs (Stripe, PayPal, Shopify, GitHub) all support an idempotency-key header for this exact reason.</p>
+<p>For internal database updates, idempotency comes from:
+- <strong>Upserts with deterministic primary keys:</strong> <code>INSERT ... ON CONFLICT DO NOTHING</code> or <code>ON CONFLICT DO UPDATE</code>.
+- <strong>Conditional updates:</strong> <code>UPDATE orders SET confirmation_sent = true WHERE id = 42 AND confirmation_sent = false</code>. The second attempt no-ops because the row is already updated.
+- <strong>Idempotency table:</strong> a separate table tracking processed <code>job_id</code> → <code>result_hash</code>. The job checks the table before doing work; the first attempt records the result.</p>
+<p><strong>Discord-style insight:</strong> for high-volume notification systems (Discord uses Celery), idempotency is often "best-effort dedupe" rather than absolute. A 0.01% duplicate notification rate is acceptable for product messages; a 0% duplicate charge rate is required for payments. The strictness of idempotency scales with the cost of duplication.</p>
+<h3 id="7b-long-running-jobs-and-the-visibility-timeout-race">7b. Long-running jobs and the visibility timeout race</h3>
+<p><strong>Naïve solution:</strong> "I'll set the visibility timeout to 1 hour to be safe."</p>
+<p><strong>How it breaks:</strong> Now a real worker crash causes the job to sit invisible for an hour before retry. Meanwhile, the queue grows, the user is waiting, and your SLO (Service Level Objective) is blown. Also: if the job is <em>truly</em> a 1-hour job (large file transcoding), the visibility timeout might still expire and a second worker starts processing — now two workers are running the same job, fighting over the output S3 path or doing duplicate API calls.</p>
+<p><strong>The actual fix: heartbeat-based liveness.</strong> The worker periodically extends the visibility timeout (or updates <code>locked_at</code> in DB-backed):</p>
+<pre><code class="language-python"># Celery / SQS pattern
+def process_long_job(self, video_id):
+  visibility_extender = threading.Thread(
+    target=lambda: self.heartbeat_every(60),
+    daemon=True
+  )
+  visibility_extender.start()
+  try:
+    transcode_video(video_id)
+  finally:
+    visibility_extender.stop()
+
+def heartbeat_every(self, secs):
+  while not stop:
+    sleep(secs)
+    sqs_client.change_message_visibility(
+      QueueUrl=self.queue_url,
+      ReceiptHandle=self.receipt,
+      VisibilityTimeout=120  # extend by 2 minutes
+    )
+</code></pre>
+<p>Set visibility timeout short (~2 minutes), but extend every minute. If the worker truly dies, the next heartbeat doesn't happen, the timeout expires after ~2 minutes, and another worker picks up. Total downtime: ~2 minutes, not 1 hour.</p>
+<p><strong>For DB-backed queues</strong>, the equivalent is the worker updating <code>locked_at = now()</code> every minute. The reaper only reclaims rows where <code>locked_at &lt; now() - 5 minutes</code>.</p>
+<p><strong>The deeper insight:</strong> the visibility timeout is the system's heartbeat budget. A worker that doesn't extend within the timeout is presumed dead. This is the same pattern as Kafka's <code>session.timeout.ms</code> for consumer group membership and Temporal's worker heartbeat — universal across "broker tracks worker liveness via timeout."</p>
+<h3 id="7c-poison-pills-jobs-that-always-fail">7c. Poison pills — jobs that always fail</h3>
+<p><strong>Naïve solution:</strong> "Retry until it succeeds."</p>
+<p><strong>How it breaks:</strong> A bug in the job code causes it to crash on a specific input. The job retries 25 times with exponential backoff, all failing. The retry sorted set fills up. Workers spend 4% of their time on this dead job, less on healthy work. If the bug affects 1% of jobs (a malformed user input), the queue effectively has 1% of its workers wasted on doomed retries. Worse, if the bug is deterministic and the input is common, the queue can fall behind permanently.</p>
+<p><strong>The actual fix: DLQ after N attempts.</strong> Every modern job queue has a built-in retry budget. Sidekiq's default is 25 attempts (~21 days of backoff). SQS's RedrivePolicy specifies <code>maxReceiveCount</code> (default off; set to 3-5 typically). After exhausting attempts, the job moves to the DLQ. The DLQ has:
+- A separate metric (<code>dlq_depth</code>).
+- An alert when depth crosses a threshold (e.g., &gt;100 jobs in DLQ).
+- A manual inspection workflow — operator looks at the failed jobs, identifies the root cause, fixes the code, replays the DLQ (or deletes the bad inputs).</p>
+<p><strong>The retry budget is a circuit breaker for poison pills.</strong> Without it, one bad input poisons the queue indefinitely.</p>
+<p><strong>Multi-domain example:</strong> GitHub's webhook delivery — webhooks that always 500 from the destination URL go to a DLQ after ~8 hours of retries. GitHub doesn't try forever. Stripe's webhook retry strategy similarly caps at 3 days. Once exhausted, the developer must inspect and either fix their endpoint or accept the loss.</p>
+<h3 id="7d-priority-across-queues-fair-scheduling-vs-starvation">7d. Priority across queues — fair scheduling vs starvation</h3>
+<p><strong>Naïve solution:</strong> "Process <code>critical</code> queue first, always. Only touch <code>default</code> when <code>critical</code> is empty."</p>
+<p><strong>How it breaks:</strong> A traffic spike makes <code>critical</code> perpetually non-empty (say, 100 jobs/sec arrival, 80 jobs/sec processing). Workers always have <code>critical</code> jobs to do. <strong><code>default</code> and <code>low</code> are never touched.</strong> The queue depth on <code>default</code> grows from 0 to 100k over an hour. Eventually the <code>default</code> queue has hours of latency. Customers using non-critical features (sending reminders, generating reports) experience long delays. The system is producing for <code>critical</code> users at the cost of starving everyone else.</p>
+<p><strong>The actual fix: weighted priority.</strong> Sidekiq's <code>--queues critical,5 default,3 low,1</code> syntax means "at each pull, pick a queue by weight." Over time, you process 5/9 critical, 3/9 default, 1/9 low. Even when <code>critical</code> has unlimited jobs, <code>default</code> and <code>low</code> still get one-third and one-ninth of capacity. Trade-off: critical isn't truly highest priority anymore — it's just highest weight. For real "drop everything else" priority, you need separate worker fleets per queue (a Sidekiq Enterprise pattern) so that <code>critical</code> doesn't compete with <code>default</code> at all — <code>default</code> workers ONLY process <code>default</code>, <code>critical</code> workers ONLY process <code>critical</code>. Static allocation, isolated capacity.</p>
+<p><strong>The general rule:</strong> never let a single queue's throughput rate equal or exceed total worker capacity, because then it starves everything else. Always reserve a floor of capacity for lower priorities, either via weighted scheduling or via dedicated worker pools.</p>
+<h3 id="7e-fifo-vs-throughput-the-ordering-tax">7e. FIFO vs throughput — the ordering tax</h3>
+<p><strong>Naïve solution:</strong> "I want FIFO, so I'll use SQS FIFO for everything."</p>
+<p><strong>How it breaks:</strong> SQS FIFO caps at <strong>300 send TPS per <code>MessageGroupId</code></strong>. If all your jobs share one group (because you didn't think hard about partition keys), your queue is capped at 300/sec. Meanwhile, your peak is 5000/sec. The queue grows unboundedly. Trying to add workers doesn't help — FIFO ordering means only one worker can be in-flight per group at a time.</p>
+<p><strong>The actual fix:</strong> <strong>only use FIFO where ordering actually matters, and shard the group key.</strong> Most jobs don't need ordering — <code>SendOrderConfirmation</code> for order 42 and order 43 can run in either order. Use Standard SQS or any non-FIFO queue. For the small subset that needs ordering (e.g., per-user ledger updates), use FIFO with <code>MessageGroupId = user_id</code> — this gives ordering per user but parallelism across users. With 10k active users, you have 10k independent groups, each at 300 TPS, total 3M TPS of capacity, with per-user ordering.</p>
+<p><strong>The deeper insight:</strong> ordering and parallelism are in tension. Strict total ordering = single-worker bottleneck. Per-key ordering = parallel across keys, ordered within. Choose the smallest unit of ordering you actually need.</p>
+<h3 id="7f-job-ordering-with-retries-the-silent-reorder">7f. Job ordering with retries — the silent reorder</h3>
+<p><strong>Naïve solution:</strong> "Jobs go in FIFO, they come out FIFO."</p>
+<p><strong>How it breaks:</strong> Job 1 (<code>UpdateBalance(user: 7, delta: +10)</code>) is enqueued at T0. Job 2 (<code>UpdateBalance(user: 7, delta: -5)</code>) at T1. Job 3 (<code>UpdateBalance(user: 7, delta: +3)</code>) at T2. Worker A picks up job 1, fails (network error), goes to retry with 30-second backoff. Worker B picks up job 2, succeeds. Worker C picks up job 3, succeeds. 30 seconds later, worker D picks up job 1's retry and succeeds. <strong>Final balance: 0 + 10 - 5 + 3 + 10 (retry) = 18, but the correct order should have been +10 then -5 then +3 = +8.</strong> Order broken by retry.</p>
+<p>Worse: the worker that originally processed job 1 <em>did</em> apply the +10 once before crashing post-update; the retry adds another +10. Now you have double-application due to non-idempotency plus order break due to retry. Two compounding bugs.</p>
+<p><strong>The actual fix:</strong> for any sequence of jobs that mutates shared state, the sequence must be either (a) FIFO-ordered with single in-flight (SQS FIFO with <code>MessageGroupId = user_id</code>), accepting the 300 TPS/group limit; or (b) commutative + idempotent (e.g., set-style "set user 7's balance to X" instead of "add Y to balance"), so order doesn't matter; or (c) routed to a workflow engine that owns ordered execution as a first-class primitive.</p>
+<p><strong>Multi-domain example:</strong> order-fulfillment pipelines (commerce) typically use FIFO per order_id — you don't want "ship order" to fire before "allocate inventory." Notification fanout (LinkedIn-style social feeds) often does NOT use FIFO — a thousand likes on a post don't need ordering, just eventual consistency.</p>
+<h3 id="7g-backpressure-queues-that-grow-forever">7g. Backpressure — queues that grow forever</h3>
+<p><strong>Naïve solution:</strong> "The queue is durable. It can absorb spikes."</p>
+<p><strong>How it breaks:</strong> Workers are processing 1000 jobs/sec. Producers are enqueueing 1500 jobs/sec. Net growth: 500 jobs/sec. Over an hour, queue depth grows by 1.8M jobs. Over a day, 43M. Eventually:
+- Redis fills its memory; OOM killer fires; Redis crashes; entire queue lost (if persistence isn't tuned hard).
+- Postgres job table grows; index queries slow down; throughput collapses further.
+- Latency from enqueue to execution grows from seconds to hours to days. The user who clicked "send confirmation" at noon gets the email two days later — useless.</p>
+<p><strong>The actual fix:</strong> monitor queue depth and alert at thresholds. The typical setup:
+- Alert at queue depth &gt; 10k for <code>critical</code> queue (which should normally be ~0).
+- Alert at queue lag (time from enqueue to dequeue) &gt; 60 seconds.
+- Autoscale worker count based on queue depth (most modern setups do this via Kubernetes HPA on a custom metric).</p>
+<p><strong>Producer-side backpressure</strong> is harder. If your web tier enqueues 1500/sec because the user is hitting a button, you can't easily make the user wait. The standard moves:
+- Rate-limit enqueueing per user (token bucket).
+- Push back at the API layer ("429 Too Many Requests").
+- Drop low-priority jobs at the source if the queue is saturated (e.g., shed <code>low</code> queue enqueues when queue depth &gt; threshold).
+- Use a "leaky bucket" enqueue that smooths bursts.</p>
+<p>For very large systems (Shopify, Stripe), tier the queues by criticality and isolate. The <code>critical</code> queue can never be starved by analytics jobs because they're on different Redis clusters with different worker fleets.</p>
+<hr>
+<h2 id="8-failure-mode-walkthrough">§8. Failure mode walkthrough</h2>
+<p>Systematically: crash mid-job, broker outage, job that runs forever, retry storm.</p>
+<h3 id="8a-worker-crash-mid-job">8a. Worker crash mid-job</h3>
+<p><strong>Crash mid-job, before any side effect.</strong> Worker hadn't called the API yet. Visibility timeout / heartbeat reaper detects the dead worker, re-enqueues the job. Another worker picks it up, calls the API once. <strong>No customer impact. At-least-once with single-execution.</strong></p>
+<p><strong>Crash mid-job, after side effect, before ack.</strong> Worker called Stripe (charged customer), crashed before deleting the job from the queue. Visibility timeout expires; another worker picks up the job; calls Stripe again. <strong>Customer charged twice — unless the job uses Stripe's idempotency key.</strong> This is the entire reason the idempotency-key pattern exists.</p>
+<p><strong>Crash with partial side effects.</strong> Worker called Stripe (success), updated the orders table (success), was about to update analytics service (failed). Visibility timeout returns the job. Retry calls Stripe (idempotency dedupes), updates orders again (idempotent UPDATE no-ops because <code>confirmation_sent = true</code>), updates analytics (succeeds). <strong>End state consistent, no double-charge, but only because every external call was idempotent.</strong></p>
+<p><strong>Recovery procedure:</strong> none required from the operator — at-least-once delivery handles it automatically, provided idempotency is in place. Without idempotency, the operator gets paged about duplicate charges, has to manually refund.</p>
+<h3 id="8b-broker-outage-redis-is-down">8b. Broker outage (Redis is down)</h3>
+<p><strong>Mid-enqueue:</strong> producer (web tier) calls <code>LPUSH</code>, Redis is unreachable. Client raises <code>Redis::CannotConnectError</code>. <strong>The job is not enqueued.</strong> The producer must:
+- Retry the enqueue (transient blip).
+- Fail the request to the user ("we're having trouble, try again").
+- Buffer locally and retry later (rare; usually too complex).</p>
+<p>In Rails / Sidekiq, the default is to raise the error to the request handler. The job is lost unless the request handler retries or returns an error.</p>
+<p><strong>Mid-processing:</strong> worker is in the middle of <code>LPUSH retry ...</code> to record a retry. Redis goes down. Worker's connection drops. The job's state is unclear — the in-progress hash entry is in the now-unavailable Redis. When Redis comes back (Sentinel failover, ~5 seconds), the job's in-progress entry will be reaped by the next reaper sweep.</p>
+<p><strong>Broker fully down for hours:</strong> the queue is unavailable. Jobs are lost (if producers fail open) or queued in-app (if producers buffer). Workers idle. After Redis comes back, queue resumes — assuming persistence (AOF) survived the outage.</p>
+<p><strong>Recovery durability point:</strong> Redis AOF + replicated Redis (Sentinel) gives RPO ~1 second (one second of writes can be lost). For stricter durability, set <code>appendfsync always</code> (per-write fsync) — RPO 0 at ~10x throughput cost. Or use a DB-backed queue where the broker's durability IS the application database's durability — same RPO as the rest of the app.</p>
+<h3 id="8c-job-that-runs-forever">8c. Job that runs forever</h3>
+<p><strong>Mode 1: infinite loop.</strong> Bug in the worker code causes <code>while true; do_nothing; end</code>. The job never returns. The visibility timeout / heartbeat handles this — if the worker doesn't heartbeat, the broker reclaims after timeout. <strong>Unless the worker heartbeats but is stuck.</strong> This is harder. The worker is "alive" from Redis's perspective but isn't making progress.</p>
+<p><strong>The fix:</strong> wall-clock job timeout in the worker. Most job queues support <code>Sidekiq.options[:timeout]</code> or equivalent — if the job has been running for &gt;N seconds, the worker forcibly terminates the thread or process. The job goes to retry. Set the timeout to be longer than the longest legitimate job (e.g., 10 minutes for media transcoding) but shorter than infinity.</p>
+<p><strong>Mode 2: slow external dependency.</strong> The job is calling SendGrid, but SendGrid is degraded — each call takes 30 seconds. The worker is "working" but spending all its time on one job. The broker doesn't know to reclaim because the worker is heartbeating. <strong>The fix:</strong> per-call timeouts. The worker sets a 5-second HTTP timeout on the SendGrid call; if it exceeds, the call fails fast, the job goes to retry. The worker is now free to handle the next job.</p>
+<h3 id="8d-retry-storm-downstream-is-down-all-jobs-retry-ddos-amplification">8d. Retry storm — downstream is down, all jobs retry, DDoS amplification</h3>
+<p><strong>The scenario:</strong> SendGrid's API is degraded; 50% of email-send jobs fail. The retry sorted set fills with retries. After backoff, they retry. They fail again. Backoff. Retry. <strong>At sustained 50% failure, the queue effectively halves its throughput</strong> (each job costs 2 attempts). At 80% failure, throughput is one-fifth. The retry sorted set grows; workers spend most of their time on retries; healthy jobs starve.</p>
+<p>Worse: if the SendGrid issue is severe and you're retrying aggressively, your retries make SendGrid's problem worse. <strong>You're DDOS-ing your own dependency.</strong></p>
+<p><strong>The actual fix: circuit breaker.</strong> When the failure rate to a downstream exceeds a threshold (say 50% over the last 60 seconds), the worker stops calling that downstream entirely. Jobs targeting that downstream go to a "downstream-degraded" queue with an exponentially longer backoff. After the circuit breaker closes (downstream recovers, success rate restored), normal processing resumes.</p>
+<p>Libraries: Hystrix (Netflix, now deprecated), Resilience4j (JVM), <code>circuitbox</code> (Ruby), Polly (.NET). The pattern is universal: don't hammer a sick service; back off, give it room to recover.</p>
+<p><strong>Recovery:</strong> once the downstream is healthy, the queue drains the backlog. If the backlog is large (millions of jobs), drain time may be hours. Worker autoscaling helps; rate-limit the drain so you don't re-DDOS on recovery.</p>
+<hr>
+<h2 id="9-why-not-just-synchronous-execution-in-the-request">§9. Why not just synchronous execution in the request</h2>
+<p>The case for background jobs is most clearly made by walking through what happens without them.</p>
+<p><strong>Naïve setup:</strong> the user submits a checkout. The web handler:
+1. Validates the input.
+2. Calls Stripe to charge the card. (~500 ms)
+3. Writes the order to Postgres. (~10 ms)
+4. Calls SendGrid to send a confirmation email. (~300 ms)
+5. Calls warehouse fulfillment API to allocate inventory. (~700 ms)
+6. Calls Elasticsearch to update search index. (~200 ms)
+7. Returns 200 to the user.</p>
+<p>Total: <strong>~1.7 seconds</strong> under happy path. The user sees a spinner for 1.7 seconds before the page loads. P99 (because some calls hit retries or slow networks): <strong>4-6 seconds</strong>. The browser may time out.</p>
+<p>Now what happens when one call fails?</p>
+<p><strong>Stripe is slow (5 sec p99):</strong> the entire request takes 5+ seconds. Many user agents time out at 30 seconds for the connection, but the user gives up at 3 seconds and reloads — now they may double-submit. The handler is half-done (Stripe charged but order not written); the reload tries to charge again.</p>
+<p><strong>SendGrid is down:</strong> the email send fails. Should the handler:
+- Fail the request to the user and refund the charge? (Now the user sees an error after their card was charged.)
+- Return success without sending the email? (Now there's no record of "we owe this user an email"; it's silently lost.)
+- Retry the SendGrid call inline? (Adds more latency, may not succeed.)</p>
+<p><strong>Server crashes mid-request (instance dies between steps 2 and 5):</strong> Stripe charged, order written, email not sent, inventory not allocated, search not indexed. <strong>The system is in an inconsistent state.</strong> When the user retries, the new attempt re-charges (the original order isn't found by their dedup logic). Two charges, one order, no email, no inventory.</p>
+<p><strong>With a job queue:</strong></p>
+<ol>
+<li>Validate input.</li>
+<li>Write order to Postgres with <code>state = 'pending'</code>. (~10 ms)</li>
+<li>Enqueue jobs: <code>ChargePayment(order_id)</code>, <code>SendConfirmation(order_id)</code>, <code>AllocateInventory(order_id)</code>, <code>ReindexSearch(order_id)</code>. (~5 ms total)</li>
+<li>Return 200 to the user. <strong>Total: ~20 ms.</strong></li>
+</ol>
+<p>The user gets an immediate response. The jobs run asynchronously. If SendGrid is down, the email job retries with backoff for hours, eventually succeeding or moving to DLQ for manual handling — the user got their order. If the web server crashes after step 3, the jobs are durable in the queue; another worker runs them. <strong>No inconsistent state, no double-charge (with idempotency keys), no user-facing failure.</strong></p>
+<p>The web tier is now stateless, fast, and resilient. The complexity of "do many things reliably" is pushed into the job queue layer, where retry, durability, and crash-recovery are first-class primitives.</p>
+<p>This is the entire reason job queues exist. <strong>If you find yourself implementing retry logic, persistence of pending work, and crash-recovery in your request handler, you're rebuilding a job queue badly.</strong></p>
+<hr>
+<h2 id="10-scaling-axes">§10. Scaling axes</h2>
+<p>How do job queues scale, and where do the inflection points hit?</p>
+<h3 id="type-1-uniform-growth-more-jobs-more-workers">Type 1: Uniform growth — more jobs, more workers</h3>
+<p>The simplest growth pattern. You started at 1000 jobs/sec; now you're at 10000 jobs/sec. The path:</p>
+<ul>
+<li><strong>Add worker processes / threads.</strong> Sidekiq runs 25 threads per process by default; adding processes scales linearly until the broker saturates. At 10k jobs/sec on a single-Redis Sidekiq, you might need 20 worker processes across 5 machines.</li>
+<li><strong>Add broker capacity.</strong> Redis can sustain ~100k-200k QPS (Queries Per Second) on a single primary. Beyond that, shard Redis by queue (one Redis per queue, or one Redis per tenant). Or move to Redis Cluster for transparent sharding.</li>
+<li><strong>Partition queues by purpose / tenant.</strong> Instead of one <code>default</code> queue handling everything, split into <code>email</code>, <code>payment</code>, <code>analytics</code>, etc. Each gets its own worker pool, its own Redis (if needed), its own scaling.</li>
+</ul>
+<p><strong>Inflection points:</strong>
+- Around 50k jobs/sec on single Redis: shard.
+- Around millions/sec across the fleet: consider managed (SQS) or move to Kafka-as-queue.
+- Worker scaling: ~hundreds of worker processes is usually fine; thousands becomes operationally heavy (deploys, restarts).</p>
+<h3 id="type-2-hotspot-intensification-one-queue-gets-hot">Type 2: Hotspot intensification — one queue gets hot</h3>
+<p>A single tenant or a single queue suddenly dominates. Black Friday lands and all the e-commerce traffic goes through <code>priority_checkout</code> queue. The path:</p>
+<ul>
+<li><strong>Isolate the hot queue.</strong> Give it its own broker (dedicated Redis), its own worker pool. Other tenants' queues don't fight for capacity.</li>
+<li><strong>Split the hot queue by sub-key.</strong> <code>priority_checkout</code> becomes <code>priority_checkout_shard_0</code>, <code>..._shard_1</code>, ..., <code>..._shard_N</code>, partitioning by <code>hash(tenant_id) % N</code>. Workers consume from all shards round-robin.</li>
+<li><strong>Add a dedicated worker fleet just for the hotspot.</strong> Shopify's pod isolation model — each merchant tier has its own pod of workers, with capacity allocated proportionally.</li>
+</ul>
+<p><strong>Why is this different from Type 1?</strong> Type 1 is "add capacity uniformly." Type 2 is "hot key needs special treatment, others don't." If you uniformly scale up workers when one queue is hot, you waste 80% of the new capacity on cold queues. You need to <em>target</em> the hot queue with isolated resources.</p>
+<p><strong>Inflection points:</strong>
+- When one queue's throughput exceeds 20% of total worker capacity, isolate it.
+- When one tenant's job rate exceeds 5x the median tenant, give them dedicated workers.
+- When a recurring hotspot is predictable (Black Friday), pre-provision dedicated capacity.</p>
+<hr>
+<h2 id="11-decision-matrix-vs-adjacent-technology-categories">§11. Decision matrix vs adjacent technology categories</h2>
+<p>When to pick which.</p>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Redis-backed job queue (Sidekiq)</th>
+<th>DB-backed (Que / river)</th>
+<th>Managed (SQS / Cloud Tasks)</th>
+<th>Workflow engine (Temporal)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Latency to dispatch</td>
+<td>&lt; 1 ms</td>
+<td>1-5 ms</td>
+<td>20-100 ms</td>
+<td>5-50 ms</td>
+</tr>
+<tr>
+<td>Throughput / instance</td>
+<td>10k-50k jobs/sec</td>
+<td>5k-20k jobs/sec</td>
+<td>100k+ (managed scaling)</td>
+<td>10k+ workflows</td>
+</tr>
+<tr>
+<td>Durability</td>
+<td>Redis AOF + replication</td>
+<td>DB durability</td>
+<td>Managed (11-9s)</td>
+<td>Quorum DB</td>
+</tr>
+<tr>
+<td>Atomicity with app DB</td>
+<td>No (separate broker)</td>
+<td>Yes (same DB)</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Job state model</td>
+<td>Job blobs in lists / sets</td>
+<td>Rows in table</td>
+<td>Managed messages</td>
+<td>Event-sourced history</td>
+</tr>
+<tr>
+<td>Multi-step workflows</td>
+<td>DIY (job chains)</td>
+<td>DIY</td>
+<td>DIY</td>
+<td>First-class</td>
+</tr>
+<tr>
+<td>Operational burden</td>
+<td>Run Redis</td>
+<td>Already run DB</td>
+<td>None</td>
+<td>Run Temporal cluster</td>
+</tr>
+<tr>
+<td>Cost at million jobs/day</td>
+<td>~$200/mo (Redis + workers)</td>
+<td>Negligible incremental</td>
+<td>~$400/mo SQS + workers</td>
+<td>~$500-2000/mo Temporal infra</td>
+</tr>
+<tr>
+<td>When to pick</td>
+<td>Mature ecosystem fit (Rails, Python, Node)</td>
+<td>Postgres-centric, need transactional outbox</td>
+<td>AWS-heavy, no infra appetite</td>
+<td>Multi-step processes with state</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Pick rules of thumb:</strong></p>
+<ul>
+<li><strong>Redis-backed (Sidekiq / Celery / BullMQ):</strong> if you have a high-volume Rails/Django/Node app, want the fastest enqueue + dequeue, accept Redis as your durability story, and your jobs are stateless short tasks. <strong>This is the default for most apps.</strong></li>
+<li><strong>DB-backed (Que / river / GoodJob):</strong> if you're Postgres-centric, want transactional outbox, accept slightly lower throughput, and want to avoid operating a separate broker. <strong>Especially compelling for "I want to write to DB and enqueue a job atomically."</strong></li>
+<li><strong>Managed (SQS / Cloud Tasks):</strong> if you're on AWS / GCP, want zero operational overhead, accept 50-100 ms latency, and your jobs are HTTP targets or Lambda invocations. <strong>AWS Lambda + SQS is one of the cleanest serverless job patterns.</strong></li>
+<li><strong>Workflow engine (Temporal):</strong> if you have multi-step workflows with state across steps, long durations, or branching logic. <strong>A job queue is wrong for "30-day onboarding."</strong></li>
+</ul>
+<hr>
+<h2 id="12-job-patterns-the-canonical-types-of-jobs">§12. Job patterns — the canonical types of jobs</h2>
+<p>Beyond "execute a function async," the field has settled on several named patterns. Knowing them by name saves design effort.</p>
+<h3 id="12a-delayed-jobs">12a. Delayed jobs</h3>
+<p>"Run this at a specific future timestamp." E.g., "send the reminder 24 hours from now." Implementation: schedule sorted set keyed by execute_at (Sidekiq, BullMQ), <code>run_at</code> column (Que, river), or <code>DelaySeconds</code> parameter (SQS, max 15 min). For arbitrary future times beyond 15 min, SQS users typically use a <code>scheduleTime</code> Cloud Tasks job or an EventBridge scheduled rule that enqueues to SQS at the right moment. The scheduler that polls due jobs is the runtime cost of delay.</p>
+<h3 id="12b-scheduled-cron-style-jobs">12b. Scheduled / cron-style jobs</h3>
+<p>"Run every day at 2am." Daily reports, weekly cleanup, hourly cache warming. Most job queues have an external scheduling component:
+- <strong>Sidekiq Cron</strong> (gem) — cron expressions; each tick enqueues a job into the regular queue.
+- <strong>Celery beat</strong> — separate process that holds the schedule; ticks enqueue jobs.
+- <strong>Hangfire RecurringJob</strong> — built-in.
+- <strong>AWS EventBridge</strong> → SQS / Lambda.
+- <strong>Cloud Scheduler</strong> → Cloud Tasks.</p>
+<p>The pattern: <strong>a scheduler emits jobs into the queue, the queue's normal machinery handles execution.</strong> Cron itself is rarely used directly because cron has no distributed coordination — three application servers each running their own cron would fire three duplicate jobs.</p>
+<h3 id="12c-recurring-jobs-with-stateful-intervals">12c. Recurring jobs with stateful intervals</h3>
+<p>Sidekiq Cron and similar support more than fixed cron — e.g., "run every 5 minutes, but only if the last run completed." This requires the scheduler to track last-run state. Implementation: a record in Redis or DB of <code>last_run_at</code> per recurring job. The scheduler checks before enqueueing.</p>
+<h3 id="12d-job-chaining">12d. Job chaining</h3>
+<p>"Job A completes triggers job B." The output of A is the input to B. Common implementations:
+- <strong>In-job enqueue:</strong> at the end of job A's <code>perform</code>, call <code>JobB.perform_async(result)</code>. Simple but couples A to B.
+- <strong>Event-driven:</strong> job A writes its result to a topic/event store; a separate consumer triggers job B. Cleaner but more infrastructure.
+- <strong>Workflow engine:</strong> Temporal handles this natively as part of the workflow definition. If you find yourself chaining 5+ jobs, switch to a workflow engine.</p>
+<h3 id="12e-batch-jobs-with-parallelism-limits">12e. Batch jobs with parallelism limits</h3>
+<p>"Process these 10k records, but only N at a time." Sidekiq Pro has <code>Sidekiq::Batch</code> — enqueue all 10k jobs, callbacks fire when the batch completes (success/failure). Celery has <code>group()</code> and <code>chord()</code> primitives. BullMQ has <code>bull.flow</code> for this. For very large batches, partition into chunks and enqueue chunk-jobs that each process M records.</p>
+<h3 id="12f-idempotency-keys-stripe-pattern">12f. Idempotency keys (Stripe pattern)</h3>
+<p>The pattern: the client (your job, or the user) provides a unique <code>Idempotency-Key</code>; the server (Stripe, GitHub, etc.) checks if it has seen this key; if yes, returns the cached response of the original request; if no, processes normally and caches the response. Window: typically 24 hours for Stripe; 60 days for some APIs. <strong>This is the canonical pattern for making external API calls safe under retry.</strong> Always pass an idempotency key when calling a non-idempotent external API from a retrying job.</p>
+<h3 id="12g-dead-letter-queues-dlq">12g. Dead-letter queues (DLQ)</h3>
+<p>A separate queue (or sorted set, or table) where jobs that exhaust retries land. Operators monitor DLQ depth as a leading indicator of systemic issues. The DLQ supports:
+- <strong>Manual inspection</strong> — view the job, see the last error, decide what to do.
+- <strong>Replay</strong> — push the job back to the main queue (e.g., after fixing a bug).
+- <strong>Drop</strong> — delete jobs that are permanently broken (e.g., orphan jobs for deleted users).</p>
+<p>Without a DLQ, poison-pill jobs either retry forever (blocking workers) or get silently dropped (data loss). The DLQ is the explicit "we couldn't handle this — human, please look" channel.</p>
+<hr>
+<h2 id="13-postgres-skip-locked-pattern-the-transactional-outbox">§13. Postgres SKIP LOCKED pattern — the transactional outbox</h2>
+<p>A dedicated section because this pattern has become foundational in modern backend design, and the job queue is one of its main applications.</p>
+<h3 id="13a-the-dual-write-problem">13a. The dual-write problem</h3>
+<p>When a service must update its database AND publish an event to a downstream system (Kafka, another service, a job queue), the two writes are not atomic. Four bad outcomes are possible:</p>
+<ol>
+<li>DB write succeeds, event publish fails → downstream missed the event.</li>
+<li>DB write fails, event publish succeeds → downstream sees an event that doesn't reflect reality.</li>
+<li>Both fail.</li>
+<li>Both succeed (happy path).</li>
+</ol>
+<p>Outcomes 1 and 2 are the "dual-write problem." They are inherent any time you have two systems that must be updated together but lack a distributed transaction.</p>
+<h3 id="13b-the-transactional-outbox-solution">13b. The transactional outbox solution</h3>
+<p>Write to your DB and write to an <strong>outbox table</strong> in the <strong>same transaction</strong>. A separate worker tails the outbox and forwards each event/job to the downstream system. Because the outbox table is in the same DB, it's atomic with your business update — either both happen or neither does. The outbox worker can be at-least-once (it sees the row, ships it, deletes it; if it crashes, it re-ships next time). At-least-once is fine because the downstream is idempotent.</p>
+<pre><code class="language-sql">BEGIN;
+
+UPDATE orders
+SET status = 'paid', paid_at = now()
+WHERE id = 42;
+
+INSERT INTO outbox (event_type, payload, created_at)
+VALUES ('OrderPaid', '{&quot;order_id&quot;:42,&quot;amount&quot;:100}', now());
+
+COMMIT;
+</code></pre>
+<p>A separate worker:</p>
+<pre><code class="language-sql">WITH next AS (
+  SELECT id, event_type, payload
+  FROM outbox
+  WHERE processed_at IS NULL
+  ORDER BY id
+  LIMIT 10
+  FOR UPDATE SKIP LOCKED
+)
+SELECT * FROM next;
+</code></pre>
+<p>Worker publishes each event to Kafka, then:</p>
+<pre><code class="language-sql">UPDATE outbox
+SET processed_at = now()
+WHERE id IN (...);
+</code></pre>
+<p>(Or DELETE; some teams keep historical outbox rows for audit.)</p>
+<h3 id="13c-why-this-is-also-a-job-queue">13c. Why this is also a job queue</h3>
+<p>If you squint, the outbox IS a job queue:
+- INSERT into outbox = enqueue.
+- SELECT FOR UPDATE SKIP LOCKED = claim.
+- DELETE = ack.
+- UPDATE with <code>retry_at</code> = retry with backoff.
+- A separate <code>failed_outbox</code> table = DLQ.</p>
+<p>This is precisely how Que, GoodJob, and river work. The transactional outbox is the canonical use case for DB-backed job queues — it's the one place where atomicity with the business DB is structurally required, and a separate broker (Redis, SQS) can't give you that.</p>
+<h3 id="13d-when-the-outbox-pattern-is-the-right-fit">13d. When the outbox pattern is the right fit</h3>
+<ul>
+<li>You're already using Postgres / MySQL.</li>
+<li>You need atomicity between a business write and a job enqueue.</li>
+<li>Your job throughput is below ~30k/sec (the practical ceiling of PG-backed queues).</li>
+<li>You want one durability story (the application DB), not two.</li>
+</ul>
+<p>When it's not the right fit:
+- Jobs at very high throughput (&gt;50k/sec) — Redis or a managed queue scales better.
+- Jobs that don't need atomicity with the DB — the outbox pattern is overhead you don't need.</p>
+<h3 id="13e-the-pattern-in-production">13e. The pattern in production</h3>
+<p>LinkedIn's Brooklin (a CDC system, conceptually similar to the outbox tailing pattern), Debezium (a CDC connector that tails MySQL binlog and Postgres WAL — Write-Ahead Log), and "outbox publishers" in many e-commerce and fintech systems are all realizations of the same insight. The DB is the durable single source of truth; the outbox makes the "and-then" of "DB update and-then publish event" atomic.</p>
+<hr>
+<h2 id="14-sqs-deep-dive">§14. SQS deep dive</h2>
+<p>A dedicated section because SQS is the canonical managed job queue and the abstractions matter.</p>
+<h3 id="14a-standard-queue">14a. Standard queue</h3>
+<ul>
+<li><strong>Throughput:</strong> virtually unlimited. Per-queue billions of messages/day demonstrated.</li>
+<li><strong>Ordering:</strong> best-effort; in practice mostly in-order but not guaranteed. Concurrent producers and replication can reorder.</li>
+<li><strong>Delivery:</strong> at-least-once. Duplicates are common (low single-digit percentage in practice).</li>
+<li><strong>Use for:</strong> the vast majority of work-queue patterns where order doesn't matter and idempotency is in place.</li>
+</ul>
+<h3 id="14b-fifo-queue">14b. FIFO queue</h3>
+<ul>
+<li><strong>Throughput:</strong> 300 send TPS per <code>MessageGroupId</code> (3,000 with high-throughput-mode for the queue overall).</li>
+<li><strong>Ordering:</strong> strict FIFO within each <code>MessageGroupId</code>.</li>
+<li><strong>Delivery:</strong> exactly-once within a <strong>5-minute dedup window</strong> (based on <code>MessageDeduplicationId</code>).</li>
+<li><strong>Use for:</strong> per-user ledger updates, per-order fulfillment sequences, anywhere ordering matters.</li>
+</ul>
+<p>The 5-minute window is the key constraint. If a producer sends <code>MessageDeduplicationId = "abc123"</code> at T0 and again at T0+4 minutes, the second is silently deduped. At T0+6 minutes, the second one would be accepted (window expired). So "exactly-once" is "exactly-once within a 5-minute window." For longer dedup needs, your application must layer its own idempotency.</p>
+<h3 id="14c-visibility-timeout">14c. Visibility timeout</h3>
+<p>Default 30 seconds. Configurable up to 12 hours. The worker can extend at any time via <code>ChangeMessageVisibility</code>. The standard pattern is short timeout (30 sec) + heartbeat extension every 20 seconds for long jobs.</p>
+<h3 id="14d-dlq-via-redrivepolicy">14d. DLQ via RedrivePolicy</h3>
+<p>Configure on the source queue: <code>RedrivePolicy = {"deadLetterTargetArn": "...", "maxReceiveCount": 5}</code>. After 5 receives without successful delete (i.e., 5 timeouts), SQS auto-moves to the DLQ. The DLQ is just another SQS queue; you can configure alarms on its depth.</p>
+<h3 id="14e-long-polling">14e. Long polling</h3>
+<p><code>ReceiveMessage</code> with <code>WaitTimeSeconds=20</code> (the max). SQS holds the connection open for up to 20 seconds, returning immediately when a message arrives. Saves cost (fewer empty receives) and reduces latency (no polling delay). <strong>Always use long polling.</strong> Short polling exists for legacy reasons.</p>
+<h3 id="14f-aws-lambda-sqs-event-source">14f. AWS Lambda + SQS event source</h3>
+<p>Configure a Lambda function with an SQS event source. AWS auto-polls the queue, batches messages (1-10 per invocation), invokes the Lambda. Lambda concurrency auto-scales — empty queue → no invocations → no cost; spiky load → more concurrent Lambdas (up to your account limit). <strong>Effectively a serverless job queue.</strong> Used heavily in event-driven cloud architectures.</p>
+<p>The pattern: producer publishes to SQS, Lambda consumes. You manage the Lambda code; AWS manages everything else. Operational burden ~0. Cost: ~$0.40 per million SQS requests + Lambda execution cost ($0.20 per million invocations + duration cost). For modest workloads (~10M jobs/day), total cost is ~$50-100/month — cheaper than running a single EC2 instance.</p>
+<hr>
+<h2 id="15-use-case-gallery">§15. Use case gallery</h2>
+<p>Different domains using job queues in different ways.</p>
+<h3 id="15a-email-sending-background-smtp-delivery">15a. Email sending (background SMTP delivery)</h3>
+<p>The original use case. User signs up → enqueue welcome email. The email job calls SendGrid / Mailgun / Postfix; on transient failure (5xx, timeout), the job retries with backoff. On permanent failure (bounce, invalid address), the job moves to DLQ for the support team to inspect. <strong>Why a queue?</strong> Email APIs are slow (~300 ms p99) and occasionally degraded; running them inline blocks the user request. Why not a workflow engine? Single step, no state — overkill.</p>
+<h3 id="15b-image-video-processing">15b. Image / video processing</h3>
+<p>User uploads a video; backend enqueues <code>TranscodeVideo(video_id)</code>. Worker downloads the original from S3, runs ffmpeg with multiple output profiles, uploads results back to S3, updates the DB with the result URLs. Each video is ~5-30 minutes of CPU. <strong>Why a queue?</strong> The work is expensive and parallelizable; user shouldn't wait. Workers can be GPU-equipped machines that autoscale on queue depth. Notification fans out when the job completes (push to user's app).</p>
+<h3 id="15c-payment-retries-webhook-delivery-to-merchants">15c. Payment retries (webhook delivery to merchants)</h3>
+<p>Stripe's webhook delivery model. A merchant subscribes to webhook events (payment.succeeded, etc.); Stripe enqueues a delivery job for each event-merchant pair. The job POSTs to the merchant's URL; on non-2xx, retries with exponential backoff (Stripe's documented schedule: a few minutes, then hours, then days, capped at 3 days, then DLQ-equivalent). <strong>Why a queue?</strong> Merchants' endpoints are slow, sometimes down, sometimes broken. The retry budget is the contract. Stripe's webhook reliability is one of their core developer-experience promises.</p>
+<h3 id="15d-order-fulfillment">15d. Order fulfillment</h3>
+<p>User completes checkout → order written to DB → enqueue <code>FulfillOrder(order_id)</code>. The fulfillment job calls the warehouse system, allocates inventory, generates a shipping label, schedules pickup. On any failure, retries with backoff; on permanent failure, alerts the operations team. <strong>Why a queue?</strong> Many independent backend calls, some of which are slow (warehouse API takes seconds). Decouples checkout latency from fulfillment correctness. Many large e-commerce platforms run this pattern at peak throughputs of hundreds of thousands of orders/hour during major sales events.</p>
+<h3 id="15e-data-import-export">15e. Data import / export</h3>
+<p>User uploads a 100 MB CSV with 1M rows; backend enqueues <code>ImportCSV(file_id)</code>. The import job streams the file from S3, parses chunks of 1000 rows, INSERTs into Postgres in batches, updates a progress counter visible to the user. Total run time: minutes to hours. <strong>Why a queue?</strong> A request handler can't run for hours; the user wants to navigate away and come back. Status displayed via a separate <code>GET /imports/{id}</code> endpoint that reads the progress counter.</p>
+<h3 id="15f-notification-fanout">15f. Notification fanout</h3>
+<p>A LinkedIn-style social feed posts an update. Service writes the post to its DB. Enqueues <code>FanOutNewPost(post_id, author_id)</code>. The fan-out job reads the author's follower list (maybe 10k users), enqueues <code>DeliverNotification(user_id, post_id)</code> for each. Each delivery job pushes to the user's app (push notification, in-app feed update). Total: 1 enqueue produces 10k child jobs. <strong>Why a queue?</strong> Fan-out is bursty and parallel; the original poster's request can't wait for 10k notifications.</p>
+<h3 id="15g-ml-batch-inference">15g. ML batch inference</h3>
+<p>Daily job: score all users' likelihood to churn. Enqueue <code>ScoreUserChurn(user_id)</code> for each of 10M users. Workers (often GPU pods) pull jobs, batch them in groups of 256 for GPU efficiency, run the model, write predictions to a feature store. Total: 10M jobs/day batched into ~40k GPU calls. <strong>Why a queue?</strong> Predictable burst of work that needs parallelism + idempotency (re-scoring is fine). The queue smooths the work over an hour, avoiding the "big SQL transaction" anti-pattern.</p>
+<h3 id="15h-database-maintenance">15h. Database maintenance</h3>
+<p>Periodic cleanup: delete expired sessions, archive old data, compact tables. Cron-style scheduled jobs enqueue work jobs. <strong>Why a queue?</strong> Cron alone doesn't distribute work across multiple servers; the queue does. Also: the maintenance jobs can be partitioned ("clean up 100k rows at a time, in 10 parallel chunks") for parallelism without locking.</p>
+<h3 id="15i-webhook-delivery-stripe-github-shopify-style">15i. Webhook delivery (Stripe, GitHub, Shopify style)</h3>
+<p>Outbound webhook delivery is itself a job queue: the platform records "I owe webhook X to merchant Y" and a worker delivers it with retries. GitHub's webhook delivery system reportedly handles tens of millions of webhook deliveries per day; Stripe's is similar. Both have public documentation of their retry schedules and DLQ behavior.</p>
+<h3 id="15j-search-index-updates">15j. Search index updates</h3>
+<p>User updates a product (e.g., changes the title). Backend writes to Postgres + enqueues <code>ReindexProduct(product_id)</code>. Worker reads the latest state from Postgres, computes the indexable document, calls Elasticsearch's <code>_update</code> API. <strong>Why a queue?</strong> Decouples the write path (fast) from the indexing path (sometimes slow during ES degradation). Also batches updates — if the same product is updated 5 times in 10 seconds, the deduplicating queue (Sidekiq Unique Jobs, BullMQ deduplication) processes only the latest.</p>
+<hr>
+<h2 id="16-real-world-implementations-with-numbers">§16. Real-world implementations with numbers</h2>
+<p>Concrete deployments illustrating the scale range.</p>
+<p><strong>Shopify's Sidekiq Enterprise deployment</strong> is one of the largest known Sidekiq installations. Engineering blog posts and public talks describe a fleet of thousands of worker pods organized by merchant tier (pods per tier provide isolation — a noisy merchant doesn't starve others). Peak job rates during Black Friday Cyber Monday have been reported in the hundreds of thousands per second across the fleet, with daily volumes reaching the hundreds of millions on peak days. Features used: Sidekiq Enterprise (Periodic, Unique Jobs, Encryption, Rate Limiting), pod-per-shard isolation, custom queue routing.</p>
+<p><strong>GitHub</strong> runs background jobs heavily for webhook delivery, repository indexing, notification fan-out, and CI orchestration. Their public engineering blog has described internal job-queue evolution from Resque (their original, open-sourced in 2010) to migration toward more modern infrastructure as scale grew.</p>
+<p><strong>Stripe's webhook delivery system</strong> delivers tens of millions of webhooks per day. The public documentation outlines the retry schedule (immediate, then increasing delays over 3 days), the idempotency-key model, and the DLQ-style "event will not retry further" terminal state. The system is one of the more battle-tested public examples of webhook-delivery-as-job-queue.</p>
+<p><strong>AWS SQS</strong> reportedly handles billions of messages per day across all customers (number widely cited in AWS marketing and confirmed in re:Invent talks). A single high-volume customer can hit a few billion messages/month — game backends, log delivery, media processing platforms.</p>
+<p><strong>Discord</strong> has publicly described using Celery (Python) for asynchronous background work, including notification delivery and trust-and-safety pipelines. Scale claimed in posts: tens of millions of users, hundreds of millions of jobs per day.</p>
+<p><strong>Airbnb</strong> originally built a custom job system (Chronos-derived) before migrating to other tools as the company grew. Their public engineering content describes the iterative path from "custom thing" to managed solutions.</p>
+<p><strong>Resque</strong> (the predecessor to Sidekiq, both originally GitHub-derived) is now largely legacy but is still in use in older Rails codebases. Sidekiq is the dominant modern Ruby choice; Resque survives in maintenance mode.</p>
+<p><strong>Hangfire</strong> is the dominant .NET background job library, used in many enterprise .NET shops. Scale per public references: thousands of jobs/sec on typical SQL Server backends.</p>
+<p><strong>Que / GoodJob / river</strong> are smaller-scale by deployment count, but the DB-backed approach has been gaining traction. river specifically (2023+) is the modern Go entry and is being adopted in greenfield projects that want transactional outbox semantics without a separate broker.</p>
+<p><strong>Cloud Tasks (Google)</strong> has fewer public scale numbers but is widely used in GCP-hosted serverless apps. Sub-account scale is similar in pattern to SQS — handle a workload appropriately.</p>
+<p>The takeaway: at low to mid scale, the queue choice is mostly about ecosystem fit (Ruby → Sidekiq, Python → Celery, Node → BullMQ, .NET → Hangfire, Go → river or asynq). At high scale, the pattern matters more than the tool — pod isolation, queue sharding, dedicated worker fleets per tier. The named tools are largely converging in capability; the operational sophistication is where the engineering investment lives.</p>
+<hr>
+<h2 id="17-summary">§17. Summary</h2>
+<blockquote>
+<p><em>A background job queue is the substrate that turns "do many things reliably after returning to the user" from an application-level concern into infrastructure. It accepts work-to-be-performed, durably stores it, dispatches it to a worker fleet at-least-once, retries on failure with backoff, schedules delayed execution via sorted sets or run_at columns, and quarantines poison pills in a dead-letter queue. It is NOT a message log (events for many consumers, replayable) and NOT a workflow engine (multi-step stateful processes); it is the one-shot, short-atomic-job primitive that lives between the request handler and the side effect. The Redis-backed (Sidekiq, Celery, BullMQ) realization gives sub-millisecond enqueue + dequeue and millions of jobs/sec on commodity hardware; the Postgres SKIP LOCKED realization (Que, river) gives transactional atomicity with your application data — the killer feature for the outbox pattern; the managed realizations (SQS, Cloud Tasks) trade latency for zero operational overhead. Across all variants, the contract is the same: at-least-once delivery (you layer idempotency), per-queue ordering (you partition by key for finer ordering), visibility-timeout-driven liveness (the broker doesn't trust the worker is alive without a heartbeat). The technology is mature, the patterns are settled, and the distinction between "make a job idempotent and trust the queue" versus "fight the queue with custom retry logic" is the difference between a system that scales and one that creates incidents.</em></p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

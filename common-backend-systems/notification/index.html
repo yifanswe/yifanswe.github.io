@@ -1,0 +1,1934 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Notification & Push — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Notification & Push</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p>Notification systems take a domain event ("Alice replied to your comment", "your payment of $43.21 succeeded", "PagerDuty incident #4421 escalated", "your Stripe payout posted") and turn it into one or more asynchronous, channel-routed, user-targeted nudges. They are a class of infrastructure that sits between event producers (any service in the business) and external delivery endpoints (APNs (Apple Push Notification service), FCM (Firebase Cloud Messaging), SES (Simple Email Service), SendGrid, Twilio, web push, in-app inbox).</p>
+<p>This is a reference about that class — what it is, what it inherently guarantees, the design space of fanout patterns, the byte-level wire mechanics of the channels, the hard problems, the failure modes, and how the same technology serves transactional payments, social feed, marketing campaigns, alerting, 2FA (Two-Factor Authentication) SMS, and in-game pushes. Multiple domains use it differently; we cover all of them.</p>
+<hr>
+<h2 id="1-what-notification-systems-are-and-what-they-are-not">§1. What notification systems ARE (and what they are NOT)</h2>
+<p>A notification system is an <strong>asynchronous fan-out delivery platform</strong> that accepts one logical event from an upstream service and produces N targeted messages routed across heterogeneous channels (push, email, SMS, in-app inbox, web push, voice). It owns four problems no individual channel API solves:</p>
+<ol>
+<li><strong>Targeting</strong>: mapping an event to a recipient set (one user, a fanout list, a segment).</li>
+<li><strong>Routing</strong>: picking channel(s) per recipient based on preferences, device availability, urgency, cost.</li>
+<li><strong>Throttling / dedup / scheduling</strong>: per-user budgets, duplicate suppression, quiet hours.</li>
+<li><strong>External-channel adaptation</strong>: HTTP/2 to APNs, SMTP/HTTPS to email, REST to SMS providers — managing connection pools, retries, backpressure.</li>
+</ol>
+<p>It sits between <strong>event producers</strong> (feed, payments, identity, monitoring, marketing automation) and <strong>delivery endpoints</strong> (APNs, FCM, SES, Twilio) plus an <strong>internal inbox store</strong>.</p>
+<h3 id="distinguish-from-adjacent-technology-categories">Distinguish from adjacent technology categories</h3>
+<ul>
+<li><strong>vs. distributed message queue</strong> (Kafka, RabbitMQ): a queue moves bytes with no notion of "user". A notification system uses a queue inside, but its abstraction is "user × channel × content". You build notification ON a queue, not as one.</li>
+<li><strong>vs. in-app realtime</strong> (WebSocket, SSE, XMPP): realtime channels deliver to currently-connected clients only. A complete platform uses BOTH — WebSocket when client is connected, APNs/FCM when offline. WebSocket is one channel among several.</li>
+<li><strong>vs. transactional email service</strong> (SES, SendGrid alone): SES knows how to send one email. The notification platform orchestrates SES + APNs + Twilio + inbox + preferences + dedup. SES is a primitive; the platform composes.</li>
+<li><strong>vs. marketing automation</strong> (Mailchimp, Iterable, Braze): marketing platforms layer campaign segmentation and A/B tests on top of the same fanout-route-throttle substrate.</li>
+<li><strong>vs. alerting</strong> (PagerDuty, Opsgenie): alerting is a notification platform specialized for high-urgency, on-call rotation, escalation policies. Same primitives.</li>
+</ul>
+<h3 id="what-notification-systems-are-not-good-for">What notification systems are NOT good for</h3>
+<ul>
+<li><strong>Synchronous in-band confirmation</strong>. Channel ACKs mean "we accepted it", not "user saw it".</li>
+<li><strong>Strict exactly-once across all channels</strong>. Push is best-effort; email goes to spam; SMS providers retry on their own. The platform delivers at-least-once; device or inbox does dedup.</li>
+<li><strong>Cross-channel ordering</strong>. Push may arrive before email even when dispatched in order — no global clock across APNs and SES.</li>
+<li><strong>Long-form rich content</strong>. APNs caps payloads at 4KB; SMS at 160 chars per segment. Send the link, host the content elsewhere.</li>
+<li><strong>Two-way conversations</strong>. Notifications are one-way. Use a messaging system for replies.</li>
+</ul>
+<hr>
+<h2 id="2-inherent-guarantees-and-what-must-be-layered-on">§2. Inherent guarantees (and what must be layered on)</h2>
+<p>By design, the platform provides:</p>
+<ul>
+<li><strong>At-least-once delivery per channel</strong>, where "delivery" means "accepted by the channel's API" — not "rendered on screen". An APNs 200 means APNs took it; the device may still be offline.</li>
+<li><strong>Durable inbox</strong> as source of truth. The in-app inbox row, once written, survives crashes. Push and email are hints.</li>
+<li><strong>Idempotency via event/dispatch keys</strong>. Same <code>event_id</code> + <code>recipient_id</code> resolves to one inbox row even on retry.</li>
+<li><strong>Channel-specific reliability</strong>:</li>
+<li><strong>Push (APNs/FCM)</strong>: best-effort. Apple retains undelivered pushes ~30d on iOS, hours on Android, then drops. <code>apns-collapse-id</code> ensures one banner even if ten pushes sent.</li>
+<li><strong>Email (SES/SendGrid)</strong>: ~99% deliverable for clean senders; latency seconds to minutes; content can land in spam.</li>
+<li><strong>SMS (Twilio)</strong>: ~95-99% delivery to MNOs (mobile network operators); operator's queue is opaque.</li>
+<li><strong>In-app inbox</strong>: 100% (we wrote it durably).</li>
+<li><strong>Back-pressure</strong>: the queue absorbs producer bursts; dispatcher rate decoupled.</li>
+</ul>
+<p>By design, the platform does NOT provide:</p>
+<ul>
+<li><strong>Exactly-once across channels</strong>. Network flakes between dispatcher and APNs cause duplicate pushes; device-side <code>collapse_id</code> collapses them. Layered on, not inherent.</li>
+<li><strong>Strict cross-channel ordering</strong>. "Push arrives before email" is convention. The dispatcher fans out in parallel; APNs ~200ms, email ~5s. Only the inbox (ordered by event timestamp) is the ordered source.</li>
+<li><strong>Real-time delivery confirmation to producer</strong>. Producer publishes and is done. Whether user saw it = async callback (Twilio webhook, SES SNS bounce) hours later.</li>
+<li><strong>Spam compliance</strong>. CAN-SPAM, GDPR, CCPA require unsubscribe handling, consent tracking. The platform exposes mechanics; the business owns the policy.</li>
+</ul>
+<p><strong>Must be layered on by the system designer</strong>:</p>
+<ul>
+<li><strong>Producer-side idempotency keys</strong> — if payment service retries "payment succeeded", we'd see two events. Producer-generated <code>event_id</code> deduped in Redis is mandatory.</li>
+<li><strong>Cross-channel coordination</strong> — "push first, email only if no ack in 5 min" — built via delay queue.</li>
+<li><strong>Compliance auditing</strong> — "did the GDPR data-export notification go on 2025-08-13?" must be queryable for 90+ days.</li>
+</ul>
+<hr>
+<h2 id="3-the-design-space-fanout-patterns">§3. The design space: fanout patterns</h2>
+<p>The dominant axis of variation in notification systems is <strong>how the recipient set is computed and materialized</strong>. Three patterns, with a sharp tradeoff.</p>
+<h3 id="fanout-on-write-push-model">Fanout-on-write (push model)</h3>
+<p>When the producer emits an event, the system <strong>immediately writes a row to every recipient's inbox</strong>. Read is trivial — the user opens the app, fetches <code>SELECT * FROM inbox WHERE user_id=X LIMIT 50</code> from their own partition.</p>
+<ul>
+<li><strong>Write cost</strong>: O(F) where F = recipient count. For a 1:1 transactional event (payment receipt), F=1 → cheap. For a 1:N social event (your friend posted), F = follower count. For a celebrity, F can be 100M.</li>
+<li><strong>Read cost</strong>: O(1) page-load — one partition lookup.</li>
+<li><strong>Storage</strong>: O(events × avg_followers) — duplicated per recipient.</li>
+<li><strong>Where it shines</strong>: transactional 1:1 (payment receipts, password resets, alerts), small-fanout social.</li>
+<li><strong>Where it breaks</strong>: high-fanout social (celebrity posts), viral content.</li>
+</ul>
+<h3 id="fanout-on-read-pull-model">Fanout-on-read (pull model)</h3>
+<p>The producer writes only to the <strong>producer's own timeline / event log</strong>. At read time, the recipient's client/server queries all relevant producers' timelines and merges.</p>
+<ul>
+<li><strong>Write cost</strong>: O(1) per event.</li>
+<li><strong>Read cost</strong>: O(F') where F' = number of producers the recipient subscribes to. For a normal user with 300 followees, every inbox open triggers 300 partition reads.</li>
+<li><strong>Storage</strong>: O(events) — single copy.</li>
+<li><strong>Where it shines</strong>: very high-fanout sources (celebrity timelines, RSS-style feeds), write-heavy workloads.</li>
+<li><strong>Where it breaks</strong>: read-heavy workloads, recipients who follow many sources, latency-sensitive UIs.</li>
+</ul>
+<h3 id="hybrid-the-standard-pick-for-non-trivial-systems">Hybrid (the standard pick for non-trivial systems)</h3>
+<p>Pick per-source. Below a <strong>celebrity threshold</strong> (~10k–100k followers), use fanout-on-write. Above the threshold, use fanout-on-read — don't pre-populate inboxes; at read time, fetch from celebrity's recent timeline and merge.</p>
+<pre><code>if poster.follower_count &lt; THRESHOLD:
+    fanout_on_write(poster, followers)
+else:
+    fanout_on_read_only(poster)
+
+# Reader path:
+inbox  = pre-pushed inbox (top N)
+celebs = user.celebrity_followees  # bounded, ~10-30
+fresh  = [read recent_timeline(c, since=24h) for c in celebs]
+return merge(inbox, *fresh).sorted_by_ts().take(50)
+</code></pre>
+<p>Twitter moved to this 2010-2012 after celebrity write-storms caused cascading failures. Facebook, Instagram, LinkedIn use variations.</p>
+<h3 id="comparison">Comparison</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Fanout-on-write</th>
+<th>Fanout-on-read</th>
+<th>Hybrid</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Write cost</td>
+<td>O(F) — explodes for celebrities</td>
+<td>O(1) — flat</td>
+<td>O(F) for non-celebs, O(1) for celebs</td>
+</tr>
+<tr>
+<td>Read cost</td>
+<td>O(1)</td>
+<td>O(F') — sometimes hundreds of reads</td>
+<td>O(1) + O(small celeb-set)</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>F× duplication</td>
+<td>1×</td>
+<td>Mixed; mostly 1× for celebs, F× for others</td>
+</tr>
+<tr>
+<td>Read latency p99</td>
+<td>~10ms (one partition)</td>
+<td>~100ms+ (multi-partition merge)</td>
+<td>~20ms (one + small merge)</td>
+</tr>
+<tr>
+<td>Write latency p99</td>
+<td>Fine for normal posts; minutes for celebs</td>
+<td>Fast always</td>
+<td>Fast always</td>
+</tr>
+<tr>
+<td>Code complexity</td>
+<td>Simple</td>
+<td>Simple</td>
+<td>Two paths + merge logic</td>
+</tr>
+<tr>
+<td>When to pick</td>
+<td>Median fanout &lt; 10k; transactional 1:1</td>
+<td>Write-heavy with very high fanout; few recipients per reader</td>
+<td>Real-world social with skewed follower distribution</td>
+</tr>
+</tbody>
+</table>
+<p>For transactional notifications (payments, security, alerts) the question doesn't arise — fanout is 1, so fanout-on-write is trivially correct. The hybrid question only matters for social fanout.</p>
+<hr>
+<h2 id="4-byte-level-mechanics">§4. Byte-level mechanics</h2>
+<p>This is where shallow docs stop and the real depth begins. The notification platform has four critical storage/transport structures: the <strong>inbox store</strong> (LSM-tree in Cassandra), the <strong>device-token store</strong> (B+ tree in MySQL), the <strong>dedup/rate-limit store</strong> (Redis hash table), and the <strong>APNs/FCM wire protocol</strong> (HTTP/2 with HPACK framing). I cover each.</p>
+<h3 id="41-inbox-store-cassandra-lsm-tree-partitioned-by-user_id">4.1. Inbox store: Cassandra LSM tree, partitioned by user_id</h3>
+<p>Access pattern:
+- <strong>Write-heavy</strong>: every notification = ≥1 inbox write. At 5B/day = ~58k writes/sec sustained, ~1.75M/sec viral burst.
+- <strong>Read pattern</strong>: "last 50 notifications for user X" — a range scan within one partition.
+- <strong>Cross-user queries</strong>: ~never. 99.9% of inbox queries scope to one <code>user_id</code>.</p>
+<p>LSM (Log-Structured Merge) tree is the textbook choice. A B+ tree (MySQL/InnoDB) would hit page-split storms at 58k writes/sec across 1B users; the random write pattern would thrash the buffer pool. LSM accepts ~10x write amplification (compaction overhead) in exchange for purely sequential writes that hit ~100k writes/sec/SSD per node.</p>
+<h4 id="schema">Schema</h4>
+<pre><code class="language-cql">CREATE TABLE notifications_inbox (
+  user_id          bigint,
+  created_at_ms    bigint,
+  notification_id  uuid,
+  type             text,
+  payload          blob,    -- protobuf-encoded
+  read_at_ms       bigint,
+  PRIMARY KEY ((user_id), created_at_ms, notification_id)
+) WITH CLUSTERING ORDER BY (created_at_ms DESC, notification_id ASC)
+  AND default_time_to_live = 2592000;  -- 30 days
+</code></pre>
+<ul>
+<li><code>(user_id)</code> is the partition key → all of one user's notifications co-locate on the same RF=3 (replication factor) replicas.</li>
+<li><code>created_at_ms DESC</code> clustering → newest first; "last 50" reads the first 50 cells of the partition.</li>
+<li><code>default_time_to_live = 30d</code> → Cassandra writes tombstones at expiry; old data is reclaimed by compaction.</li>
+</ul>
+<h4 id="lsm-layout-on-disk">LSM layout on disk</h4>
+<p>Each Cassandra node holds data as <strong>immutable SSTables (Sorted String Tables) on disk</strong> plus a <strong>mutable in-memory memtable</strong>.</p>
+<pre><code>                         WRITE PATH
+                         ─────────
+  client write
+      │
+      ▼
+  commit log (append-only, fsync periodic 10ms or per-batch)  ── DURABILITY POINT
+      │
+      ▼
+  memtable  (skip-list or trie-map in heap, sorted by clustering key)
+      │
+      │  when memtable hits flush threshold (~256 MB or 15 min)
+      ▼
+  flush to disk as a new SSTable (immutable, sorted)
+      │
+      ▼
+  background compaction merges SSTables (size-tiered or leveled)
+
+                         READ PATH
+                         ─────────
+  read for (user_id=12345, last 50)
+      │
+      ▼
+  1. memtable lookup
+  2. bloom filter check on each SSTable for partition (user_id=12345)
+  3. for SSTables that pass: read partition index → seek to offset
+  4. merge results in clustering-key order, take top 50
+  5. apply tombstones (expired TTLs)
+</code></pre>
+<h4 id="sstable-file-layout">SSTable file layout</h4>
+<pre><code>┌─────────────────────────────────────────────────────────────────┐
+│  Data.db        (rows, sorted by partition_key then clustering) │
+│  Index.db       (partition-key → byte offset into Data.db)      │
+│  Filter.db      (bloom filter for partition keys, ~1% FP)       │
+│  Summary.db     (sampled Index.db entries, kept in heap)        │
+│  Statistics.db  (min/max clustering keys, tombstone counts)     │
+│  CompressionInfo.db                                              │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>For <code>SELECT * FROM notifications_inbox WHERE user_id=X LIMIT 50</code>:
+1. Hash <code>user_id</code> → identify home replicas via consistent-hashing token ring.
+2. On a replica, bloom filter on Filter.db says "yes, this SSTable might have user_id=X" — false positive ~1%.
+3. Index.db (or Summary.db, in-heap, sampled) gives byte offset in Data.db.
+4. Seek into Data.db, scan forward in clustering order, take 50 cells.</p>
+<p>Two seeks worst case per SSTable. If user X's data spans 4 SSTables (some rows recently flushed, others from older compactions), we touch 4 SSTables and merge in memory. <strong>Leveled compaction</strong> keeps the count low (~5 SSTables/level for any one row); <strong>size-tiered compaction</strong> can be higher and is the Cassandra default unless tuned otherwise.</p>
+<h4 id="tradeoff-vs-b-tree">Tradeoff vs B+ tree</h4>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>LSM (Cassandra)</th>
+<th>B+ tree (MySQL)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Write throughput</td>
+<td>~100k/sec/node (sequential)</td>
+<td>~20k/sec/node (random splits)</td>
+</tr>
+<tr>
+<td>Read latency p99</td>
+<td>~5-10ms (multi-SSTable merge)</td>
+<td>~1-2ms (single tree traversal)</td>
+</tr>
+<tr>
+<td>Compaction overhead</td>
+<td>~10x write amplification</td>
+<td>~2-3x via splits + buffer pool</td>
+</tr>
+<tr>
+<td>Range scan within partition</td>
+<td>Fast</td>
+<td>Fast (leaf-chain)</td>
+</tr>
+<tr>
+<td>Cross-partition query</td>
+<td>Terrible (no global index)</td>
+<td>OK via secondary indexes</td>
+</tr>
+<tr>
+<td>TTL expiry</td>
+<td>Native</td>
+<td>Manual cleanup job</td>
+</tr>
+</tbody>
+</table>
+<p>For 1B-user inbox with high write rate and partition-local reads, LSM wins. Cross-user analytics ("notifications about post X across users") = add Pinot/Druid as secondary store.</p>
+<h4 id="durability-and-recovery">Durability and recovery</h4>
+<p>Commit log is the durability point. Cassandra appends to commit log BEFORE updating memtable. On crash: restart → replay commit log → serve reads. Fsync is <strong>periodic</strong> (10ms default) for throughput, or <strong>batch</strong> (per write) for stricter durability — tier transactional notifications to a separate keyspace with <code>batch</code>.</p>
+<h4 id="one-operation-end-to-end">One operation, end-to-end</h4>
+<pre><code>T+0:   Dispatcher constructs CQL INSERT (user_id=12345, TTL=30d).
+T+1:   Coordinator receives at CQL layer.
+T+2:   Coordinator forwards to all 3 replicas; awaits QUORUM (2 of 3).
+T+3:   Each replica: append to commit log (sequential, ~1µs to page cache;
+       fsync at next 10ms tick), update memtable skip-list at
+       (user_id=12345) sorted by created_at_ms DESC, ACK coordinator.
+T+5:   Coordinator ACKs dispatcher. p50 ~5ms, p99 ~20ms.
+
+──── [crash on one replica here] ────
+
+Recovery: replay commit log to last fsync. If a write ACKed but lost in
+10ms window, other 2 replicas have it → read-repair on next read, or
+anti-entropy (Merkle-tree, nodetool repair) later.
+DURABILITY POINT: commit log entries across the QUORUM.
+
+T+15min: Memtable hits 256 MB → flush to SSTable (sequential, ~0.4s).
+         Once SSTable durable, commit log segment released.
+
+Later: Background compaction (leveled: L0→L1 in 160 MB chunks).
+       Tombstones (expired TTLs) dropped during compaction.
+</code></pre>
+<h3 id="42-device-token-store-mysql-b-tree-sharded-by-user_id">4.2. Device-token store: MySQL B+ tree, sharded by user_id</h3>
+<pre><code class="language-sql">CREATE TABLE device_tokens (
+  user_id        BIGINT      NOT NULL,
+  device_id      VARCHAR(64) NOT NULL,
+  platform       ENUM('IOS','ANDROID','WEB') NOT NULL,
+  token          VARCHAR(256) NOT NULL,
+  app_version    VARCHAR(32),
+  locale         VARCHAR(16),
+  last_seen_ms   BIGINT,
+  active         BOOLEAN     NOT NULL DEFAULT TRUE,
+  PRIMARY KEY (user_id, device_id),
+  INDEX idx_token (token(64))
+) ENGINE=InnoDB;
+</code></pre>
+<p>Why B+ tree:
+- Point or narrow-range lookups (≤10 rows per user). B+ tree branching factor ~100 → O(log_100 N) lookups. For 1B rows, ~5 levels deep; upper 3 levels in InnoDB buffer pool → 1 disk seek p99.
+- Predictable mutations: token rotation = UPSERT on <code>(user_id, device_id)</code>; no churn explosion.
+- Sharded by <code>user_id</code> across 32 MySQL clusters → ~40 GB per shard. Each shard = 1 master + 2 replicas. Trivial ops.</p>
+<p>Token-rotation feedback loop (the 410/404 path described in §8) writes back to this table to deactivate dead tokens.</p>
+<h3 id="43-redis-dedup-rate-limit-preference-cache">4.3. Redis: dedup, rate-limit, preference cache</h3>
+<p><strong>Dedup</strong>: <code>SETNX dedup:{event_id}:{user_id} 1 EX 86400</code>. SETNX returns 0 → already dispatched → drop. At 58k events/sec × ~50 deliveries/event ≈ 2.9M ops/sec → ~45k/sec/node across a 64-node Redis cluster (well within ~100k ops/sec/core ceiling). ~250M live keys × 50 bytes ≈ 12 GB. Fits.</p>
+<p><strong>Rate limit (sliding token bucket)</strong>: <code>ratelimit:push:{user_id} → { tokens, last_refill_ms }</code>. Lua script atomically refills by elapsed time, decrements 1, returns allowed. Per-channel buckets independent (push 5/min, email 3/hr, SMS 1/hr).</p>
+<p><strong>Preference cache</strong>: <code>prefs:{user_id} → { push, email, sms, quiet_hours, tz, muted_types }</code>. Read-through, TTL=60s. Unsubscribe API writes MySQL AND <code>DEL prefs:{user_id}</code> → next read is fresh.</p>
+<h3 id="44-apnsfcm-wire-protocol-http2-with-hpack-and-persistent-connections">4.4. APNs/FCM wire protocol: HTTP/2 with HPACK and persistent connections</h3>
+<p>The depth signal: you don't just "POST to APNs" — you maintain <strong>persistent HTTP/2 connections</strong>, multiplex thousands of concurrent pushes through each connection, manage HPACK header compression, and handle <code>GOAWAY</code> for graceful connection lifecycle. This is where APNs and FCM amortize TLS setup and dramatically increase throughput.</p>
+<h4 id="apns-over-http2">APNs over HTTP/2</h4>
+<pre><code>TCP connection                                    [persistent, keep-alive]
+  └─ TLS 1.3 handshake (or session resumption)   [client cert or JWT auth]
+     └─ HTTP/2 connection
+        ├─ Stream 1: POST /3/device/{token1}    payload1
+        ├─ Stream 3: POST /3/device/{token2}    payload2
+        ├─ Stream 5: POST /3/device/{token3}    payload3
+        ├─ ... (up to ~1000 concurrent streams per connection)
+        └─ Stream 2001: POST /3/device/{tokenN} payloadN
+
+  Responses arrive interleaved on the same connection:
+        Stream 1:    200 OK
+        Stream 3:    410 Unregistered      ← device gone, mark token dead
+        Stream 5:    429 Too Many Requests ← back off
+        Stream 2001: 200 OK
+</code></pre>
+<p>Frame-level mechanics:</p>
+<ul>
+<li><strong>HEADERS frame</strong>: HPACK-compressed. After the first request on a connection, repeated headers like <code>apns-topic: com.foo.app</code>, <code>apns-push-type: alert</code>, <code>authorization: bearer &lt;JWT&gt;</code> cost ~5 bytes each (an HPACK dynamic table index, not the full string). At scale this matters: 10k pushes × 200 bytes/header saved = 2 MB/connection/sec saved.</li>
+<li><strong>DATA frame</strong>: the JSON payload (≤4KB for normal pushes, 5KB for voip-pushtype).</li>
+<li><strong>WINDOW_UPDATE frame</strong>: HTTP/2 flow control. APNs advertises a window (e.g., 64KB initial); if your in-flight data exceeds it, you wait for <code>WINDOW_UPDATE</code>. Backpressure-aware clients respect this; aggressive ones cause TCP-level stalls.</li>
+<li><strong>GOAWAY frame</strong>: APNs sends this when it wants to gracefully close — typically during Apple's edge deploys, or when the connection has been alive "too long". Your client must drain in-flight streams and reconnect on a fresh connection. Failing to handle GOAWAY is a common bug — sends silently fail or hang.</li>
+<li><strong>PING frame</strong>: HTTP/2 liveness check. Clients send periodically; missing PONG → connection dead → reconnect.</li>
+</ul>
+<h4 id="throughput-math-why-persistent-connections-matter">Throughput math: why persistent connections matter</h4>
+<pre><code>Cold connection (per-push reconnect):
+  TLS handshake = ~50-100ms
+  One push per handshake → ~10 pushes/sec/conn
+
+Persistent connection with multiplexing:
+  ~1000 concurrent streams per HTTP/2 connection
+  Each stream completes in ~80ms (Apple round-trip)
+  Throughput per connection ≈ 1000 streams / 0.08s = ~12.5k pushes/sec
+
+  Sustained throughput limited by APNs server-side ≈ 1000-2000 pushes/sec/conn
+</code></pre>
+<p>At 1.75M push/sec viral burst:</p>
+<pre><code>1.75M/sec ÷ 1000/sec/conn = 1,750 persistent APNs connections
+</code></pre>
+<p>Spread across ~50 dispatcher hosts, each holding 30-40 connections. Apple permits up to ~100 connections per provider certificate; you negotiate higher for large customers (Twitter, LinkedIn, Meta have higher caps).</p>
+<h4 id="fcm-specifics">FCM specifics</h4>
+<p>FCM (Firebase Cloud Messaging) similarly speaks HTTP/2 but offers explicit <strong>batch endpoints</strong>:</p>
+<pre><code>POST https://fcm.googleapis.com/v1/projects/{pid}/messages:send  (single)
+POST https://fcm.googleapis.com/batch                            (batch, up to 500)
+</code></pre>
+<p>Batch endpoint accepts a multipart body with up to 500 distinct messages, returns a single HTTPS round-trip with an array of responses. APNs has no equivalent batch endpoint — you rely on HTTP/2 stream multiplexing.</p>
+<p>Application-level batching tip: even on APNs, group pushes into ~500 streams per ~10ms flush window. This amortizes encryption and improves HPACK reuse.</p>
+<h4 id="concrete-walkthrough-one-event-device-end-to-end">Concrete walkthrough: one event → device, end-to-end</h4>
+<pre><code>T+0ms:   Producer (feed-service) publishes NotificationEvent to events.raw
+         partition (hashed by event_id).
+T+1ms:   Kafka durable: leader fsyncs, replicates to 2 ISR followers.
+T+5ms:   Fanout-service consumes event, queries follower-graph store.
+T+8ms:   Fanout-service writes per-user deliveries to deliveries.queued
+         (partitioned by recipient user_id).
+T+10ms:  Dispatcher worker (handling partition for user 42) consumes.
+T+11ms:  Redis SETNX dedup:event-abc:42 → 1 (first time).
+T+12ms:  Redis GET prefs:42 → push=true, not in quiet hours.
+T+13ms:  Redis Lua rate-limit check → allowed; consume 1 token.
+T+14ms:  Cassandra INSERT into notifications_inbox; ACKs at QUORUM (~5ms).
+T+19ms:  MySQL SELECT device_tokens WHERE user_id=42 AND active=TRUE
+         → 3 tokens (iOS, Android, web).
+T+21ms:  Dispatcher enqueues 3 channel-specific sends.
+T+22ms:  APNs router picks an idle HTTP/2 stream on its persistent
+         connection to api.push.apple.com.
+T+23ms:  HEADERS + DATA frame (TCP_NODELAY, ~1KB payload).
+T+50ms:  Apple's edge ACKs at TCP level, begins processing.
+T+80ms:  APNs returns 200 OK on the stream.
+T+81ms:  Dispatcher updates delivery_status → DELIVERED (channel=APNS).
+T+200ms: Apple forwards to user's phone over persistent push channel.
+T+300ms: Phone displays banner.
+
+p50 event→banner: ~300ms.
+p99: ~3-5s (Apple's queue introduces delay; FCM similar).
+</code></pre>
+<p>Internal infra latency (T+0 to T+80): ~80ms. Apple-side: ~220ms. We have no control over Apple — internal speed-ups bottleneck at the wire.</p>
+<hr>
+<h2 id="5-capacity-envelope-small-to-giant">§5. Capacity envelope: small to giant</h2>
+<p>The same architecture spans 6+ orders of magnitude depending on scale. The substrate (queue → fanout → dispatcher → channel routers) is the same; the sizing isn't.</p>
+<table>
+<thead>
+<tr>
+<th>Scale</th>
+<th>Throughput</th>
+<th>Footprint</th>
+<th>Real example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Tiny</strong></td>
+<td>~5 notif/sec</td>
+<td>Single SES account + AWS SNS. No queue. Sync send. Few hundred users.</td>
+<td>Indie SaaS, side-project.</td>
+</tr>
+<tr>
+<td><strong>Small</strong></td>
+<td>~500 notif/sec</td>
+<td>One Postgres (preferences + inbox), one Redis (dedup), SES + Twilio. ~10k DAU.</td>
+<td>Early startup, B2B SaaS notifications.</td>
+</tr>
+<tr>
+<td><strong>Mid</strong></td>
+<td>~10k notif/sec</td>
+<td>Kafka cluster (5 brokers), Cassandra inbox (10 nodes), Redis cluster (8 nodes), 100s of persistent APNs/FCM connections. Slack-shape. ~10M users.</td>
+<td>Slack notifications, Discord (early-mid), Notion.</td>
+</tr>
+<tr>
+<td><strong>Large</strong></td>
+<td>~500k notif/sec sustained, ~5M peak</td>
+<td>Kafka 50+ brokers, Cassandra 100+ nodes, multi-region. Hybrid fanout (celebrities). Twitter 300k followers/celebrity, Facebook 10B/day, LinkedIn 1B users.</td>
+<td>Twitter, LinkedIn, Facebook, Instagram, Snap.</td>
+</tr>
+<tr>
+<td><strong>Giant</strong></td>
+<td>1M+ msgs/sec sustained, ~10M+ peak</td>
+<td>Per-region Cassandra, dedicated DC fleet, custom hardware for persistent connections, Erlang VMs holding millions of long-lived sockets.</td>
+<td>WhatsApp (100B+ msgs/day), iMessage, WeChat.</td>
+</tr>
+</tbody>
+</table>
+<p>At each tier the architecture is <strong>the same shape</strong> but the next bottleneck moves:</p>
+<ul>
+<li>Tiny/Small → bottleneck is <strong>producer rate</strong>.</li>
+<li>Mid → bottleneck is <strong>single MySQL inbox</strong>; move to Cassandra.</li>
+<li>Large → bottleneck is <strong>celebrity write storms</strong>; move to hybrid fanout-on-write/read.</li>
+<li>Giant → bottleneck is <strong>persistent connection management</strong> (millions of sockets); custom socket-tier in Erlang/Go.</li>
+</ul>
+<hr>
+<h2 id="6-architecture-in-context-canonical-pattern">§6. Architecture in context (canonical pattern)</h2>
+<pre><code>EVENT PRODUCERS (payments, feed, identity, chat, monitoring, marketing, ...)
+       │  publishes NotificationEvent
+       ▼
+┌──────────────────────────┐
+│ Kafka: events.raw        │  partitioned by event_id, retention 7d, repl=3
+└────────────┬─────────────┘
+             ▼
+┌───────────────────────────────────┐
+│   FANOUT SERVICE (stateless)      │
+│  - lookup recipient set            │
+│  - apply visibility / mute rules   │
+│  - branch hot path vs cold path    │
+└──┬──────────────────────────┬─────┘
+   │ normal: fanout-on-write   │ celebrity: fanout-on-read
+   ▼                           ▼
+┌─────────────────────────────┐   ┌─────────────────────────────┐
+│ Kafka: deliveries.queued    │   │ No fanout write             │
+│ partitioned by user_id      │   │ Recipients query celebrity  │
+│                             │   │ timeline at read-time       │
+└────────────┬────────────────┘   └─────────────────────────────┘
+             ▼
+┌────────────────────────────────────────────────────────────────┐
+│         DISPATCHER WORKER POOL (stateless, autoscaling)         │
+│  consume by user_id; per-user serial processing                 │
+│  for each delivery:                                              │
+│   1. dedup (Redis SETNX, TTL 24h)                               │
+│   2. preference (Redis cache, MySQL fallback)                   │
+│   3. quiet-hours (user's IANA TZ)                               │
+│   4. rate-limit (Redis token bucket, multi-layer)               │
+│   5. template render (locale + personalization)                 │
+│   6. write inbox (Cassandra UPSERT by user_id)                  │
+│   7. enqueue channel sends                                       │
+└──┬──────────┬──────────┬──────────┬────────────────────────────┘
+   │ HTTP/2   │ HTTPS    │ HTTPS    │ HTTPS
+   ▼          ▼          ▼          ▼
+ APNs       FCM       SES/        Twilio/
+ (Apple)    (Google)  SendGrid    MessageBird
+
+SUPPORTING STORES:
+  Cassandra: notifications_inbox (PK=user_id, CK=created_at DESC)
+  Cassandra: delivery_status     (PK=event_id, retention=90d)
+  MySQL:     user_preferences, device_tokens (sharded by user_id)
+  Redis:     dedup, rate-limit, preference cache
+  S3:        long-term audit (compacted from delivery_status)
+
+FEEDBACK LOOP:
+  APNs/FCM 410/404 → token dead
+  SES SNS bounce/complaint webhooks
+  Twilio delivery callbacks
+      ↓ Kafka: feedback.events
+  Feedback processor → device_tokens (deactivate)
+                     → user_preferences (mark email undeliverable)
+</code></pre>
+<p>Partition keys, repeated explicitly:
+- <code>events.raw</code>: by <code>event_id</code> → uniform producer load.
+- <code>deliveries.queued</code>: by <code>user_id</code> → dispatcher worker can serialize per-user, batch Redis hits.
+- <code>notifications_inbox</code>: <code>user_id</code> partition, <code>created_at_ms</code> clustering DESC.
+- <code>delivery_status</code>: by <code>event_id</code> → "show me everything that happened for event X".
+- <code>device_tokens</code>: by <code>user_id</code>.</p>
+<p>This is the <strong>canonical pattern</strong>, not one product's full system. Slack, LinkedIn, Twitter, Discord, Stripe all use variations of this same shape.</p>
+<hr>
+<h2 id="7-hard-problems-inherent-to-this-technology">§7. Hard problems inherent to this technology</h2>
+<h3 id="problem-1-celebrity-fanout-one-source-100m-recipients">Problem 1: Celebrity fanout (one source, 100M recipients)</h3>
+<p>Appears in <strong>social</strong> (celebrity post), <strong>marketing</strong> (broadcast to all users), <strong>alerting</strong> (incident paging every on-call), <strong>transactional</strong> (regulatory notice to every user in a region).</p>
+<p><strong>Naïve fix</strong>: fanout-on-write to all 100M. Synchronous = post hangs for hours. Async via Kafka = queue backlogs, normal users wait.</p>
+<p><strong>Why it breaks</strong>: source publishes at T=0; fanout enqueues 100M deliveries. At 1M deliveries/sec system-wide = 100s of pure source load. Dispatcher pool sized for 200k/sec = 500s (~8 min). Normal users' events stuck behind in the same Kafka partition (if partitioned naively) or starved of dispatcher capacity.</p>
+<p><strong>Real fix</strong>: hybrid fanout-on-write + fanout-on-read with a source threshold (see §3). When <code>source.recipient_count &gt; 10k</code>, skip inbox pre-population; recipients query source's recent timeline at read time and merge.</p>
+<p>For push notifications, <strong>sample</strong> — engagement scoring drops to recipients who actually engage with this source (1-10% of total). Per-user notification budgets (≤5 push/day) further trim. Net: a celebrity post pushes to ~1M, not 100M.</p>
+<p>For marketing broadcast, <strong>shard over time</strong> — drip 100M emails over 30 minutes via a delay queue. Protects SES/SendGrid quotas; avoids overwhelming downstream IMAP servers.</p>
+<h3 id="problem-2-exactly-once-vs-at-least-once">Problem 2: Exactly-once vs at-least-once</h3>
+<p>Appears in <strong>payments</strong> (don't double-send receipts), <strong>2FA</strong> (don't send two codes), <strong>alerting</strong> (don't page on-call twice), <strong>social</strong> (don't double-notify "Alice replied").</p>
+<p><strong>Naïve fix</strong>: distributed locking or 2PC (Two-Phase Commit) between dispatcher and APNs.</p>
+<p><strong>Why it breaks</strong>: APNs is external; cannot participate in 2PC. APNs returns 200 → maybe delivered, maybe APNs crashed. Even if APNs ACKs at T=80ms, dispatcher could crash at T=81 before recording DELIVERED — on restart, reprocess from Kafka offset, dispatch again, two pushes.</p>
+<p><strong>Real fix</strong>: at-least-once delivery, idempotency at the <strong>device level</strong>.
+- Device-side dedup via <code>apns-collapse-id</code> / FCM <code>collapse_key</code>: pushes with same collapse ID supersede; user sees one banner.
+- Inbox idempotency by <code>event_id</code> (Cassandra UPSERT): row written once regardless of retries.
+- For transactional events (password reset, payment receipts), producer attaches <code>idempotency_key</code>; same key within 24h returns the same delivery. Stripe's receipt pipeline does this.</p>
+<p>For most non-transactional notifications, at-least-once + device-side dedup is correct; exactly-once is the wrong goal.</p>
+<h3 id="problem-3-cross-channel-ordering">Problem 3: Cross-channel ordering</h3>
+<p>Appears in <strong>chat</strong> (1→3→7 unread; user must see "7", not "1"), <strong>alerting</strong> (alert open → resolved; user must not see "resolved" first), <strong>e-commerce</strong> (placed → shipped → delivered).</p>
+<p><strong>Naïve fix</strong>: rely on Kafka partition ordering by <code>user_id</code>.</p>
+<p><strong>Why it breaks</strong>: T=10 "1 new message" and T=12 "3 new messages" both in same partition. Fanout reads in order; dispatcher reads in order. But dispatcher splits each into push/email/in-app. Push #1 queued behind 50 others on connection A; push #2 lands on idle connection B. Phone receives "3" at T=15, "1" at T=17.</p>
+<p><strong>Real fix</strong>:
+1. Deterministic per-<code>(user_id, channel)</code> shard inside the dispatcher so all pushes for user 42 go through the same APNs router — FIFO per user.
+2. <code>apns-collapse-id</code> / <code>collapse_key</code>: newer state supersedes older on the device. Wire-order wrong → device still shows latest.
+3. Inbox Cassandra clustering by <code>created_at_ms</code> guarantees chronological order regardless of dispatch parallelism, provided each row carries the <strong>event's</strong> timestamp, not dispatcher's write time.</p>
+<p>App-layer per-user serialization + device collapse_id + storage event-time ordering = effective in-channel ordering.</p>
+<h3 id="problem-4-multi-layer-rate-limiting-and-spam-prevention">Problem 4: Multi-layer rate limiting and spam prevention</h3>
+<p>Appears in <strong>marketing</strong> (campaign quota), <strong>transactional</strong> (don't blast 50 receipts for 50 retries), <strong>alerting</strong> (alert flapping → suppression), <strong>social</strong> (mass-tag spam).</p>
+<p><strong>Naïve fix</strong>: trust producers to rate-limit themselves.</p>
+<p><strong>Why it breaks</strong>: producer bug retries in a loop, sends 10k events for one user. Each → ~5 notifications. User spammed, uninstalls.</p>
+<p><strong>Real fix</strong>: multi-layer rate limit at the dispatcher.</p>
+<pre><code>Layer 1: per-user, per-channel:   5 push/min, 10 push/hr
+Layer 2: per-user, per-type:      3 NEW_FOLLOWER/day
+Layer 3: per-user global cap:     20 notif/day across channels
+Layer 4: per-campaign kill switch (operator-controlled)
+Layer 5: provider circuit breaker (APNs/FCM err &gt; 5% → open)
+</code></pre>
+<p>Each = Redis token bucket; Lua script atomically checks-and-decrements. Rejection records <code>RATE_LIMITED_LAYER_2</code> in <code>delivery_status</code>.</p>
+<p>Deeper anti-spam: rolling <strong>notification quality score</strong> — high open-rate types count cheaper; low-engagement throttled harder. Feedback from <code>feedback.events</code> → preference scoring.</p>
+<h3 id="problem-5-time-zone-aware-quiet-hours">Problem 5: Time-zone-aware quiet hours</h3>
+<p>Appears in <strong>marketing</strong> (don't email at 3am local), <strong>social</strong> ("liked your post" deferred while chat always allowed), <strong>alerting</strong> (low-severity deferred to on-call's quiet hours).</p>
+<p><strong>Naïve fix</strong>: store quiet hours as UTC offsets; check <code>now_utc</code>.</p>
+<p><strong>Why it breaks</strong>: user in Tokyo (UTC+9), quiet hours "22:00-08:00 local". Storing as UTC = "13:00-23:00". User flies to NY (UTC-5); same local hours, but UTC now "03:00-13:00". UTC representation requires updating on travel.</p>
+<p><strong>Real fix</strong>:
+- Store TZ as IANA name (<code>Asia/Tokyo</code>). App SDK refreshes on device-tz change.
+- Store quiet hours as local time (<code>{start_local: "22:00", end_local: "08:00"}</code>).
+- Dispatcher computes <code>now_in_user_tz</code>. If in window: schedule for end via delay queue (Redis ZSET, scheduler polls due items, re-enqueues).</p>
+<p>DST (Daylight Saving Time) handled by the IANA TZ database. Edge case: traveler crossing zones may briefly experience inconsistencies; accept this.</p>
+<h3 id="problem-6-unsubscribe-propagation-latency">Problem 6: Unsubscribe propagation latency</h3>
+<p>Appears in <strong>marketing</strong> (GDPR/CAN-SPAM legal violation), <strong>transactional</strong> (user opts out of receipts), <strong>social</strong> (user mutes thread).</p>
+<p><strong>Naïve fix</strong>: write to MySQL, let cache TTL (60s) catch up.</p>
+<p><strong>Why it breaks</strong>: user unsubscribes at T=0. Notification fires at T=10; dispatcher reads stale cache; sends. For regulated channels, legal violation.</p>
+<p><strong>Real fix</strong>:
+1. Unsubscribe API writes MySQL AND <code>DEL prefs:{user_id}</code> in Redis. Next read fresh.
+2. Publish <code>unsubscribe.events</code> to Kafka. Fanout-side consumer updates an in-memory bloom filter; system stops creating deliveries for that user.
+3. For in-flight in <code>deliveries.queued</code>: dispatcher re-checks preferences at dispatch time after the Redis DEL.</p>
+<p>Combined: median propagation &lt;500ms; worst case &lt;5s.</p>
+<hr>
+<h2 id="8-failure-mode-walkthrough">§8. Failure mode walkthrough</h2>
+<h3 id="81-dispatcher-crashes-mid-processing">8.1. Dispatcher crashes mid-processing</h3>
+<p>Dispatcher consumed event from Kafka, wrote inbox to Cassandra, ENQUEUED push to APNs router, then crashed before committing Kafka offset.</p>
+<p>Recovery:
+- Kafka consumer restarts from last committed offset.
+- Reprocesses event.
+- Inbox INSERT: idempotent on (user_id, event_id) → no double row.
+- Push to APNs: redispatched; APNs receives duplicate; <code>apns-collapse-id</code> suppresses second banner on device.
+- <code>delivery_status</code> UPSERT; end state DELIVERED.</p>
+<p><strong>Durability point</strong>: Kafka offset. Commit only after Cassandra write AND APNs send return success. Commit too early = lose work; too late = duplicate work (at-least-once contract handles this).</p>
+<h3 id="82-apns-throttling-unavailable">8.2. APNs throttling / unavailable</h3>
+<p>APNs returns 429 / 503. Circuit breaker on APNs router opens if 429/503 rate &gt; 5% over 30s. Open: stop sending; HTTP/2 connections idle but open. Half-open after 30s: 10 test pushes; if 9/10 succeed → close.</p>
+<p>While open: pushes queue in <code>deliveries.apns.retry</code>. After recovery, drain at 20% capacity, ramp up. Inbox already written; user sees on next app open. If push was the only channel and freshness window exceeded (e.g., chat &gt;1h), escalate to email/SMS if opted in.</p>
+<h3 id="83-device-token-rotation">8.3. Device token rotation</h3>
+<p>User reinstalls app → old token dead. APNs returns 410 Gone; FCM returns 404 or 200 with <code>NOT_REGISTERED</code>.</p>
+<p>Dispatcher publishes <code>feedback.events: { TOKEN_DEAD, ... }</code>. Feedback processor: <code>UPDATE device_tokens SET active=FALSE WHERE token=?</code>. Next push for that user: active=TRUE filter excludes it. Weekly cleanup hard-deletes tokens inactive &gt;30d. Reinstalled app registers new token via <code>POST /devices</code> on first launch.</p>
+<h3 id="84-bad-email-but-good-push">8.4. Bad email but good push</h3>
+<p>SES bounce → SNS webhook → <code>feedback.events: { EMAIL_BOUNCE, hard }</code>. <code>UPDATE user_emails SET bounced=TRUE</code>; preference cache evicted; future notifications skip email; push and in-app continue. In-app banner asks user to update.</p>
+<p>Soft bounces (mailbox full): retry with backoff (1h, 4h, 24h); 3 soft → treat as hard.</p>
+<h3 id="85-cassandra-node-death">8.5. Cassandra node death</h3>
+<p>Cluster continues at effective RF=2 for partitions on that node. Operator runs <code>nodetool removenode</code>, adds fresh node. New node bootstraps: gossips, gets token range, streams from surviving 2 replicas (~hours for 1TB). During bootstrap, writes go to new node AND old replicas; reads use old replicas until bootstrap completes.</p>
+<p><strong>Durability point</strong>: RF=3 with QUORUM. Losing 1 of 3 ≠ losing data.</p>
+<h3 id="86-kafka-broker-death-leadership-change">8.6. Kafka broker death / leadership change</h3>
+<p>Standard Kafka recovery: ISR (in-sync replica) promoted; producers re-discover leader; consumers continue from last committed offset. Producers idempotent via <code>event_id</code>; a retry after leader change does not double-create (dedup layer catches it).</p>
+<h3 id="87-network-partition-split-brain">8.7. Network partition (split-brain)</h3>
+<p>Cassandra is AP. 3-replica partition splits 2+1; majority side serves QUORUM reads/writes; minority refuses writes. On heal: hinted handoff + read-repair.</p>
+<p>Kafka uses controller quorum (KRaft/ZooKeeper). Minority brokers lose leadership; producers redirect to majority. No split-brain.</p>
+<p>Dispatcher pods on the minority side stall as local Kafka loses leadership. No double-delivery thanks to dedup.</p>
+<hr>
+<h2 id="9-why-not-sync-in-handler-fanout">§9. Why not sync in-handler fanout?</h2>
+<p>The naïve alternative: when the producer service handles its request (Alice posts), the same handler synchronously calls APNs/SES/Twilio for every recipient before returning.</p>
+<ul>
+<li>T=0: Alice POSTs a status update.</li>
+<li>T=1ms: feed-service inserts post. Resolves 5,000 followers, 3 devices each.</li>
+<li>T=2ms: Handler issues 15,000 HTTP/2 streams to APNs. Each ~100ms p99.</li>
+<li>With 1000 concurrent → 15 batches × 100ms = 1500ms synchronous wait. Alice sees a 1.5s spinner for what should be a 50ms post. If APNs hiccups, her post times out at 5s.</li>
+</ul>
+<p>Celebrity case: @cristiano with 100M followers → 100,000 batches × 100ms = 10,000s = 2.8 hours. Tweet "didn't post" (timeout).</p>
+<p>The naïve version conflates the <strong>write path</strong> with the <strong>fanout path</strong>:
+- <strong>Write path</strong>: synchronous, ms-budget, only writes Alice's post + emits an event to Kafka.
+- <strong>Fanout path</strong>: asynchronous, seconds-to-minutes budget, handles N-recipient expansion offline.</p>
+<p>It also has no rate limiting, dedup, retry, quiet hours, preference check, inbox persistence. Every one of these is forced into the architecture once fanout is off the critical path. Same logic for transactional 1:1: even a payment receipt should not put SES latency on the payment API. Decouple producer from delivery via a queue, always.</p>
+<hr>
+<h2 id="10-scaling-axes">§10. Scaling axes</h2>
+<h3 id="type-1-uniform-expansion-more-users-same-rate-per-user">Type 1: uniform expansion (more users, same rate per user)</h3>
+<table>
+<thead>
+<tr>
+<th>Scale</th>
+<th>Topology</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1M users (~5k/sec)</td>
+<td>Single MySQL + read replicas; 3-broker Kafka; single Redis.</td>
+</tr>
+<tr>
+<td>10M (~50k/sec)</td>
+<td>Shard MySQL (4); Kafka 20 brokers; Redis cluster (8); introduce Cassandra inbox.</td>
+</tr>
+<tr>
+<td>100M (~500k/sec)</td>
+<td>Cassandra 64 nodes; Kafka 100 brokers; Redis 32; ~500 APNs/FCM conns; multi-region.</td>
+</tr>
+<tr>
+<td>1B (~5M/sec)</td>
+<td>Per-region Cassandra with async cross-region replication; Kafka MirrorMaker; per-region dispatcher pool.</td>
+</tr>
+</tbody>
+</table>
+<p>Inflection points:
+- ~10M: shard MySQL preference table.
+- ~50M: move inbox off MySQL onto Cassandra/LSM.
+- ~200M: per-region deployment (APAC↔US latency too high for single-region fanout).
+- ~500M: introduce hybrid fanout because follower distribution has heavy-tail outliers.</p>
+<h3 id="type-2-hotspot-intensification-same-entities-more-rate-per-entity">Type 2: hotspot intensification (same entities, more rate per entity)</h3>
+<p>The harder axis — celebrity going viral, campaign blasting all users, alert storm.</p>
+<table>
+<thead>
+<tr>
+<th>Scale</th>
+<th>Topology change</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Max fanout 10k</td>
+<td>Fanout-on-write universal.</td>
+</tr>
+<tr>
+<td>100k</td>
+<td>Add per-partition load shedding so high-fanout event doesn't starve same Kafka partition.</td>
+</tr>
+<tr>
+<td>1M</td>
+<td>Celebrity threshold + hybrid fanout. Above-threshold = fanout-on-read for inbox; push limited to engaged recipients.</td>
+</tr>
+<tr>
+<td>10M</td>
+<td>Engagement sampling for push (top-K engaged based on past interaction).</td>
+</tr>
+<tr>
+<td>100M (Cristiano scale)</td>
+<td>Engagement sampling + per-user budget enforcement. Even if 10M "want" the push, per-user-per-day cap ≤5 means most never receive this specific event.</td>
+</tr>
+<tr>
+<td>1B (hypothetical)</td>
+<td>Shard source's own timeline by <code>(source_id, hour_bucket)</code> so reading last 24h doesn't hit one Cassandra partition.</td>
+</tr>
+</tbody>
+</table>
+<p>Inflection points: 10k = celebrity threshold (the Twitter moment, ~2010-2012); 1M = engagement sampling; 100M = source-timeline sharding.</p>
+<p>Type 2 is harder because it doesn't show in averages. p50 fine; only the celebrity's post or their followers' inbox loads show pain. Need percentile-by-source-size monitoring.</p>
+<hr>
+<h2 id="11-decision-matrix">§11. Decision matrix</h2>
+<h3 id="fanout-pattern">Fanout pattern</h3>
+<table>
+<thead>
+<tr>
+<th>Approach</th>
+<th>Pros</th>
+<th>Cons</th>
+<th>Pick when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Fanout-on-write</strong></td>
+<td>Read O(1). Predictable inbox latency. Scales horizontally with replica count.</td>
+<td>Write O(F). Celebrity write storms. Storage = F × content.</td>
+<td>Median fanout &lt; 10k; transactional 1:1; read latency tight.</td>
+</tr>
+<tr>
+<td><strong>Fanout-on-read</strong></td>
+<td>Write O(1). Celebrity-friendly. Storage 1×.</td>
+<td>Read O(F'). Cache misses cascade. Inbox latency variable.</td>
+<td>Write-heavy; long-tail fanout; tolerable read latency.</td>
+</tr>
+<tr>
+<td><strong>Hybrid</strong></td>
+<td>Best of both.</td>
+<td>Two code paths + merge logic; threshold tuning.</td>
+<td>Any non-trivial social/multi-source system. <strong>Default pick.</strong></td>
+</tr>
+<tr>
+<td><strong>Polling-only</strong></td>
+<td>Trivial backend. No APNs/FCM dependency.</td>
+<td>Bad UX. Server load ∝ active user count.</td>
+<td>Internal admin tools only.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="channel-choice-per-notification-type">Channel choice (per notification type)</h3>
+<table>
+<thead>
+<tr>
+<th>Channel</th>
+<th>Latency</th>
+<th>Cost / send</th>
+<th>Reliability</th>
+<th>Reach</th>
+<th>Pick for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Push (APNs/FCM)</strong></td>
+<td>~300ms</td>
+<td>~free</td>
+<td>~95% (device may be off)</td>
+<td>App-installed users</td>
+<td>Real-time engagement, chat, alerts.</td>
+</tr>
+<tr>
+<td><strong>In-app inbox</strong></td>
+<td>App-open</td>
+<td>~free</td>
+<td>100%</td>
+<td>App-installed users</td>
+<td>Source of truth; user can review later.</td>
+</tr>
+<tr>
+<td><strong>Email (SES/SendGrid)</strong></td>
+<td>seconds-minutes</td>
+<td>~$0.0001</td>
+<td>~99% (clean senders)</td>
+<td>Universal</td>
+<td>Long-form; transactional receipts; marketing.</td>
+</tr>
+<tr>
+<td><strong>SMS (Twilio)</strong></td>
+<td>seconds</td>
+<td>~$0.01</td>
+<td>~95-99%</td>
+<td>Universal</td>
+<td>2FA codes, high-urgency, OTP.</td>
+</tr>
+<tr>
+<td><strong>Voice call (Twilio)</strong></td>
+<td>seconds</td>
+<td>~$0.02</td>
+<td>Variable</td>
+<td>Universal</td>
+<td>Critical alerts (PagerDuty escalation).</td>
+</tr>
+<tr>
+<td><strong>Web push</strong></td>
+<td>seconds</td>
+<td>~free</td>
+<td>~80% (browser caveats)</td>
+<td>Web users</td>
+<td>Browser engagement when app isn't installed.</td>
+</tr>
+<tr>
+<td><strong>Chat-app delivery (WhatsApp Business, iMessage Business)</strong></td>
+<td>seconds</td>
+<td>~$0.01-0.05</td>
+<td>High</td>
+<td>Region-dependent</td>
+<td>Where SMS is expensive/blocked.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="build-vs-buy">Build vs buy</h3>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Pick</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&lt; 10 notif/sec</td>
+<td>Buy (OneSignal, Iterable, Knock, Courier)</td>
+<td>Fanout problem doesn't exist yet.</td>
+</tr>
+<tr>
+<td>10–1k notif/sec</td>
+<td>Mostly buy, build glue</td>
+<td>Managed platform handles channels; you write preference + dedup.</td>
+</tr>
+<tr>
+<td>1k–100k notif/sec</td>
+<td>Build platform, rent channels</td>
+<td>Platform owns fanout, dedup, scheduling. APNs mandatory; SES/Twilio replaceable.</td>
+</tr>
+<tr>
+<td>100k+ notif/sec</td>
+<td>Build platform, rent channels with failover</td>
+<td>Add SES + SendGrid redundancy; Twilio + MessageBird for SMS.</td>
+</tr>
+<tr>
+<td>1M+ notif/sec</td>
+<td>Build everything custom; persistent-connection tier in Erlang/Go</td>
+<td>WhatsApp scale; vendor pricing dominates.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Defensible answer</strong>: at most companies, <strong>build the platform, rent the channels</strong>. APNs is irreducible (Apple controls the device); SES/Twilio are replaceable adapters.</p>
+<hr>
+<h2 id="12-use-case-gallery-different-domains-same-tech">§12. Use case gallery (different domains, same tech)</h2>
+<p><strong>Social feed/notifications</strong> (Twitter, Facebook, LinkedIn, Instagram, Snap): high-fanout, skewed follower distribution. Push-heavy with in-app inbox as source of truth. Engagement filtering critical (~1% of candidate notifications actually delivered). Hybrid fanout-on-write/read indispensable above ~10k followers. Push <code>collapse_id</code> used for "you have N new likes" coalescing.</p>
+<p><strong>Chat</strong> (WhatsApp, Slack, Discord, iMessage): persistent connection for in-app; APNs/FCM for offline. Per-message push for 1:1; per-thread for groups. Coalescing critical ("12 new messages in 'team-android'", not 12 banners). WhatsApp runs Erlang VMs holding millions of persistent sockets; the notification system is per-recipient routing on top. Slack/Discord support per-channel mute, do-not-disturb, keyword highlights — enforced at the dispatcher.</p>
+<p><strong>Transactional emails</strong> (Stripe receipts, GitHub PR notifications, AWS billing): 1:1 fanout. Idempotency mandatory (don't double-send a $100 receipt). Email-heavy. Webhook callbacks (Stripe Connect) hang off the same pipeline. SES + SendGrid as redundant providers. Audit retention: 7 years for financial.</p>
+<p><strong>Marketing campaigns</strong> (Mailchimp, Iterable, Braze, Klaviyo): multi-million-recipient broadcast. Sharded over time (drip over 30 min, not instant blast). Per-recipient personalization. CAN-SPAM/GDPR unsubscribe propagation. A/B testing on top. Multi-channel orchestration (email → SMS reminder if no open in 24h).</p>
+<p><strong>Alert delivery</strong> (PagerDuty, Opsgenie, VictorOps, Datadog): low-volume, high-urgency, on-call routing. Escalation policies (SMS → call → manager after 5 min). Multi-channel mandatory (don't rely on push alone for "production down at 3am"). Acknowledgment loop ("ACK" via SMS reply cancels the page). Quiet hours bypassed for sev-1.</p>
+<p><strong>2FA SMS</strong> (Twilio Verify, Authy, Okta): 1:1 code delivery. Sub-second latency required (users abandon if &gt;30s). Idempotency at the request level (don't send 3 codes if user clicks "send code" 3 times — rate-limit and return cached code). Per-region carrier-quality routing.</p>
+<p><strong>In-game notifications</strong> (Riot, Epic, Blizzard): mix of in-app (player got an item) and push (your tournament starts in 5 min). Real-time persistent connection for in-game events; APNs/FCM for offline. Per-tournament fanout. Heavy use of <code>collapse_id</code> for "5 new gifts" rollup.</p>
+<p><strong>E-commerce order updates</strong> (Amazon, Shopify merchants, DoorDash): multi-stage transactional (placed → confirmed → shipped → out-for-delivery → delivered). Cross-channel orchestration (email receipt, push "package nearby", SMS "delivery attempt failed"). Idempotency on order_id.</p>
+<hr>
+<h2 id="13-real-world-implementations-with-numbers">§13. Real-world implementations with numbers</h2>
+<ul>
+<li><strong>Twitter Timeline fanout</strong>: flipped from fanout-on-write to hybrid around <strong>2010-2012</strong> after celebrity accounts (Lady Gaga, Justin Bieber crossing 10M+) caused write storms. Documented in Twitter eng blog and "Designing Data-Intensive Applications" Ch. 1. Current threshold reportedly ~<strong>1M followers</strong> above which fanout-on-read for inbox.</li>
+<li><strong>Facebook notifications</strong>: ~<strong>10B+ notifications/day</strong> across push, email, in-app — ~115k notif/sec sustained, peaks 5-10x. Internal service "Notify". Multi-tier fanout with engagement filtering — only ~1-5% of candidate notifications actually delivered. Cassandra-based inbox.</li>
+<li><strong>LinkedIn ATC (Air Traffic Controller)</strong>: 1B+ users; <strong>5-50B notification deliveries/day</strong>. Kafka → dispatcher (preference + rate-limit) → APNs/FCM/SES. Inbox stored in <strong>Espresso</strong> (LinkedIn's sharded distributed DB on MySQL). Documented in LinkedIn engineering blog "Air Traffic Controller for notifications".</li>
+<li><strong>WhatsApp</strong>: <strong>100B+ messages/day</strong> = ~1.16M msgs/sec sustained, multi-million/sec peak. Each potentially a push. Custom Erlang VMs handle millions of persistent connections; APNs/FCM for offline.</li>
+<li><strong>Snap</strong>: ~10B snaps/day at peak. Pipeline on AWS (DynamoDB + SQS + SNS), custom dedup and engagement filtering.</li>
+<li><strong>Discord</strong>: ~4B+ events/day. One of the largest Cassandra deployments — "How Discord Stores Trillions of Messages". Per-user partition with rolling time-bucket clustering.</li>
+<li><strong>Slack</strong>: Kafka + custom dispatcher + SES/APNs/FCM. ~25M DAU. Custom mute/DND/keyword logic at the dispatcher.</li>
+<li><strong>PagerDuty</strong>: hundreds of millions of alerts/year. SMS + voice + push + email + escalation. &lt;10s p99 alert-to-page. Twilio for SMS/voice; APNs/FCM for push.</li>
+<li><strong>Mailchimp</strong>: ~<strong>1.5B marketing emails/day</strong>. Custom SMTP fleet (SES insufficient at this scale) plus reputation-management infrastructure. Multi-stage sending (warm-up, ramp).</li>
+<li><strong>Stripe</strong>: ~10M+ transactional emails/day. SES + SendGrid redundancy. Idempotency mandatory on every receipt.</li>
+</ul>
+<hr>
+<h2 id="14-email-deliverability-deep-dive">§14. Email deliverability deep dive</h2>
+<p>Sending an email through SES (Simple Email Service) or SendGrid is the easy part. Getting that email to land in the recipient's <strong>inbox</strong> instead of the spam folder — at scale, sustainably, across Gmail / Outlook / Yahoo Mail / corporate mail servers — is the hard part. This is the <strong>deliverability</strong> discipline, and it's invisible to most engineers until 90% of a campaign lands in spam.</p>
+<p>The substrate rests on three authentication standards, layered: SPF, DKIM, DMARC. Then on top of that: sender reputation (per-IP, per-domain), feedback loops, and warm-up regimens. Without all of these, a high-volume sender is treated like a spammer by default.</p>
+<h3 id="141-spf-sender-policy-framework">14.1. SPF — Sender Policy Framework</h3>
+<p>SPF (Sender Policy Framework, expanded) is a DNS TXT record on your sending domain that lists which IPs are allowed to send mail purporting to be from that domain. A receiving MTA (Mail Transfer Agent) checks: the connecting SMTP server's IP is <code>1.2.3.4</code>; the <code>MAIL FROM</code> envelope is <code>bounce@example.com</code>; the receiver looks up <code>example.com TXT</code> and sees:</p>
+<pre><code>example.com.  IN  TXT  &quot;v=spf1 ip4:54.240.0.0/18 include:_spf.mailprovider.com -all&quot;
+</code></pre>
+<p><code>-all</code> (hardfail) means "if the connecting IP isn't in this list, reject." <code>~all</code> (softfail) means "accept but mark suspicious." Most large senders use <code>-all</code> because softfail is treated as spam-leaning by Gmail anyway.</p>
+<p>The footgun: SPF only validates the <strong>envelope <code>MAIL FROM</code></strong> (the bounce address), not the <strong>header <code>From:</code></strong> the user sees. A spammer can pass SPF for <code>bounce.spammer.com</code> while showing <code>From: ceo@yourbank.com</code> in the visible header — SPF doesn't protect against that. This is why SPF alone isn't enough; you need DKIM and DMARC layered on top.</p>
+<h3 id="142-dkim-domainkeys-identified-mail">14.2. DKIM — DomainKeys Identified Mail</h3>
+<p>DKIM (DomainKeys Identified Mail, expanded) signs the email <strong>body + selected headers</strong> with a private key. The recipient fetches the public key from DNS at <code>selector._domainkey.example.com</code> and verifies the signature. If the body or signed headers were modified in transit, the signature fails.</p>
+<p>Wire mechanics: the outgoing MTA inserts a <code>DKIM-Signature:</code> header:</p>
+<pre><code>DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+    d=example.com; s=s2025;
+    h=from:to:subject:date:message-id;
+    bh=MTIzNDU2Nzg5MGFiY2RlZg==;
+    b=Dw1z8e7K6L3M2N1O5P4Q9R8S7T6U5V4W3X2Y1Z0A9B8C7D6E5F4G3H2I1J0...
+</code></pre>
+<ul>
+<li><code>d=</code> signing domain</li>
+<li><code>s=</code> selector — lets you rotate keys (<code>s2025</code> this year, <code>s2026</code> next year) without breaking older messages</li>
+<li><code>h=</code> headers covered</li>
+<li><code>bh=</code> body hash</li>
+<li><code>b=</code> signature</li>
+</ul>
+<p>Verifier looks up <code>s2025._domainkey.example.com TXT</code> → public RSA key (or Ed25519 for newer setups). RFC 8463 allows Ed25519-SHA256.</p>
+<p>Footgun: relaxed canonicalization (<code>c=relaxed/relaxed</code>) is the default because mail servers fiddle with whitespace; <strong>simple/simple</strong> breaks under most relays. Body hashes computed over <code>Content-Transfer-Encoding</code>-decoded body, with line-ending normalization; getting this wrong = "I see no problem, but Gmail rejects every message."</p>
+<p>Key rotation: every 6-12 months. New keypair, new selector, publish public key, switch signing, retire old selector after 1 month of no signed messages. Some compliance regimes require quarterly rotation.</p>
+<h3 id="143-dmarc-domain-based-message-authentication-reporting-and-conformance">14.3. DMARC — Domain-based Message Authentication, Reporting, and Conformance</h3>
+<p>DMARC (Domain-based Message Authentication, Reporting, and Conformance, expanded) ties SPF + DKIM together and adds a <strong>policy + reporting</strong> layer. The receiver checks: did SPF pass AND was the SPF domain "aligned" with the visible <code>From:</code> domain? Did DKIM pass with a signing <code>d=</code> aligned with <code>From:</code>? If either authenticated-and-aligned check passes, DMARC passes. If both fail, apply policy.</p>
+<p>DNS record:</p>
+<pre><code>_dmarc.example.com.  IN  TXT  &quot;v=DMARC1; p=reject; rua=mailto:dmarc-agg@example.com;
+                               ruf=mailto:dmarc-forensic@example.com; pct=100; aspf=s; adkim=s&quot;
+</code></pre>
+<ul>
+<li><code>p=none</code> (monitor only — start here)</li>
+<li><code>p=quarantine</code> (spam folder)</li>
+<li><code>p=reject</code> (drop entirely)</li>
+<li><code>rua=</code> aggregate report (daily XML summary of who tried to send as you)</li>
+<li><code>ruf=</code> forensic per-message reports (rare, privacy-sensitive)</li>
+<li><code>aspf=s, adkim=s</code> strict alignment — <code>subdomain.example.com</code> doesn't satisfy alignment for <code>example.com</code>. Most senders relax this with <code>r</code>.</li>
+</ul>
+<p>Operationalization sequence: start <code>p=none</code> for 30-60 days; analyze <code>rua</code> reports for forgotten legitimate senders (marketing tool, HR vendor, finance ERP); add them to SPF / DKIM; tighten to <code>p=quarantine</code>; finally <code>p=reject</code>. Some Fortune-500s take 18 months to reach <code>p=reject</code> because of the "shadow IT" that emails as their domain.</p>
+<p>The disaster scenario: a financial firm at <code>p=none</code> discovers, via DMARC reports, that 40k phishing emails/day are being sent claiming to be from them. They tighten to <code>p=reject</code> overnight — and discover their HR vendor sending password-reset emails was never SPF-aligned. Password resets bounce. The fix: <code>p=reject</code> requires complete inventory of legitimate senders <strong>first</strong>.</p>
+<h3 id="144-sender-reputation-per-ip-and-per-domain">14.4. Sender reputation — per-IP and per-domain</h3>
+<p>Gmail, Outlook, Yahoo each maintain internal reputation scores for every sending IP and every sending domain. Inputs:
+- bounce rate (&gt;5% over 24h = bad)
+- spam complaint rate (&gt;0.1% = bad; this is the "this is spam" button)
+- spamtrap hits (mail to addresses that aren't real users — used by anti-spam vendors to catch list buyers)
+- engagement signals (opens, replies, "not spam" clicks)
+- volume consistency (sudden 10x spike from a new IP = suspicious)</p>
+<p>Gmail's <strong>Postmaster Tools</strong> exposes per-domain reputation as <code>High / Medium / Low / Bad</code>. Microsoft's <strong>SNDS</strong> (Smart Network Data Services) gives per-IP reputation. Yahoo has limited but functional feedback loops.</p>
+<p>Bad reputation = silent throttling. You send 1M emails, MTAs return 250 OK on every one, but only 200k actually reach the inbox. The other 800k go to spam, or "deliverability throttling" where Gmail accepts at 10% rate. No error — just slow delivery and bad open rates.</p>
+<h3 id="145-warm-up-of-new-sending-ips">14.5. Warm-up of new sending IPs</h3>
+<p>A brand-new IP with zero history sending 1M emails on day 1 → treated as a spam attack by every receiver. The standard warm-up regimen:</p>
+<pre><code>Day 1:    100 emails
+Day 2:    200
+Day 3:    500
+Day 4:    1,000
+Day 5:    2,000
+Week 2:   10,000-20,000/day
+Week 3:   50,000-100,000/day
+Week 4:   200,000-500,000/day
+Week 5+:  ramp to target volume; multiple IPs in pool
+</code></pre>
+<p>During warm-up, send only to <strong>highly engaged users</strong> (users who recently opened mail) so engagement signals look good. Mix transactional (high engagement) with marketing. Monitor Postmaster Tools daily. Pause if reputation slips.</p>
+<p>The "we sent 1M emails from a cold IP and 90% went to spam" disaster: a startup launches its marketing campaign on a fresh Mailgun IP, blasts 1M users they have addresses for (including dormant addresses from years ago). Result: 8% bounce rate, 2% complaint rate, IP blacklisted at Spamhaus, all future mail blocked. Recovery: weeks of remediation, often impossible — you abandon the IP and start over.</p>
+<p>Established sending platforms (SES, SendGrid, Mailgun) maintain warmed-up IP pools and round-robin new tenants onto them, but if you reserve dedicated IPs, you own the warm-up.</p>
+<h3 id="146-feedback-loops-and-bounce-processing">14.6. Feedback loops and bounce processing</h3>
+<ul>
+<li><strong>Hard bounce</strong>: permanent failure (<code>550 5.1.1 User unknown</code>). Suppress immediately. Re-sending hard bounces = spam signal.</li>
+<li><strong>Soft bounce</strong>: temporary (<code>450 4.2.1 Mailbox full</code>). Retry with backoff (1h, 4h, 24h, 72h). 3-5 consecutive soft bounces = treat as hard.</li>
+<li><strong>Complaint (FBL — feedback loop)</strong>: receiver tells you "user marked this as spam." AOL, Yahoo, Microsoft offer FBL programs. Gmail doesn't expose per-message, only aggregate reputation. Process: receiver POSTs an ARF (Abuse Reporting Format) message to your registered endpoint. Suppress that recipient immediately.</li>
+<li><strong>Unsubscribe</strong>: see §17.</li>
+</ul>
+<p>Bounce processing must update the <code>user_emails.bounced=TRUE</code> flag and propagate to caches within seconds. A common bug: bounces processed by a nightly batch job → 24-hour window where bouncing addresses keep getting retried → reputation tanks.</p>
+<hr>
+<h2 id="15-sms-economics-and-carrier-filtering">§15. SMS economics and carrier filtering</h2>
+<p>SMS looks like the same primitive as push, but the economics, regulation, and delivery mechanics are fundamentally different. Push is essentially free (you pay for infrastructure, not per-message); SMS costs money per message and is regulated as a common-carrier service.</p>
+<h3 id="151-per-message-cost">15.1. Per-message cost</h3>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>US (rough)</th>
+<th>Mexico</th>
+<th>UK</th>
+<th>Brazil</th>
+<th>India</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Twilio</td>
+<td>$0.0075-$0.0085</td>
+<td>$0.03-$0.05</td>
+<td>$0.04</td>
+<td>$0.05-$0.08</td>
+<td>$0.02-$0.04</td>
+</tr>
+<tr>
+<td>AWS SNS</td>
+<td>$0.00645</td>
+<td>$0.05+</td>
+<td>$0.0468</td>
+<td>$0.06+</td>
+<td>$0.04+</td>
+</tr>
+<tr>
+<td>MessageBird</td>
+<td>$0.007</td>
+<td>$0.04</td>
+<td>$0.04</td>
+<td>$0.07</td>
+<td>$0.03</td>
+</tr>
+</tbody>
+</table>
+<p>At LinkedIn / Twitter scale (~10M SMS/day for 2FA + alerts), SMS cost = $75k+/day = $27M+/year. Optimization battle:
+- Route via cheapest provider per country (Twilio US, MessageBird EU, regional providers in Latin America).
+- For 2FA, prefer <strong>authenticator app</strong> or <strong>email</strong> when possible — push for app adoption.
+- Negotiate volume tiers (Twilio gives ~30-40% discount at 100M+/month).</p>
+<p>International ranges from $0.02 (most of EU) to $0.20+ (premium destinations like Cuba, North Korea, satellite). Some countries (China, India) have aggressive operator filtering that loses 20%+ of messages with no refund.</p>
+<h3 id="152-short-codes-vs-long-codes-vs-toll-free-vs-alphanumeric">15.2. Short codes vs long codes vs toll-free vs alphanumeric</h3>
+<p><strong>Long codes</strong> (regular 10-digit phone numbers, e.g., +1-415-555-0100): cheap to provision, but throughput-limited (~1 message/sec/number in US under "A2P 10DLC", below). Used for transactional 1:1, replies, customer support.</p>
+<p><strong>Short codes</strong> (5-6 digits, e.g., 32665 = "FBOOK"): $500-$1000/month per code, throughput up to 100+ messages/sec, pre-approved by carriers for high-volume traffic. Mandatory for marketing in US. Approval takes 4-8 weeks (carriers vet the use case). Highly trusted; messages rarely filtered.</p>
+<p><strong>Toll-free SMS</strong> (e.g., +1-800-...): middle ground. Approved by Toll-Free Messaging Verification (TFMV) process. Up to 10-25 msg/sec. Used for transactional + light marketing.</p>
+<p><strong>Alphanumeric sender ID</strong> (e.g., "Uber", "Stripe" as sender name, not a number): supported in most of EU, India, Brazil. Not supported in US, Canada (US replies-by-text break — there's no number to reply to). Pre-registration required per-country; alphanumeric IDs are blocked in countries where unregistered.</p>
+<h3 id="153-carrier-filtering-and-a2p-10dlc">15.3. Carrier filtering and A2P 10DLC</h3>
+<p>US carriers (AT&amp;T, Verizon, T-Mobile) aggressively filter messages they think look like spam, phishing, prohibited content (gambling, cannabis, predatory loans). Filtering is opaque — you get <code>delivered=true</code> from Twilio but the message never lands.</p>
+<p>In <strong>2020-2021</strong> US carriers rolled out <strong>A2P 10DLC</strong> (Application-to-Person 10-Digit Long Code) — every business sending on long codes must register their brand and use case with The Campaign Registry (TCR). Without registration, long-code messages are heavily throttled or blocked. With registration, you get tiered throughput (1 msg/sec → 75 msg/sec depending on trust score).</p>
+<p>Registration components:
+- <strong>Brand</strong>: company identity, EIN/DUNS, website. Vet level (Standard/Sole Proprietor/Charity/Government) determines throughput.
+- <strong>Campaign</strong>: per use-case approval (2FA, marketing, account notification, customer service). Cannot use a campaign for unrelated content.
+- <strong>Per-message tagging</strong>: each SMS includes the campaign ID; carriers verify alignment.</p>
+<p>Carrier filtering rejects:
+- URL shorteners (<code>bit.ly</code>, <code>tinyurl</code>) — appear in phishing; use your own branded shortener.
+- "STOP/HELP" not honored — instant block.
+- Predatory keywords (heavy use of $$, "winner", "click here").
+- Content not matching campaign category.</p>
+<h3 id="154-tcpa-us-compliance">15.4. TCPA — US compliance</h3>
+<p><strong>TCPA</strong> (Telephone Consumer Protection Act, 1991) governs unsolicited communications. For marketing SMS, you need <strong>prior express written consent</strong> — the user must have actively opted in to receive marketing texts from your specific brand. Inferred consent from "they gave us their number to ship a package" is NOT consent for marketing.</p>
+<p>Penalties: <strong>$500-$1,500 per violation</strong>. Class actions ruinous: a 100k-recipient TCPA violation = $50M-$150M.</p>
+<p>Required elements in marketing SMS:
+- Brand identification ("Acme:")
+- "Reply STOP to opt out" in the first message
+- "Msg &amp; data rates may apply" disclosure
+- Opt-out must be honored within 24h (industry norm faster — instant)</p>
+<p>For transactional SMS (2FA codes, shipping updates, fraud alerts) the TCPA bar is lower — implied consent from the transaction relationship is generally sufficient — but rules vary by state.</p>
+<h3 id="155-we-got-1m-sms-sent-but-only-80-delivered-reconciliation">15.5. "We got 1M SMS sent but only 80% delivered" reconciliation</h3>
+<p>Twilio's "delivered" status callback fires when the carrier accepts the message. But the user-perceived delivery rate is lower because:</p>
+<ul>
+<li><strong>Carrier silently drops</strong> (<code>delivered=true</code> but never lands) — 5-15% for unregistered 10DLC, near 0 for short codes.</li>
+<li><strong>User has phone off / out of range</strong> for &gt;72h — carrier expires the message. Twilio reports <code>undelivered</code>.</li>
+<li><strong>Invalid number</strong> — <code>failed=true</code>, refunded.</li>
+<li><strong>Region-blocked</strong> — some destinations (Cuba, parts of Africa) are filtered by US carriers.</li>
+</ul>
+<p>Reconciliation: pull Twilio delivery reports, join with internal click/open data (link in SMS → URL with tracking token). True "user saw it" rate often 60-80% of "sent" — significantly worse than email or push.</p>
+<hr>
+<h2 id="16-push-token-lifecycle">§16. Push token lifecycle</h2>
+<p>The device token (APNs token, FCM registration token) is the addressing primitive. It is <strong>not</strong> a permanent identifier; it rotates more than developers expect, and stale tokens accumulate fast.</p>
+<h3 id="161-token-issuance">16.1. Token issuance</h3>
+<pre><code>1. App launches. Calls platform SDK.
+   iOS: UIApplication.shared.registerForRemoteNotifications()
+   Android: FirebaseMessaging.getInstance().getToken()
+2. SDK negotiates with APNs / FCM (TLS connection to push platform).
+3. Platform returns a token string (~64-char hex for APNs, ~150+ chars for FCM).
+4. App POSTs token to your backend with user_id + device_id + app_version + platform.
+5. Backend UPSERTs into device_tokens table (user_id, device_id) primary key.
+</code></pre>
+<p>Token issuance happens on every cold launch (cached locally; re-confirmed with platform). If the cached token differs from what platform returns, register the new one with backend.</p>
+<h3 id="162-token-rotation-triggers">16.2. Token rotation triggers</h3>
+<p>Tokens rotate for many reasons. The app SDK detects the rotation event and the developer must re-register:</p>
+<ul>
+<li><strong>App reinstall</strong> — old token immediately dead.</li>
+<li><strong>iOS update</strong> (major version bumps often rotate).</li>
+<li><strong>APNs/FCM-side rotation</strong> — platform may rotate tokens every 6-12 months even without user action.</li>
+<li><strong>Backup restore</strong> — restoring to a new device or after OS reset rotates tokens.</li>
+<li><strong>User signs out and back in</strong> (some apps tie token to user identity).</li>
+<li><strong>App data clear</strong> (Android — settings → clear app data).</li>
+<li><strong>FCM specifically</strong> rotates more aggressively than APNs.</li>
+</ul>
+<p>Rotation contract: the app's <code>didReceiveRegistrationToken</code> (Android) / <code>application:didRegisterForRemoteNotificationsWithDeviceToken:</code> (iOS) callback fires with the new token. <strong>Every</strong> cold launch should re-POST the token to backend (idempotent UPSERT) — relying on "only register if changed" misses cases where the local cache diverges from platform reality.</p>
+<h3 id="163-dead-token-detection">16.3. Dead token detection</h3>
+<p>APNs returns:
+- <strong>410 Gone</strong> + body <code>{"reason":"Unregistered"}</code> → token permanently dead. Mark inactive.
+- <strong>400</strong> + <code>{"reason":"BadDeviceToken"}</code> → token was never valid. Mark inactive.
+- <strong>413</strong> payload too large → not a token issue.</p>
+<p>FCM returns:
+- <strong>404 NOT_FOUND</strong> or <strong>400</strong> with <code>error.details[].errorCode = UNREGISTERED</code> → token dead.
+- <strong>400</strong> <code>INVALID_ARGUMENT</code> <code>errorCode = INVALID_REGISTRATION</code> → token never valid.</p>
+<p>These responses fire the feedback loop documented in §8.3: feedback.events Kafka message → device_tokens.active=FALSE → next push skips this token.</p>
+<h3 id="164-the-50-dead-tokens-problem">16.4. The "50% dead tokens" problem</h3>
+<p>A common production state: an app has 100M registered tokens in MySQL but only 50M users are active. The other 50M tokens are dead (uninstalled, reinstalled, OS-reset). Without diligent cleanup, every push fanout sends 100M API calls and pays the cost (APNs is free, but FCM HTTP/2 connection load is real; SES costs money per email send).</p>
+<p>Sources of accumulation:
+- Backend never receives dead-token feedback (silent suppression in some FCM paths — only "delivered" callbacks come back, not "this token was dead").
+- Backend receives feedback but doesn't process it (feedback loop bug).
+- App fails to deregister token on logout (user logs out, token still associated with their account, but the app is now showing a different user).
+- Multi-account apps don't bind token → account properly.</p>
+<p>Mitigations:
+- <strong>Idle cleanup</strong>: tokens with no successful push in 60 days → mark inactive. If user re-launches the app, fresh registration reactivates.
+- <strong>Active probe</strong>: send a silent push (<code>content-available: 1</code>) once a week; if it fails (410), mark dead.
+- <strong>Per-platform metrics</strong>: track <code>dead_token_rate</code> per platform per app version. Spike = SDK bug / migration issue.
+- <strong>App-side teardown</strong>: on logout, app calls <code>DELETE /devices/{device_id}</code> on backend.</p>
+<p>Acceptable steady state: &lt;5% dead tokens. &gt;20% = serious accumulation. &gt;50% = years of neglect.</p>
+<hr>
+<h2 id="17-unsubscribe-and-preference-center">§17. Unsubscribe and preference center</h2>
+<p>Unsubscribe handling is where notification systems collide with compliance law. Doing it wrong = regulatory fines, brand damage, and angry users marking as spam (which tanks deliverability).</p>
+<h3 id="171-one-click-unsubscribe">17.1. One-click unsubscribe</h3>
+<p><strong>RFC 8058</strong> and the <strong><code>List-Unsubscribe</code></strong> + <strong><code>List-Unsubscribe-Post</code></strong> headers define one-click unsubscribe. Required by Gmail (since Feb 2024) and Yahoo for all senders sending &gt;5k/day, and by FTC under CAN-SPAM.</p>
+<p>Email headers:</p>
+<pre><code>List-Unsubscribe: &lt;https://example.com/unsub?token=abc123&gt;, &lt;mailto:unsub+abc123@example.com&gt;
+List-Unsubscribe-Post: List-Unsubscribe=One-Click
+</code></pre>
+<p>The mail client sees both headers and renders a one-click "Unsubscribe" button. On click, the mail client issues a <strong>POST</strong> to the HTTPS URL (not a GET — POST avoids prefetchers / link scanners unsubscribing the user). The POST body includes the <code>List-Unsubscribe=One-Click</code> form parameter.</p>
+<p>Backend handler must:
+1. Validate the token (HMAC signature, includes user_id + list_id + timestamp).
+2. Update preferences synchronously — user MUST be unsubscribed by the time the POST returns.
+3. Confirm with HTTP 200.
+4. Future emails to this address suppressed within minutes.</p>
+<p>Common bug: backend asynchronously enqueues the unsubscribe → returns 200 → 5 minutes later marketing batch sends another email to this user. RFC 8058 implies, and Gmail enforces, that unsubscribe must take effect "promptly" (interpreted as &lt;10 business days under CAN-SPAM; in practice, instant).</p>
+<h3 id="172-the-can-spam-10-business-days-violation">17.2. The CAN-SPAM "10 business days" violation</h3>
+<p>CAN-SPAM Act (US) requires honoring opt-out within <strong>10 business days</strong>. Many companies built their unsubscribe pipeline at <code>T+0 click → T+nightly batch updates DB → T+next-day cache invalidates → mail service sees fresh state at T+1 to T+2</code>.</p>
+<p>The violation pattern: bug in the batch job, or batch fails for a week, → unsubscribed users continue receiving mail past the 10-day mark. FTC has settled cases for $1M+ per incident. Class actions for high-volume marketers can reach $10M-$50M.</p>
+<p>The fix is straightforward: write-through cache invalidation. Click → DB write + Redis DEL → future reads see fresh state immediately.</p>
+<h3 id="173-granular-preference-center">17.3. Granular preference center</h3>
+<p>A "one giant unsubscribe button" is hostile to deliverability. Users who unsubscribe entirely → no engagement → eventually mark future legitimate mail as spam → reputation drops.</p>
+<p>Granular preferences let users dial down without leaving:</p>
+<pre><code>Per-channel:    [push] [email] [SMS] [in-app]
+Per-category:
+   - Transactional        [always on, cannot opt out]
+   - Account &amp; security   [always on for some, opt-in for others]
+   - Product updates      [user controlled]
+   - Marketing            [user controlled]
+   - Recommendations      [user controlled]
+   - Social               [user controlled, granular by type]
+   - Digest               [daily / weekly / off]
+Per-frequency:  [real-time] [daily summary] [weekly digest]
+Per-time:       [9am-5pm] [respects quiet hours]
+Per-source:     [mute user X] [mute thread Y]
+</code></pre>
+<p>The schema:</p>
+<pre><code class="language-sql">CREATE TABLE notification_preferences (
+  user_id      BIGINT       NOT NULL,
+  channel      VARCHAR(16)  NOT NULL,  -- push/email/sms/inapp
+  category     VARCHAR(32)  NOT NULL,  -- marketing/security/social/...
+  enabled      BOOLEAN      NOT NULL,
+  frequency    ENUM('realtime','daily','weekly','off') DEFAULT 'realtime',
+  updated_at   BIGINT       NOT NULL,
+  PRIMARY KEY (user_id, channel, category)
+);
+</code></pre>
+<p>Each notification has a <code>(channel, category)</code> tag at creation. Dispatcher does a single lookup per (user_id, channel, category) → enabled/disabled. Marketing teams cannot send "marketing" to a user who muted that category, regardless of organizational pressure.</p>
+<h3 id="174-unsubscribe-propagation-eventual-vs-strong-consistency">17.4. Unsubscribe propagation: eventual vs strong consistency</h3>
+<p>Marketing infrastructure runs across many services: A/B test platform, journey orchestrator, email service, SMS service, in-app inbox. An unsubscribe must propagate to all of them.</p>
+<p><strong>Eventual consistency</strong> (typical): unsubscribe event → Kafka → each downstream service consumes → updates its local cache. Median propagation 1-5s, p99 30s.</p>
+<p><strong>Strong consistency</strong> (required for legal): preference center is the source of truth, and every send-time decision must read it (Redis cache with write-through invalidation, not async replication). Each delivery handler does:</p>
+<pre><code>1. Read preferences from Redis (cache).
+2. If cache miss → read from MySQL → repopulate cache.
+3. If preferences indicate suppression → drop, log delivery_status=SUPPRESSED_PREFERENCE.
+</code></pre>
+<p>For high-compliance channels (marketing email, marketing SMS), eventual consistency is a legal risk. The fix: write-through invalidation makes the cache strong-read. Some companies go further and do a synchronous MySQL read in the marketing path (sacrifice 1-2ms latency for compliance certainty).</p>
+<hr>
+<h2 id="18-compliance-gdpr-can-spam-tcpa-casl">§18. Compliance: GDPR / CAN-SPAM / TCPA / CASL</h2>
+<p>Notification systems sit on a regulatory landmine. Different jurisdictions impose different rules; the platform must enforce them at send time.</p>
+<h3 id="181-gdpr-eu">18.1. GDPR (EU)</h3>
+<p>GDPR (General Data Protection Regulation, EU, 2018) governs personal data of EU residents. Notification implications:</p>
+<ul>
+<li><strong>Lawful basis required</strong> for processing email/phone (Article 6). For marketing notifications, the basis is almost always <strong>consent</strong> — explicit, granular, freely given, withdrawable.</li>
+<li><strong>Consent must be specific</strong> — "I agree to marketing" is too broad. "I agree to receive monthly product updates by email" is granular.</li>
+<li><strong>Right to erasure (Article 17)</strong> — user requests deletion → all PII must be removed including from notification logs. Audit trail must show compliance.</li>
+<li><strong>Audit trail of consent</strong> — when did the user opt in? IP? Form version? Required to defend compliance. Store in append-only log with 7+ year retention.</li>
+<li><strong>Cross-border transfer (Chapter V)</strong> — if your notification platform is US-based and sends to EU users, you need a transfer mechanism (Standard Contractual Clauses, adequacy decision, or Data Privacy Framework). Sending an email from US infrastructure to EU residents is a transfer.</li>
+</ul>
+<p>Penalties: up to <strong>4% of global annual revenue or €20M</strong>, whichever higher. Real cases: Meta €1.2B (2023), Amazon €746M (2021).</p>
+<h3 id="182-can-spam-us">18.2. CAN-SPAM (US)</h3>
+<p>CAN-SPAM (Controlling the Assault of Non-Solicited Pornography And Marketing Act, 2003) governs commercial email. Requirements:</p>
+<ul>
+<li><strong>No false/deceptive From, To, Reply-To, or Subject</strong> — the brand must be identifiable.</li>
+<li><strong>Identify message as ad</strong> — for marketing, must be clear it's an advertisement.</li>
+<li><strong>Physical postal address required</strong> — every commercial email must include a valid postal address in the footer. Many companies miss this on transactional emails that include "while you're here, check out..." cross-sell — once you add marketing, you must add the address.</li>
+<li><strong>Opt-out mechanism</strong> — clear, conspicuous, easy. Honor within 10 business days. Cannot charge for opt-out. Cannot require login.</li>
+<li><strong>Monitor third parties acting on your behalf</strong> — if an agency sends spam claiming to be you, you're liable.</li>
+</ul>
+<p>Penalties: $51,744 per violation (2024). 1M-recipient spam = theoretically $51B; practical settlements much lower.</p>
+<h3 id="183-tcpa-us-sms-and-voice">18.3. TCPA (US — SMS and voice)</h3>
+<p>TCPA (Telephone Consumer Protection Act, 1991) governs phone-based communications. SMS implications:</p>
+<ul>
+<li><strong>Prior express written consent</strong> for marketing SMS. The bar is high: signed agreement (digital sig OK) acknowledging the user will receive marketing SMS at a specific number.</li>
+<li><strong>Implied consent</strong> sufficient for transactional (you placed an order → we text shipping updates).</li>
+<li><strong>Opt-out</strong> — STOP, UNSUBSCRIBE, CANCEL, END, QUIT, OPTOUT must all be honored.</li>
+<li><strong>Caller-ID requirements</strong> — no spoofing.</li>
+</ul>
+<p>Penalties: <strong>$500 per call/text, $1,500 per willful violation</strong>. Class actions ruinous because of low per-violation bar — accidentally texting 100k unconsenting users = $50M-$150M.</p>
+<h3 id="184-casl-canada">18.4. CASL (Canada)</h3>
+<p>CASL (Canadian Anti-Spam Legislation, 2014) is strictly more rigorous than CAN-SPAM:</p>
+<ul>
+<li><strong>Express opt-in mandatory</strong> — implied consent narrowly allowed for existing business relationships, expires after 2 years inactivity.</li>
+<li><strong>Identification</strong> — must clearly identify sender, include contact info.</li>
+<li><strong>Unsubscribe</strong> — must function for 60 days after sending; honored within 10 business days.</li>
+</ul>
+<p>Penalties: up to <strong>CAD $10M per violation</strong> for businesses; private right of action (individuals can sue).</p>
+<h3 id="185-the-marketing-wants-to-send-legal-wont-let-them-reality">18.5. The "marketing wants to send, legal won't let them" reality</h3>
+<p>This is the perennial tension. Marketing org wants to send the campaign to a 50M-recipient list. Legal looks at the list:
+- 8M users opted into "product updates" not "marketing."
+- 5M users are EU residents — was their consent properly recorded under GDPR? Is the marketing wording consistent with what they consented to?
+- 12M users haven't engaged in 18+ months — under CASL their implied consent has lapsed.
+- 1M users have a phone number on the list that was given for 2FA only — TCPA blocks marketing use.</p>
+<p>Result: legal-approved list = 24M, not 50M. Marketing pushes back. Engineering builds the platform such that the <strong>preference center is the source of truth</strong> and the <strong>suppression list is enforced at send time</strong> — marketing cannot route around it without changing the platform.</p>
+<p>The opposite failure: legal isn't involved, marketing sends to everyone, an EU regulator audits, GDPR fines follow. The platform must enforce policy, not trust intent.</p>
+<hr>
+<h2 id="19-ab-testing-notification-content">§19. A/B testing notification content</h2>
+<p>Notifications are some of the most measurable things in any product — every send has clean attribution (sent/delivered/opened/clicked). This is fertile ground for experimentation, and most companies underuse it.</p>
+<h3 id="191-what-to-test">19.1. What to test</h3>
+<ul>
+<li><strong>Subject lines</strong> (email): "Your weekly summary" vs "Yifan, your week in review" vs "5 highlights from last week" → 10-30% open rate difference.</li>
+<li><strong>Preheader</strong> (the first ~100 chars below subject) — major impact on open rate.</li>
+<li><strong>Send time</strong> — "9am local Tuesday" vs "11am local Tuesday" vs "model-predicted optimal time per user."</li>
+<li><strong>From name</strong> — "Acme" vs "Yifan from Acme" vs "Acme Notifications."</li>
+<li><strong>Push title and body</strong> — "New like" vs "Alice liked your post" vs "Alice loved your idea" — 3-10% open rate difference.</li>
+<li><strong>Channel mix</strong> — push only vs push + email after 1h if not opened.</li>
+<li><strong>Frequency caps</strong> — 5/day vs 10/day → measure long-term retention.</li>
+</ul>
+<h3 id="192-send-time-optimization">19.2. Send-time optimization</h3>
+<p>Per-user STO (Send-Time Optimization): predict when a specific user is most likely to open. Model trained on per-user engagement timestamps over weeks. Output: "User 12345 opens email best at 7:42am Tue-Thu."</p>
+<p>Implementation: nightly batch updates <code>user_preferences.optimal_send_window</code> per user-channel. At dispatch, if the campaign supports STO, schedule for the user's window using a delay queue.</p>
+<p>The trap: STO works great for marketing where 1-hour latency is acceptable. Don't apply STO to transactional or alerting.</p>
+<h3 id="193-the-experimentation-pipeline">19.3. The experimentation pipeline</h3>
+<pre><code>1. Define experiment:
+   experiment_id = &quot;weekly_digest_subject_v3&quot;
+   variants = [&quot;control: Your weekly summary&quot;,
+               &quot;A: Yifan, your week in review&quot;,
+               &quot;B: 5 highlights from last week&quot;]
+   traffic_allocation = [0.5, 0.25, 0.25]
+   metric = open_rate (primary), click_rate (secondary), unsubscribe_rate (guardrail)
+   duration = 14 days
+2. At send time:
+   variant = hash(user_id || experiment_id) % 100
+   if variant &lt; 50: control
+   elif variant &lt; 75: A
+   else: B
+3. Log to experiment log:
+   { experiment_id, user_id, variant, sent_ts }
+4. Outcome tracking:
+   { experiment_id, user_id, event_type, event_ts }
+   events: SENT, DELIVERED, OPENED, CLICKED, UNSUBSCRIBED
+5. Analysis:
+   per-variant rates with confidence intervals
+   chi-square or proportion-z test
+   guardrail check: did variant tank unsubscribe rate?
+</code></pre>
+<p>Bucketing by <code>hash(user_id || experiment_id)</code>: same user always gets the same variant for this experiment, even across sessions. This is <strong>deterministic bucketing</strong> — critical for clean attribution.</p>
+<h3 id="194-open-rate-vs-click-rate-as-success-metrics">19.4. Open rate vs click rate as success metrics</h3>
+<ul>
+<li><strong>Open rate</strong> (email): user opened the email (tracking pixel loaded). Inflated by mail client preview, Apple Mail Privacy Protection (MPP) which pre-fetches all images → opens reported even if user never looked. Since Sept 2021, open rate on iOS is essentially noise.</li>
+<li><strong>Click rate</strong>: user clicked a link in the email. Stronger signal, less inflated.</li>
+<li><strong>Conversion rate</strong>: user did the action you wanted (purchase, return, etc.). Strongest signal, lowest volume — needs larger sample sizes.</li>
+<li><strong>Long-term engagement / retention</strong>: did this campaign increase 30-day-retained users? The strongest signal, requires careful experiment design (don't compare opens; compare cohorts).</li>
+</ul>
+<p>For push: open rate = user opened the app from the push notification. Direct attribution via launch URL.</p>
+<p>For SMS: open rate ≈ delivery rate (almost everyone reads SMS). Click rate via tracking URL.</p>
+<h3 id="195-guardrail-metrics">19.5. Guardrail metrics</h3>
+<p>Optimizing open rate without guardrails leads to disasters: "URGENT: open immediately" subject lines, manipulative urgency, deceptive previews — all boost opens, all destroy long-term trust. Guardrail metrics block:</p>
+<ul>
+<li>Unsubscribe rate</li>
+<li>Spam complaint rate</li>
+<li>Long-term retention</li>
+<li>NPS or sentiment polls</li>
+<li>Cross-product engagement (did this notification cannibalize others?)</li>
+</ul>
+<p>If a variant wins on open rate but increases unsubscribe rate by 0.5% absolute, abandon it.</p>
+<hr>
+<h2 id="20-notification-templating">§20. Notification templating</h2>
+<p>Sending 10M notifications a day in 30 languages, with personalization, A/B variants, and brand-consistent design requires a templating system. Hand-crafting HTML strings doesn't scale.</p>
+<h3 id="201-template-engines">20.1. Template engines</h3>
+<ul>
+<li><strong>Liquid</strong> (Shopify, GitHub) — open syntax with filters: <code>{{ user.first_name | default: "there" }}</code>. Designed for end-user authoring; sandbox-safe.</li>
+<li><strong>Handlebars</strong> (Mailchimp, common in JavaScript ecosystems) — logic-less templates with helpers. <code>{{#if user.is_premium}}...{{/if}}</code>. Familiar to web developers.</li>
+<li><strong>Jinja2 / Twig</strong> — full programming language in templates; powerful but easy to introduce bugs and security holes if you let untrusted authors write templates.</li>
+<li><strong>MJML</strong> (Mailjet Markup Language) — declarative responsive email markup. <code>&lt;mj-section&gt;&lt;mj-column&gt;&lt;mj-text&gt;Hi&lt;/mj-text&gt;&lt;/mj-column&gt;&lt;/mj-section&gt;</code>. Compiles to bulletproof HTML that renders in Outlook 2007, Apple Mail, Gmail, mobile clients. Removes the email-HTML nightmare.</li>
+<li><strong>MJML + Liquid</strong> combined — MJML for layout, Liquid for personalization. Common stack.</li>
+</ul>
+<p>For push and SMS, templates are simpler — usually just a few <code>{{ variable }}</code> substitutions in plain text.</p>
+<h3 id="202-template-versioning-and-rollback">20.2. Template versioning and rollback</h3>
+<p>Templates change frequently (marketing tweaks, A/B variants, product updates). Versioning is essential:</p>
+<pre><code>template:weekly_digest
+├── v1   (2025-01-15) [active until 2025-04-22]
+├── v2   (2025-04-22) [active until 2025-09-10]
+├── v3   (2025-09-10) [active]
+└── v4   (2026-01-08) [staging — A/B at 5% traffic]
+</code></pre>
+<p>Each version is immutable once published. Production traffic routes to a specific version (typically "latest stable" + A/B traffic to "candidate"). Rollback = redirect traffic back to vN-1.</p>
+<h3 id="203-the-we-shipped-a-template-change-that-broke-100k-emails-rollback">20.3. The "we shipped a template change that broke 100k emails" rollback</h3>
+<p>Disaster pattern: someone edits the template directly in production (no version control), pushes "Save," and the template now has a malformed <code>{{ user.first_name }</code> (missing brace). Next 100k sends render with the literal string <code>{{ user.first_name }</code> in the body. Users complain. Brand embarrassment.</p>
+<p>Worse pattern: the template references a field that doesn't exist on some users (<code>user.subscription.tier</code> when free users have no subscription). Half of recipients get an email saying "Welcome, premium member null!"</p>
+<p>Defenses:
+1. <strong>Template editing is via PR</strong>, not in-place. Reviewed, tested, merged.
+2. <strong>Lint</strong> all templates for common errors before deploy (missing braces, unknown variables, malformed HTML).
+3. <strong>Render against test fixtures</strong> — every template has 5-10 example users (free, premium, suspended, etc.); CI renders against all, checks for missing fields and broken HTML.
+4. <strong>Email test</strong> — every template change auto-sends to a <code>template-qa@company.com</code> mailbox; team reviews before promoting.
+5. <strong>Canary rollout</strong> — new template at 1% traffic for 1 hour, monitor render error rate, then 100%.
+6. <strong>One-click rollback</strong> — UI button reverts to previous version instantly. Time-to-recover &lt; 1 minute.</p>
+<h3 id="204-template-testing-infrastructure">20.4. Template testing infrastructure</h3>
+<ul>
+<li><strong>Render preview</strong>: in dev tool, pick a template + a sample user → render HTML. Email clients render preview in their UIs (Litmus, Email on Acid offer cross-client preview at $200-500/month).</li>
+<li><strong>Litmus testing</strong>: renders the email in 90+ email clients (Outlook 2007 through Gmail iOS) and screenshots. Catches Outlook table-layout breaks.</li>
+<li><strong>Spam scoring</strong>: send the email through SpamAssassin / MailTester before publish; address score &lt;5.</li>
+<li><strong>Accessibility check</strong>: alt text on images, sufficient color contrast, plaintext alternative.</li>
+</ul>
+<hr>
+<h2 id="21-multi-language-and-localization">§21. Multi-language and localization</h2>
+<p>For a global product, every notification must be localized. Sending English to 100M users where 60M don't read English = low engagement + complaints + cultural insensitivity.</p>
+<h3 id="211-language-detection">21.1. Language detection</h3>
+<p>Inputs (in priority order, typically):</p>
+<ol>
+<li><strong>User-set preference</strong> — explicit, highest priority. "User chose Spanish in settings."</li>
+<li><strong>App locale</strong> — what the user's device is set to.</li>
+<li><strong>Browser locale</strong> (<code>Accept-Language</code> header) — for web push, web email rendering.</li>
+<li><strong>IP geolocation</strong> — fallback for users with no preference; less accurate than language settings.</li>
+<li><strong>Default</strong> — English (US), typically.</li>
+</ol>
+<p>Stored per-user in MySQL <code>users.locale = "es-MX"</code> (BCP 47 language tag). Refreshed on every login.</p>
+<h3 id="212-translation-pipeline">21.2. Translation pipeline</h3>
+<pre><code>1. Engineer adds English string to source.
+   message_key = &quot;notif.new_follower.body&quot;
+   en: &quot;{name} started following you&quot;
+2. Build extracts strings → POEditor / Lokalise / Crowdin / internal TMS.
+3. Translators (human, sometimes machine-assisted) localize:
+   es: &quot;{name} empezó a seguirte&quot;
+   ja: &quot;{name}さんがあなたをフォローし始めました&quot;
+   ar: &quot;بدأ {name} في متابعتك&quot;
+4. Translations checked back into repo.
+5. Build packages translations into delivery service.
+6. At dispatch time, lookup string by (key, locale).
+</code></pre>
+<p>For high-volume content (chat messages, user-generated), human translation isn't feasible; machine translation (Google Translate API, DeepL, internal models) used with quality warnings.</p>
+<h3 id="213-variable-substitution-with-grammar">21.3. Variable substitution with grammar</h3>
+<p>This is where most localization breaks. English: "1 message" / "2 messages" — singular vs plural, two forms.</p>
+<p>Slavic languages (Polish, Russian) have 3-4 plural forms:
+- 1 message
+- 2-4 messages (paucal — special form)
+- 5+ messages (genitive plural)
+- 0 messages (sometimes special)</p>
+<p>Arabic has 6 plural forms (zero, one, two, few, many, other).</p>
+<p>Use <strong>ICU MessageFormat</strong> or <strong>Fluent</strong> (Mozilla) for plural-aware templates:</p>
+<pre><code>{count, plural,
+  =0 {No new messages}
+  one {1 new message}
+  few {# new messages}
+  many {# new messages}
+  other {# new messages}
+}
+</code></pre>
+<p>Localizer fills in per-language plural rules. At render time, library picks the right branch.</p>
+<p>Gender agreement (Romance languages, Slavic, Hebrew, Arabic) requires similar branching:</p>
+<pre><code>{user_gender, select,
+  female {Es ist deine Freundin}
+  male {Es ist dein Freund}
+  other {Es ist deine Person}
+}
+</code></pre>
+<h3 id="214-rtl-right-to-left">21.4. RTL (right-to-left)</h3>
+<p>Arabic, Hebrew, Farsi, Urdu render right-to-left. Email HTML and push UI both need RTL handling:</p>
+<ul>
+<li>HTML: <code>&lt;html dir="rtl" lang="ar"&gt;</code> and <code>text-align: right</code> on body.</li>
+<li>Push: most platforms render based on system locale, but punctuation and embedded English/numbers need bidirectional handling (Unicode Bidi algorithm — RLM, LRM marks for clarity).</li>
+<li>Image direction: arrows and icons may need to flip for RTL contexts (a "forward" arrow points right in LTR, left in RTL).</li>
+<li>Tables and layouts mirror — first column becomes the rightmost.</li>
+</ul>
+<p>Test RTL with a native RTL speaker on real devices. Pseudo-locale (<code>xx-RTL</code>) for engineering QA.</p>
+<h3 id="215-localization-related-notification-disasters">21.5. Localization-related notification disasters</h3>
+<ul>
+<li><strong>Currency formatting</strong>: "$1,000.00" (US) vs "1.000,00 €" (Germany). Wrong format = confusion or worse, wrong amount.</li>
+<li><strong>Date formatting</strong>: "11/04/2025" — US reads November 4, EU reads April 11. Use ISO 8601 (<code>2025-04-11</code>) or localized format library.</li>
+<li><strong>Time formatting</strong>: 14:30 vs 2:30 PM. 12h/24h preferences vary.</li>
+<li><strong>Address format</strong>: country/state/zip order varies. Don't hardcode US layouts.</li>
+<li><strong>Cultural taboos</strong>: certain colors, numbers (4 in Chinese contexts, 13 in Western contexts), images can be offensive in some cultures.</li>
+</ul>
+<hr>
+<h2 id="22-time-zone-aware-quiet-hours-in-depth">§22. Time-zone-aware quiet hours in depth</h2>
+<p>§7 problem 5 covered the basics. The deeper concerns:</p>
+<h3 id="221-iana-tz-database">22.1. IANA TZ database</h3>
+<p>Not "UTC-8". The IANA (Internet Assigned Numbers Authority) TZ database (also called the Olson database, tzdata) is the canonical mapping of named zones to offsets across time, including DST transitions, historical changes, and political adjustments.</p>
+<p>Example: <code>America/Los_Angeles</code> is currently UTC-8 in winter and UTC-7 in summer. In 1942-1945, it observed "War Time" with different offsets. In 2022, the US Senate passed (then stalled) a bill to make DST permanent — if enacted, tzdata would record the change.</p>
+<p>Store user's TZ as the IANA name. At dispatch, compute <code>now_in_user_tz</code> using a library (Java <code>ZoneId</code>, Python <code>zoneinfo</code>, JS <code>Intl.DateTimeFormat</code>). Never store a numeric offset that ignores DST and political shifts.</p>
+<h3 id="222-per-user-tz-storage">22.2. Per-user TZ storage</h3>
+<p>Storage:</p>
+<pre><code class="language-sql">ALTER TABLE users ADD COLUMN tz VARCHAR(64) DEFAULT 'UTC';
+-- e.g. 'Asia/Tokyo', 'Europe/Berlin', 'America/Los_Angeles'
+</code></pre>
+<p>Sources:
+- User-explicit setting (account preferences).
+- App SDK reports device TZ on every backend session (cache for 24h).
+- IP geolocation as fallback for unregistered users.</p>
+<p>Refresh on every login. Travelers can override manually.</p>
+<h3 id="223-the-user-travels-decision">22.3. The "user travels" decision</h3>
+<p>User normally in <code>America/Los_Angeles</code>. Travels to Tokyo. Device TZ now <code>Asia/Tokyo</code>. App reports this on next session.</p>
+<p>Do we use the <strong>new</strong> TZ for quiet hours?
+- For most notifications: yes. Quiet hours follow the device — user doesn't want a 2am Tokyo wakeup.
+- For scheduled notifications: question. "Remind me at 9am tomorrow" — 9am Pacific (original setup) or 9am Tokyo (current)? Usually: explicit <code>(tz_at_time_of_scheduling, local_time)</code> pair. Display "9am Pacific (1am Tokyo)" so user can re-schedule.
+- For 2FA: ignore quiet hours. Security beats sleep.
+- For alerting (on-call): explicit on-call rotation handles, not user TZ.</p>
+<h3 id="224-batched-send-during-users-morning-at-scale">22.4. Batched send during user's morning at scale</h3>
+<p>Marketing wants to send the morning digest at 9am local time to 100M users. Naive: cron job at 9am UTC sends 100M emails — but that's not "user morning" for most.</p>
+<p>Better: per-user schedule. Every minute, scheduler picks up the 100M / (24*60) = ~70k users whose <code>9am_local == now_utc</code> and dispatches.</p>
+<p>Trap: time zones cluster around populous areas. 9am Pacific = 5pm UTC. ~100M Pacific users hit the system in one minute = global thundering herd.</p>
+<p>Mitigations:
+- <strong>Drip within window</strong>: "send between 9-10am local" → distribute over 60 minutes; ~1.7M users/min sustained.
+- <strong>Capacity reservation</strong>: spin up dispatcher fleet ahead of US-Eastern 9am, scale down after EU-Western 9am.
+- <strong>Prioritization</strong>: transactional dispatchers separate from marketing dispatchers — marketing scheduler queues into a dedicated pool that won't crowd out 2FA codes.
+- <strong>Pre-warm cache</strong>: at T-15min, pre-load user preferences for the upcoming window into Redis.</p>
+<p>Real example: Mailchimp's "Send at the right time" feature predicts per-user-optimal time within a daily window; it deliberately staggers sends to avoid simultaneous burst.</p>
+<hr>
+<h2 id="23-multi-device-sync">§23. Multi-device sync</h2>
+<p>Modern users have multiple devices — iPhone, iPad, Mac, Apple Watch, web browsers across multiple machines. A single notification logically targets the user but physically must be delivered to all their devices, and read state must sync.</p>
+<h3 id="231-the-all-devices-delivery">23.1. The "all devices" delivery</h3>
+<p>When a notification fires for user 42:</p>
+<pre><code>1. Look up active devices for user 42:
+   { iPhone (token_A), iPad (token_B), Mac (token_C), Apple Watch (token_D) }
+2. Send to APNs with each token.
+3. Inbox row written once (per user, not per device).
+</code></pre>
+<p>But wait — APNs has device-grouping APIs:
+- <strong><code>apns-push-type: alert</code></strong> with no special grouping → all devices buzz.
+- <strong><code>apns-thread-id</code></strong> → groups related notifications on the device.
+- <strong>Apple's "iCloud user-id"</strong> binding → APNs can deliver to all devices of one iCloud user without you needing to enumerate tokens. This is rare in practice; most apps still manage per-device tokens.</p>
+<p>Android FCM is less mature here. No native "all devices of this user" routing — you manage tokens per device, send N times.</p>
+<h3 id="232-read-state-propagation">23.2. Read state propagation</h3>
+<p>User reads on iPhone. Mac, iPad, Watch should all clear the badge.</p>
+<pre><code>1. iPhone: user taps notification or opens app inbox.
+2. App sends POST /notifications/{id}/read to backend.
+3. Backend: UPDATE notifications_inbox SET read_at_ms = NOW() WHERE user_id=42 AND notification_id=X.
+4. Backend publishes 'read.events' to Kafka: { user_id, notification_id }.
+5. Per-device WebSocket workers consume; push state-change to connected clients.
+6. iPad / Mac (if app open with WebSocket) update UI immediately.
+7. Watch — if APNs supports state-change push (it does for newer iOS), send silent push:
+   { aps: { content-available: 1 }, notification_id, action: &quot;mark_read&quot; }
+   Watch processes silently, badge decrements.
+</code></pre>
+<p>The hard part: the watch isn't always connected. iPhone is offline (battery dead). Mac is asleep. State-change pushes queue at APNs/FCM with TTL ~4h; if the device comes online within TTL, state syncs. After TTL, the only sync is "next app open" → fetch unread count from backend.</p>
+<h3 id="233-the-dismissed-on-phone-still-showing-on-watch-ux-failure">23.3. The "dismissed on phone, still showing on watch" UX failure</h3>
+<p>Common failure: user dismisses on phone, watch still shows the banner. Causes:</p>
+<ul>
+<li>Watch wasn't reachable via APNs at the time of dismiss (Bluetooth disconnected from phone, no Wi-Fi).</li>
+<li>Notification was delivered to phone+watch independently; dismissal on phone didn't propagate.</li>
+<li>App on watch doesn't have background app refresh enabled to process the silent push.</li>
+</ul>
+<p>Fix path: in-app inbox as the <strong>universal read-state source of truth</strong>. When the watch app opens later, it fetches inbox → sees notification X is read → clears.</p>
+<h3 id="234-the-in-app-inbox-as-the-universal-read-state-truth">23.4. The in-app inbox as the universal read-state truth</h3>
+<p>Push notifications are ephemeral hints. The durable, canonical "what's unread" is the inbox row's <code>read_at_ms</code> field. Every device, on every app open, syncs against the inbox. Even if pushes are lost, missed, or out of order, the inbox is authoritative.</p>
+<p>This is why the inbox-write must happen BEFORE the push send. If push goes out and inbox write fails, the user sees a banner that they cannot find later. If inbox write succeeds and push fails, the user sees the notification on next app open — degraded UX, but no information loss.</p>
+<hr>
+<h2 id="24-rich-push-notifications">§24. Rich push notifications</h2>
+<p>Push has evolved well beyond "title + body". Rich features differentiate engagement.</p>
+<h3 id="241-image-attachments">24.1. Image attachments</h3>
+<p>APNs: <code>mutable-content: 1</code> + Notification Service Extension. The extension fetches an image URL and attaches it. Image is downloaded on the device.</p>
+<pre><code class="language-json">{
+  &quot;aps&quot;: {
+    &quot;alert&quot;: { &quot;title&quot;: &quot;New photo from Alice&quot;, &quot;body&quot;: &quot;Check it out!&quot; },
+    &quot;mutable-content&quot;: 1
+  },
+  &quot;image_url&quot;: &quot;https://cdn.example.com/photos/abc123.jpg&quot;
+}
+</code></pre>
+<p>FCM: <code>image</code> field in notification payload natively supported.</p>
+<pre><code class="language-json">{
+  &quot;message&quot;: {
+    &quot;token&quot;: &quot;...&quot;,
+    &quot;notification&quot;: {
+      &quot;title&quot;: &quot;New photo&quot;,
+      &quot;body&quot;: &quot;From Alice&quot;,
+      &quot;image&quot;: &quot;https://cdn.example.com/photos/abc123.jpg&quot;
+    }
+  }
+}
+</code></pre>
+<p>Constraints: image ≤10MB for APNs, ≤1MB for FCM. CDN-hosted (cached, fast). JPEG/PNG/GIF.</p>
+<h3 id="242-action-buttons">24.2. Action buttons</h3>
+<p>In-notification action buttons let the user reply, mark read, delete, like, etc. without opening the app.</p>
+<p>APNs: define a category in the app:</p>
+<pre><code>let replyAction = UNTextInputNotificationAction(
+    identifier: &quot;REPLY&quot;,
+    title: &quot;Reply&quot;,
+    options: [],
+    textInputButtonTitle: &quot;Send&quot;,
+    textInputPlaceholder: &quot;Type a message...&quot;)
+
+let markReadAction = UNNotificationAction(
+    identifier: &quot;MARK_READ&quot;,
+    title: &quot;Mark as Read&quot;,
+    options: [])
+
+let category = UNNotificationCategory(
+    identifier: &quot;MESSAGE&quot;,
+    actions: [replyAction, markReadAction],
+    intentIdentifiers: [],
+    options: [])
+</code></pre>
+<p>Push payload includes <code>"category": "MESSAGE"</code>; OS renders the buttons. On user tap, the app's <code>userNotificationCenter(_:didReceive:)</code> fires (or background-only handler for non-launching actions).</p>
+<p>FCM: actions defined per-notification in the payload. Similar mechanics.</p>
+<h3 id="243-critical-alerts">24.3. Critical alerts</h3>
+<p>iOS 12+: <strong>Critical alerts</strong> override Do Not Disturb and silent mode. The system plays sound regardless of user settings. Requires:
+- Special entitlement from Apple (request via developer portal; granted for legitimate use cases — health, safety, emergency).
+- User opt-in dialog separate from regular push permission.
+- Volume controllable in payload (<code>critical-alert-volume</code>).</p>
+<p>Use cases: hospital pagers, smoke alarms, security alerts. Misuse = Apple revokes the entitlement.</p>
+<h3 id="244-provisional-notifications-ios">24.4. Provisional notifications (iOS)</h3>
+<p>iOS 12+ also: <strong>provisional authorization</strong>. Apps can show notifications without first asking permission — but they appear quietly in Notification Center, no banner / sound. User sees them and can promote to full notifications, or disable.</p>
+<p>Use case: AI-based decisions about visibility. Send 100 candidate notifications quietly; system learns which the user interacts with; promote those styles to full alerts.</p>
+<p>Payload:</p>
+<pre><code class="language-json">{
+  &quot;aps&quot;: {
+    &quot;alert&quot;: &quot;...&quot;,
+    &quot;interruption-level&quot;: &quot;passive&quot;
+  }
+}
+</code></pre>
+<p>Levels: <code>passive</code>, <code>active</code> (default), <code>time-sensitive</code> (bypasses focus modes), <code>critical</code> (above).</p>
+<h3 id="245-web-push-and-vapid">24.5. Web push and VAPID</h3>
+<p>Web push is the same APNs/FCM substrate exposed to browsers (Chrome, Firefox, Safari since iOS 16.4). User grants permission → browser registers with the push service → app stores the subscription endpoint.</p>
+<p>VAPID (Voluntary Application Server Identification, RFC 8292) is the auth: server signs requests to the push service with a private key; service verifies with the registered public key. No per-user token in your auth — just per-server identity.</p>
+<p>Subscription:</p>
+<pre><code class="language-json">{
+  &quot;endpoint&quot;: &quot;https://fcm.googleapis.com/fcm/send/eXaMpLeToKeN&quot;,
+  &quot;expirationTime&quot;: null,
+  &quot;keys&quot;: {
+    &quot;p256dh&quot;: &quot;BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7A8u-Ts1XbjhazAkj7I99e8QcYP7DkM=&quot;,
+    &quot;auth&quot;: &quot;tBHItJI5svbpez7KI4CCXg==&quot;
+  }
+}
+</code></pre>
+<p>Server posts payload + VAPID headers to <code>endpoint</code>. Push service forwards to user's browser. See §27 for full web push detail.</p>
+<hr>
+<h2 id="25-anti-abuse-and-spam-prevention">§25. Anti-abuse and spam prevention</h2>
+<p>Notification fatigue is a real ecosystem-level problem. Users uninstall, mute, or train themselves to ignore notifications when oversaturated.</p>
+<h3 id="251-per-user-rate-limits">25.1. Per-user rate limits</h3>
+<pre><code>Per-channel (push, email, SMS independently):
+  - 5 push / hour
+  - 30 push / day
+  - 10 email / day
+  - 3 SMS / day
+
+Per-category:
+  - Marketing: 1/day max, 5/week max
+  - Social: 10/day max
+  - Transactional: no cap
+  - Security: no cap (but throttle bots)
+</code></pre>
+<p>Enforced via Redis token bucket (§4.3). Each delivery attempt checks; if limit reached, the notification:
+- For transactional: never rate-limited (defeats purpose).
+- For social: dropped silently or rolled into a digest.
+- For marketing: dropped silently; counted against engagement metric.</p>
+<h3 id="252-per-sender-reputation">25.2. Per-sender reputation</h3>
+<p>Internal: each notification type / campaign has a quality score:</p>
+<pre><code>quality_score = w1 * open_rate + w2 * click_rate - w3 * unsubscribe_rate - w4 * complaint_rate
+</code></pre>
+<p>Low-quality campaigns throttled harder. High-quality (high engagement) campaigns get priority.</p>
+<p>Marketing team's instinct: send to everyone, daily. Engineering's enforcement: quality score below threshold → reduce reach for next campaign. Pushes the team to send better content.</p>
+<h3 id="253-the-marketing-wants-to-blast-everyone-daily-vs-users-uninstall-tension">25.3. The "marketing wants to blast everyone daily" vs "users uninstall" tension</h3>
+<p>This tension has been studied extensively. Industry norms:</p>
+<ul>
+<li><strong>Push frequency</strong>: above ~5/day for non-essential content, uninstall rate climbs sharply. Power users tolerate 10-20/day if all are high-quality (chat apps); marketing-heavy apps see uninstalls at 2-3/day.</li>
+<li><strong>Email frequency</strong>: 1-2/week is the "set it and forget it" cadence. 5+/week → unsubscribe rate climbs.</li>
+<li><strong>SMS frequency</strong>: 1/week max for marketing. 2+/week triggers complaints.</li>
+</ul>
+<p>Counterintuitive: reducing frequency often <strong>increases</strong> total engagement. Less notification fatigue → users more likely to open the ones you do send.</p>
+<h3 id="254-notification-fatigue-research">25.4. Notification fatigue research</h3>
+<p>Studies (Google research, Facebook internal, university HCI groups) consistently show:</p>
+<ul>
+<li>Users have a small "attention budget" for notifications — once exceeded, all further notifications get dismissed without inspection.</li>
+<li>The first notification of the day has highest engagement; the 10th has near-zero.</li>
+<li>Notifications received during "downtime" (evening, weekend) have lower engagement than work-hours.</li>
+<li>"Important looking" notifications (red badges, exclamation marks) used promiscuously train users to ignore them.</li>
+</ul>
+<p>Design implications: ration carefully, prioritize ruthlessly, batch low-value updates, optimize for quality over quantity.</p>
+<h3 id="255-quiet-periods">25.5. Quiet periods</h3>
+<p>Beyond per-user quiet hours: system-wide quiet periods for non-critical content. Examples:</p>
+<ul>
+<li>No marketing pushes between 9pm-9am in any TZ.</li>
+<li>No marketing emails on weekends.</li>
+<li>"New year detox" — reduce marketing volume in early January when inbox fatigue is high.</li>
+<li>During major news events (election day, disaster) — pause marketing to avoid appearing tone-deaf.</li>
+</ul>
+<p>These are policy decisions, not technical limits, but the platform exposes the controls.</p>
+<hr>
+<h2 id="26-in-app-inbox-patterns">§26. In-app inbox patterns</h2>
+<p>The in-app inbox (the bell icon, the notifications screen) is the durable source of truth. There are two architectural patterns.</p>
+<h3 id="261-fanout-on-write-to-per-user-inbox">26.1. Fanout-on-write to per-user inbox</h3>
+<p>Covered extensively in §3 and §4.1. Inbox rows are pre-written; user opens inbox; fast partition scan; rows displayed.</p>
+<p>Pros: O(1) read, fast UI. Cons: O(F) write cost; storage scales with users × events × duplication.</p>
+<h3 id="262-lazy-hydration-on-inbox-open">26.2. Lazy hydration on inbox open</h3>
+<p>Alternative: don't pre-write inbox rows. Maintain only the event log (which user did what to which post). At inbox open, query "all events relevant to user X in last 30 days" and synthesize the inbox.</p>
+<pre><code>1. Event log: per-event row keyed by (source_id, event_id, ts).
+2. Subscription log: which user follows which sources, with start_ts.
+3. Inbox open:
+   - Get user's subscriptions.
+   - For each subscription, scan events since (user's last_seen OR 30d ago).
+   - Merge, sort, take top 50.
+4. Cache result for ~5min per user.
+</code></pre>
+<p>Pros: O(1) write (no per-user duplication). Cheap storage.</p>
+<p>Cons: O(F') read per inbox open. Cache misses are expensive. Real-time updates (new notification while user is on the inbox screen) require WebSocket or polling.</p>
+<h3 id="263-hybrid-pre-write-for-hot-hydrate-for-cold">26.3. Hybrid: pre-write for hot, hydrate for cold</h3>
+<p>Most systems use hybrid:
+- Pre-write for active users (logged in within 30 days).
+- Lazy-hydrate for dormant users (logged in &gt;30 days ago).</p>
+<p>When dormant user returns, hydrate inbox in background while showing a loading state, then transition.</p>
+<p>Storage savings: ~70% of users in a typical product are dormant; pre-writing for them is mostly wasted storage.</p>
+<h3 id="264-read-state-propagation">26.4. Read-state propagation</h3>
+<p>Already discussed in §23. Inbox row's <code>read_at_ms</code> field is canonical. Updated when:
+- User opens inbox (mark all visible as "seen", not necessarily "read").
+- User taps a specific notification (mark that one "read").
+- User triggers "Mark all as read."</p>
+<p>Propagated to other devices via WebSocket + silent push.</p>
+<h3 id="265-retention">26.5. Retention</h3>
+<p>Inbox can't grow unbounded. Industry norms:</p>
+<ul>
+<li>Cap at <strong>30 days</strong> (Twitter, Facebook, Instagram).</li>
+<li>Cap at <strong>100-500 notifications</strong> per user (Slack, Discord).</li>
+<li>Cap at <strong>N per category</strong> (e.g., 50 social, 100 transactional, unlimited critical).</li>
+</ul>
+<p>Implementation:
+- Cassandra TTL (<code>default_time_to_live</code>) — automatic expiry at write.
+- Periodic cleanup job — <code>DELETE WHERE user_id=X AND row_count &gt; 100</code> (more complex, runs nightly).
+- Per-category retention — different TTLs per <code>category</code> field; needs partition partitioned by category or post-filter.</p>
+<p>Trade-off: longer retention = more storage, slower inbox queries (more rows to scan), more compaction overhead. Shorter retention = bad UX when users want to find old notifications.</p>
+<hr>
+<h2 id="27-web-push-and-progressive-web-apps">§27. Web push and progressive web apps</h2>
+<p>Web push extends notifications to browsers, including for sites with no installed app.</p>
+<h3 id="271-service-worker-subscription">27.1. Service Worker subscription</h3>
+<p>A web push capability requires:</p>
+<ol>
+<li><strong>Service Worker</strong> registered for the origin — a JS background script the browser keeps running even when no tab is open.</li>
+<li><strong>Push permission</strong> — user opts in via <code>Notification.requestPermission()</code>. UI prompt; ~5-20% acceptance rate typically.</li>
+<li><strong>Subscription</strong> — <code>serviceWorkerRegistration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: VAPID_PUBLIC_KEY })</code>. Returns the subscription endpoint + keys.</li>
+</ol>
+<p>App POSTs subscription to backend. Backend stores in <code>device_tokens</code> table (platform = WEB).</p>
+<h3 id="272-vapid-keys">27.2. VAPID keys</h3>
+<p>VAPID (Voluntary Application Server Identification, RFC 8292) — the auth model for web push. No platform-issued provider certificate (unlike APNs). Instead, your server generates an ECDSA P-256 keypair:</p>
+<pre><code>private key (kept on server)
+public key   (registered with subscription; embedded in subscribe call)
+</code></pre>
+<p>Each push request includes a JWT signed with the private key. Push service verifies with the public key on file.</p>
+<p>JWT claims:</p>
+<pre><code class="language-json">{
+  &quot;aud&quot;: &quot;https://fcm.googleapis.com&quot;,
+  &quot;exp&quot;: 1716393600,
+  &quot;sub&quot;: &quot;mailto:admin@example.com&quot;
+}
+</code></pre>
+<p><code>sub</code> is your contact (browser vendors use this to reach you if your server misbehaves).</p>
+<h3 id="273-payload-encryption">27.3. Payload encryption</h3>
+<p>RFC 8291: web push payloads are <strong>end-to-end encrypted between server and browser</strong>. The push service (Mozilla Push, FCM, etc.) cannot read content — it just forwards encrypted bytes.</p>
+<p>Encryption:
+- Server generates an ECDH ephemeral keypair per push.
+- Derives a shared secret with the browser's subscription public key (P-256 ECDH).
+- HKDF derives an encryption key.
+- Encrypts the payload with AES-128-GCM.
+- Sends ciphertext + ephemeral public key in HTTP headers.</p>
+<p>Browser:
+- Decrypts using its private key + server's ephemeral public key.
+- Fires the Service Worker's <code>push</code> event handler.
+- Handler calls <code>self.registration.showNotification(title, options)</code>.</p>
+<p>This is one of the rare end-to-end encrypted notification channels — APNs/FCM operators can read your payload; web push operators cannot.</p>
+<h3 id="274-the-browser-push-acceptance-rate-is-low-reality">27.4. The "browser push acceptance rate is low" reality</h3>
+<p>Web push permission prompts are highly disruptive. Chrome and Firefox have made permission UIs increasingly user-protective:</p>
+<ul>
+<li>Chrome 80+: quieter UI for repeat-asks. The default permission rate has been reported at ~10-20% in industry analyses.</li>
+<li>Safari (iOS 16.4+): requires the site to be a PWA installed to home screen.</li>
+<li>Firefox: aggressive prompt-frequency limits.</li>
+</ul>
+<p>Best practices:
+- Don't ask on first page load — ask after user demonstrates interest.
+- Frame the value: "Get notified when your friend replies" not "We want to send you notifications."
+- Don't re-prompt after rejection — counter-productive.</p>
+<p>Acceptance rate of 5% on a 1M-MAU site = 50k web push subscribers. Better than nothing, but small fraction of audience.</p>
+<h3 id="275-browser-quirks">27.5. Browser quirks</h3>
+<ul>
+<li>Chrome / Edge: subscriptions managed by FCM under the hood; reliable.</li>
+<li>Firefox: own push service (Mozilla); generally reliable.</li>
+<li>Safari: APNs under the hood since iOS 16.4 / macOS 13; same auth as native iOS (VAPID or APNs certs).</li>
+<li>Mobile browsers: Chrome Android supports web push; Safari iOS only for PWAs.</li>
+</ul>
+<hr>
+<h2 id="28-notification-observability">§28. Notification observability</h2>
+<p>Without metrics, the notification platform is opaque. Observability is essential.</p>
+<h3 id="281-per-channel-delivery-rates">28.1. Per-channel delivery rates</h3>
+<table>
+<thead>
+<tr>
+<th>Channel</th>
+<th>Delivery rate target</th>
+<th>Definition</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Push (APNs/FCM)</td>
+<td>~90%</td>
+<td>API returns 2xx</td>
+</tr>
+<tr>
+<td>Email (SES/SendGrid)</td>
+<td>~95%</td>
+<td>No hard bounce within 24h</td>
+</tr>
+<tr>
+<td>SMS (Twilio)</td>
+<td>~95-99%</td>
+<td>Carrier-delivered status</td>
+</tr>
+<tr>
+<td>In-app inbox</td>
+<td>~100%</td>
+<td>Row written to Cassandra</td>
+</tr>
+</tbody>
+</table>
+<p>Anything below target investigated. Common causes of drops:</p>
+<ul>
+<li>Push: token rotation, dead tokens accumulating.</li>
+<li>Email: deliverability issues (DKIM rotation incomplete, IP reputation slipping).</li>
+<li>SMS: carrier filtering, registration lapsed.</li>
+<li>In-app: rare — Cassandra outage.</li>
+</ul>
+<h3 id="282-open-rate-read-rate">28.2. Open rate / read rate</h3>
+<p>The "user actually saw it" funnel:</p>
+<pre><code>sent → delivered → opened → clicked → converted
+100%   95%         30%       3%        0.5%
+</code></pre>
+<p>Per-channel and per-campaign breakdowns. Compare to baselines; alert on regression.</p>
+<p>Tracking mechanics:
+- <strong>Email open</strong>: tracking pixel (1x1 image hosted on your CDN with <code>?token=msg_id</code>). Loaded = open. Apple Mail Privacy Protection (MPP) pre-fetches, inflating opens since 2021.
+- <strong>Email click</strong>: rewrite all links through a tracking redirect (<code>example.com/track?url=...&amp;msg=...</code>). Click = redirect logged.
+- <strong>Push open</strong>: when user taps the push, app records launch source.
+- <strong>SMS click</strong>: tracking URL in the message.
+- <strong>In-app</strong>: read state from inbox row.</p>
+<h3 id="283-the-funnel-from-sent-to-action">28.3. The funnel from sent to action</h3>
+<p>Most product analytics platforms (Mixpanel, Amplitude) integrate with the notification platform. Each <code>sent</code>, <code>delivered</code>, <code>opened</code>, <code>clicked</code>, <code>unsubscribed</code> event flows through to the analytics pipeline tagged with user_id, campaign_id, variant.</p>
+<p>KPIs by stakeholder:
+- <strong>Eng</strong>: delivery rate, latency, error rates, infra cost.
+- <strong>Product</strong>: open rate, click rate, retention impact.
+- <strong>Marketing</strong>: conversion, attributed revenue.
+- <strong>Legal/compliance</strong>: unsubscribe latency, bounce processing, complaint rate.</p>
+<p>Alerts:
+- Delivery rate drops &gt;2% absolute → page on-call.
+- Spam complaint rate &gt;0.1% (Gmail threshold) → block campaign, page marketing ops.
+- IP reputation drops in Postmaster Tools → page deliverability team.</p>
+<h3 id="284-per-recipient-delivery-audit">28.4. Per-recipient delivery audit</h3>
+<p>For regulated content (HIPAA-adjacent, financial, GDPR data subject requests), you need to prove "we sent notification X to user Y at time Z, via channel C." This requires:</p>
+<ul>
+<li><code>delivery_status</code> table with per-(event, recipient, channel) row, retained 7+ years for finance, 1+ year for general.</li>
+<li>Append-only audit log (S3 with compliance lock or equivalent).</li>
+<li>Searchable by user_id (for GDPR access requests).</li>
+</ul>
+<p>The audit log is separate from the operational stores (which have shorter retention) — S3 / object storage is cheap.</p>
+<hr>
+<h2 id="29-failure-modes-not-covered-earlier">§29. Failure modes not covered earlier</h2>
+<p>§8 covered the common ones. Some more:</p>
+<h3 id="291-apns-throttling-ip-quarantine">29.1. APNs throttling — IP quarantine</h3>
+<p>If you exceed APNs' throughput limits or send to many dead tokens, Apple throttles your IP. Throttle persists for hours to days. Recovery: exponential backoff, drain queue slowly, monitor success rate.</p>
+<p>Worse: repeated abuse → APNs can quarantine the IP for weeks. Then you have to rotate to a new outbound IP and restart connections. Mitigations:
+- Strict 410-handling (immediately remove dead tokens).
+- Backoff on 429.
+- Stay well under per-IP throughput limits (~10k req/sec rough).
+- Spread across multiple outbound IPs.</p>
+<h3 id="292-fcm-upstream-changes">29.2. FCM upstream changes</h3>
+<p>FCM has had multiple breaking changes:</p>
+<ul>
+<li><strong>2014</strong>: GCM (Google Cloud Messaging) replaced by FCM (Firebase Cloud Messaging). Token format changed.</li>
+<li><strong>2018</strong>: XMPP upstream messaging deprecated; HTTP/2 required.</li>
+<li><strong>2023-2024</strong>: Legacy HTTP API deprecated; FCM HTTP v1 (the newer API with Google service account auth) required.</li>
+</ul>
+<p>Each migration broke apps that hadn't updated their server code. Operational learning: monitor Google announcements; subscribe to firebase-talk; budget yearly migration time.</p>
+<h3 id="293-email-bounce-types">29.3. Email bounce types</h3>
+<ul>
+<li><strong>Hard bounce</strong>: permanent (<code>550 5.1.1 User unknown</code>, <code>550 5.7.1 Blocked</code>). Suppress immediately. Re-trying = spam signal that drops your reputation.</li>
+<li><strong>Soft bounce</strong>: temporary (<code>450 4.2.1 Mailbox full</code>, <code>421 4.7.0 Temporary system problem</code>). Retry with backoff: 1h, 4h, 24h, 72h. If still bouncing after 5 attempts over 3 days → treat as hard.</li>
+<li><strong>Spam bounce</strong>: bounced because target server thinks you're spam (<code>550 5.7.1 Message rejected as spam</code>). Categorize separately; investigation needed (not just suppress).</li>
+<li><strong>Block bounce</strong>: target server has explicitly blocked your IP. Hard to recover; rotate IP after warming new one.</li>
+</ul>
+<p>Bounce processing must be reliable — a backed-up bounce queue means you keep sending to known-bad addresses, which destroys your sender reputation.</p>
+<h3 id="294-ses-sendgrid-outages">29.4. SES / SendGrid outages</h3>
+<p>SES has had partial outages (specific regions, specific recipient domains). Mitigation:</p>
+<ul>
+<li>Multi-provider redundancy: SES primary, SendGrid backup. Switch via config flag.</li>
+<li>Per-recipient-domain failover: if SES → @gmail.com is failing but SendGrid works, route Gmail addresses to SendGrid.</li>
+<li>Queue + retry: outage = queue accumulates → drain when recovered. Track queue depth.</li>
+</ul>
+<h3 id="295-provider-api-rate-limits">29.5. Provider API rate limits</h3>
+<p>Every external API has rate limits:</p>
+<ul>
+<li>APNs: ~10k req/sec/IP/cert.</li>
+<li>FCM: 600k QPS per project (high; rarely hit).</li>
+<li>SES: per-account TPS (transactions per second), upgradeable from 1 to 10k+.</li>
+<li>Twilio: 1 msg/sec/long-code (US 10DLC) up to 75 msg/sec for high-trust tiers. Short codes 100+/sec.</li>
+</ul>
+<p>Hit the limit = 429 / 4xx. Backoff. Stay below 80% of the limit in steady state. Spread across multiple sender accounts if needed.</p>
+<h3 id="296-dns-failures">29.6. DNS failures</h3>
+<p>Provider hostnames (<code>api.push.apple.com</code>, <code>fcm.googleapis.com</code>, <code>email-smtp.us-east-1.amazonaws.com</code>) resolved via DNS. DNS outages cause cascading failures. Mitigations:</p>
+<ul>
+<li>Long-lived DNS cache locally (resolver running on dispatcher hosts).</li>
+<li>Multiple resolvers configured (your VPC's DNS + Google 8.8.8.8 fallback).</li>
+<li>Pin IPs as fallback (with caution — providers do rotate IPs).</li>
+<li>Service mesh DNS (consul, internal DNS) with health checks.</li>
+</ul>
+<hr>
+<h2 id="30-cost-economics">§30. Cost economics</h2>
+<p>The bottom line. Costs by channel at scale:</p>
+<h3 id="301-push">30.1. Push</h3>
+<ul>
+<li><strong>APNs</strong>: free. You pay for infrastructure (dispatcher hosts, persistent connection capacity).</li>
+<li><strong>FCM</strong>: free. Same.</li>
+<li><strong>Self-hosted infra cost</strong>: ~$0.05-0.10 per 1M push at scale (compute + network).</li>
+<li><strong>SaaS push providers</strong> (OneSignal, Airship, Iterable, Braze): $1-10 per 1M push depending on volume tier and features (often bundled with other channels and analytics).</li>
+</ul>
+<p>For a 1B-pushes/month product, self-hosting saves $1k-$10k/month vs SaaS — but you need 1-3 engineers maintaining it. Break-even around 100M-1B push/month.</p>
+<h3 id="302-email">30.2. Email</h3>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>$/1k emails (typical)</th>
+<th>Best for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AWS SES</td>
+<td>$0.10</td>
+<td>High volume, low cost; you handle deliverability</td>
+</tr>
+<tr>
+<td>SendGrid</td>
+<td>$0.30-1.00</td>
+<td>Mid volume; managed deliverability; templates</td>
+</tr>
+<tr>
+<td>Mailgun</td>
+<td>$0.30-0.80</td>
+<td>Developer-friendly</td>
+</tr>
+<tr>
+<td>Postmark</td>
+<td>$1.25</td>
+<td>Transactional only; obsessive deliverability</td>
+</tr>
+<tr>
+<td>SparkPost</td>
+<td>$0.20-0.80</td>
+<td>High volume</td>
+</tr>
+<tr>
+<td>Internal SMTP fleet</td>
+<td>$0.01-0.05 + infra</td>
+<td>&gt;1B/month; Mailchimp-scale</td>
+</tr>
+</tbody>
+</table>
+<p>For 1B emails/month:
+- SES: ~$100k/month
+- SendGrid: ~$300k/month
+- Internal SMTP: ~$10-50k/month + 5-10 engineers managing deliverability</p>
+<p>Inflection: ~100M emails/month is where you start considering internal SMTP. At 1B+/month most large senders build their own.</p>
+<h3 id="303-sms">30.3. SMS</h3>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>$/1k SMS (US)</th>
+<th>International</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Twilio</td>
+<td>$7.50-8.50</td>
+<td>30-200+</td>
+<td>Most common; broad coverage</td>
+</tr>
+<tr>
+<td>AWS SNS</td>
+<td>$6.45</td>
+<td>varies</td>
+<td>Cheaper US; less polished</td>
+</tr>
+<tr>
+<td>MessageBird</td>
+<td>$7-9</td>
+<td>varies</td>
+<td>EU strong</td>
+</tr>
+<tr>
+<td>Bandwidth</td>
+<td>$4-7</td>
+<td>US-only</td>
+<td>Direct carrier relationships</td>
+</tr>
+<tr>
+<td>Sinch</td>
+<td>$6-8</td>
+<td>varies</td>
+<td>Volume-focused</td>
+</tr>
+</tbody>
+</table>
+<p>For 10M SMS/month US (10M × 2FA codes):
+- Twilio: ~$75k/month
+- Bandwidth: ~$40-70k/month (volume tier negotiated)
+- AWS SNS: ~$65k/month</p>
+<p>International doubles or triples cost. Premium destinations (Russia, Cuba, parts of Africa) can be 10x US.</p>
+<h3 id="304-volume-tier-negotiations">30.4. Volume tier negotiations</h3>
+<p>All major providers offer volume tiers, but the published rates are list. Real enterprise rates after negotiation:</p>
+<ul>
+<li>SES: list $0.10/1k → enterprise as low as $0.04-0.06/1k at billions/month.</li>
+<li>SendGrid: list $1/1k at small scale → ~$0.15/1k at billions/month.</li>
+<li>Twilio: list $0.0075/SMS → ~$0.005-0.006 at hundreds of millions/month.</li>
+</ul>
+<p>Negotiation levers:
+- Multi-year commitment (1-3 years).
+- Multi-channel bundle (email + SMS + voice).
+- Public case study / co-marketing.
+- Migration from competitor (provider will discount to win the deal).</p>
+<h3 id="305-hidden-costs">30.5. Hidden costs</h3>
+<ul>
+<li><strong>Dedicated IPs</strong> (for sender reputation control): $50-500/month per IP, plus warm-up time.</li>
+<li><strong>Compliance tooling</strong>: DMARC monitoring (Valimail, EasyDMARC) $500-5000/month.</li>
+<li><strong>Deliverability consulting</strong>: $5-50k/month at large scale.</li>
+<li><strong>Analytics &amp; A/B platform</strong>: Iterable / Braze / Klaviyo add $5-50k/month bundled.</li>
+<li><strong>Engineering time</strong>: dedicated notification platform team = $1-5M/year fully-loaded.</li>
+</ul>
+<p>For a Series-B company, "build vs buy" is rarely about per-message cost — it's about engineering opportunity cost. For a public company at $100M+ ARR with notifications central to product, build wins on cost and control.</p>
+<hr>
+<h2 id="31-summary">§31. Summary</h2>
+<blockquote>
+<p><em>Notification delivery is a fanout amplifier with a back-pressure-aware bus: events on a durable queue, a fanout service explodes them into per-user deliveries (sharded by recipient_id), dispatcher workers apply dedup + preference + rate-limit + quiet-hours in a tight Redis loop, persist the inbox to an LSM-tree store (Cassandra, partitioned by user_id) as the source of truth, then push to channel routers that maintain persistent HTTP/2 connections to APNs/FCM with collapse_id for device-side dedup. The central design pivot is the recipient-set distribution: fanout-on-write for normal sources, fanout-on-read for celebrity-shaped sources, engagement-based push sampling on top — turning a 100M-recipient post into ~1M actual pushes. Delivery is at-least-once with idempotency at the inbox row and the device; exactly-once is the wrong contract. The inbox is the source of truth, the push is a hint, and the producer must never see the channels — they emit events to a queue and the platform owns everything that happens after.</em></p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

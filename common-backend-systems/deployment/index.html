@@ -1,0 +1,1522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Container Orchestration & Deployment — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Container Orchestration & Deployment</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>A technology reference on container orchestrators and deployment systems — what they are, how Kubernetes works at the byte level, where the design space splits across Kubernetes, Nomad, ECS (Elastic Container Service), Docker Swarm and Mesos, and how deployment patterns (blue-green, canary, rolling, dark launch, shadow) layer on top. Use cases (a SaaS web app, a stateful Postgres cluster, ML training pipelines, batch ETL, edge IoT) appear throughout as illustrations of the same class of technology bent to fit different workloads.</p>
+</blockquote>
+<hr>
+<h2 id="1-what-container-orchestration-is">§1. What Container Orchestration Is</h2>
+<p>A <strong>container orchestrator</strong> is a runtime that schedules containerized workloads onto a cluster of machines, manages their lifecycle, exposes them as services, and handles failures — all driven by a declarative description of desired state. You hand the system a manifest that says "I want three replicas of my web app, each with 500m CPU and 512Mi RAM, exposed on port 8080, on nodes labeled 'web-tier'," and the orchestrator's job is to make reality match that description and keep it matching as nodes die, traffic spikes, and new versions deploy.</p>
+<p>The defining property is <strong>desired-state convergence</strong>. You don't issue imperative commands ("start container X on node Y"). You declare what should be true, and a control loop continuously observes the current state, compares it to the desired state, and takes actions to close the gap. This is what makes the system resilient: every minute, the same loop that originally placed your container is asking "are three replicas still running? are they on healthy nodes? do they still pass health checks?" — and if the answer is no, it does what it takes to make the answer yes.</p>
+<p>Container orchestration sits at one corner of a design space:</p>
+<ul>
+<li><strong>Container orchestration (Kubernetes, Nomad, ECS, Docker Swarm)</strong> — schedules OCI (Open Container Initiative) containers onto a cluster, exposes them as services, manages lifecycle. Pods or tasks are ephemeral; the orchestrator handles replacement. Modern default for stateless and most stateful workloads.</li>
+<li><strong>VM (Virtual Machine) orchestration (VMware vSphere, OpenStack, AWS EC2 Auto Scaling Groups)</strong> — heavier units (VMs boot in 30–120 seconds vs containers in 1–5 seconds), stronger isolation (hypervisor), denser per-VM workloads (multiple processes). Still used for legacy apps, kernel-tied workloads, or strict isolation requirements.</li>
+<li><strong>Serverless platforms (AWS Lambda, Google Cloud Run, Azure Functions, Fargate)</strong> — abstract the cluster away entirely. You hand the platform a function or container, it runs it on demand, scales to zero, charges per invocation. No node management; constrained execution environment (15-minute timeout, ephemeral filesystem, limited memory).</li>
+<li><strong>Bare-metal provisioning (Foreman, MAAS, Tinkerbell)</strong> — installs OSes and configurations onto physical machines. The base layer beneath VMs and containers. Slow turnover (hours to days), no native scheduling.</li>
+<li><strong>Configuration management (Ansible, Puppet, Chef, SaltStack)</strong> — applies configuration to long-lived hosts via SSH or agents. Predates containers; orthogonal but often combined for the host layer beneath the container layer.</li>
+</ul>
+<p>This doc focuses on container orchestration — primarily Kubernetes, since that is where 90%+ of new deployments happen and where the byte-level mechanics matter most — with the other variants compared along the way.</p>
+<p><strong>What container orchestration is NOT good for:</strong></p>
+<ul>
+<li><strong>Persistent state guarantees.</strong> Pods are ephemeral. The orchestrator will reschedule your database pod to another node without warning if it deems necessary. Persistence is a separate concern handled by the storage layer (PVs — Persistent Volumes, PVCs — Persistent Volume Claims, CSI — Container Storage Interface drivers) but the orchestrator itself promises nothing about your data.</li>
+<li><strong>Cross-cluster atomicity.</strong> A Kubernetes deployment to cluster A and a deployment to cluster B are independent. There is no built-in distributed transaction across clusters. Multi-cluster systems must layer that on top.</li>
+<li><strong>Business logic correctness.</strong> The orchestrator runs your code; it does not validate that your code is right. A pod with a bug will be cheerfully kept alive forever as long as its health check returns 200 OK.</li>
+<li><strong>Tiny workloads.</strong> Running a 50-pod cluster requires ~3 control-plane nodes plus storage plus monitoring — overhead that might cost more than the workload itself. Below a certain threshold (~100 pods, ~5 services), a single VM with systemd is genuinely simpler.</li>
+<li><strong>Hard real-time.</strong> Pod scheduling, CNI (Container Network Interface) plumbing, and kubelet bookkeeping introduce variable startup latency. If you need a workload running within 50 ms of a trigger, use a pre-warmed serverless platform or pin a long-running pod.</li>
+<li><strong>GPU-dense legacy training that wants direct hardware control.</strong> Doable in Kubernetes (NVIDIA's device plugin) but legacy tools (Slurm) still dominate in scientific HPC (High Performance Computing) and parts of AI training.</li>
+</ul>
+<p>Mental model: a container orchestrator is the <strong>scheduling and lifecycle layer</strong> between your application code and the physical infrastructure. Everything above it (load balancing rules, deployment strategies, secrets, configs) is expressed declaratively; everything below it (CPU, memory, disk, network) is abstracted into the resource model. The orchestrator's job is to reconcile the two.</p>
+<hr>
+<h2 id="2-inherent-guarantees">§2. Inherent Guarantees</h2>
+<p>What container orchestration provides by design, and what must still be layered above it.</p>
+<h3 id="provided-by-design">Provided by design</h3>
+<ul>
+<li><strong>Desired-state convergence.</strong> Every controller in the system runs a reconcile loop that, given a declarative spec, takes actions to make actual state match. If you say "three replicas," the system will keep three replicas alive as long as the cluster has capacity.</li>
+<li><strong>Self-healing through pod replacement.</strong> A pod that crashes is restarted (default <code>restartPolicy: Always</code> for Deployments). A node that dies has its pods rescheduled to other nodes within ~5 minutes (the pod eviction timeout). A failing health check ejects the pod from service endpoints within seconds.</li>
+<li><strong>Rolling updates with bounded disruption.</strong> Updating an image rolls pods one (or N) at a time, respecting <code>maxUnavailable</code> and <code>maxSurge</code>. Traffic shifts away from terminating pods (via readiness probes + endpoints controller) before they are killed.</li>
+<li><strong>Service discovery.</strong> Every Service object gets a stable virtual IP (ClusterIP) and DNS name (<code>my-service.my-ns.svc.cluster.local</code>). Pods come and go; the Service abstracts that churn.</li>
+<li><strong>Secret and config injection.</strong> Secrets (base64-encoded, encrypted at rest in etcd if configured) and ConfigMaps mount into pods as files or environment variables. Rotation is supported (with caveats — see §7).</li>
+<li><strong>Resource isolation.</strong> Pods declare CPU and memory <code>requests</code> and <code>limits</code>. The scheduler honors requests for placement; the kernel (via cgroups) enforces limits at runtime.</li>
+<li><strong>Horizontal scaling on metrics.</strong> HPA (Horizontal Pod Autoscaler) and VPA (Vertical Pod Autoscaler) adjust replica count or per-pod resources based on metrics. KEDA (Kubernetes Event-Driven Autoscaling) extends this to non-metric triggers like queue depth.</li>
+</ul>
+<h3 id="must-be-layered-above">Must be layered above</h3>
+<ul>
+<li><strong>Persistent state.</strong> Pods are stateless to the orchestrator. Persistent storage is provided by PVs backed by EBS (Elastic Block Store), GCE (Google Compute Engine) Persistent Disks, Ceph, NFS, etc. The orchestrator decides where the pod runs; the storage layer decides whether the data follows. Operators (e.g., CloudNativePG, Strimzi, Vitess) wrap stateful workloads with custom reconciliation logic.</li>
+<li><strong>Cross-region / multi-cluster coordination.</strong> A single Kubernetes cluster is bounded to one (or a few coupled) failure domains. Active/active across regions requires a federation tool (KubeFed, Cluster API, Argo CD ApplicationSet, Karmada) plus an external service mesh or global load balancer.</li>
+<li><strong>Network policy enforcement.</strong> Default Kubernetes networking is flat — every pod can reach every other pod. NetworkPolicy objects are <em>requests</em>; the CNI plugin must enforce them (Calico, Cilium do; some don't). Zero-trust requires a service mesh layer (Istio, Linkerd) or a CNI that does L7 filtering (Cilium with eBPF).</li>
+<li><strong>Deployment strategies beyond rolling update.</strong> Native Deployment supports rolling update and recreate. Canary, blue-green, traffic-mirroring all require extra machinery — Argo Rollouts, Flagger, service mesh traffic splitting, or hand-rolled scripts.</li>
+<li><strong>GitOps / CI/CD.</strong> Kubernetes accepts manifests; it does not fetch them from git, build images, or sequence rollouts. Tools like ArgoCD, FluxCD, Spinnaker, and Tekton add the delivery pipeline on top.</li>
+<li><strong>Backup and disaster recovery.</strong> Velero, Stash, etc. handle etcd snapshots and PV backups. The orchestrator itself only knows current state; it does not maintain history.</li>
+<li><strong>Multi-tenancy isolation.</strong> Namespaces are <em>soft</em> boundaries — RBAC (Role-Based Access Control), ResourceQuotas, LimitRanges layer on top. <em>Hard</em> multi-tenancy (untrusted workloads) requires extra (gVisor, Kata Containers, vCluster, or separate clusters).</li>
+<li><strong>Cost allocation, chargeback, FinOps.</strong> The orchestrator does not natively attribute compute cost to teams. Tools like Kubecost, OpenCost calculate this from labels.</li>
+</ul>
+<p>Synthesis: the orchestrator guarantees <strong>scheduling, lifecycle, and service abstraction for ephemeral workloads on a cluster of homogeneous-enough machines</strong>. Everything beyond — persistent state, cross-cluster, security policy enforcement, delivery pipeline, multi-tenancy — is the system designer's problem.</p>
+<hr>
+<h2 id="3-the-design-space">§3. The Design Space</h2>
+<p>The orchestrator design space is dominated by Kubernetes but has meaningful variants.</p>
+<h3 id="axis-1-general-purpose-orchestrator-vs-cloud-managed">Axis 1: General-purpose orchestrator vs cloud-managed</h3>
+<ul>
+<li><strong>General-purpose, self-hostable (Kubernetes, Nomad, Docker Swarm, Mesos):</strong> runs anywhere — on-prem bare metal, EC2 (Elastic Compute Cloud), bare-metal cloud, edge. You operate the control plane (or use a managed offering of the same software).</li>
+<li><strong>Cloud-proprietary (Amazon ECS, AWS Fargate, Azure Container Instances):</strong> tightly coupled to one cloud's services. Simpler to operate (no etcd, no control plane to babysit) but locked in.</li>
+</ul>
+<h3 id="axis-2-container-only-vs-multi-workload">Axis 2: Container-only vs multi-workload</h3>
+<ul>
+<li><strong>Container-focused (Kubernetes, ECS, Docker Swarm):</strong> pods/tasks are the primary unit. Other workloads (raw binaries, VMs) are second-class or unsupported.</li>
+<li><strong>Multi-workload (Nomad):</strong> schedules containers, raw executables (the <code>exec</code> driver), QEMU VMs, Java JARs, Windows tasks. One scheduler, many runtimes. Useful when your fleet has legacy executables you can't easily containerize.</li>
+</ul>
+<h3 id="axis-3-batteries-included-vs-minimal">Axis 3: Batteries-included vs minimal</h3>
+<ul>
+<li><strong>Batteries-included (Kubernetes):</strong> ships with a controller for almost everything — Deployment, StatefulSet, DaemonSet, Job, CronJob, HPA, NetworkPolicy, Ingress (via controllers), Service, PVC, etc. Steep learning curve; rich ecosystem.</li>
+<li><strong>Minimal core (Nomad):</strong> ~50 MB single binary. Scheduling, service discovery, simple stanza-based job definitions. Ecosystem is thinner; ops burden lower.</li>
+</ul>
+<h3 id="axis-4-deployment-delivery-model">Axis 4: Deployment delivery model</h3>
+<p>Orthogonal to the orchestrator itself, but tightly coupled in practice:</p>
+<ul>
+<li><strong>Push-based (Spinnaker, traditional Jenkins-driven <code>kubectl apply</code>):</strong> the CI/CD system has cluster credentials, pushes manifests in. Familiar; secrets in CI; cluster has no idea where its config came from.</li>
+<li><strong>Pull-based GitOps (ArgoCD, FluxCD):</strong> an in-cluster controller watches a git repository, pulls manifests, applies them, reports drift. Cluster has no inbound credentials; the source of truth is git.</li>
+<li><strong>Progressive delivery (Argo Rollouts, Flagger):</strong> a deployment controller that handles canary and blue-green natively, gating each step on metrics from Prometheus / Datadog / etc.</li>
+</ul>
+<h3 id="comparison-table">Comparison table</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Kubernetes</th>
+<th>Nomad</th>
+<th>ECS</th>
+<th>Docker Swarm</th>
+<th>Mesos</th>
+<th>Spinnaker (delivery)</th>
+<th>ArgoCD (delivery)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scope</td>
+<td>Orchestrator</td>
+<td>Orchestrator</td>
+<td>Orchestrator (AWS-bound)</td>
+<td>Orchestrator</td>
+<td>Orchestrator (legacy)</td>
+<td>Delivery pipeline</td>
+<td>Delivery pipeline</td>
+</tr>
+<tr>
+<td>Self-hostable?</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>No (AWS only)</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes (runs in cluster)</td>
+</tr>
+<tr>
+<td>Single binary?</td>
+<td>No (5+ components)</td>
+<td>Yes (~50 MB)</td>
+<td>N/A (cloud service)</td>
+<td>Yes</td>
+<td>No</td>
+<td>No (microservices)</td>
+<td>No (controller + UI)</td>
+</tr>
+<tr>
+<td>Workload types</td>
+<td>Containers, jobs</td>
+<td>Containers, raw, VMs, JAR</td>
+<td>Containers (Fargate or EC2)</td>
+<td>Containers</td>
+<td>Containers, frameworks</td>
+<td>Targets k8s, EC2, GCE</td>
+<td>Targets k8s</td>
+</tr>
+<tr>
+<td>Service discovery</td>
+<td>Built-in (CoreDNS)</td>
+<td>Built-in (Consul integration)</td>
+<td>AWS Cloud Map</td>
+<td>Built-in</td>
+<td>None native</td>
+<td>N/A</td>
+<td>N/A</td>
+</tr>
+<tr>
+<td>Storage abstraction</td>
+<td>PV/PVC/CSI</td>
+<td>Host volumes, CSI</td>
+<td>EBS, EFS, FSx via integrations</td>
+<td>Volumes</td>
+<td>Frameworks own this</td>
+<td>N/A</td>
+<td>N/A</td>
+</tr>
+<tr>
+<td>Network policy</td>
+<td>Yes (CNI dependent)</td>
+<td>Limited</td>
+<td>Security groups</td>
+<td>Limited</td>
+<td>N/A</td>
+<td>N/A</td>
+<td>N/A</td>
+</tr>
+<tr>
+<td>Cluster max nodes</td>
+<td>~5,000 / cluster (5k pods/node, 150k pods total)</td>
+<td>~10,000</td>
+<td>5,000 (Fargate auto-scales)</td>
+<td>~1,000</td>
+<td>Tens of thousands (historic)</td>
+<td>N/A</td>
+<td>N/A</td>
+</tr>
+<tr>
+<td>Operational complexity</td>
+<td>High</td>
+<td>Low</td>
+<td>Low (managed)</td>
+<td>Low (declining ecosystem)</td>
+<td>Very high</td>
+<td>Medium</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td>Deployment model</td>
+<td>Built-in rolling, ecosystem for canary</td>
+<td>Built-in canary, blue-green</td>
+<td>Built-in rolling, canary via CodeDeploy</td>
+<td>Rolling only</td>
+<td>Framework-dependent</td>
+<td>Multi-stage pipelines</td>
+<td>GitOps pull</td>
+</tr>
+<tr>
+<td>Status (2026)</td>
+<td>Dominant</td>
+<td>Healthy niche</td>
+<td>Strong on AWS</td>
+<td>Effectively legacy</td>
+<td>Dead</td>
+<td>Mature; usage declining</td>
+<td>Dominant GitOps</td>
+</tr>
+</tbody>
+</table>
+<p>The first three rows of "status" are the relevant ones. Kubernetes won the orchestrator war; Nomad survives at HashiCorp shops and at Cloudflare's scale; ECS survives because AWS keeps shipping it; Swarm and Mesos are dead-walking. For delivery, ArgoCD has become the de facto standard in new cloud-native shops; Spinnaker remains entrenched at Netflix and similar large estates that adopted it early.</p>
+<p>The synthesis: each row's "typical use" is a <em>consequence</em> of the column entries. Kubernetes ends up at "everything" because batteries-included plus 5000-node scale meets most workloads. Nomad ends up at "Cloudflare's edge" because a 50 MB single binary across 200+ POPs (Points of Presence) is operable; Kubernetes there would not be. ECS ends up at "AWS-native shops" because the lock-in is the feature.</p>
+<hr>
+<h2 id="4-underlying-mechanics-the-kubernetes-control-plane-at-the-byte-level">§4. Underlying Mechanics: The Kubernetes Control Plane at the Byte Level</h2>
+<p>This is the depth section. We use Kubernetes as the anchor since it dominates the design space, walk a single <code>kubectl apply</code> from API call to running container, and explain why each layer exists.</p>
+<h3 id="41-the-control-plane-architecture">4.1 The control plane architecture</h3>
+<p>A Kubernetes cluster is built from a control plane (typically 3 or 5 nodes for HA — High Availability) and a set of worker nodes. The control plane comprises:</p>
+<pre><code>                   ┌────────────────────────────────────┐
+                   │       Control Plane Node           │
+                   │  ┌──────────────────────────────┐  │
+                   │  │ kube-apiserver               │  │  ← REST + validation + admission
+                   │  │   (stateless, horizontally    │  │
+                   │  │    scalable)                  │  │
+                   │  └────────────┬─────────────────┘  │
+                   │               │                    │
+                   │  ┌────────────▼─────────────────┐  │
+                   │  │ etcd                         │  │  ← all cluster state lives here
+                   │  │   (Raft-replicated KV)        │  │     (key-value store, MVCC)
+                   │  └──────────────────────────────┘  │
+                   │  ┌──────────────────────────────┐  │
+                   │  │ kube-scheduler               │  │  ← decides which node a pod runs on
+                   │  └──────────────────────────────┘  │
+                   │  ┌──────────────────────────────┐  │
+                   │  │ kube-controller-manager      │  │  ← runs Deployment/ReplicaSet/etc loops
+                   │  └──────────────────────────────┘  │
+                   │  ┌──────────────────────────────┐  │
+                   │  │ cloud-controller-manager     │  │  ← interfaces with AWS/GCP/Azure
+                   │  └──────────────────────────────┘  │
+                   └────────────────────────────────────┘
+                                  │
+                                  │
+   ┌──────────────────────────────┼──────────────────────────────────┐
+   │                              │                                   │
+   ▼                              ▼                                   ▼
+┌──────────────┐           ┌──────────────┐                  ┌──────────────┐
+│ Worker Node  │           │ Worker Node  │     ...          │ Worker Node  │
+│ ┌──────────┐ │           │ ┌──────────┐ │                  │ ┌──────────┐ │
+│ │ kubelet  │ │ ← agent   │ │ kubelet  │ │                  │ │ kubelet  │ │
+│ │  + CRI   │ │   talks    │ │          │ │                  │ │          │ │
+│ │  + CNI   │ │   to       │ │          │ │                  │ │          │ │
+│ │  + CSI   │ │   apiserver│ │          │ │                  │ │          │ │
+│ ├──────────┤ │            │ ├──────────┤ │                  │ ├──────────┤ │
+│ │kube-proxy│ │ ← service  │ │kube-proxy│ │                  │ │kube-proxy│ │
+│ │          │ │   routing  │ │          │ │                  │ │          │ │
+│ ├──────────┤ │            │ ├──────────┤ │                  │ ├──────────┤ │
+│ │containerd│ │ ← actually │ │containerd│ │                  │ │containerd│ │
+│ │  / CRI-O │ │   runs     │ │          │ │                  │ │          │ │
+│ │          │ │   containers│ │          │ │                  │ │          │ │
+│ └──────────┘ │            │ └──────────┘ │                  │ └──────────┘ │
+│              │            │              │                  │              │
+│  ┌────┐┌────┐│            │  ┌────┐      │                  │  ┌────┐      │
+│  │Pod ││Pod ││            │  │Pod │      │                  │  │Pod │      │
+│  └────┘└────┘│            │  └────┘      │                  │  └────┘      │
+└──────────────┘            └──────────────┘                  └──────────────┘
+</code></pre>
+<p>Each component has one job. They communicate only through the API server.</p>
+<h3 id="42-etcd-the-desired-state-store">4.2 etcd — the desired-state store</h3>
+<p><strong>etcd is the single source of truth for the cluster.</strong> Every other component is stateless or has reconstructible state; everything that must persist (object specs, current status, leader elections) lives in etcd. It is a Raft-replicated key-value store with:</p>
+<ul>
+<li><strong>MVCC (Multi-Version Concurrency Control):</strong> every write creates a new revision; old revisions are kept for <code>--auto-compaction-retention</code> (typically 1 hour) so that watchers can resume from any point in the recent past.</li>
+<li><strong>Watch streams:</strong> clients open long-lived gRPC streams subscribed to a key prefix. Any mutation under that prefix flows out as an event. This is the mechanism the API server uses to feed change events to every controller in the cluster.</li>
+<li><strong>Consensus:</strong> writes require a quorum of etcd members (3-of-5, 2-of-3). Reads default to <em>linearizable</em> (also quorum-bound) but can be <em>serializable</em> (read from local member, possibly stale, faster).</li>
+</ul>
+<p>A typical key in etcd looks like:</p>
+<pre><code>/registry/pods/default/web-app-7d4f8c-x9k2p
+  → value: protobuf-encoded PodSpec + PodStatus, ~5-50 KB
+</code></pre>
+<p>The API server reads and writes etcd; nothing else does. This isolation is intentional — it means etcd's permissions model can be brutal (TLS — Transport Layer Security — client certs only), and the cluster's complexity can grow without etcd having to learn about Pods, Services, or any Kubernetes concept. To etcd it is all opaque bytes.</p>
+<p>Scale ceiling: etcd is generally happy up to about 8 GB of total data, ~150k objects, sustaining hundreds of writes per second. Past that, the Raft log grows large enough that follower replication starts lagging; cluster operators must tune <code>--quota-backend-bytes</code>, run regular <code>etcdctl defrag</code>, and limit the largest objects (the <code>kube-apiserver --max-request-bytes</code> defaults to 1.5 MB — a hint that very large objects are not the design point). Stripe has reported running etcd at the edge of this envelope; Google's k8s offering shards across multiple etcd clusters per logical cluster as a workaround.</p>
+<h3 id="43-kube-apiserver-the-validation-and-admission-layer">4.3 kube-apiserver — the validation and admission layer</h3>
+<p>The API server is a stateless HTTPS server that exposes the entire Kubernetes API as REST. It has four responsibilities:</p>
+<ol>
+<li><strong>Authentication</strong> — verifies the client (TLS cert, token, OIDC — OpenID Connect, webhook).</li>
+<li><strong>Authorization</strong> — runs RBAC checks. "Can user U perform verb V on resource R in namespace N?"</li>
+<li><strong>Admission control</strong> — runs mutating and validating webhooks. This is where defaulting, validation, and policy enforcement happen. Examples:
+   - The built-in <code>LimitRanger</code> admission controller fills in default CPU/memory requests.
+   - A <code>PodSecurityPolicy</code> (or its successor <code>PodSecurity</code> admission) rejects pods that ask for root.
+   - An external mutating webhook (e.g., Istio's sidecar injector) adds an Envoy sidecar to every pod in a labeled namespace.</li>
+<li><strong>Persistence to etcd</strong> — after admission, the object is written to etcd. The response to the client is returned only after etcd ack.</li>
+</ol>
+<p>The API server is <strong>horizontally scalable</strong> — you can run 3, 5, 10 instances behind a load balancer, all reading/writing the same etcd. Watch fan-out is the main scaling constraint: each watcher is a long-lived stream the apiserver must feed. At large scale (5000-node clusters), the API server uses an internal <em>watch cache</em> that deduplicates etcd watches — one watcher per resource type to etcd, fanned out in-process to thousands of API clients.</p>
+<h3 id="44-the-controller-pattern-the-heart-of-declarative">4.4 The controller pattern — the heart of declarative</h3>
+<p>A <strong>controller</strong> is a process that:</p>
+<ol>
+<li>Watches one or more API resources via the API server's watch protocol.</li>
+<li>Maintains a local cache of the current state.</li>
+<li>Periodically (or on event) compares current state to desired state.</li>
+<li>Computes the actions needed to converge.</li>
+<li>Issues those actions through the API server.</li>
+<li>Repeats forever.</li>
+</ol>
+<p>This is the <strong>reconcile loop</strong>:</p>
+<pre><code>                  ┌─────────────────┐
+                  │  Watch events   │  ← from API server (apiserver feeds
+                  │   queue up      │     watch events into client-go's
+                  └────────┬────────┘    SharedInformer cache)
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │   workqueue (rate-     │
+              │   limited, dedup)      │
+              └──────────┬─────────────┘
+                         │ pop a key
+                         ▼
+              ┌────────────────────────┐
+              │  Reconcile(key)         │
+              │   1. fetch current state│
+              │   2. fetch desired spec │
+              │   3. compute delta      │
+              │   4. take action via    │
+              │      apiserver API call │
+              │   5. update status      │
+              └────────────────────────┘
+                         │
+                  ┌──────┴──────┐
+                  │             │
+              (success)     (error / requeue)
+</code></pre>
+<p>Every "primitive" in Kubernetes is a controller. The Deployment controller reconciles Deployments by creating ReplicaSets. The ReplicaSet controller reconciles ReplicaSets by creating Pods. The Endpoints controller reconciles Endpoints by listing Pods. Custom Resource Definitions (CRDs) extend this — write a CRD plus a custom controller and you've added a new primitive without modifying core Kubernetes. This is how operators (CloudNativePG for Postgres, Strimzi for Kafka, Prometheus Operator for monitoring) work.</p>
+<p>The cardinal principle: <strong>controllers are level-triggered, not edge-triggered</strong>. A controller does not consume a single "create pod X" message and then forget; it observes "I want 3 pods named X-*" and continuously asserts that. Drop an event and the next periodic sync still corrects it. This is what makes the system robust to network blips, controller restarts, and etcd hiccups.</p>
+<h3 id="45-the-scheduler-bin-packing-with-predicates-and-priorities">4.5 The scheduler — bin-packing with predicates and priorities</h3>
+<p>The default scheduler (kube-scheduler) is the controller that watches for Pods with <code>spec.nodeName</code> unset and assigns them to a node. The algorithm is <strong>filter, then score</strong>:</p>
+<pre><code>For each pending pod:
+  Step 1: FILTER (a.k.a. predicates)
+    For each node N in cluster:
+      pass = true
+      check NodeAffinity / NodeSelector match    ← skip if mismatch
+      check Taints / Tolerations                 ← skip if untolerated
+      check resource fits (CPU, memory, ephemeral storage)
+      check pod fits port requirements
+      check volume zone matches node zone
+      check existing pod (anti-)affinity rules
+      ...
+      if any check fails, drop N from candidates
+
+  Step 2: SCORE (a.k.a. priorities)
+    For each candidate node N that passed filter:
+      score = 0
+      score += LeastRequested      (prefer emptier nodes — bin-pack tightness)
+      score += BalancedAllocation  (prefer balance between CPU/memory)
+      score += NodeAffinityWeight  (weighted by soft affinity rules)
+      score += ImageLocality       (prefer nodes that already have the image)
+      score += InterPodAffinity    (prefer near/far from labeled pods)
+      ...
+
+  Step 3: BIND
+    Pick the highest-scoring node.
+    Issue Binding API call → apiserver writes spec.nodeName = N to etcd.
+    The pod is now &quot;assigned.&quot; kubelet on node N will pick it up.
+</code></pre>
+<p>The scheduler is <strong>single-threaded by default for binding</strong> (one pod at a time) but the filter and score phases parallelize across goroutines. A scheduler can sustain ~100 pods/sec on a 5000-node cluster, which is the practical ceiling for fast scale-up.</p>
+<p>There is no central database of "which pod is where" — that information is the union of <code>spec.nodeName</code> fields on Pod objects in etcd. The scheduler does not own placement decisions retroactively. Once a pod is bound, only an eviction or a deletion moves it. This is by design: Kubernetes does <em>not</em> reschedule live pods for bin-packing reasons unless explicitly told to (via <code>descheduler</code> or <code>PodDisruptionBudget</code>-aware eviction).</p>
+<h3 id="46-kubelet-the-per-node-agent">4.6 kubelet — the per-node agent</h3>
+<p>Every worker node runs a <strong>kubelet</strong>, the agent that turns Pod specs into running containers. The kubelet:</p>
+<ol>
+<li>Watches the API server for Pods with <code>spec.nodeName == thisNode</code>.</li>
+<li>Talks to the <strong>CRI (Container Runtime Interface)</strong> — a gRPC API implemented by containerd or CRI-O — to create the pod sandbox, pull images, and start each container.</li>
+<li>Talks to the <strong>CNI (Container Network Interface)</strong> plugin to attach network interfaces.</li>
+<li>Talks to the <strong>CSI (Container Storage Interface)</strong> plugin to mount persistent volumes.</li>
+<li>Periodically reports node and pod status back to the API server, which writes to etcd.</li>
+<li>Runs liveness and readiness probes; restarts containers that fail.</li>
+<li>Streams logs to disk; serves them to <code>kubectl logs</code>.</li>
+</ol>
+<p>The kubelet itself does NOT run containers. Containers are run by <strong>containerd</strong> (the dominant low-level runtime since Docker was deprecated as the in-cluster runtime in Kubernetes 1.24, 2022). The kubelet → containerd boundary is the CRI:</p>
+<pre><code>kubelet                                    containerd
+  │     CreateContainerRequest               │
+  │ ───────────────────────────────────────► │   shim process forks runc
+  │                                           │   runc sets up namespaces
+  │     CreateContainerResponse(id=xyz)       │   (PID, NET, MNT, IPC, UTS, USER)
+  │ ◄─────────────────────────────────────── │   cgroups limit resources
+  │     StartContainerRequest                 │   container is now running
+  │ ───────────────────────────────────────► │
+  │     StartContainerResponse                │
+  │ ◄─────────────────────────────────────── │
+</code></pre>
+<p>Below containerd is <strong>runc</strong> (or alternatives — gVisor for sandboxing, Kata Containers for VM-isolated containers, crun for a lighter C implementation). runc is what actually executes the <code>clone()</code> and <code>unshare()</code> syscalls to create Linux namespaces and the <code>cgroups v2</code> writes to enforce CPU/memory limits.</p>
+<p>The CRI separation is what allows the orchestrator to evolve independently of the runtime. Kubernetes spoke "Docker" originally; the deprecation of <code>dockershim</code> in 2022 was the long-deferred result of standardizing on CRI.</p>
+<h3 id="47-cni-container-network-interface-how-pod-networking-works">4.7 CNI (Container Network Interface) — how pod networking works</h3>
+<p>The CNI is a contract: "given a network namespace and a pod's identity, attach a network interface and configure routing." The implementation is the <strong>CNI plugin</strong>, and the choice of plugin is one of the most consequential per-cluster decisions.</p>
+<p>The three dominant CNI plugins:</p>
+<ul>
+<li><strong>Cilium</strong> — eBPF-based. Programs the Linux kernel's networking subsystem directly via BPF (Berkeley Packet Filter) maps. No <code>iptables</code>, no kube-proxy needed. Supports L7 (application-layer) policy. Best performance at high pod counts. The de-facto choice for new large clusters in 2026.</li>
+<li><strong>Calico</strong> — supports BGP (Border Gateway Protocol) for routing pod IPs across nodes, or VXLAN/IPIP overlay for non-BGP environments. Long the production default; very flexible policy model.</li>
+<li><strong>Flannel</strong> — VXLAN overlay only. Simplest to operate; no policy enforcement. Common in dev clusters; rarely in production at scale.</li>
+</ul>
+<p>How pod-to-pod networking actually works under Cilium (with <code>bpf_lxc</code> mode):</p>
+<pre><code>Pod A on Node 1 wants to send a packet to Pod B on Node 2.
+
+1. Pod A's process calls sendmsg(). The socket is in Pod A's network namespace.
+2. The kernel's network stack consults the routing table inside Pod A's netns.
+   Default route → veth-A-host (the host-side end of a veth pair).
+3. Packet arrives in the host's main network namespace via the veth.
+4. Cilium's eBPF program attached to veth-A-host inspects the packet:
+   - Checks NetworkPolicy: is Pod A allowed to talk to Pod B?
+   - Looks up Pod B's identity in a BPF map (keyed by destination IP).
+   - Determines the egress route: which physical interface, which encap.
+5. If Node 2 is on the same L2 (Layer 2) segment, the packet is encapsulated
+   in VXLAN (or routed natively if BGP is configured) and sent out eth0.
+6. Node 2's eth0 receives. Cilium's ingress eBPF program decapsulates,
+   checks NetworkPolicy again on the destination side, and delivers to
+   veth-B-host.
+7. Packet flows through veth-B-host → veth-B-pod → Pod B's netns → Pod B's
+   socket.
+</code></pre>
+<p>The key point: <strong>CNI is at L3+ (Layer 3 and above)</strong>. Pods get IP addresses; the rest is kernel routing plus optional encapsulation. The orchestrator does not invent a new network stack; it configures the kernel's existing one.</p>
+<h3 id="48-csi-container-storage-interface-how-pvcs-map-to-disks">4.8 CSI (Container Storage Interface) — how PVCs map to disks</h3>
+<p>The CSI is the storage analogue of CNI. Each storage backend (EBS, GCE PD, Ceph, Portworx, OpenEBS, vSAN, NFS) ships a CSI driver that runs as two components:</p>
+<ul>
+<li>A <strong>controller plugin</strong> (a Deployment) that handles cluster-level operations: create volume, delete volume, snapshot.</li>
+<li>A <strong>node plugin</strong> (a DaemonSet) that handles per-node operations: attach volume to this node, mount inside pod.</li>
+</ul>
+<p>The flow when a pod requests a PersistentVolumeClaim (PVC):</p>
+<pre><code>1. User creates a PVC:
+     kind: PersistentVolumeClaim
+     spec:
+       resources: { requests: { storage: 100Gi } }
+       storageClassName: ebs-gp3
+
+2. PVC controller sees the PVC. Looks up the StorageClass to find the provisioner.
+3. CSI controller plugin gets a CreateVolume call:
+     csi-ebs creates a 100 GiB gp3 EBS volume via AWS API.
+     Returns volumeHandle = &quot;vol-0123abc&quot;.
+4. A PersistentVolume (PV) object is created with that handle.
+5. The PVC binds to the PV.
+6. A pod referencing the PVC is scheduled to node N.
+7. The kubelet on node N calls the CSI node plugin: NodePublishVolume.
+8. CSI node plugin:
+     a. Attaches vol-0123abc to node N via AWS API (~5-20 seconds).
+     b. Detects the resulting /dev/nvme1n1.
+     c. Mounts /dev/nvme1n1 onto /var/lib/kubelet/pods/&lt;pod-uid&gt;/volumes/...
+9. kubelet bind-mounts that directory into the container's mount namespace
+   at the path specified in volumeMounts.
+10. Container starts. Its filesystem now includes the persistent volume.
+</code></pre>
+<p>When the pod is deleted or rescheduled, the reverse happens: unmount, detach, optionally delete the underlying volume (depending on <code>PersistentVolumeReclaimPolicy</code>).</p>
+<p>The brittle parts: attach/detach is slow (5-30 seconds), zonal volumes can only attach to nodes in the same zone, and only certain backends (EBS gp3 in mt-attach mode, AWS EFS, Ceph RBD) support multi-attach. This is the source of the "my stateful pod is stuck terminating" pain — the CSI driver is waiting for AWS to detach a volume that has a stale lease.</p>
+<h3 id="49-walking-kubectl-apply-podyaml-end-to-end">4.9 Walking <code>kubectl apply pod.yaml</code> end-to-end</h3>
+<p>The depth walkthrough. A developer types <code>kubectl apply -f pod.yaml</code>. Here is everything that happens.</p>
+<pre><code>Pod manifest:
+  apiVersion: v1
+  kind: Pod
+  metadata: { name: web-app, namespace: prod }
+  spec:
+    containers:
+    - name: app
+      image: registry.example.com/web-app:v1.4.2
+      resources: { requests: { cpu: 500m, memory: 512Mi } }
+
+Step 1: kubectl
+  Reads ~/.kube/config to find the apiserver URL and credentials.
+  Parses the YAML; converts to JSON.
+  Computes a 3-way merge patch vs the last-applied-config annotation.
+  Sends HTTPS PATCH https://apiserver:6443/api/v1/namespaces/prod/pods/web-app.
+
+Step 2: kube-apiserver — request routing
+  TLS handshake; client cert validated.
+  Authn: extracts user identity from cert (Common Name + Organization).
+  Authz: RBAC check — can user 'alice' verb 'patch' resource 'pods' in 'prod'?
+  Routes to the v1.Pod handler.
+
+Step 3: kube-apiserver — admission
+  Mutating admission webhooks run in order:
+    - LimitRanger fills in default memory limit (e.g., 1Gi).
+    - NamespaceDefaulter sets serviceAccountName: default.
+    - Istio sidecar injector adds an envoy sidecar container.
+  Validating admission webhooks run:
+    - PodSecurity admission checks privilege escalation.
+    - ResourceQuota controller checks remaining quota in 'prod' namespace.
+
+Step 4: kube-apiserver — persistence
+  apiserver encodes the Pod as Protobuf (default storage format).
+  Issues etcd transaction:
+    if revision('pods/prod/web-app') == expected_revision:
+      put('pods/prod/web-app', encoded_pod)
+  etcd's Raft leader appends to WAL, replicates to followers, applies to
+  state machine, returns success after quorum.
+  apiserver returns 201/200 to kubectl. Pod is now persisted.
+
+Step 5: Scheduler
+  Scheduler's pod-informer cache receives a watch event: new Pod with
+  spec.nodeName == &quot;&quot;.
+  Scheduler enqueues web-app.
+  Filter phase: iterates over the 100 nodes in the cluster.
+    Node 1: requests 500m CPU; has 200m free. FILTER OUT.
+    Node 2: 800m free. PASS.
+    ...
+    47 nodes pass.
+  Score phase: scores each. Node 17 wins (most free capacity + image already cached).
+  Binding: scheduler issues a POST /pods/web-app/binding with target Node 17.
+  apiserver writes spec.nodeName = &quot;node17&quot; to etcd.
+
+Step 6: kubelet on node17
+  kubelet's pod informer sees Pod with spec.nodeName == node17.
+  Pulls Pod into its pod-manager.
+  Calls CRI: RunPodSandbox — containerd creates the pod sandbox (a pause
+    container that holds the network namespace).
+  Calls CNI ADD: Cilium attaches a veth pair, allocates pod IP 10.244.17.42,
+    programs eBPF maps with the pod's identity.
+  Calls CRI: PullImage if not present. containerd pulls registry.example.com/
+    web-app:v1.4.2 via the configured credentials (~5-50 seconds depending
+    on image size and registry latency).
+  Calls CRI: CreateContainer for the 'app' container — containerd creates
+    the OCI bundle and runc config.
+  Calls CRI: StartContainer — runc clone()s the process inside the namespaces;
+    cgroups v2 enforce 500m CPU shares and 1Gi memory limit.
+  Container is now running with PID 1 = the app process.
+
+Step 7: Readiness probe
+  kubelet runs the readiness probe (e.g., HTTP GET /healthz on port 8080).
+  Once it returns 200, kubelet patches the Pod's status.conditions to set
+  Ready: True.
+  apiserver writes the status update to etcd.
+
+Step 8: Endpoints controller
+  The Endpoints controller watches Pods for the Service that selects this pod.
+  Sees the pod become Ready.
+  Adds 10.244.17.42:8080 to the Endpoints object for service 'web-app'.
+  apiserver writes the Endpoints update to etcd.
+
+Step 9: kube-proxy / Cilium dataplane
+  kube-proxy on every node sees the Endpoints change.
+  Updates its iptables/IPVS rules (or, with Cilium, eBPF maps) so that
+  packets to the service ClusterIP load-balance to include 10.244.17.42:8080.
+
+Step 10: Traffic flows
+  Other pods in the cluster doing DNS for web-app.prod.svc.cluster.local
+  resolve to the Service ClusterIP. Their packets are DNAT'd to 10.244.17.42:8080.
+
+DURABILITY POINT:
+  The cluster's authoritative state lives in etcd. If every kubelet, scheduler,
+  and apiserver dies, the data in etcd is sufficient to reconstruct the cluster.
+  If etcd loses quorum but a quorum's worth of disks survive, a restored member
+  can rejoin and apply the WAL. If etcd is irrecoverably lost, recovery requires
+  restoring from a snapshot (typically taken via `etcdctl snapshot save` on a
+  cron).
+</code></pre>
+<p>Most engineers stop at "kubectl applies the pod, it runs." The depth is in the controller-watch-react chain that makes the system level-triggered and resilient: every step is the result of a controller observing state and acting, not a chain of imperative commands.</p>
+<hr>
+<h2 id="5-capacity-envelope">§5. Capacity Envelope</h2>
+<p>The throughput and scale range that container orchestration covers.</p>
+<h3 id="small-scale-startup-with-3-node-cluster-50-pods">Small scale — startup with 3-node cluster, ~50 pods</h3>
+<p>A typical seed-stage SaaS. Three small EC2 instances or droplets, each running both control plane and workload (a single-cluster mode like k3s or a managed k8s like Linode Kubernetes Engine). 50 pods total across ~5 services: web app, API, worker, Postgres, Redis. Resource utilization per node ~30%. Cluster spec rarely changes. The orchestrator's overhead is significant proportionally — control plane CPU is on the order of 100m–500m, etcd takes ~200 MB RAM, kubelet+containerd another ~300 MB — but absolute numbers are tiny.</p>
+<p><strong>The next bottleneck</strong> at this scale is not the orchestrator; it's the application. The cluster could handle 10x more pods without breaking a sweat.</p>
+<h3 id="mid-scale-spotify-backstage-10k-pods">Mid scale — Spotify, Backstage, ~10k pods</h3>
+<p>Spotify's internal platform (Backstage was born here) runs thousands of microservices on Kubernetes. The fleet is on the order of 10k pods, 500–1000 nodes, multiple clusters per region for blast radius isolation. At this scale:</p>
+<ul>
+<li>The control plane is dedicated (3 or 5 nodes, managed by GKE — Google Kubernetes Engine).</li>
+<li>etcd holds ~3–8 GB of data. Compaction and defrag are operational concerns.</li>
+<li>~5–10 deployments per day per service, hundreds of services, thousands of deployments per day overall.</li>
+<li>Each cluster is sized to ~150 nodes max; multi-cluster federation handles the rest.</li>
+</ul>
+<p>The <strong>next bottleneck</strong> is operational: keeping the API server's request rate under control (large <code>kubectl get -A</code> queries can stall), keeping etcd compact, keeping CNI policies consistent.</p>
+<h3 id="large-scale-stripe-100k-pods">Large scale — Stripe, ~100k pods</h3>
+<p>Stripe runs in the low hundreds of thousands of pods across many clusters, on AWS. The orchestrator there is largely Kubernetes but with significant in-house automation. The numbers:</p>
+<ul>
+<li>Each cluster is capped around 1000–3000 nodes for safety.</li>
+<li>etcd is run with <code>--snapshot-count</code> aggressive tuning to keep WALs short.</li>
+<li>Pod startup latency p99 is in the 30–60 second range (image pull dominates for cold cache; ~5–10s for warm).</li>
+<li>Deployment rate is thousands per day; rollouts are progressive and metric-gated.</li>
+</ul>
+<p>The <strong>next bottleneck</strong> is <em>cluster sprawl</em>: managing 50+ clusters becomes its own engineering problem. Cluster API (the Kubernetes-managing-Kubernetes pattern) and per-cluster GitOps were developed largely to solve this.</p>
+<h3 id="giant-scale-google-borg-kubernetes-millions-of-cores">Giant scale — Google Borg → Kubernetes, millions of cores</h3>
+<p>Google's Borg (Kubernetes' direct ancestor; the 2015 Borg paper is required reading) runs at the multi-million-core scale. A single Borg cell holds tens of thousands of machines. Kubernetes today is not run quite this large — Google internally still uses Borg for the largest workloads — but Kubernetes' design point is "scale tested to 5000 nodes per cluster, 150,000 pods total." For larger estates, the answer is <em>multiple clusters</em>, not larger clusters.</p>
+<p>The <strong>next bottleneck</strong> is <em>cross-cluster coordination</em>: deploying a service to 50 clusters with consistent versioning, gating rollouts on global error rates, handling regional failovers. This is what Spinnaker was originally built for at Netflix.</p>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Pods</th>
+<th>Nodes</th>
+<th>etcd size</th>
+<th>Deploy rate</th>
+<th>Operator effort</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Startup</td>
+<td>~50</td>
+<td>3</td>
+<td>&lt;100 MB</td>
+<td>1-5/day</td>
+<td>&lt;10% of one SRE</td>
+</tr>
+<tr>
+<td>Mid (Spotify)</td>
+<td>~10k</td>
+<td>500-1000</td>
+<td>3-8 GB</td>
+<td>hundreds/day</td>
+<td>dedicated platform team</td>
+</tr>
+<tr>
+<td>Large (Stripe)</td>
+<td>~100k</td>
+<td>5000-10000</td>
+<td>strict tuning</td>
+<td>thousands/day</td>
+<td>large platform team</td>
+</tr>
+<tr>
+<td>Giant (Google)</td>
+<td>millions</td>
+<td>100k+</td>
+<td>many shards</td>
+<td>continuous</td>
+<td>hundreds of engineers</td>
+</tr>
+</tbody>
+</table>
+<p>The scale curve has a knee around <strong>150-300 nodes per cluster</strong> where the operational model has to change (dedicated control plane, dedicated monitoring, automated etcd backup). It has another knee around <strong>3000-5000 nodes per cluster</strong> where Kubernetes itself starts to creak (apiserver memory, scheduler latency, etcd write throughput) and <em>multi-cluster federation</em> becomes mandatory.</p>
+<hr>
+<h2 id="6-architecture-in-context">§6. Architecture in Context</h2>
+<p>The canonical pattern. Source code becomes a running pod through this pipeline:</p>
+<pre><code>                    ┌─────────────────────┐
+                    │ developer / git push│
+                    └──────────┬──────────┘
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │  CI (Continuous     │
+                    │  Integration):      │
+                    │   build image       │
+                    │   run unit tests    │
+                    │   scan for CVEs     │
+                    │   push to registry  │
+                    └──────────┬──────────┘
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │ container image     │   ← OCI image layers,
+                    │ registry            │     content-addressable
+                    │ (ECR, GCR, Harbor,  │     by SHA256 digest
+                    │ Docker Hub)         │
+                    └──────────┬──────────┘
+                               │
+       ┌───────────────────────┼───────────────────────┐
+       │                       │                       │
+       ▼                       ▼                       ▼
+  ┌─────────┐         ┌─────────────────┐    ┌──────────────────┐
+  │ git ops │         │  CD pipeline    │    │ manual deploy    │
+  │ repo of │         │  (Spinnaker,    │    │ (rare; emergency)│
+  │ k8s     │         │   custom script,│    │                  │
+  │ manifests│        │   Jenkins+kubectl)   │                  │
+  └────┬────┘         └────────┬────────┘    └────────┬─────────┘
+       │                       │                      │
+       ▼                       ▼                      ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │  ArgoCD / FluxCD     OR    direct kubectl apply           │
+  │  (GitOps controller        (push to apiserver with        │
+  │   in-cluster, pulls         credentials)                  │
+  │   manifests from git)                                     │
+  └──────────────────────────┬───────────────────────────────┘
+                             │
+                             ▼
+            ┌──────────────────────────────────┐
+            │   Kubernetes API server          │  ◄── validation, admission
+            │   → etcd                          │
+            │   → controllers                   │
+            │   → scheduler                     │
+            │   → kubelet → containerd → runc   │
+            └──────────────┬───────────────────┘
+                           │
+                           ▼
+            ┌──────────────────────────────────┐
+            │  Pods running on nodes           │
+            │   exposed via Service (ClusterIP)│
+            │   plus Ingress (L7 ingress       │
+            │   controller — Nginx, Traefik,   │
+            │   Envoy, Istio gateway)          │
+            └──────────────────────────────────┘
+                           │
+                           ▼
+            ┌──────────────────────────────────┐
+            │ Traffic from users / other        │
+            │ services                          │
+            └──────────────────────────────────┘
+</code></pre>
+<p>The canonical pieces:</p>
+<ul>
+<li><strong>Image registry</strong> is content-addressable. A pod refs an image by tag (<code>web-app:v1.4.2</code>) or, better, by digest (<code>web-app@sha256:abc...</code>) for immutability. Tags are mutable; digests are not. Production should pin by digest.</li>
+<li><strong>GitOps tool</strong> is the source-of-truth bridge. The cluster watches a git repo (per environment) for manifests and applies them. Changes flow through PRs; rollbacks are <code>git revert</code>.</li>
+<li><strong>The orchestrator</strong> does the heavy lifting from manifest to running container.</li>
+<li><strong>Service mesh / ingress</strong> handles ingress routing, TLS termination, mTLS (mutual TLS) between services, traffic splitting for canary, observability.</li>
+</ul>
+<p>Variants:</p>
+<ul>
+<li><strong>Push model</strong>: CI/CD has cluster credentials; CI runs <code>kubectl apply</code>. Familiar but couples CI's identity to cluster modifications.</li>
+<li><strong>Pull model (GitOps)</strong>: cluster watches git; CI just commits to git. Stronger security model, easier audit.</li>
+<li><strong>Service mesh optional</strong>: many clusters never deploy one. Mesh is most valuable for many-service estates with strict zero-trust requirements; for simple clusters, NetworkPolicy plus Ingress suffices.</li>
+</ul>
+<hr>
+<h2 id="7-hard-problems-inherent-to-this-technology">§7. Hard Problems Inherent to This Technology</h2>
+<p>Five problems that anyone using container orchestration will hit. Each: the naive solution, how it fails, the actual fix.</p>
+<h3 id="71-bin-packing-under-heterogeneous-resource-constraints">7.1 Bin-packing under heterogeneous resource constraints</h3>
+<p><strong>The problem in one line:</strong> the scheduler must place pods on nodes that fit their CPU, memory, and other resource requests, and bin-packing is NP-hard in general.</p>
+<p>The concrete failure: a cluster with 100 nodes, each with 8 cores and 32 GiB RAM, hosts 1500 pods averaging ~500m CPU and ~1.5 GiB RAM each. Aggregate utilization is roughly 75% CPU and 70% RAM — comfortable on paper. A new pod arrives requesting 4 CPU and 16 GiB RAM. <strong>It does not fit on any node</strong>, because no node has 4 contiguous CPU cores free, even though aggregate capacity is plentiful. This is the "every node is half full but no node fits this pod" problem.</p>
+<p>The naive fix: scale up by adding nodes. Wasteful — you have ~25% capacity unused already.</p>
+<p>The actual fixes, in order of intervention:</p>
+<ol>
+<li><strong>Right-size pod requests.</strong> Many pods request 1 CPU and use 100m. Use VPA (Vertical Pod Autoscaler) in recommendation mode to right-size requests across the fleet. Typical result is 30-50% capacity reclaimed.</li>
+<li><strong>Topology-aware scheduling.</strong> For pods that need to be close (low-latency communication) or far apart (HA), use <code>topologySpreadConstraints</code> to influence placement.</li>
+<li><strong>Run the descheduler.</strong> A separate controller that evicts pods that "should" be elsewhere — pods on overloaded nodes, pods that violate (now updated) affinity rules, low-utilization pods. The orchestrator does not rebalance on its own; the descheduler bridges this gap.</li>
+<li><strong>Cluster autoscaler.</strong> Detects pending pods that can't fit any current node, and provisions new nodes from a node group whose instance type fits. Returns nodes when usage drops. The standard tool for elasticity.</li>
+<li><strong>Karpenter (AWS).</strong> A next-generation autoscaler that picks instance types dynamically (rather than from preset node groups), often finding a better fit. Reports 30-60% cost savings vs traditional Cluster Autoscaler in published case studies.</li>
+</ol>
+<p>Illustration from a different domain — ML training. A training job needs 8 GPUs (Graphics Processing Units), preferably on the same node for NVLink bandwidth. The scheduler must find a node with 8 free GPUs <em>and</em> respect any taints (e.g., GPU nodes tainted to keep general workloads off). Without GPU-aware scheduling (<code>nvidia.com/gpu</code> resource type, the NVIDIA device plugin, GPU-feature-discovery labels), the scheduler will refuse to place the pod even on nodes with GPUs because it doesn't know they exist. With it, the scheduler treats GPU as just another resource — but the constraint that all 8 must be on one node is a <code>requiredDuringSchedulingIgnoredDuringExecution</code> pod-affinity rule.</p>
+<h3 id="72-statefulset-vs-deployment-vs-daemonset-vs-job-pick-the-right-primitive">7.2 StatefulSet vs Deployment vs DaemonSet vs Job — pick the right primitive</h3>
+<p><strong>The problem in one line:</strong> Kubernetes ships four (really five, with CronJob) primitives for managing pod lifecycles, and picking the wrong one creates correctness or operability problems.</p>
+<p>The four:</p>
+<ul>
+<li><strong>Deployment</strong> — stateless replicas. Pods are interchangeable. Rolling updates replace random pods; identity is irrelevant.</li>
+<li><strong>StatefulSet</strong> — stateful replicas. Pods have stable identities (<code>my-db-0</code>, <code>my-db-1</code>, <code>my-db-2</code>), stable storage (each has its own PVC), and ordered startup/shutdown. The default for clustered databases, Kafka brokers, etc.</li>
+<li><strong>DaemonSet</strong> — one pod per node. Used for node-local agents: log shippers (Fluentd, Vector), metrics exporters (node-exporter), CNI plugins, CSI node plugins.</li>
+<li><strong>Job</strong> — runs to completion. One-shot tasks: database migrations, ML training runs, ETL.</li>
+<li><strong>CronJob</strong> — Job on a schedule.</li>
+</ul>
+<p>The concrete failure: a team deploys a Postgres replica via Deployment with <code>replicas: 3</code>. Each pod has a <code>PersistentVolumeClaim</code> mounted at <code>/var/lib/postgresql</code>. The cluster scales down to one pod, then back up to three. <strong>The three new pods cannot tell which one was the primary.</strong> Their PVCs are not bound to specific replicas; the Deployment didn't promise stable identity. Data is inconsistent.</p>
+<p>The naive fix: hand-engineer identity by setting <code>metadata.name</code>. Doesn't work — Deployment generates names with random suffixes.</p>
+<p>The actual fix: use StatefulSet. A StatefulSet with <code>serviceName: my-db</code> and <code>replicas: 3</code> creates pods named <code>my-db-0</code>, <code>my-db-1</code>, <code>my-db-2</code>. Each has its own PVC (<code>my-data-my-db-0</code>, etc.), stable through restarts. The headless Service <code>my-db</code> resolves to specific pod DNS names (<code>my-db-0.my-db.ns.svc.cluster.local</code>). The orchestrator now guarantees that "the pod with identity 0" always has the same data attached.</p>
+<p>Then layer an <strong>operator</strong> — a custom controller — on top to handle the operational concerns: leader election, failover, backup, version upgrades. CloudNativePG, Strimzi (Kafka), Vitess (sharded MySQL), Crunchy Postgres Operator are widely used examples. The operator pattern is why Kubernetes finally became viable for stateful workloads in the 2020-2024 window.</p>
+<p>Illustration in batch — an ML training pipeline. The training script is naturally a Job: run once, succeed or fail, no replication. Argo Workflows or Tekton (or Kubeflow Pipelines) wrap Jobs into multi-step DAGs (Directed Acyclic Graphs) with dependencies, retries, and artifact passing. The orchestrator runs the Jobs; the workflow tool sequences them.</p>
+<h3 id="73-persistent-storage-my-pod-moved-to-a-new-node-wheres-my-data">7.3 Persistent storage — "my pod moved to a new node, where's my data?"</h3>
+<p><strong>The problem in one line:</strong> pods are ephemeral; the orchestrator can move them; without explicit storage configuration, the data on the old node is lost.</p>
+<p>The concrete failure: a pod writes a 5 GiB SQLite file to its container filesystem. The node hosting the pod is drained for kernel patching. The pod is rescheduled to a different node. <strong>The SQLite file is gone.</strong> The container filesystem is per-instance.</p>
+<p>The naive fix: use <code>emptyDir</code> volume. Doesn't help — <code>emptyDir</code> is also tied to the pod's lifecycle; it dies with the pod.</p>
+<p>The actual fix: use a <code>PersistentVolumeClaim</code> (PVC) backed by a network-attached PersistentVolume (PV) — EBS, GCE PD, Azure Disk, Ceph RBD, etc. The PV is independent of any node; it can attach to whichever node the pod runs on.</p>
+<p>But this introduces new problems:</p>
+<ul>
+<li><strong>Zonal volumes.</strong> EBS volumes are zonal (us-east-1a or us-east-1b, not both). If the pod is scheduled to a node in us-east-1c, the volume cannot attach. The <code>topology.kubernetes.io/zone</code> label and <code>WaitForFirstConsumer</code> binding mode of the StorageClass jointly ensure the volume is provisioned in the zone where the pod runs.</li>
+<li><strong>Single-attach (RWO — ReadWriteOnce).</strong> Most block storage attaches to one node at a time. If the old node hangs without releasing the volume, the new node can't attach. Recovery requires manual intervention (force-detach) or, increasingly, a CSI driver that handles it (the AWS CSI driver does in newer versions).</li>
+<li><strong>Multi-attach (RWX — ReadWriteMany).</strong> Needed for shared storage (e.g., a stateful Jenkins). Requires a network filesystem (EFS, NFS, CephFS) — slower than block storage. Not supported by every CSI driver.</li>
+</ul>
+<p>Illustration from a database use case: CloudNativePG deploys Postgres on Kubernetes. Each replica is a pod with its own PVC (an EBS gp3 volume, typically 50–500 GiB). When the primary fails, the operator promotes a replica by patching the leader-pod label; the replica's PVC continues to exist. The application reconnects via a Service that selects the new leader. Storage continuity is what makes this work; without it, every failover would be a full data refresh.</p>
+<h3 id="74-network-policies-and-zero-trust-pod-networking">7.4 Network policies and zero-trust pod networking</h3>
+<p><strong>The problem in one line:</strong> by default, every pod in a Kubernetes cluster can reach every other pod over the network, and that is a security disaster waiting to happen.</p>
+<p>The concrete failure: a developer pushes a Docker image that contains a known CVE (Common Vulnerabilities and Exposure). The image runs as part of the marketing-service Deployment. An attacker exploits the CVE, gets a shell, and then <code>curl</code>s the payments-service' internal endpoint. The payments service trusts in-cluster traffic; the attacker exfiltrates payment data.</p>
+<p>The naive fix: rely on the cluster's perimeter. Doesn't help once anything inside the cluster is compromised.</p>
+<p>The actual fix: NetworkPolicy. A NetworkPolicy object expresses "pods labeled X can be reached only from pods labeled Y on ports Z." A common default is "deny all" plus selective allow:</p>
+<pre><code class="language-yaml">kind: NetworkPolicy
+metadata: { name: default-deny, namespace: payments }
+spec:
+  podSelector: {}        # selects all pods in this namespace
+  policyTypes: [Ingress, Egress]
+  # no ingress/egress rules = deny all
+</code></pre>
+<p>Then explicit allows for the legitimate cross-service traffic. NetworkPolicy is enforced by the CNI plugin — Calico and Cilium do; Flannel does not. For L7 (application layer — HTTP methods, paths, headers) policy, the service mesh (Istio AuthorizationPolicy) or Cilium L7 policy is required.</p>
+<p>Layer above that: <strong>mTLS (mutual TLS)</strong> between services, terminated by a service mesh sidecar. Each service has its own short-lived cert (SPIFFE — Secure Production Identity Framework for Everyone — identities are the modern pattern), and traffic is encrypted and authenticated at the connection level. Even if NetworkPolicy is misconfigured, the connection won't establish without valid certs.</p>
+<p>Illustration in a feed serving stack: the recommendation service must call the user-profile service for hydration but should never reach the billing service. NetworkPolicy expresses this. Without it, a vulnerability in the recommendation service compromises billing. With it, lateral movement is blocked at the network layer.</p>
+<h3 id="75-multi-tenancy-namespaces-vs-separate-clusters">7.5 Multi-tenancy — namespaces vs separate clusters</h3>
+<p><strong>The problem in one line:</strong> namespaces are <em>soft</em> isolation; for <em>hard</em> multi-tenancy (untrusted workloads, regulatory boundaries, strict resource isolation), namespaces are insufficient.</p>
+<p>The concrete failure: an engineering org runs 50 teams' workloads on one cluster, each in its own namespace. Team A deploys a buggy pod that allocates 100 GiB of swap-backed memory; the node OOM-killer (Out Of Memory) starts evicting pods, including team B's database. The kernel does not respect namespace boundaries for memory pressure.</p>
+<p>The naive fix: tighter ResourceQuotas. Helps with quota accounting but doesn't prevent node-level resource contention from a single greedy pod when limits are unbounded or improperly set.</p>
+<p>The actual fix is multi-layered:</p>
+<ul>
+<li><strong>ResourceQuota</strong> caps per-namespace requested resources. Prevents one team from consuming all of CPU/memory at admission time.</li>
+<li><strong>LimitRange</strong> sets defaults and maxima for individual pod requests/limits.</li>
+<li><strong>Pod Security Standards</strong> (Restricted/Baseline/Privileged) limit kernel capabilities.</li>
+<li><strong>NetworkPolicy</strong> isolates per-namespace traffic.</li>
+<li><strong>PriorityClass</strong> + <strong>PodDisruptionBudget</strong> prevent low-priority workloads from preempting high-priority ones.</li>
+<li>For <em>hard</em> multi-tenancy:</li>
+<li><strong>Separate clusters</strong> per tenant. The cleanest answer.</li>
+<li><strong>vCluster</strong> — virtual Kubernetes clusters running inside a host cluster, each with its own apiserver and controllers.</li>
+<li><strong>gVisor / Kata Containers</strong> — runtime sandboxes that provide stronger kernel isolation per pod.</li>
+</ul>
+<p>Illustration in SaaS: a B2B SaaS hosting customer code (e.g., a webhook platform like Pipedream or a notebook host like Hex) runs untrusted user code. Hard multi-tenancy is mandatory. Most such products use Firecracker microVMs (AWS Fargate's underlying tech) or gVisor for each tenant rather than relying on namespace isolation.</p>
+<h3 id="76-cluster-upgrades-without-downtime">7.6 Cluster upgrades without downtime</h3>
+<p><strong>The problem in one line:</strong> Kubernetes ships a new version every 4 months and supports each version for ~14 months — meaning upgrades are a constant operational concern, and a botched upgrade can take down the cluster.</p>
+<p>The concrete failure: a team runs Kubernetes 1.24, the API server breaks <code>kubectl apply</code> for a CRD they depend on, and the upgrade to 1.28 deprecates the <code>policy/v1beta1</code> PodDisruptionBudget API they have hardcoded in scripts. Half their Deployments fail to apply during the upgrade.</p>
+<p>The naive fix: upgrade in place. Risky — control plane downtime, deprecated APIs surface immediately.</p>
+<p>The actual fix:</p>
+<ol>
+<li><strong>Read the release notes</strong>. Every Kubernetes minor release has a "removed APIs" section. Audit your manifests against it.</li>
+<li><strong>Use <code>kubectl convert</code> (or tools like <code>kubent</code>)</strong> to find usage of deprecated APIs.</li>
+<li><strong>Upgrade the control plane first, in place</strong> (managed Kubernetes handles this — GKE/EKS/AKS upgrade control planes with rolling control-plane node replacement). Workloads keep running.</li>
+<li><strong>Then upgrade nodes</strong>, one at a time, by draining (which gracefully evicts pods, respecting PodDisruptionBudgets) and then replacing.</li>
+<li>For very risky upgrades, <strong>provision a new cluster, deploy workloads in parallel, shift traffic, decommission old</strong>. The "blue-green cluster" pattern. Expensive but bulletproof.</li>
+</ol>
+<p>Illustration in a high-availability service: a payments cluster cannot afford even seconds of downtime. The operator runs the upgrade as a blue-green at the cluster level — new cluster ("green") provisioned on the new Kubernetes version, all workloads deployed via GitOps, traffic shifted at the load balancer, old cluster ("blue") decommissioned a week later. Total upgrade cost: 2x infra for a week. Total downtime: zero.</p>
+<hr>
+<h2 id="8-failure-mode-walkthrough">§8. Failure Mode Walkthrough</h2>
+<p>What happens when things break, and what survives.</p>
+<h3 id="81-worker-node-loss">8.1 Worker node loss</h3>
+<p>A node disappears (kernel panic, hardware failure, EC2 instance terminated, network partition).</p>
+<ul>
+<li><strong>Within ~5 minutes</strong> (default <code>pod-eviction-timeout</code>), the node-lifecycle controller marks the node <code>NotReady</code> and starts evicting its pods. Eviction is logical — the pods on the node are marked for deletion, but the node may still be running them; this is the source of "split-brain" risks for stateful workloads.</li>
+<li><strong>Stateless pods</strong> get rescheduled to other nodes by the Deployment/ReplicaSet controller. Total disruption: minutes, depending on pod startup time.</li>
+<li><strong>Stateful pods</strong> (StatefulSet) are rescheduled only after the operator confirms safety. The operator may pause; manual intervention may be needed if quorum is at risk.</li>
+<li><strong>What survives:</strong> etcd state is intact. The pods that were on the dead node are restarted elsewhere. Data in PVs reattaches to the new pod (after the volume detaches from the dead node, which can be slow if the cloud doesn't know the node is dead).</li>
+</ul>
+<p>Recovery procedure: wait. The orchestrator is designed to handle this. If volumes stick, manually force-detach via the cloud console.</p>
+<h3 id="82-control-plane-node-loss">8.2 Control plane node loss</h3>
+<p>One of three (or five) control plane nodes dies.</p>
+<ul>
+<li><strong>etcd:</strong> loses one of three members. The remaining two form a quorum of 2-of-3 and continue serving. If a second member dies, write quorum is lost.</li>
+<li><strong>apiserver:</strong> the surviving instances continue serving. The load balancer routes around the dead instance.</li>
+<li><strong>Scheduler / controller-manager:</strong> these have leader-election semantics. The leader on the dead node loses its lease (~15 seconds), and another instance becomes leader.</li>
+<li><strong>Workloads:</strong> running pods continue to run. New pod placement, scaling, and rollouts pause briefly (~30 seconds) until a new scheduler leader is elected.</li>
+</ul>
+<p>Recovery procedure: replace the failed node. Add a new etcd member. The new member catches up via Raft replication.</p>
+<h3 id="83-etcd-loses-quorum">8.3 etcd loses quorum</h3>
+<p>Two of three (or three of five) etcd members die at once. <strong>This is the catastrophic case.</strong></p>
+<ul>
+<li><strong>The apiserver becomes read-only</strong> (linearizable reads also block; only stale reads from local etcd may serve, depending on config).</li>
+<li><strong>No new pods can be scheduled. No new deployments can be applied.</strong></li>
+<li><strong>Running pods continue to run.</strong> This is critical: the data plane survives even when the control plane is down. The orchestrator's level-triggered design pays off here.</li>
+</ul>
+<p>Recovery procedure:</p>
+<ol>
+<li>Identify the still-alive member.</li>
+<li>Take a snapshot from its on-disk WAL (or use the most recent scheduled snapshot).</li>
+<li><strong>Restore from snapshot</strong> by initializing a new etcd cluster with the snapshot and bringing it up.</li>
+<li>Reconfigure the apiserver to point at the new cluster.</li>
+<li>Verify state. Some recent changes (the last few minutes) may be lost depending on snapshot recency.</li>
+</ol>
+<p>This is why <strong>etcd snapshots on a regular cadence (every 30 minutes is common) are non-optional</strong>. The DURABILITY POINT is the snapshot file.</p>
+<h3 id="84-cni-failure">8.4 CNI failure</h3>
+<p>The CNI plugin (or its underlying dataplane — VXLAN, BGP, eBPF programs) breaks across the cluster. This is rarer but very high-blast-radius.</p>
+<ul>
+<li><strong>Existing connections</strong> may keep working (kernel sockets are already established).</li>
+<li><strong>New connections fail.</strong> Pod-to-pod, pod-to-service, ingress-to-pod — all may fail.</li>
+<li><strong>DNS resolution fails</strong> because CoreDNS pods can't be reached.</li>
+</ul>
+<p>Recovery: depends on the failure mode. If a Cilium daemon crashed cluster-wide due to a bad config push, revert the config. If the BGP session collapsed, restart the BGP daemon. If a kernel bug, reboot nodes one by one.</p>
+<p>The lesson: CNI changes are second only to etcd changes in blast radius. Test in a smaller cluster first; roll out gradually.</p>
+<h3 id="85-image-pull-failures">8.5 Image pull failures</h3>
+<p>A pod is scheduled but <code>ImagePullBackOff</code> because the registry is unreachable or the image doesn't exist at the requested tag.</p>
+<ul>
+<li><strong>The pod stays in Pending → ImagePullBackOff</strong> indefinitely, retrying with exponential backoff (up to 5 minutes between attempts).</li>
+<li><strong>Other pods continue to run.</strong> This is a per-pod failure, not a cluster failure.</li>
+<li><strong>Recovery:</strong> fix the image reference, or fix the registry. Pin to digests to avoid "image moved" surprises.</li>
+</ul>
+<h3 id="86-crashloopbackoff">8.6 CrashLoopBackOff</h3>
+<p>A container starts, crashes, gets restarted, crashes again. Kubernetes ramps up the backoff exponentially (10s, 20s, 40s, 80s, capped at 5 minutes).</p>
+<ul>
+<li><strong>The pod is technically running</strong> but in a useless state.</li>
+<li><strong>Readiness probes</strong> are key — if the readiness probe fails, the pod is removed from Service endpoints, so traffic doesn't hit a broken pod.</li>
+<li><strong>Recovery:</strong> look at the container logs (<code>kubectl logs --previous</code>), fix the bug, push a new image, redeploy.</li>
+</ul>
+<h3 id="87-poddisruptionbudget-blocking-node-drain">8.7 PodDisruptionBudget blocking node drain</h3>
+<p>A node needs to be drained for maintenance. A PodDisruptionBudget (PDB) says "at least 2 of 3 replicas must always be available." Draining a node would violate the PDB if multiple replicas are on it.</p>
+<ul>
+<li><strong>The drain hangs.</strong> kubectl drain blocks until the PDB is satisfiable.</li>
+<li><strong>Recovery:</strong> spread the replicas first (<code>topologySpreadConstraints</code> makes this automatic), or use <code>--ignore-daemonsets --delete-emptydir-data --force</code> for emergency drains, accepting the brief unavailability.</li>
+</ul>
+<hr>
+<h2 id="9-why-not-just-ssh-to-servers-and-systemd">§9. Why Not Just SSH to Servers and systemd?</h2>
+<p>Why does container orchestration exist? What's the naive alternative, and why does it break?</p>
+<p>The naive replacement: a fleet of VMs, each running systemd, with services managed by hand or by a configuration manager (Ansible, Chef). Deployments are scp-and-restart. Service discovery is hardcoded IPs or a DNS round-robin. Scaling is "provision more VMs and tell the load balancer."</p>
+<p>This works at small scale and gets painful in predictable steps:</p>
+<ol>
+<li>
+<p><strong>At ~20 services, manual scaling becomes a constant chore.</strong> Need 10% more capacity? SSH to 50 boxes, edit configs, restart. Drift creeps in — some boxes get the new config, some don't.</p>
+</li>
+<li>
+<p><strong>No self-healing.</strong> A service crashes; systemd restarts it. systemd can't reschedule it to a different machine if the machine itself is broken. The fleet's owner has to notice and intervene. Engineering on-call burden grows linearly with fleet size.</p>
+</li>
+<li>
+<p><strong>Rolling updates are bespoke.</strong> Every team writes their own "deploy with 20% at a time" logic. Bugs in that logic cause outages. Some teams skip it and deploy all-at-once; some teams over-engineer it.</p>
+</li>
+<li>
+<p><strong>Service discovery degrades.</strong> Hardcoded IPs break when machines are replaced. DNS works but is slow to converge. A purpose-built service registry (Consul, etcd, ZooKeeper) helps but adds its own ops burden.</p>
+</li>
+<li>
+<p><strong>Resource isolation is whatever the kernel gives you.</strong> Two services on the same VM compete for memory; OOM-killer takes the wrong one. You either over-provision (one service per VM, expensive) or accept noisy neighbors.</p>
+</li>
+<li>
+<p><strong>The "1000 servers" tipping point.</strong> Somewhere around 100-500 servers, the cumulative ops burden of "SSH and systemd" exceeds the burden of running Kubernetes. The crossover depends on team size and skill, but the curve is real.</p>
+</li>
+</ol>
+<p>The walk-through: a team grows from 5 services on 10 VMs to 50 services on 200 VMs over 2 years. Initially they used Ansible playbooks and hand-rolled deployment scripts. They now spend half a sprint per quarter on deployment infrastructure: writing scripts to drain-and-replace, retrofitting service discovery, debugging "why is this service running an old version on box-37." Eventually they migrate to Kubernetes; the deployment infrastructure becomes a few hundred lines of YAML and a CI pipeline. The team's velocity on actual product work goes up.</p>
+<p>The orchestrator does not eliminate complexity; it <strong>moves the complexity into shared, well-understood, declarative primitives</strong>. That trade is worth it once you have enough services that the per-service overhead of "build your own deploy script" exceeds the platform overhead of "learn Kubernetes."</p>
+<hr>
+<h2 id="10-scaling-axes">§10. Scaling Axes</h2>
+<p>Orchestrators scale along two distinct axes; the failure modes are different.</p>
+<h3 id="type-1-uniform-growth-more-services-more-nodes">Type 1 — uniform growth: more services, more nodes</h3>
+<p>Linear scaling, mostly. Add nodes to add capacity. Adapt to higher pod counts by tuning the control plane.</p>
+<ul>
+<li><strong>Up to ~150 nodes per cluster</strong> with default settings: no special tuning. Standard managed Kubernetes (GKE/EKS/AKS) handles this transparently.</li>
+<li><strong>150-1000 nodes</strong>: dedicated control plane sized up (4-8 cores on apiserver, ~16 GiB RAM on etcd). Tune <code>--max-pods-per-node</code> (default 110; can go to 250 on big nodes). Tune <code>--kube-api-qps</code> and <code>--kube-api-burst</code> so that controllers don't get rate-limited.</li>
+<li><strong>1000-5000 nodes</strong>: this is the soft ceiling for a single Kubernetes cluster. Beyond ~5000 nodes, scheduling latency, etcd write throughput, and apiserver memory all start hitting the wall. Spotify, Uber, Stripe reportedly cap at this size and use multiple clusters.</li>
+<li><strong>Beyond 5000 nodes</strong>: multi-cluster federation. Cluster API, Karmada, or per-environment / per-region clusters managed by GitOps ApplicationSet (in ArgoCD) or Flux's Kustomization tree. There is no single-cluster solution; you split.</li>
+</ul>
+<h3 id="type-2-hotspot-intensification-same-services-higher-traffic">Type 2 — hotspot intensification: same services, higher traffic</h3>
+<p>A single service needs to scale from 100 to 100,000 QPS. The mechanism is <em>per-service</em>:</p>
+<ul>
+<li><strong>HPA (Horizontal Pod Autoscaler)</strong> scales replica count based on CPU utilization, memory, or custom metrics. With <code>metrics-server</code> for CPU/memory and <code>custom-metrics-adapter</code> for Prometheus-derived metrics, an HPA can target "scale to keep CPU at 70%" or "scale to keep p95 latency at 200ms." Standard tool.</li>
+<li><strong>KEDA (Kubernetes Event-Driven Autoscaler)</strong> generalizes HPA to non-metric triggers — Kafka lag, SQS queue depth, Postgres query result, CloudWatch alarm. KEDA's design point is event-driven workloads: a service that processes messages from a queue should scale by queue depth, not CPU.</li>
+<li><strong>VPA (Vertical Pod Autoscaler)</strong> adjusts per-pod resource requests. Less useful for hot services (which want more replicas, not bigger pods) but excellent for right-sizing in the steady state.</li>
+</ul>
+<p>The scaling curve:</p>
+<ul>
+<li><strong>Below 1k QPS / 50 replicas</strong>: HPA with default settings is enough. Scale-up takes ~1-3 minutes (pod schedule + image pull + warmup). Acceptable for most workloads.</li>
+<li><strong>1k–10k QPS / 50-500 replicas</strong>: HPA is still fine but tune <code>behavior.scaleUp.policies</code> to scale more aggressively. Consider over-provisioning headroom (<code>--min-replicas</code> set to ~30% above current load) to absorb spikes before HPA reacts.</li>
+<li><strong>10k–100k QPS</strong>: replica count matters less than node capacity. You may saturate a single Service object's iptables/IPVS routing rules; consider headless Service + client-side load balancing, or move to a service mesh.</li>
+<li><strong>100k+ QPS</strong>: shard the service. Different shards in different namespaces / clusters; clients route by key. The orchestrator handles a single shard; sharding is above it.</li>
+</ul>
+<p>Inflection points:</p>
+<ul>
+<li><strong>At ~150 nodes:</strong> dedicated platform team becomes necessary; the cluster ops burden exceeds "side task."</li>
+<li><strong>At ~5000 nodes:</strong> multi-cluster federation becomes mandatory.</li>
+<li><strong>At ~10k QPS per service:</strong> observability investment becomes mandatory; you can't troubleshoot at this scale by reading logs.</li>
+</ul>
+<hr>
+<h2 id="11-decision-matrix-vs-adjacent-categories">§11. Decision Matrix vs Adjacent Categories</h2>
+<p>When to pick Kubernetes vs Nomad vs ECS vs Serverless vs bare VMs.</p>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Kubernetes</th>
+<th>Nomad</th>
+<th>ECS / Fargate</th>
+<th>AWS Lambda</th>
+<th>Bare VMs + systemd</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Smallest viable scale</td>
+<td>~3 nodes + ~50 pods</td>
+<td>~1 node</td>
+<td>~10 tasks</td>
+<td>~1 function</td>
+<td>1 VM</td>
+</tr>
+<tr>
+<td>Largest cluster (single)</td>
+<td>5,000 nodes</td>
+<td>10,000 nodes</td>
+<td>thousands</td>
+<td>unlimited (no cluster)</td>
+<td>hundreds</td>
+</tr>
+<tr>
+<td>Operational complexity</td>
+<td>High</td>
+<td>Low-medium</td>
+<td>Low (managed)</td>
+<td>Very low</td>
+<td>Medium (Ansible-driven)</td>
+</tr>
+<tr>
+<td>Stateful support</td>
+<td>Yes (StatefulSet + operators)</td>
+<td>Limited</td>
+<td>Limited (EFS-backed)</td>
+<td>No</td>
+<td>Yes (full control)</td>
+</tr>
+<tr>
+<td>Multi-cloud / on-prem</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>No (AWS only)</td>
+<td>Vendor-specific</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Heterogeneous workloads (containers + VMs + binaries)</td>
+<td>Containers only</td>
+<td>Yes (multi-driver)</td>
+<td>Containers only</td>
+<td>Functions only</td>
+<td>Anything</td>
+</tr>
+<tr>
+<td>Cost overhead</td>
+<td>~3 control-plane nodes + 5-10% compute</td>
+<td>~1-3 servers + 2-3% compute</td>
+<td>Per-task / per-vCPU-hour</td>
+<td>Per-invocation</td>
+<td>Per-VM</td>
+</tr>
+<tr>
+<td>Cold start latency</td>
+<td>5-60s (image pull dominant)</td>
+<td>1-10s</td>
+<td>30-60s (Fargate)</td>
+<td>50-500ms</td>
+<td>N/A (always on)</td>
+</tr>
+<tr>
+<td>Vendor lock-in</td>
+<td>Low (CNCF standard)</td>
+<td>Low (HashiCorp)</td>
+<td>High (AWS)</td>
+<td>Very high</td>
+<td>None</td>
+</tr>
+<tr>
+<td>Community / ecosystem</td>
+<td>Massive</td>
+<td>Medium</td>
+<td>Medium</td>
+<td>Massive</td>
+<td>Massive</td>
+</tr>
+<tr>
+<td>Best for</td>
+<td>Long-running services, microservices at scale</td>
+<td>Mixed workloads, simpler ops, edge</td>
+<td>AWS shops, especially ones already deep in AWS</td>
+<td>Spiky / event-driven workloads</td>
+<td>&lt;50 servers, simple apps, full control needs</td>
+</tr>
+<tr>
+<td>Skip if</td>
+<td>Tiny scale (&lt;100 pods); kernel-tied legacy</td>
+<td>You want a single dominant ecosystem</td>
+<td>Not in AWS</td>
+<td>Workload &gt;15min, needs persistent connections, large memory</td>
+<td>More than ~100 servers</td>
+</tr>
+</tbody>
+</table>
+<h3 id="specific-thresholds">Specific thresholds</h3>
+<ul>
+<li><strong>Pick Kubernetes</strong> if: &gt;100 pods, multiple environments, multi-team, multi-cloud or on-prem, mainstream stack (you can hire people who know it).</li>
+<li><strong>Pick Nomad</strong> if: HashiCorp shop, simpler ops desired, multi-workload (containers + raw binaries + VMs), edge/distributed (Cloudflare's edge runs Nomad across hundreds of POPs).</li>
+<li><strong>Pick ECS / Fargate</strong> if: AWS-only, want managed everything, willing to accept lock-in, simpler workload patterns.</li>
+<li><strong>Pick Lambda / Cloud Functions</strong> if: event-driven, short-running, spiky, no persistent state in the function. The workload that fits Lambda is narrow but when it fits, the operational cost is near-zero.</li>
+<li><strong>Pick bare VMs + systemd</strong> if: small scale, special hardware needs, regulatory or compliance pinning to specific OS images, full control over kernel. Don't pick this for &gt;100 services.</li>
+</ul>
+<hr>
+<h2 id="12-deployment-patterns">§12. Deployment Patterns</h2>
+<p>This is where the technology meets the discipline. The same Kubernetes cluster can be used to deploy with completely different risk profiles depending on which pattern you adopt.</p>
+<h3 id="121-rolling-update-the-default">12.1 Rolling update — the default</h3>
+<p>Kubernetes Deployments default to RollingUpdate, parametrized by <code>maxUnavailable</code> and <code>maxSurge</code>. Both can be absolute numbers or percentages.</p>
+<pre><code>maxUnavailable: 25%   ← at most 25% of replicas may be unavailable at a time
+maxSurge: 25%         ← at most 25% extra replicas may be created beyond
+                        the desired count during the rollout
+
+For a Deployment with replicas: 8:
+  - At most 2 pods are unavailable at any time
+  - At most 10 pods exist transiently (8 + 2 surge)
+</code></pre>
+<p>The rollout:</p>
+<pre><code>Time 0:  ┌─────────────────────────────────────┐
+         │ v1: 8 replicas                       │  ← steady state
+         └─────────────────────────────────────┘
+
+Time 1:  ┌─────────────────────────────────────┐
+         │ v1: 6 ready, 2 terminating         │
+         │ v2: 2 ready                         │  ← 25% replaced
+         └─────────────────────────────────────┘
+
+Time 2:  ┌─────────────────────────────────────┐
+         │ v1: 4 ready, 2 terminating          │
+         │ v2: 4 ready                         │
+         └─────────────────────────────────────┘
+
+...
+
+Time N:  ┌─────────────────────────────────────┐
+         │ v2: 8 ready                          │  ← rolled out
+         └─────────────────────────────────────┘
+</code></pre>
+<p><strong>Pro:</strong> simple, built-in, no extra cost, zero downtime if traffic shifts gracefully.
+<strong>Con:</strong> v1 and v2 run concurrently. Any incompatibility (database schema, API contract) must be backward-compatible. Rollback is also a rolling update — slow.
+<strong>Best for:</strong> small-to-medium services with backward-compatible changes. Most workloads.</p>
+<h3 id="122-blue-green-deployment">12.2 Blue-green deployment</h3>
+<p>Two complete production environments, "blue" (current) and "green" (new). Deploy v2 to green while blue serves traffic. Once green is verified, flip the load balancer.</p>
+<pre><code>Step 1:  ┌─────────────┐         ┌─────────────┐
+         │ Blue (v1)   │ ← all   │ Green       │  (empty / being built)
+         │ serving     │  traffic│             │
+         └─────────────┘         └─────────────┘
+
+Step 2:  ┌─────────────┐         ┌─────────────┐
+         │ Blue (v1)   │ ← all   │ Green (v2)  │
+         │ serving     │  traffic│ smoke tests │
+         └─────────────┘         └─────────────┘
+
+Step 3:  ┌─────────────┐         ┌─────────────┐
+         │ Blue (v1)   │         │ Green (v2)  │ ← all traffic
+         │ idle        │         │ serving     │
+         └─────────────┘         └─────────────┘
+         (kept for rollback)
+
+Step 4:  ┌─────────────┐         ┌─────────────┐
+         │ Blue        │         │ Green (v2)  │
+         │ decommiss.  │         │ now &quot;blue&quot;  │
+         └─────────────┘         └─────────────┘
+</code></pre>
+<p><strong>Pro:</strong> atomic switch. Rollback is instant (flip the LB back). No version skew during deploy.
+<strong>Con:</strong> 2x infrastructure during the transition. Long-lived sessions / WebSockets / streaming must be drained or accepted to break.
+<strong>Best for:</strong> stateless services where rollback latency matters (e.g., a deploy at 3am that turns out to be broken — you want a 30-second rollback, not 30 minutes).</p>
+<p>Implementation in Kubernetes: deploy two Deployments (<code>web-app-blue</code> with v1, <code>web-app-green</code> with v2) selected by separate labels. The Service selects whichever label points to the "live" Deployment. Flip the Service selector to switch.</p>
+<h3 id="123-canary-deployment">12.3 Canary deployment</h3>
+<p>Gradually shift traffic from v1 to v2, monitoring metrics at each step. Roll forward if metrics are healthy; roll back if not.</p>
+<pre><code>Phase 1 (1%):    ┌────────┐  ┌──┐
+                 │ v1 99% │  │v2│
+                 │        │  │1%│
+                 └────────┘  └──┘
+                 Wait 15min. Check error rate, p95 latency, CPU.
+
+Phase 2 (10%):   ┌─────────┐ ┌────┐
+                 │ v1 90%  │ │ v2 │
+                 │         │ │10% │
+                 └─────────┘ └────┘
+
+Phase 3 (50%):   ┌──────┐    ┌──────┐
+                 │ v1   │    │ v2   │
+                 │ 50%  │    │ 50%  │
+                 └──────┘    └──────┘
+
+Phase 4 (100%):              ┌────────┐
+                              │ v2 100%│
+                              └────────┘
+</code></pre>
+<p><strong>Pro:</strong> blast radius capped at the canary percentage. Bugs are caught early with limited customer impact. Metrics-driven rollback is automatable.
+<strong>Con:</strong> the rollout is slow (hours to days for risk-averse deploys). Requires good metrics and traffic-splitting infrastructure.
+<strong>Best for:</strong> customer-facing services where a regression is expensive. Standard at Netflix, Lyft, Stripe.</p>
+<p>Implementation:</p>
+<ul>
+<li><strong>Argo Rollouts</strong> (Kubernetes-native progressive delivery controller) handles canary natively. Define stages, weights, pauses, and metric checks declaratively.</li>
+<li><strong>Flagger</strong> (Flux-ecosystem analog) does the same.</li>
+<li><strong>Service mesh traffic splitting</strong> (Istio VirtualService, Linkerd) shifts traffic at the L7 layer.</li>
+<li><strong>Ingress controller weights</strong> for simpler cases (Nginx, Traefik).</li>
+</ul>
+<p>The metric gates are the secret sauce. A canary rollout that doesn't query Prometheus / Datadog and abort on regression is just a slow rolling update.</p>
+<h3 id="124-dark-launch">12.4 Dark launch</h3>
+<p>Deploy the code, but gate behind a <strong>feature flag</strong> (see <code>13_feature_flag.md</code>). Traffic still goes to v2 pods, but the new code path is dormant. Once verified safe, flip the flag to enable.</p>
+<pre><code>Step 1: Deploy v2 pods. Flag = OFF.
+        Behavior: identical to v1 (new code path not entered).
+
+Step 2: Enable flag for internal users only.
+        Behavior: internal users see new code path; everyone else: old.
+
+Step 3: Enable for 1% of external users.
+
+Step 4: Enable for 100%.
+
+Step 5: Remove the flag (and dead code) in a later release.
+</code></pre>
+<p><strong>Pro:</strong> decouples deploy from release. Rollback is "flip the flag" — milliseconds.
+<strong>Con:</strong> the codebase carries feature-flag clutter. Discipline required to clean up old flags.
+<strong>Best for:</strong> any user-visible change with non-trivial blast radius. The backbone of "many deploys per day" cultures.</p>
+<h3 id="125-ab-deployment">12.5 A/B deployment</h3>
+<p>Multiple versions running concurrently, with traffic split based on some attribute (user cohort, region, A/B test bucket). Not really about safe deployment — about controlled experimentation.</p>
+<pre><code>                    ┌────────────────┐
+   User request ──► │ Router / mesh  │
+                    └────────┬───────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+        ┌──────────┐  ┌──────────┐  ┌──────────┐
+        │ Variant A│  │ Variant B│  │ Variant C│
+        │ (control)│  │ (test)   │  │ (test)   │
+        │ 80%      │  │ 10%      │  │ 10%      │
+        └──────────┘  └──────────┘  └──────────┘
+</code></pre>
+<p>The deployment system supports this by deploying multiple Deployments behind weighted routing rules. The experimentation system (see <code>13_feature_flag.md</code>) is what decides which user goes where.</p>
+<h3 id="126-shadow-traffic-traffic-mirroring">12.6 Shadow traffic / traffic mirroring</h3>
+<p>Send a copy of production traffic to v2; ignore the response; observe v2's behavior. Validate that v2 doesn't crash, doesn't have memory leaks, doesn't behave wildly different — without any user being affected.</p>
+<pre><code>                    ┌────────────────┐
+   User request ──► │ Router / mesh  │
+                    └────────┬───────┘
+                             │
+                ┌────────────┴────────────┐
+                │                         │
+                ▼                         ▼
+          ┌──────────┐              ┌──────────┐
+          │ v1       │              │ v2       │ ← receives mirrored copy
+          │ (live)   │              │ (shadow) │   response is discarded
+          └────┬─────┘              └──────────┘
+               │
+               ▼
+          ┌──────────┐
+          │ User sees│
+          │ v1's     │
+          │ response │
+          └──────────┘
+</code></pre>
+<p><strong>Pro:</strong> zero-risk validation against real traffic. Catches bugs that synthetic tests miss.
+<strong>Con:</strong> double-spends compute. Side effects (writes to a real database, sending emails) must be either disabled in v2 or made idempotent. Set up requires traffic-mirroring support in the mesh.
+<strong>Best for:</strong> large refactors where the externally-observable behavior must be identical. Used heavily for service migrations (Go rewrite of a Java service, etc.).</p>
+<p>Istio supports this via <code>VirtualService</code> <code>mirror</code> field. Envoy proxies do too.</p>
+<h3 id="127-the-deploy-on-friday-anti-pattern">12.7 The "deploy on Friday" anti-pattern</h3>
+<p>A cultural concern, not a technical one. The thinking: "don't deploy on Friday because if it breaks, you ruin your weekend." Symptoms:</p>
+<ul>
+<li>Deploys cluster into Monday-Thursday.</li>
+<li>Long-lived feature branches accumulate.</li>
+<li>Big-bang Monday deploys carry more risk than the small daily deploys they replaced.</li>
+</ul>
+<p>The fix is not "deploy on Friday anyway." It's making <strong>every</strong> deploy low-risk:</p>
+<ul>
+<li>Trunk-based development. Short-lived branches.</li>
+<li>Small frequent deploys instead of large infrequent ones (Accelerate / DORA — DevOps Research and Assessment — research confirms deploy frequency negatively correlates with change failure rate).</li>
+<li>Feature flags to decouple deploy from release.</li>
+<li>Automated canary with metric gating, so a bad deploy auto-rolls-back without a human in the loop.</li>
+<li>24/7 on-call rotation that doesn't punish weekend incidents.</li>
+</ul>
+<p>Done right, deploys become a non-event. Stripe, Etsy, and similar engineering cultures deploy hundreds of times per day across all hours, with confidence.</p>
+<hr>
+<h2 id="13-gitops-and-cicd">§13. GitOps and CI/CD</h2>
+<p>The delivery layer that sits between source code and the orchestrator.</p>
+<h3 id="131-push-based-deploy">13.1 Push-based deploy</h3>
+<p>The traditional model. CI builds the image, pushes to registry, then runs <code>kubectl apply</code> against the target cluster with stored credentials.</p>
+<pre><code>       ┌──────────┐       ┌──────────┐      ┌──────────┐
+       │ git push │ ────► │ CI runner│ ──── │ image    │
+       └──────────┘       │ builds + │      │ registry │
+                          │ tests +  │      └──────────┘
+                          │ pushes   │             │
+                          └──────────┘             ▼
+                                │           ┌──────────┐
+                                └─────────► │ kubectl  │ ── credentials stored in CI
+                                            │ apply    │
+                                            └──────────┘
+                                                  │
+                                                  ▼
+                                            ┌──────────┐
+                                            │ Cluster  │
+                                            └──────────┘
+</code></pre>
+<p><strong>Pro:</strong> simple, low-tech, direct.
+<strong>Con:</strong> the CI system must have cluster credentials. If the CI system is compromised, the cluster is compromised. Audit trail is in CI logs, which may not be retained. Drift between desired state (in git) and actual state (in cluster) is hard to detect.</p>
+<p>Most teams started here and graduated to GitOps.</p>
+<h3 id="132-pull-based-gitops">13.2 Pull-based GitOps</h3>
+<p>ArgoCD or FluxCD runs <em>inside the cluster</em> and watches a git repository. When the repo changes, the controller pulls the new manifests and applies them. The cluster initiates outbound connections; no inbound credentials needed.</p>
+<pre><code>       ┌──────────┐       ┌──────────┐      ┌──────────┐
+       │ git push │ ────► │ CI       │ ──── │ image    │
+       └──────────┘       │ builds + │      │ registry │
+                          │ tests +  │      └──────────┘
+                          │ commits  │
+                          │ updated  │
+                          │ manifest │
+                          │ to       │
+                          │ &quot;config&quot; │
+                          │ repo     │
+                          └──────────┘
+                                │
+                                ▼
+                          ┌──────────────────────┐
+                          │ git config repo      │  ← source of truth
+                          │ (Kubernetes manifests)│
+                          └──────────────────────┘
+                                ▲
+                                │ git pull (every 3 minutes
+                                │  or on webhook)
+                                │
+                          ┌──────────────────────┐
+                          │ ArgoCD in cluster    │
+                          │  - polls git         │
+                          │  - applies manifests │
+                          │  - reports drift     │
+                          └──────────────────────┘
+                                │
+                                ▼
+                          ┌──────────────────────┐
+                          │  Cluster             │
+                          └──────────────────────┘
+</code></pre>
+<p><strong>Pro:</strong>
+- No inbound credentials to the cluster. CI only needs to commit to git.
+- Source of truth is git, with full audit trail.
+- Drift detection is automatic — ArgoCD reports any in-cluster resource that doesn't match git.
+- Multi-cluster scales naturally (ApplicationSet pattern: one git repo, many target clusters).</p>
+<p><strong>Con:</strong>
+- Higher initial setup cost.
+- Secrets handling requires extra tooling (Sealed Secrets, External Secrets Operator, SOPS) since you can't store plaintext secrets in git.
+- Rollback is <code>git revert</code> — slightly slower than a direct <code>kubectl rollout undo</code>.</p>
+<p>GitOps has become the de facto standard for new cloud-native deployments. ArgoCD is the dominant choice; FluxCD is the close runner-up. The CNCF (Cloud Native Computing Foundation) graduated both.</p>
+<h3 id="133-argo-rollouts-and-progressive-delivery">13.3 Argo Rollouts and progressive delivery</h3>
+<p>Argo Rollouts is a Kubernetes-native progressive delivery controller. It extends the Deployment primitive with explicit canary, blue-green, and analysis steps. A typical config:</p>
+<pre><code class="language-yaml">kind: Rollout
+spec:
+  replicas: 10
+  strategy:
+    canary:
+      steps:
+      - setWeight: 10
+      - pause: { duration: 10m }
+      - analysis:
+          templates:
+          - templateName: success-rate
+      - setWeight: 50
+      - pause: { duration: 20m }
+      - analysis:
+          templates:
+          - templateName: success-rate
+      - setWeight: 100
+</code></pre>
+<p>The <code>analysis</code> step queries Prometheus, Datadog, or another metric source. If the success rate falls below the threshold, the rollout pauses or aborts. This is the operationalization of "metric-gated canary" without writing custom scripts.</p>
+<p>Flagger plays the same role in the Flux ecosystem.</p>
+<h3 id="134-trunk-based-development-feature-flags">13.4 Trunk-based development + feature flags</h3>
+<p>The modern alternative to long-lived release branches:</p>
+<ul>
+<li><strong>Trunk-based development.</strong> All developers commit to <code>main</code> (or <code>master</code>). Short-lived feature branches (&lt;2 days) merged via PR.</li>
+<li><strong>Feature flags.</strong> New code is gated behind a flag. Unreleased features can be merged to main and deployed without being exposed to users.</li>
+<li><strong>Continuous deployment.</strong> Every merge to main triggers a build + deploy. Production is, on a multi-team trunk, getting updated dozens of times per day.</li>
+</ul>
+<p>This pattern decouples three things that used to be coupled:</p>
+<ol>
+<li><strong>Code merge</strong> (when the work lands in main).</li>
+<li><strong>Deploy</strong> (when the binary reaches production).</li>
+<li><strong>Release</strong> (when users see the new behavior).</li>
+</ol>
+<p>Coupling them all together creates large-blast-radius releases. Separating them — code in main but flagged off, deploy when ready, flip the flag when ready — is what enables the "thousands of deploys per day" cultures.</p>
+<hr>
+<h2 id="14-use-case-gallery">§14. Use Case Gallery</h2>
+<p>Five domains where the same orchestrator technology serves dramatically different workloads.</p>
+<h3 id="141-typical-saas-web-app-deployment">14.1 Typical SaaS web app deployment</h3>
+<p>The canonical case. A SaaS company runs ~50 microservices: web frontend, API gateway, several backend services, async workers, caches, observability sidecars. Each service is a Deployment with HPA scaling on CPU. Total ~500 pods. One Kubernetes cluster per environment (dev, staging, prod). ArgoCD does GitOps. Argo Rollouts handles canary for prod. Standard Prometheus + Grafana for monitoring. Service mesh (Istio) for mTLS + tracing.</p>
+<p>Demands on the tech: zero-downtime deploys, quick rollback, multi-team isolation via namespaces.</p>
+<p>Variant of the tech: Kubernetes (managed — EKS or GKE), Deployment for stateless, StatefulSet for the one Postgres they self-host, plus a few CronJobs for nightly batches.</p>
+<h3 id="142-stateful-database-deployment">14.2 Stateful database deployment</h3>
+<p>A team needs to run Postgres on Kubernetes (rather than managed RDS — Relational Database Service) for cost or feature reasons. They use <strong>CloudNativePG</strong>, an operator that manages a Postgres cluster as a CRD.</p>
+<pre><code class="language-yaml">kind: Cluster   # CloudNativePG CRD
+spec:
+  instances: 3
+  postgresql: { parameters: { max_connections: &quot;200&quot; } }
+  bootstrap:
+    initdb:
+      database: app
+  storage:
+    size: 100Gi
+    storageClass: gp3
+</code></pre>
+<p>The operator's reconciliation loop:</p>
+<ul>
+<li>Creates a StatefulSet with 3 pods (<code>cluster-1</code>, <code>cluster-2</code>, <code>cluster-3</code>).</li>
+<li>Bootstraps <code>cluster-1</code> as the primary.</li>
+<li>Sets up streaming replication to <code>cluster-2</code> and <code>cluster-3</code>.</li>
+<li>Sets up a Service that selects the primary (<code>cluster-rw</code> for read/write) and a Service for replicas (<code>cluster-ro</code> for read-only).</li>
+<li>Schedules backups via WAL archiving to S3.</li>
+<li>On primary failure, promotes a replica, updates the Service selector, and re-syncs the old primary.</li>
+</ul>
+<p>Demands on the tech: stable pod identities, persistent storage that follows the pod, low-latency failover, careful upgrade orchestration.</p>
+<p>Variant: StatefulSet + CSI-backed PVCs + a custom operator. The orchestrator alone is insufficient; the operator is what makes the stateful workload manageable.</p>
+<h3 id="143-ml-training-jobs">14.3 ML training jobs</h3>
+<p>Training a model is fundamentally different from serving one. Training jobs are:</p>
+<ul>
+<li>Long-running (hours to weeks).</li>
+<li>Resource-intensive (multiple GPUs, often distributed via Horovod, PyTorch DDP, or DeepSpeed).</li>
+<li>Batch-shaped (run to completion, then exit).</li>
+<li>Multi-step (preprocess → train → evaluate → register).</li>
+</ul>
+<p>The Kubernetes-native ML stack:</p>
+<ul>
+<li><strong>Argo Workflows</strong> or <strong>Kubeflow Pipelines</strong> for the DAG. Each step is a container; the workflow tool sequences them.</li>
+<li><strong>Volcano</strong> scheduler (or Kubernetes' own gang-scheduling support) — co-schedules all pods of a distributed training job to start together. Without this, you can deadlock waiting for all replicas to be runnable.</li>
+<li><strong>NVIDIA GPU operator</strong> + <code>nvidia.com/gpu</code> resource type for GPU scheduling.</li>
+<li><strong>Cluster autoscaler</strong> scaled to GPU node groups. GPU nodes are expensive (~$3-30/hour); scale to zero when idle.</li>
+</ul>
+<p>A typical training run: Argo Workflow with five sequential steps; the training step is a 4-GPU job that runs for 8 hours; the workflow handles retries, artifact passing (model checkpoints to S3), and cleanup.</p>
+<p>Demands on the tech: GPU scheduling, gang scheduling, persistent intermediate artifacts, integration with experiment tracking (MLflow, Weights &amp; Biases).</p>
+<p>Variant: Job + Volcano scheduler + NVIDIA device plugin + workflow tool on top.</p>
+<h3 id="144-batch-processing">14.4 Batch processing</h3>
+<p>The classic ETL workload. A nightly job that reads from a warehouse, transforms, writes to another warehouse. Runs once per day, takes 2 hours.</p>
+<p>Kubernetes-native batch:</p>
+<ul>
+<li><strong>CronJob</strong> for the schedule.</li>
+<li><strong>Job</strong> spawned by CronJob, with <code>backoffLimit: 3</code>, <code>activeDeadlineSeconds: 7200</code>.</li>
+<li><strong>Argo Workflows</strong> or <strong>Tekton</strong> if the batch is multi-step or has fan-out (e.g., a workflow that processes 10,000 files in parallel with 100 concurrency).</li>
+</ul>
+<p>A typical pattern: a <code>CronJob</code> runs at 02:00 UTC daily. It creates a <code>Job</code> with <code>parallelism: 50, completions: 10000</code>. Kubernetes schedules 50 pods concurrently; as each completes, another starts, until all 10,000 are done.</p>
+<p>Demands on the tech: scheduled execution, fan-out parallelism, failure handling with retries, resource fairness (don't starve interactive workloads).</p>
+<p>Variant: CronJob + Job + a workflow tool for orchestration.</p>
+<h3 id="145-edge-deployment">14.5 Edge deployment</h3>
+<p>Running compute close to users — in retail stores, factories, telcos, vehicles. Constraints:</p>
+<ul>
+<li>Limited compute per site (often a single small server, a Raspberry Pi cluster, or a few nodes).</li>
+<li>Intermittent network connectivity to the central cloud.</li>
+<li>Operated by non-experts (store managers, technicians).</li>
+<li>High site count (thousands to tens of thousands).</li>
+</ul>
+<p>Solutions:</p>
+<ul>
+<li><strong>k3s</strong> — a 50 MB single-binary Kubernetes distribution by Rancher. Designed for edge. Replaces etcd with SQLite by default for single-node deployments. Runs on a Raspberry Pi.</li>
+<li><strong>KubeEdge</strong> — extends Kubernetes to manage nodes that may be offline. Pods sync to edge nodes when connectivity is available; the edge node continues running pods during disconnects.</li>
+<li><strong>Nomad</strong> — Cloudflare uses Nomad to manage 200+ POPs (Points of Presence) globally. Each POP runs a Nomad agent; a central Nomad cluster schedules across them.</li>
+<li><strong>Argo CD ApplicationSet</strong> — deploys the same manifest to N target clusters generated from a list (e.g., one per store).</li>
+</ul>
+<p>Demands on the tech: tiny footprint, tolerance for disconnection, easy bulk management, simple per-site upgrade.</p>
+<p>Variant: k3s + GitOps + carefully sized resource requests.</p>
+<hr>
+<h2 id="15-real-world-implementations-with-numbers">§15. Real-World Implementations with Numbers</h2>
+<p>Named systems shipping container orchestration at scale, across different use cases.</p>
+<h3 id="google-borg-kubernetes">Google Borg → Kubernetes</h3>
+<p>The progenitor. Google's internal Borg system (paper: "Large-scale cluster management at Google with Borg," EuroSys 2015) runs essentially all of Google. A typical Borg cell is 10,000 machines; Google has hundreds of cells. Total scale is millions of machines, billions of containers.</p>
+<p>Borg pioneered: declarative job specs, two-level scheduling (Borg → tasks → Linux processes), priority/preemption, cgroups-based isolation. Kubernetes (open-sourced 2014) is the externalized lessons learned from Borg.</p>
+<p>Kubernetes itself targets 5,000 nodes per cluster; Google internally runs Kubernetes for some workloads but still relies on Borg for the largest.</p>
+<h3 id="spotify">Spotify</h3>
+<p>Spotify migrated from a homegrown system to Kubernetes around 2018-2020. The platform team open-sourced <strong>Backstage</strong> — a developer portal that ties Kubernetes deployments, observability, and ownership together. Public numbers: thousands of services, ~10k pods, hundreds of deploys per day. Multiple clusters per region, GitOps via Flux.</p>
+<h3 id="airbnb">Airbnb</h3>
+<p>Airbnb runs ~100 production services on Kubernetes (mostly EKS) across multiple regions. Migrated from a homegrown deployment system. Public talks cite ~70% cost reduction in some workloads after migrating to Kubernetes with HPA + Cluster Autoscaler properly tuned, due to better bin-packing.</p>
+<h3 id="lyft">Lyft</h3>
+<p>Lyft is one of the largest publicly-discussed Envoy users (Envoy was created at Lyft). They run a service mesh on Kubernetes with thousands of services, billions of requests per day. The Lyft platform team contributed heavily to the cloud-native ecosystem.</p>
+<h3 id="pinterest">Pinterest</h3>
+<p>Pinterest runs on Kubernetes (~10k pods) plus their own platform abstractions on top. They've published on multi-cluster ingress, GitOps at scale, and Argo Rollouts adoption.</p>
+<h3 id="stripe">Stripe</h3>
+<p>Stripe runs heavily on Kubernetes across many clusters. They've published on Argo CD at scale, on careful pod-startup latency tuning (image pull is the dominant component, mitigated by aggressive caching), and on the operational model for hundreds of thousands of pods.</p>
+<h3 id="netflix">Netflix</h3>
+<p>Netflix runs partly on Kubernetes (via their internal platform "Titus" for many years, more recently incorporating Kubernetes) and partly directly on EC2. Spinnaker was created at Netflix as the deployment orchestrator across both. Their use case is the canonical "thousands of services, hundreds of deploys per day, multi-region active-active" pattern. Open Connect (Netflix's CDN edge servers) runs Nomad.</p>
+<h3 id="cloudflare">Cloudflare</h3>
+<p>Cloudflare runs Nomad on 200+ POPs globally. They've publicly discussed why Nomad's smaller footprint (versus Kubernetes) fits the edge: each POP has a constrained number of nodes, the multi-workload model lets them run a mix of containers and raw binaries, and a single binary is easier to deploy across that many sites.</p>
+<h3 id="aws-ecs-and-fargate">AWS — ECS and Fargate</h3>
+<p>Amazon ECS is used by a huge number of AWS customers — Slack, Lyft (in addition to Kubernetes), many SaaS startups. ECS is simpler than Kubernetes (no cluster to manage), tightly integrated with AWS (IAM — Identity and Access Management — roles map to tasks via task-role ARNs, VPC — Virtual Private Cloud — networking is native, ALB — Application Load Balancer — targets are first-class). Fargate underneath is AWS Lambda-style: AWS allocates micro-VMs (Firecracker), runs the container, charges per vCPU-hour. Used by ~100k+ customers.</p>
+<h3 id="numbers-summary">Numbers summary</h3>
+<table>
+<thead>
+<tr>
+<th>Org</th>
+<th>Orchestrator</th>
+<th>Approx pods</th>
+<th>Approx services</th>
+<th>Approx deploys/day</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Google</td>
+<td>Borg (+ k8s)</td>
+<td>billions of containers</td>
+<td>unknown</td>
+<td>continuous</td>
+</tr>
+<tr>
+<td>Spotify</td>
+<td>Kubernetes</td>
+<td>~10k</td>
+<td>thousands</td>
+<td>hundreds</td>
+</tr>
+<tr>
+<td>Stripe</td>
+<td>Kubernetes</td>
+<td>~100k</td>
+<td>thousands</td>
+<td>thousands</td>
+</tr>
+<tr>
+<td>Lyft</td>
+<td>Kubernetes</td>
+<td>tens of thousands</td>
+<td>thousands</td>
+<td>thousands</td>
+</tr>
+<tr>
+<td>Pinterest</td>
+<td>Kubernetes</td>
+<td>~10k+</td>
+<td>hundreds</td>
+<td>hundreds</td>
+</tr>
+<tr>
+<td>Cloudflare</td>
+<td>Nomad</td>
+<td>tens of thousands across POPs</td>
+<td>hundreds</td>
+<td>continuous</td>
+</tr>
+<tr>
+<td>Netflix</td>
+<td>Spinnaker over EC2+k8s</td>
+<td>hundreds of thousands</td>
+<td>thousands</td>
+<td>thousands</td>
+</tr>
+</tbody>
+</table>
+<p>The range is enormous. Different orgs at different scales arrive at different points in the design space, and yet the same fundamental abstractions (declarative spec, reconcile loop, ephemeral workloads, network-attached storage) underlie all of them.</p>
+<hr>
+<h2 id="16-summary">§16. Summary</h2>
+<blockquote>
+<p><em>Container orchestration is the runtime layer that turns "I want N copies of this service" into reality: a control plane stores desired state in a Raft-replicated KV store, controllers run reconcile loops that translate intent into actions, a scheduler bin-packs pods onto nodes, and per-node agents drive a container runtime through standardized interfaces for compute (CRI), networking (CNI), and storage (CSI). On top of that runtime, deployment patterns — rolling, canary, blue-green, dark launch, shadow — and delivery systems — GitOps with Argo or Flux, progressive delivery with Argo Rollouts, push pipelines with Spinnaker — turn the act of shipping software from a heroic event into a continuous, declarative, level-triggered process. The technology's contract is narrower than it appears: it promises scheduling, lifecycle, and abstraction for ephemeral workloads on a cluster of machines, not persistent state, not cross-cluster atomicity, not business correctness — and the difference between teams that ship Kubernetes well and teams that don't is largely the difference between those who internalize that narrow contract and those who don't.</em></p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

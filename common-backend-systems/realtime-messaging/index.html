@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Messaging — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Real-Time Messaging</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<h2 id="1-what-real-time-messaging-is">§1. What Real-Time Messaging IS</h2>
+<p>Real-time messaging is a class of infrastructure that maintains a persistent, low-latency, server-initiated channel from a backend to a connected client (browser, mobile app, IoT sensor, game client, trading terminal) so the server can push data the instant it changes. It is the in-application live data plane. When a Slack channel lights up the moment a teammate types, when a Robinhood ticker repaints sub-second on a price tick, when Figma cursors glide across a collaborator's canvas, when a Pokemon GO raid lobby fills with player positions, when a Twitch chat overlay scrolls past a streamer's screen at 30 messages per second — all of those experiences live or die on real-time messaging infrastructure.</p>
+<p>The defining property is <strong>server-to-client push without the client asking first</strong>. The client opens one connection (typically a WebSocket, sometimes Server-Sent Events (SSE), sometimes MQTT (Message Queuing Telemetry Transport), occasionally HTTP long-poll for legacy paths), holds it open for minutes or hours, and the server pumps events down that connection as they happen.</p>
+<p>It is essential to distinguish real-time messaging from four adjacent categories that often get confused with it:</p>
+<p><strong>Pull-based polling.</strong> A client asking "any new data?" every two seconds is fundamentally a different beast. Polling is request-driven, stateless, simple to operate, and catastrophic at scale: each poll is a fresh HTTP request with all its overhead (DNS, TCP handshake or HTTP/2 stream setup, TLS resume, request/response headers ≈ 1 KB minimum), it imposes a worst-case latency floor equal to the poll interval, and the cost scales linearly with the number of clients regardless of whether data changed. Real-time messaging exists to make the <em>push</em> path cheap and the <em>idle</em> path nearly free.</p>
+<p><strong>Mobile push notifications (Apple Push Notification service / Firebase Cloud Messaging).</strong> Documents in this series cover this elsewhere (see <code>12_notification.md</code>). APNs (Apple Push Notification service) and FCM (Firebase Cloud Messaging) are out-of-band delivery: messages routed through Apple's or Google's gateway to a device that may or may not have the app running. They wake apps from background, render notification banners, deliver to suspended apps. They are decidedly NOT in-app live data — payload size is constrained (4 KB on APNs, 4 KB on FCM data messages), end-to-end latency is hundreds of milliseconds to tens of seconds, delivery is best-effort with carrier-dependent reliability, and the server never has a direct connection to the device. Real-time messaging is what you use when the app is in the foreground, has a chat window open, and needs to render a new message in 50 ms.</p>
+<p><strong>Message queue / event streaming (Kafka, RabbitMQ, Pulsar — see <code>02_message_queue.md</code>).</strong> A message queue is broker-to-consumer. The consumers are application servers, batch workers, stream processors — not end-user devices. Queues are designed for durable, replayable, in-data-center transport with millisecond-to-second latency tolerances and consumer groups that pull at their own pace. Real-time messaging often <em>uses</em> a queue or pub-sub on the backend (for cross-gateway routing — see §13), but the customer-facing leg from gateway-to-device is a different protocol with different guarantees.</p>
+<p><strong>Web Real-Time Communication (WebRTC).</strong> WebRTC carries peer-to-peer media — video calls, voice, screen share — directly between user agents over UDP-based transports (Stream Control Transmission Protocol over Datagram Transport Layer Security, abbreviated SCTP-over-DTLS). It is built for tens-of-millisecond audio/video latency, traverses NAT (Network Address Translation) via ICE/STUN/TURN, and uses jitter buffers and codec-aware loss handling. It is not server-pushed event data; the server's role is signaling-only (and signaling itself often runs over WebSocket — see §15). When this doc talks about "real-time messaging," it means structured event delivery, not media planes.</p>
+<p>What real-time messaging is NOT good for: durable history (no replay guarantees once delivered), exactly-once semantics (network is too lossy for that — at best, at-least-once with client dedup), strong ordering across topics or rooms (only within a single subscription, often only within a single connection), or as a system of record (a database or queue should hold the source of truth — the WebSocket gateway is a transport, not storage). It is also a poor fit for very large payloads — a 50 MB asset belongs in object storage with a URL pushed over the channel, not the asset itself.</p>
+<h2 id="2-inherent-guarantees">§2. Inherent Guarantees</h2>
+<p>Real-time messaging gives you, by design:</p>
+<p><strong>Sub-second delivery to connected clients.</strong> The end-to-end push budget for a well-built gateway fleet is on the order of 10–80 ms within a region, dominated by network round trip and pub-sub propagation. Once a connection is established and a message is published, hitting all subscribed clients in under 100 ms is a reasonable expectation.</p>
+<p><strong>Broadcast to N subscribers.</strong> The protocol-level mechanic (write the frame N times to N sockets) is trivial; the architectural mechanic (route through a pub-sub fabric so all gateway nodes know who subscribes to which room) is the work, and is what differentiates a toy WebSocket server from a real platform.</p>
+<p><strong>Presence.</strong> "Who is currently online" is a first-class concept. A gateway knows which clients are connected because it holds their TCP sockets. Aggregating that view across a fleet (so that a UI can render "47 people in this channel") is presence-as-a-service, and most managed real-time platforms ship it.</p>
+<p><strong>Cheap idle.</strong> Once the connection is open and quiet, the steady-state cost per client is tiny — kernel-level TCP keepalive plus an occasional application-level heartbeat. A single Linux box with appropriate tuning routinely holds 1M+ concurrent idle WebSocket connections; the WhatsApp 2 million connections per FreeBSD server stat from 2014 is the canonical reference.</p>
+<p>What real-time messaging does NOT give you, but is often naively assumed to:</p>
+<p><strong>Durable storage.</strong> If a gateway crashes and a client was disconnected at the moment a message published, the message is gone unless something else (a queue, a database, a replay buffer) wrote it down. Real-time messaging is a transport, not a journal. If your product needs "show me everything I missed while offline," you must layer a durable history on top — often a Kafka topic for fanout, a relational or document store for the user's personal history, and a sequence-number-based replay protocol so the client can ask "I last saw event 12,847, give me 12,848 onwards."</p>
+<p><strong>Exactly-once delivery.</strong> A TCP socket reset mid-frame, a reconnect after a wifi flip, a server failover — any of these can result in a duplicate frame, especially when combined with at-least-once retry semantics in the pub-sub backbone. Client-side dedup keyed on a server-issued message ID is mandatory.</p>
+<p><strong>Strong ordering across rooms or topics.</strong> Within a single subscription on a single connection, you typically get FIFO. Across two different rooms? No guarantee — they're going through different pub-sub channels that may have independent latency. Across two reconnects? Definitely no guarantee.</p>
+<p><strong>Authoritative state.</strong> The gateway doesn't know what the truth is. It is a delivery pipe. The application server publishes "user X said this" to the pub-sub; the gateway forwards it. If the application server's database write fails after the publish, the connected clients saw a phantom message. Production systems write to the database first, then publish; the database is the truth, the WebSocket is the notification.</p>
+<p><strong>Cross-region ordering.</strong> A user in Frankfurt and a user in São Paulo connected to different regional gateways will see globally-fanned events with regional latency skew. Geo-replication and conflict resolution (Conflict-free Replicated Data Types — CRDTs, or Operational Transformation — OT) are application-layer concerns, not gateway concerns.</p>
+<p>The mental model: <strong>real-time messaging is a TCP-on-steroids primitive for hierarchical multicast to user devices.</strong> It is fast, it is broadcast-shaped, it is connection-stateful, and it requires everything else (durability, ordering, exactly-once) to be layered on by you.</p>
+<h2 id="3-the-design-space">§3. The Design Space</h2>
+<p>The variants split along three axes: <strong>protocol</strong> (the wire format), <strong>deployment model</strong> (self-hosted vs managed), and <strong>abstraction level</strong> (raw socket vs framework).</p>
+<h3 id="protocols">Protocols</h3>
+<table>
+<thead>
+<tr>
+<th>Protocol</th>
+<th>Direction</th>
+<th>Transport</th>
+<th>Reconnect</th>
+<th>Strengths</th>
+<th>Weaknesses</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>WebSocket (RFC 6455)</td>
+<td>Full-duplex</td>
+<td>TCP, single connection after HTTP Upgrade</td>
+<td>Manual (app/library)</td>
+<td>Bidirectional, binary or text, low overhead per frame (2-14 bytes header), browser-native</td>
+<td>Stateful proxies / corporate firewalls sometimes block, no built-in reconnect, requires sticky load balancing for affinity</td>
+</tr>
+<tr>
+<td>Server-Sent Events (SSE)</td>
+<td>Server → client only</td>
+<td>HTTP/1.1 or HTTP/2 streaming, <code>text/event-stream</code></td>
+<td>Automatic with <code>Last-Event-ID</code></td>
+<td>Plays nice with HTTP infra (caches, proxies, CDNs), simple to implement, native browser <code>EventSource</code> API</td>
+<td>Text only, no client→server channel (must use separate POST), single connection per origin pre-HTTP/2</td>
+</tr>
+<tr>
+<td>HTTP long-poll</td>
+<td>Pseudo-push (client polls, server holds)</td>
+<td>HTTP/1.1</td>
+<td>Per-request</td>
+<td>Works through every firewall and proxy ever built</td>
+<td>High overhead per message (full HTTP cycle), high latency under load (request gap), expensive at scale</td>
+</tr>
+<tr>
+<td>MQTT (Message Queuing Telemetry Transport)</td>
+<td>Pub-sub</td>
+<td>TCP (typical), or MQTT-over-WebSocket</td>
+<td>Library-managed</td>
+<td>Tiny header (~2 bytes), QoS (Quality of Service) levels 0/1/2, designed for low-power devices, retained messages, last-will-and-testament</td>
+<td>Not browser-native, requires a broker (Mosquitto, EMQX, HiveMQ), pub-sub-shaped (not point-to-point)</td>
+</tr>
+<tr>
+<td>gRPC streaming</td>
+<td>Bidirectional or server-stream</td>
+<td>HTTP/2</td>
+<td>Library-managed</td>
+<td>Strong typing (Protobuf), multiplexed on HTTP/2</td>
+<td>Limited browser support (gRPC-Web is a degraded variant), not optimized for huge fanout</td>
+</tr>
+</tbody>
+</table>
+<p>WebSocket is the dominant choice in browser-driven chat and collaboration. SSE is the dominant choice for "live feed" use cases where the client doesn't need to push much — stock tickers, log streaming, AI chatbot token streaming, dashboards. Long-poll is legacy, retained mostly as a fallback for users behind hostile corporate proxies. MQTT is the IoT default — it ships on every Tesla, every commercial HVAC sensor network, AWS IoT Core, and Azure IoT Hub.</p>
+<h3 id="deployment-models">Deployment models</h3>
+<table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Examples</th>
+<th>Operational profile</th>
+<th>Cost shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Self-hosted gateway, open source</td>
+<td>Centrifugo (Go), socket.io (Node.js), Phoenix Channels (Elixir/Erlang), nchan (nginx module)</td>
+<td>You run the fleet, the pub-sub broker, the LB. Maximum control, requires SRE depth.</td>
+<td>Cap-ex on VMs/containers; cost per connection is small</td>
+</tr>
+<tr>
+<td>Self-hosted, batteries-included framework</td>
+<td>SignalR (.NET), Action Cable (Rails), Django Channels (Python)</td>
+<td>Tied to a web framework. Productive for app teams, ceiling lower than dedicated gateways.</td>
+<td>Same as above, plus framework coupling</td>
+</tr>
+<tr>
+<td>Managed real-time platform</td>
+<td>Ably, Pusher (now Beams/Channels), PubNub</td>
+<td>They hold connections, fan out, persist history. You pay per connection-hour and per message.</td>
+<td>Per-message and per-connection pricing; can balloon at scale</td>
+</tr>
+<tr>
+<td>Cloud-provider native</td>
+<td>AWS API Gateway WebSockets, Cloudflare Durable Objects with WebSocket, Azure Web PubSub</td>
+<td>Tightly integrated with cloud functions (Lambda/Workers). Pay-per-event.</td>
+<td>Pay per connection-minute and per message; cold-start latency on lambdas</td>
+</tr>
+<tr>
+<td>Embedded in framework</td>
+<td>SignalR for .NET, Action Cable for Rails, Phoenix Channels for Elixir</td>
+<td>Ergonomic for the framework's developers; usually built on top of a transport (WebSocket fallback to long-poll)</td>
+<td>Operational cost ≈ web fleet cost</td>
+</tr>
+</tbody>
+</table>
+<h3 id="comparison-table-popular-options">Comparison table — popular options</h3>
+<table>
+<thead>
+<tr>
+<th>System</th>
+<th>Language</th>
+<th>Protocol(s)</th>
+<th>Pub-sub backbone</th>
+<th>Sweet spot</th>
+<th>Notable users / scale</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>socket.io</td>
+<td>Node.js library</td>
+<td>WebSocket + long-poll fallback</td>
+<td>Redis adapter (or in-memory single node)</td>
+<td>Small-to-mid apps that want auto-reconnect, rooms, fallback</td>
+<td>Trello, early Microsoft Office for the web</td>
+</tr>
+<tr>
+<td>Centrifugo</td>
+<td>Go (single binary)</td>
+<td>WebSocket, SSE, HTTP-stream, GRPC</td>
+<td>Redis, Nats, Tarantool</td>
+<td>Self-hosted, scriptable, free, ~1M conns per node</td>
+<td>Mail.ru, many gaming and SaaS deployments</td>
+</tr>
+<tr>
+<td>Phoenix Channels</td>
+<td>Elixir/Erlang (BEAM VM)</td>
+<td>WebSocket, long-poll</td>
+<td>Phoenix.PubSub (in-VM clustering or Redis)</td>
+<td>When you want supervisor trees and per-channel processes</td>
+<td>Discord (until they replaced parts), bleacher report (2M concurrent in 2015)</td>
+</tr>
+<tr>
+<td>Pusher Channels</td>
+<td>Managed</td>
+<td>WebSocket</td>
+<td>Their internal fabric</td>
+<td>App teams who want SDKs and to stop running infra</td>
+<td>GitHub Issues live updates, many SaaS apps</td>
+</tr>
+<tr>
+<td>Ably</td>
+<td>Managed</td>
+<td>WebSocket, SSE, MQTT, raw HTTP</td>
+<td>Their global fabric</td>
+<td>Multi-region, regulated industries needing guaranteed delivery</td>
+<td>Live sports, fintech, big-event broadcast</td>
+</tr>
+<tr>
+<td>PubNub</td>
+<td>Managed</td>
+<td>WebSocket, HTTP-stream</td>
+<td>Global PoP fabric</td>
+<td>Apps wanting in-region edge plus chat features</td>
+<td>Curbside, telehealth, gaming</td>
+</tr>
+<tr>
+<td>AWS API Gateway WebSockets</td>
+<td>Managed</td>
+<td>WebSocket</td>
+<td>Triggers Lambda per event</td>
+<td>Serverless WebSocket; modest scale; pay per event</td>
+<td>Chat-as-feature in many enterprise apps</td>
+</tr>
+<tr>
+<td>Cloudflare Durable Objects</td>
+<td>Managed (Workers)</td>
+<td>WebSocket</td>
+<td>Object-as-actor (each room = 1 DO)</td>
+<td>Per-room consistency, edge-near-user</td>
+<td>Cloudflare's own dashboard, multi-player games like figma-style edge collab demos</td>
+</tr>
+<tr>
+<td>MQTT broker (Mosquitto, EMQX, HiveMQ)</td>
+<td>C/Erlang/Java</td>
+<td>MQTT over TCP/TLS</td>
+<td>Broker-internal</td>
+<td>IoT, telemetry, sensor fanout</td>
+<td>Tesla fleet, smart-home, industrial IoT</td>
+</tr>
+</tbody>
+</table>
+<p>Defended picks for common starting points:</p>
+<ul>
+<li><strong>Browser chat or dashboard, you control the stack, modest scale (under a million concurrent):</strong> Centrifugo plus Redis Streams. Single Go binary, websockets and SSE both supported, easy ops, well documented, free.</li>
+<li><strong>You want to ship features not run infra, sub-100K concurrent:</strong> Ably or Pusher. SDKs across every client platform, presence and history out of the box.</li>
+<li><strong>Cloud-native, you live on AWS:</strong> API Gateway WebSockets + DynamoDB connection table + Lambda handlers. Cost ramps fast above ~100K concurrent but the operational story is zero.</li>
+<li><strong>You're already on Cloudflare Workers:</strong> Durable Objects. One DO per room scales horizontally by room.</li>
+<li><strong>IoT or sensor-heavy:</strong> MQTT with EMQX. Anything else is a wrong shape.</li>
+</ul>
+<h2 id="4-byte-level-mechanics">§4. Byte-Level Mechanics</h2>
+<p>A real-time messaging deep dive is incomplete without the wire format. Knowing what a WebSocket frame actually looks like, what <code>text/event-stream</code> does on the wire, and how MQTT spends two bytes saying "publish" separates someone who has shipped this from someone who has read about it.</p>
+<h3 id="websocket-protocol-the-handshake">WebSocket protocol — the handshake</h3>
+<p>A WebSocket connection begins as a plain HTTP request that is upgraded mid-stream:</p>
+<pre><code>GET /chat HTTP/1.1
+Host: chat.example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+Origin: https://example.com
+</code></pre>
+<p>The client sends a random 16-byte nonce, base64-encoded, in <code>Sec-WebSocket-Key</code>. The server proves it speaks the protocol by computing:</p>
+<pre><code>accept = base64(SHA1(Sec-WebSocket-Key + &quot;258EAFA5-E914-47DA-95CA-C5AB0DC85B11&quot;))
+</code></pre>
+<p>That magic GUID is hardcoded in RFC 6455 specifically so that a server that doesn't understand WebSockets cannot accidentally complete a handshake. Response:</p>
+<pre><code>HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+</code></pre>
+<p>After the <code>101</code>, the TCP connection is no longer HTTP. It is a stream of WebSocket frames in both directions.</p>
+<h3 id="websocket-protocol-the-frame-format">WebSocket protocol — the frame format</h3>
+<p>The frame layout, byte by byte:</p>
+<pre><code> 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-------+-+-------------+-------------------------------+
+|F|R|R|R| opcode|M| Payload len |    Extended payload length    |
+|I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
+|N|V|V|V|       |S|             |   (if payload len==126/127)   |
+| |1|2|3|       |K|             |                               |
++-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - - +
+|     Extended payload length continued, if payload len == 127  |
++ - - - - - - - - - - - - - - - +-------------------------------+
+|                               |Masking-key, if MASK set to 1  |
++-------------------------------+-------------------------------+
+| Masking-key (continued)       |          Payload Data         |
++-------------------------------- - - - - - - - - - - - - - - - +
+:                     Payload Data continued ...                :
++ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
+|                     Payload Data continued ...                |
++---------------------------------------------------------------+
+</code></pre>
+<p>Field walk-through:</p>
+<ul>
+<li><strong>FIN (1 bit):</strong> <code>1</code> if this frame is the final fragment of a logical message. Long messages can be split across multiple frames with <code>FIN=0</code> until the last.</li>
+<li><strong>RSV1/2/3 (1 bit each):</strong> Reserved. Used by extensions (e.g., <code>permessage-deflate</code> sets RSV1 to mark a compressed frame).</li>
+<li><strong>Opcode (4 bits):</strong> <code>0x0</code> = continuation, <code>0x1</code> = text (UTF-8), <code>0x2</code> = binary, <code>0x8</code> = close, <code>0x9</code> = ping, <code>0xA</code> = pong.</li>
+<li><strong>MASK (1 bit):</strong> Must be 1 on client-to-server frames, must be 0 on server-to-client frames. This is an anti-cache-poisoning measure baked into the spec.</li>
+<li><strong>Payload length (7 bits, possibly +16 or +64):</strong> Three-tier encoding. <code>≤125</code> means the value is the length. <code>126</code> means the next 16 bits are an unsigned big-endian length (up to 64 KB). <code>127</code> means the next 64 bits are an unsigned big-endian length (theoretically 2^63 bytes; in practice servers cap this).</li>
+<li><strong>Masking key (32 bits, only if MASK=1):</strong> Random per-frame. The client XORs payload bytes against this rotating key before sending.</li>
+<li><strong>Payload:</strong> The actual data. If MASKed, recipients XOR back against the masking key.</li>
+</ul>
+<p>A minimal "hello" text frame from client to server: <code>0x81 0x85 m1 m2 m3 m4 h⊕m1 e⊕m2 l⊕m3 l⊕m4 o⊕m1</code>. That's 11 bytes on the wire for a 5-character message. The same message in HTTP polling would be ~600 bytes including headers. That ratio — roughly 50–100× less overhead per event in steady state — is the entire economic argument for WebSocket.</p>
+<p>Control frames (close, ping, pong) carry no payload or a tiny one and must have <code>FIN=1</code>. Ping/pong is the protocol-level heartbeat; many implementations use it to detect dead connections within 30–60 seconds.</p>
+<h3 id="server-sent-events-on-the-wire">Server-Sent Events — on the wire</h3>
+<p>SSE is dramatically simpler. The client opens a long-lived HTTP GET with:</p>
+<pre><code>GET /events HTTP/1.1
+Accept: text/event-stream
+Cache-Control: no-cache
+</code></pre>
+<p>The server responds with <code>200 OK</code>, <code>Content-Type: text/event-stream</code>, and a body that is never closed. The body format:</p>
+<pre><code>id: 12847
+event: message
+data: {&quot;user&quot;:&quot;alice&quot;,&quot;text&quot;:&quot;hi&quot;}
+
+id: 12848
+event: presence
+data: {&quot;user&quot;:&quot;bob&quot;,&quot;status&quot;:&quot;away&quot;}
+
+retry: 5000
+:heartbeat
+</code></pre>
+<p>Each event is one or more <code>key: value</code> lines terminated by a blank line. <code>id</code> becomes <code>Last-Event-ID</code> on the next connect attempt — the browser sends it automatically as a header, and the server uses it to replay missed events. <code>event</code> is the named event type (default <code>message</code>). <code>data</code> is the payload (and is the only field the JavaScript receives via <code>e.data</code>; everything else is metadata). Lines starting with <code>:</code> are comments, often used as a heartbeat (e.g., <code>:keepalive\n\n</code> every 15 s to prevent intermediate proxies from killing an idle stream).</p>
+<p>Automatic reconnect is built into the browser's <code>EventSource</code> API. If the connection drops, the client waits the <code>retry</code> value (defaulting to ~3 s) and reconnects with <code>Last-Event-ID</code>. This is why SSE is so often the right call for "feed" UX cases — the gnarly part of WebSocket apps (reconnect logic with backoff and replay) is in the platform, not the app.</p>
+<h3 id="mqtt-fixed-header-variable-header-payload">MQTT — fixed header + variable header + payload</h3>
+<p>MQTT's frame is even tighter than WebSocket's:</p>
+<pre><code>Fixed header:
+ 7 6 5 4 3 2 1 0
++---+---+---+---+
+|  Type | Flags |   ← 1 byte
++---+---+---+---+
+| Remaining Len |   ← 1-4 bytes, variable-length integer
++---+---+---+---+
+</code></pre>
+<p>The <code>Type</code> (4 bits) names the packet — <code>1</code>=CONNECT, <code>2</code>=CONNACK, <code>3</code>=PUBLISH, <code>4</code>=PUBACK, <code>8</code>=SUBSCRIBE, <code>13</code>=PINGREQ, etc. <code>Flags</code> (4 bits) encode per-type modifiers (for PUBLISH: DUP=duplicate-of-prior-publish, QoS, RETAIN).</p>
+<p>After the fixed header comes a remaining-length field encoded as a variable-byte integer (7 bits of payload per byte, top bit as continuation). A single byte handles up to 127, four bytes handle up to 256 MB.</p>
+<p>A QoS 0 PUBLISH of <code>{"temp":21.3}</code> on topic <code>sensor/42/temp</code> is:</p>
+<pre><code>30           — type=PUBLISH (3&lt;&lt;4), flags=0
+13           — remaining length = 19
+00 0D        — topic name length = 13
+73 65 6E 73 6F 72 2F 34 32 2F 74 65 6D 70   — &quot;sensor/42/temp&quot;
+{ &quot; t e m p &quot; : 2 1 . 3 }                    — payload (12 bytes)
+</code></pre>
+<p>About 21 bytes for the whole exchange. A web-style POST of the same data with JSON body, headers, and TLS overhead is comfortably 1 KB. For battery-powered sensors waking up to send a reading once a minute, that ratio determines whether the device lasts a year or a month.</p>
+<p><strong>MQTT QoS (Quality of Service) levels:</strong></p>
+<ul>
+<li><strong>QoS 0 (at-most-once):</strong> Fire and forget. No acknowledgment. Fast, but messages can be silently dropped. Used for telemetry where loss of a single sample is acceptable (CPU temperature every second).</li>
+<li><strong>QoS 1 (at-least-once):</strong> PUBLISH followed by PUBACK. Sender retransmits until acked. Receiver may see duplicates. Used for events that must arrive but tolerate dupes (sensor exceeding threshold).</li>
+<li><strong>QoS 2 (exactly-once):</strong> Four-step handshake: PUBLISH → PUBREC → PUBREL → PUBCOMP. Highest cost, used rarely (financial transactions over MQTT). The performance hit is meaningful — you've doubled the round trips.</li>
+</ul>
+<h3 id="http-long-polling-request-held-open">HTTP long-polling — request held open</h3>
+<p>The client issues a regular HTTP GET with a <code>since=&lt;cursor&gt;</code> parameter. The server doesn't reply immediately; it parks the request — typically holding the response open for 25–60 seconds — and returns the moment new data arrives, or returns an empty <code>204</code> when the parking timeout fires. The client immediately reconnects. From the application's perspective it's push; from the protocol's, it's a sequence of polls where each request happens to be long. Overhead per message is high (1 full HTTP cycle per event); the only reason it survives is that it works through every firewall and proxy on Earth — even ones that strip the WebSocket Upgrade header and break SSE.</p>
+<h3 id="end-to-end-walkthrough-one-chat-message">End-to-end walkthrough — one chat message</h3>
+<p>Concretely tracing a single chat send from user Alice to a room of 5,000 subscribers, on a fleet using WebSocket + Redis Pub/Sub:</p>
+<ol>
+<li><strong>Alice's browser</strong> holds an open WebSocket to gateway node <code>gw-7</code>. She types "hello" and the app calls <code>ws.send('{"room":"r-99","text":"hello"}')</code>. The browser builds a text frame: opcode <code>0x1</code>, MASK bit set, masking key from <code>crypto.getRandomValues()</code>, masked payload. About 35 bytes go on the wire.</li>
+<li><strong><code>gw-7</code></strong> reads the frame off the kernel socket (epoll wakeup), unmasks, parses JSON. Validates Alice's session (cached from the auth handshake at connect time — see §7). Calls into the application layer: <code>chatService.publish(room='r-99', from='alice', text='hello')</code>.</li>
+<li><strong>Application layer</strong> writes the message to the persistent store (Cassandra or DynamoDB) with a monotonically-increasing sequence number for that room — say <code>seq=12,847</code>. This is the durable write that makes the chat replayable.</li>
+<li><strong>Application layer</strong> publishes to Redis: <code>PUBLISH room:r-99 '{"seq":12847,"from":"alice","text":"hello","at":169...}'</code>. The Redis primary fans this out over its pub-sub fabric to every Redis subscriber.</li>
+<li><strong>All gateway nodes</strong> (<code>gw-0</code> through <code>gw-31</code>) are subscribed to <code>room:r-99</code>. Each receives the published payload via their long-lived <code>PSUBSCRIBE</code> or <code>SUBSCRIBE</code> connection.</li>
+<li><strong>Each gateway</strong> looks up its in-memory map of <code>room → set&lt;connection&gt;</code>. It builds a WebSocket text frame (server-to-client, no mask): <code>0x81 + length + payload</code>. It writes this frame to every relevant socket. For 5,000 subscribers spread across 32 gateways, each gateway pushes ~156 frames. The kernel handles this with <code>sendmsg()</code> calls and TCP windowing.</li>
+<li><strong>Each subscriber's browser</strong> receives the frame, the runtime delivers <code>onmessage</code> with the parsed payload, the chat UI renders.</li>
+</ol>
+<p>End-to-end budget on a tight system: ~5 ms for steps 1-3, ~5 ms for the Redis publish + fanout, ~5–20 ms for each gateway to push to its sockets, ~10–30 ms network to the client. Total: 25–80 ms median for everyone in the room. The architecture <em>is</em> the deep dive — each component is responsible for a slice of that budget, and any one of them being slow shows up as users grumbling that "Slack feels laggy today."</p>
+<h2 id="5-capacity-envelope">§5. Capacity Envelope</h2>
+<p>The capacity story of real-time messaging is dominated by <strong>concurrent connections</strong> more than by message rate. The unit economics are: how many TCP sockets can one box hold? How many messages per second can the fleet move? How much memory and how many file descriptors per socket?</p>
+<p><strong>Small scale: one Node.js + socket.io box, ~1,000 concurrent.</strong> A side-project chat app, a niche dashboard, a hobby multiplayer game. The default Node.js + socket.io configuration with no tuning will happily hold 1–5K connections on a small VM. Memory per connection is ~5–10 KB at the application layer, ~10 KB more in the kernel. Messages-per-second is in the low thousands. No load balancer, single box, redeploy = everyone reconnects, life is fine. Latency is sub-50 ms because everything is one box.</p>
+<p><strong>Mid scale: a chat product with 100K concurrent.</strong> Typical SaaS messaging tier — a customer support chat embedded in a B2B product, a real-time dashboard for a fleet management company. Two to ten gateway nodes (Centrifugo, socket.io with Redis adapter, Phoenix Channels), a Redis cluster for pub-sub, a load balancer with WebSocket support (HAProxy, NGINX, Envoy, or AWS ALB), and an application fleet that publishes events. Per node: 20-50K connections, depending on language runtime (Erlang/Elixir hit 100K easily, Node.js needs more boxes). Messages per second: tens of thousands. Latency budget: 20-100 ms p99.</p>
+<p><strong>Large scale: Slack-tier, hundreds of millions of WebSocket connections per day, tens of millions concurrent.</strong> Slack famously runs a custom WebSocket gateway tier (formerly an EVS / Edge Vendor Server architecture, with later modifications). Each gateway is a stateful node holding hundreds of thousands of sockets, fronted by ELBs. The pub-sub backbone routes channel-bound messages across the gateway fleet. They publish channel events to a fleet of gateways, gateways subscribe to channels their clients are in (using lazy subscription — see §13), and presence updates are aggregated. Slack has publicly discussed throughput on the order of billions of messages per day and ~10M concurrent at peak. Discord runs Elixir/Phoenix, has reported holding millions of WebSocket connections concurrently and 5M+ concurrent voice users at peak, with a custom Erlang-based "guild" actor model where each Discord server is a process. WhatsApp ran on FreeBSD with custom Erlang, famously holding 2M connections per server on commodity hardware back in 2014; today's WhatsApp Web pushes similar numbers per box.</p>
+<p><strong>Giant scale: ten million concurrent on a single broadcast.</strong> Twitch real-time chat has handled streams with 1M+ concurrent chatters fanning out to overlay viewers. The 2019 Fortnite "The End" event saw 12M+ concurrent players in a coordinated event; Pokemon GO during a major raid event saw 50M+ concurrent active players, each with bidirectional channels for game state. At this scale, the bottleneck is not connection count — it's <strong>fanout amplification</strong>: 1 user types in a global chat with 1M subscribers, and the system must write 1M frames in milliseconds. Hierarchical broker tiers, regional clustering, and per-room sharding become structural. Twitter Spaces and major event broadcasts coordinate fanout via multi-tier fanout fabrics where one "publish" expands across regional clusters before hitting individual gateway nodes.</p>
+<p><strong>IoT scale: millions of MQTT sensors.</strong> A Tesla fleet, a smart-meter rollout in a national power grid, a connected-vehicle telematics platform. These systems hold hundreds of thousands of MQTT connections per broker node; brokers like EMQX have published benchmarks of 10M+ connections per node with appropriate tuning. AWS IoT Core reportedly handles hundreds of millions of devices for customers like John Deere and various utility cooperatives.</p>
+<p>Bottleneck progression by scale tier:</p>
+<ul>
+<li>1K connections: nothing breaks, you're fine.</li>
+<li>10K connections: file descriptor limits, default 1024 per process — bump to 1M with <code>ulimit</code>.</li>
+<li>100K connections per node: TCP buffer memory dominates — tune <code>tcp_rmem</code>/<code>tcp_wmem</code> lower.</li>
+<li>1M connections per node: ephemeral port exhaustion if your gateway dials <em>outbound</em> (each in-bound socket needs a kernel struct but no port). Source ports for outbound pub-sub connections become a limit.</li>
+<li>10M concurrent fleet-wide: cross-region routing, pub-sub fabric throughput, presence aggregation. Architecture changes shape.</li>
+</ul>
+<h2 id="6-architecture-in-context">§6. Architecture in Context</h2>
+<p>The canonical pattern, regardless of vendor:</p>
+<pre><code>       Clients (browser, mobile, IoT)
+                    │
+                    │ TLS-terminated WebSocket / SSE / MQTT
+                    ▼
+        ┌───────────────────────┐
+        │  L7 Load Balancer     │   ← supports WebSocket upgrade,
+        │  (ALB, Envoy, HAProxy)│      passes Upgrade/Connection headers,
+        └───────────────────────┘      sticky by hash(client_ip) or cookie
+                    │
+        ┌─────────┬─┴─┬─────────┐
+        ▼         ▼   ▼         ▼
+   ┌────────┐ ┌────────┐ ┌────────┐
+   │gw-node │ │gw-node │ │gw-node │   ← stateful: each connection lives on one
+   │   0    │ │   1    │ │   N    │      node. In-memory map: conn_id → socket
+   └────────┘ └────────┘ └────────┘             and    room_id → set&lt;conn_id&gt;
+        │         │         │
+        │ SUBSCRIBE / PUBLISH on rooms / users / topics
+        ▼         ▼         ▼
+        ┌───────────────────────────┐
+        │  Pub-sub backbone         │   ← Redis Pub/Sub, Redis Streams,
+        │  (cross-gateway routing)  │      Kafka, NATS JetStream
+        └───────────────────────────┘
+                    ▲
+                    │ PUBLISH events
+                    │
+        ┌───────────┴───────────┐
+        │ Application servers   │   ← actual product logic; writes to DB,
+        │ (REST/gRPC handlers)  │      then publishes the change as an event
+        └───────────────────────┘
+                    │
+                    ▼
+            Durable stores
+        (Cassandra, DynamoDB,
+         Postgres, Kafka journal)
+</code></pre>
+<p>The structural facts:</p>
+<ul>
+<li><strong>Each WebSocket lives on exactly one gateway node.</strong> That node holds the TCP socket, the per-connection state (auth, subscriptions, send buffer). If it dies, the socket dies, and the client must reconnect.</li>
+<li><strong>The load balancer needs sticky affinity only for reconnect.</strong> A WebSocket connection is sticky-by-nature (the TCP connection is to one IP); the LB chooses the node at connect time. Sticky cookies matter for HTTP long-poll fallback (so successive polls hit the same node).</li>
+<li><strong>The pub-sub layer is what makes scaling horizontal.</strong> A new gateway node can join the fleet, subscribe to the pub-sub fabric, and start accepting connections. It doesn't need to know about other gateway nodes — only the shared pub-sub does.</li>
+<li><strong>The application servers don't talk to gateways directly.</strong> They publish events to the pub-sub layer with topic/channel/room as the key. The gateways subscribe to channels that their connected clients have joined. This decouples the application's write path from the connection topology.</li>
+</ul>
+<p>For Cloudflare Durable Objects, the picture is different — the "gateway" <em>is</em> the Durable Object, one per room or per user. The pub-sub is implicit (clients all WebSocket to the same DO, which holds them in a single actor). Scaling shifts from "more gateway nodes" to "more rooms ⇒ more DOs spread across the edge." Each DO is single-threaded and consistent for its scope — a natural fit for collaborative editing of a single document where you want strong serialization.</p>
+<p>For AWS API Gateway WebSockets, the gateway is stateless from your perspective — AWS holds the sockets, and each frame triggers a Lambda invocation. State (which connection IDs are in which room) lives in a DynamoDB table you maintain. Fanout to a room becomes "look up connections in DDB, then call <code>PostToConnection</code> for each."</p>
+<h2 id="7-hard-problems-inherent-to-this-technology">§7. Hard Problems Inherent to This Technology</h2>
+<h3 id="71-connection-state-is-stateful-each-websocket-is-pinned-to-one-node">7.1 Connection state is stateful — each WebSocket is pinned to one node</h3>
+<p>The naïve fix: "just put a load balancer in front."</p>
+<p>How it breaks: the load balancer chooses node <code>gw-3</code> for Alice's initial connection. Now the application server publishes "new message in room r-99." Which node should receive it? Not just <code>gw-3</code>. <em>Every</em> node with a subscriber in r-99. The LB can't help with this; it only knows ingress.</p>
+<p>The real fix: a pub-sub fabric across nodes. Each gateway, when a client joins a room, subscribes to <code>room:r-99</code> on Redis or a similar channel-based broker. The application publishes once; Redis fans out to every gateway holding a subscriber. This decouples ingress from delivery.</p>
+<p>The downside: every gateway has to maintain potentially thousands of channel subscriptions on Redis. Naïve implementations subscribe-per-room and run into Redis client subscription limits. The fix is "subscribe lazily" (gateway subscribes when first client joins a room, unsubscribes when last leaves) and "subscribe-by-shard" (subscribe to one of 256 hash-partitioned channels and filter in-process).</p>
+<h3 id="72-connection-storm-on-deploy">7.2 Connection storm on deploy</h3>
+<p>Naïve case: deploy a new version of your gateway. Each replaced node terminates its connections. 200K clients reconnect within 30 seconds.</p>
+<p>How it breaks: a thundering-herd reconnect drives load balancer CPU through the roof, and the new gateway nodes get hit by a TLS handshake storm — 200K handshakes in 30 seconds is 6.7K TLS handshakes per second sustained, which is enough to topple a CPU-bound TLS terminator. Worse, all those clients re-fetch initial state (history, presence, room membership) simultaneously, hitting the database with a synchronized read storm.</p>
+<p>The real fix: <strong>jittered reconnect</strong>. The client library, when it detects disconnect, waits a random delay drawn from an exponential distribution (e.g., <code>min(retry_count^2 * 1s, 30s) * Math.random()</code>). Browsers implementing this spread the reconnect storm across 30-60 seconds. The server controls this via a hint — Centrifugo sends a <code>disconnect_advise</code> with a recommended backoff; SSE uses the <code>retry:</code> field. Combined with a <strong>rolling deploy</strong> (1-5% of nodes per cycle, not all at once), the storm becomes a manageable trickle.</p>
+<p>A real example: Slack's downtime stories mention reconnect storms after WebSocket fleet restarts. They mitigate with deliberate connection draining, advance signaling, and per-region rolling rollouts.</p>
+<h3 id="73-presence-at-scale">7.3 Presence at scale</h3>
+<p>Naïve: every client sends an app-level heartbeat every 5 seconds; gateway joins this across the fleet for the "who's online" view.</p>
+<p>Breaks: 100M users × heartbeat/5s = 20M heartbeats/sec. Even at 50 bytes each, that's 1 GB/s of pure heartbeat, and cross-fleet aggregation dwarfs the actual chat traffic.</p>
+<p>Fix: <strong>don't compute global presence — compute scoped presence.</strong> A user only needs presence of people relevant to them — direct contacts, current channel, current document. Gateway publishes "user X is on me" once at connect, refreshes via TTL (Time To Live) in Redis (key <code>presence:user:42</code> with <code>EX 60</code>), any other gateway can <code>GET presence:user:42</code>. The heartbeat is in-band via WebSocket ping/pong — no application-level heartbeats. For <em>mass-presence broadcasts</em> like "X is typing" to a 1M-user room, throttle (one event per 5s per user per channel) and drop fanout entirely above ~1K subscribers — just show "lots of typing".</p>
+<h3 id="74-backpressure-slow-clients-fill-server-memory">7.4 Backpressure — slow clients fill server memory</h3>
+<p>Naïve: gateway writes to socket, kernel buffers, life moves on.</p>
+<p>Breaks: a client on a 56K connection or stalled iOS background socket reads slowly. Kernel send buffer fills, gateway userspace queue fills. Fire-and-forget <code>write()</code> accumulates GBs of buffered data per slow client. With 200K connections, even 10 KB per buffer = 2 GB of resident memory for the slow ones alone.</p>
+<p>Fix: bounded per-connection queues with explicit overflow policy. Per-socket write queue; when it exceeds threshold (e.g., 1 MB or 100 messages), gateway either (a) drops oldest, (b) drops the connection, or (c) downgrades the client to summary subscription. Centrifugo, socket.io, and Phoenix all expose this as configurable. Discord publicly described a backpressure incident where slow consumers caused fanout-side memory pressure; their fix was strict per-connection caps with disconnect on overrun.</p>
+<h3 id="75-reconnect-with-replay-what-did-i-miss-while-offline">7.5 Reconnect with replay — what did I miss while offline?</h3>
+<p>Naïve: when client reconnects, send current state.</p>
+<p>Breaks: "current state" alone misses in-between events. If Alice's wifi was dead for 30 seconds while 50 messages arrived, "current state" might be just the latest — she has a gap. For collaborative editing this is <em>worse</em>: missing one OT (Operational Transform) op means client state diverges.</p>
+<p>Fix: server-assigned monotonic sequence numbers per room/topic + bounded replay buffer. Each event has <code>seq=N</code>; client tracks highest seq seen. On reconnect, client sends <code>last_seq=12847</code>; server replays 12848 through current. If buffer doesn't go back that far, server tells client to re-fetch full state from the database. Centrifugo calls this "history with positioning"; Ably calls it "channel rewind"; Phoenix calls it "presence diff plus event history" — same pattern, different names. Redis Streams (<code>XADD</code> + <code>XREVRANGE</code> + <code>XREAD BLOCK</code>) is the canonical primitive — both subscribe and replay on a bounded log.</p>
+<h3 id="76-authentication-of-websocket-connections">7.6 Authentication of WebSocket connections</h3>
+<p>Naïve: send a JWT (JSON Web Token) in the first WebSocket frame after connecting.</p>
+<p>Breaks: the connection is established before any frame arrives. Unauthenticated clients have consumed a slot, gotten through your firewall, completed TLS. Browsers also don't let you set arbitrary headers on a WebSocket — only <code>Sec-WebSocket-Protocol</code> is app-controllable.</p>
+<p>Three established patterns: (1) <strong>Cookie-based auth on the HTTP Upgrade request</strong> — same-origin cookies ride along on the Upgrade as any HTTP request; Slack, Discord, embedded chats do this; fragile cross-origin. (2) <strong>Query parameter token</strong> — <code>wss://chat.example.com/ws?token=&lt;JWT&gt;</code>; easy but shows up in access logs (privacy); use one-time, short-lived tokens. (3) <strong>Auth-after-connect with grace period</strong> — open unauthenticated, expect an <code>AUTH</code> frame in 5 seconds, close otherwise; most managed platforms (Ably, Pusher) use this combined with per-IP connect quotas.</p>
+<p>Whatever the pattern, identity is verified once at connect and cached for the connection's lifetime. Mid-connection revocation requires periodic re-check or short-enough lifetimes that token expiry forces reconnect.</p>
+<h3 id="77-multi-region-routing">7.7 Multi-region routing</h3>
+<p>Naïve: one region; users connect to the nearest gateway.</p>
+<p>Breaks: Alice in Frankfurt is on <code>eu-west-1</code>. Bob in São Paulo is on <code>sa-east-1</code>. Same chat room. Bob publishes to São Paulo's Redis; Frankfurt gateways aren't subscribed there. Alice never sees the message.</p>
+<p>Fix: cross-region replication of the pub-sub layer. Options: (1) <strong>Active-active Kafka with MirrorMaker</strong> — canonical heavyweight; each region has a Kafka cluster, MirrorMaker replicates topics. (2) <strong>NATS supercluster</strong> — built-in cross-cluster routing, milliseconds to propagate. (3) <strong>Vendor magic</strong> — Ably, PubNub, Cloudflare DOs all do this under the hood. Latency hit is physics: Frankfurt-to-São Paulo is ~110 ms RTT one-way. Fatal for real-time games (hence regional sharding), tolerable for chat.</p>
+<h3 id="78-load-balancer-affinity-vs-node-death">7.8 Load balancer affinity vs node death</h3>
+<p>Naïve: sticky sessions via cookie — reconnects always go to the same node.</p>
+<p>Breaks: <code>gw-3</code> is dead. Cookie says "gw-3." Either LB respects it (client gets 502s in a loop) or ignores it (not actually sticky). Even on a healthy node, the new node lacks session state and must rebuild from auth + rooms + presence.</p>
+<p>Fix: sticky-but-failover. LB hashes the client preferentially but falls back if preferred is gone. New gateway queries Redis on connect: "what state did this user have?" — auth token validated, last-known rooms listed. Gateway rejoins rooms on pub-sub, client continues. This is "session rehydration" — Phoenix Channels does it with <code>Presence</code> and <code>Channel.join</code> callbacks.</p>
+<h2 id="8-failure-mode-walkthrough">§8. Failure Mode Walkthrough</h2>
+<p><strong>Gateway node crash.</strong> A <code>gw-3</code> segfaults or the host kernel panics. All TCP sockets it held are dead. From the client's perspective, the WebSocket emits a <code>close</code> event (or a heartbeat timeout if the host vanished without RST). The client library backs off and reconnects to a different gateway via the LB. The new gateway authenticates, restores room subscriptions from session state (cookie + cached presence in Redis), subscribes on pub-sub. Lost data window: anything published between the old gateway's death and the new gateway's resubscribe. The replay protocol (§7.5) covers this if implemented.</p>
+<p><strong>Pub-sub broker outage.</strong> Redis cluster has a primary failover; for 5-30 seconds, publishes fail. Application servers see errors. Gateways see no events. From the client's perspective, the WebSocket is up but the room is silent. Local-only messages (gateway to a client connected to the same gateway, if the gateway short-circuits same-node publishes) still work. After Redis recovers, the gap is filled via the replay protocol (clients send <code>last_seq</code>, gateway pulls from a durable backing — Kafka, Postgres — replays). The <strong>durability point</strong> is the application's write to the database: the database has the truth even when Redis is degraded.</p>
+<p><strong>Slow client behind buggy NAT or carrier.</strong> Connection is technically alive but data isn't flowing. WebSocket pings time out. Gateway closes the socket. Client's library reconnects on the next heartbeat. This is the dominant failure mode in real-world deployments — far more common than crashes. Buggy NATs at hotels or budget carriers idle-timeout TCP connections at ~30 seconds; the fix is application-level keepalive every 25 seconds.</p>
+<p><strong>iOS / Android background.</strong> App goes background. iOS suspends the process within 30 seconds (sometimes faster). The WebSocket is killed by the OS. The server eventually notices via failed heartbeat. To wake the app for inbound messages, the system uses a <strong>push notification</strong> delivered via APNs/FCM — the out-of-band channel. On app foreground, the WebSocket reconnects and the replay protocol fills the gap. This is the canonical "real-time messaging plus push notifications" hybrid; neither one alone covers backgrounded mobile.</p>
+<p><strong>WiFi to cellular transition.</strong> Phone walks out of a coffee shop. WiFi network leaves; cellular takes over. TCP connection on old WiFi NIC is dead (RST when the carrier-grade NAT loses state). Client detects via heartbeat timeout or <code>online</code>/<code>offline</code> browser event, reconnects on the new network. Reconnect path uses replay (§7.5).</p>
+<p><strong>Network partition between gateway and pub-sub.</strong> Gateway can't reach Redis; clients connect but can't subscribe. Modern gateways treat this as a fatal local error and refuse new connections (drain mode) or shed existing connections to make clients reconnect to healthy nodes. Recovery: the operator fixes the network, then the gateway exits drain.</p>
+<p><strong>Permanent loss of a region.</strong> EU region goes dark for hours. Users connected there get retried by the client library; eventually their library tries a backup hostname or a regional DNS rotation routes them elsewhere. Cross-region pub-sub means messages in flight at the moment of partition are lost; the durability story is "the database has the truth and the user catches up on reconnect."</p>
+<p><strong>Durability point summary:</strong> the database write before publish, plus the replay buffer (Redis Streams, Kafka log) for in-flight events, plus the client-side <code>last_seq</code> cursor that lets clients ask "give me what I missed." A real-time message bus <em>cannot</em> be the truth — its job is to be a fast, lossy mirror of the durable journal underneath. Every failure-mode recovery routes through that fact.</p>
+<h2 id="9-why-not-just-polling">§9. Why Not Just Polling?</h2>
+<p>The math is the argument. Consider a chat app with 1M concurrent users, average 1 message per user per minute incoming.</p>
+<p><strong>Polling at 5-second interval:</strong>
+- Each poll: full HTTP request (TCP+TLS handshake amortized via HTTP keep-alive, but headers + path + cookies still ≈ 800 bytes both ways).
+- Polls per user per minute: 12.
+- Polls per minute: 12M.
+- Bytes per minute: 12M × 1.6 KB = 19.2 GB/min = 320 MB/sec.
+- Server CPU: 12M requests/min ≈ 200K req/sec sustained — needs a fleet of HTTP servers just for polling.
+- Worst-case latency: 5 seconds (mid-poll). p50: 2.5 seconds. Catastrophic for chat UX.</p>
+<p><strong>WebSocket equivalent:</strong>
+- 1M sockets open, idle.
+- Per-message overhead: ~30 bytes (frame header + small payload).
+- Messages per minute: 1M (one per user) × ~30 bytes = 30 MB/min = 500 KB/sec.
+- Server CPU: handling 17K msg/sec across a fleet — modest.
+- Latency: 20-80 ms p99.</p>
+<p>That's a ~600x reduction in bytes and ~10-100x in CPU, and the latency improves by two orders of magnitude. Polling at low scale is fine — under 10K users, it works. Past that, you're paying for HTTP overhead per idle user, and that gets ruinous fast.</p>
+<p>There's a second mode of failure too: polling implicitly assumes the server can serve every poll. A burst of concurrent polling clients from the same network (an office, an apartment block) creates synchronized request spikes — every 5 seconds, a thundering herd of polls hits the LB at once. WebSocket completely sidesteps this: the LB is touched once, at connect time.</p>
+<p><strong>The exception that proves the rule: long-poll fallback.</strong> Even WebSocket-first stacks ship long-poll as a fallback for hostile network paths (corporate proxies, ancient firewalls, IE11). They tolerate the cost because it's a small minority of users. Polling-as-primary is what you choose only when WebSocket and SSE both fail or the use case is genuinely poll-shaped (a <code>GET /jobs/status</code> for a long-running job).</p>
+<h2 id="10-scaling-axes">§10. Scaling Axes</h2>
+<p><strong>Type 1 — uniform growth (more concurrent connections, same rate per connection).</strong> A chat app that grows from 100K to 10M users, each averaging the same volume per user. The fix is <strong>horizontal partitioning of gateways</strong>. Add nodes; the load balancer spreads ingress; the pub-sub fabric handles cross-node routing; per-user load stays constant.</p>
+<p>Inflection points:
+- Up to ~50K connections per node: anything works (Node.js, Python, Go).
+- 50K-500K per node: language matters. Go, Rust, Java/Netty, Elixir/BEAM handle this without breaking a sweat. Node.js works but you'll have more nodes.
+- 500K-2M per node: kernel tuning territory. Bump <code>fs.file-max</code>, lower <code>net.ipv4.tcp_rmem</code>/<code>wmem</code>, tune <code>somaxconn</code>, disable Nagle on small writes. Reference: WhatsApp's 2M-per-box configuration.
+- Above ~2M per node: physics. PCIe bus contention, NIC queue depth, kernel scheduler overhead. Solutions: kernel-bypass (DPDK, user-space TCP stacks like F-Stack) — only Cloudflare, FB, and a few others have done this for WebSocket.</p>
+<p>Pub-sub backbone scaling:
+- Single Redis primary: ~10K pub-sub fanouts/sec, ~100K subscribers per channel.
+- Redis cluster (hash-slotted): scales by sharding channels; ~100K fanouts/sec per slot.
+- Kafka: orders of magnitude more durable throughput, higher latency (~5-20 ms vs &lt;1 ms for Redis).
+- Nats with JetStream: in the same band as Kafka, lighter ops.</p>
+<p><strong>Type 2 — hotspot intensification (one room has 1M subscribers — fanout amplification).</strong> A live event in a chat room, a celebrity's stream, a live trading dashboard during a market crash. Same number of users, but they're all watching one thing.</p>
+<p>The fix: <strong>fanout-aware topology.</strong> Approaches:</p>
+<ol>
+<li><strong>Hierarchical fanout.</strong> Instead of one publish-to-N-subscribers, publish to a tree: 1 → 32 → 1024 → final clients. Each layer fans out to ~32. Latency increases logarithmically, throughput per publisher stays constant.</li>
+<li><strong>Regional sharding.</strong> A global room with 1M subscribers is split into 10 regional rooms of 100K each, with a regional "echo" service that copies events between regional buckets. Each gateway only fans out to its local subscribers.</li>
+<li><strong>Sampling and rate-limiting at scale.</strong> For a stream chat with 1M viewers and 1K msg/sec, every viewer can't receive every message — even with cheap fanout, the network bandwidth is hostile. Twitch dynamically downsamples chat at high viewer counts; older messages are dropped on the floor, only "popular" ones (high engagement) are propagated to all.</li>
+<li><strong>Server-broadcast over IP multicast (private networks).</strong> For datacenter-internal fanout, IP multicast lets one packet hit thousands of subscribers. Used in financial market data dissemination — not in public Internet WebSocket fanout, because the public Internet doesn't support multicast.</li>
+</ol>
+<p>Inflection points for hot rooms:
+- 1K subscribers: trivial.
+- 100K subscribers: needs cross-gateway fanout via pub-sub.
+- 1M subscribers in one room: needs hierarchical fanout or hub-and-spoke regional structure.
+- 10M+ subscribers in one event: needs CDN-style edge fanout (Cloudflare for video chat overlays, Twitch's own edge tier).</p>
+<h2 id="11-decision-matrix">§11. Decision Matrix</h2>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>WebSocket</th>
+<th>SSE</th>
+<th>Long-poll</th>
+<th>Push notification</th>
+<th>Polling</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Browser chat (in-app)</td>
+<td><strong>Best</strong></td>
+<td>OK if no client→server</td>
+<td>Fallback only</td>
+<td>No (out-of-app)</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Stock ticker / price feed</td>
+<td>OK</td>
+<td><strong>Best</strong> (server→client only, HTTP-friendly)</td>
+<td>No</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Collaborative editing</td>
+<td><strong>Best</strong> (needs bidirectional, low latency)</td>
+<td>No (no upstream channel)</td>
+<td>No</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Multiplayer game state</td>
+<td><strong>Best</strong> (low-latency bidirectional)</td>
+<td>No</td>
+<td>No</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Backgrounded mobile app</td>
+<td>No (connection dies)</td>
+<td>No</td>
+<td>No</td>
+<td><strong>Best</strong></td>
+<td>No</td>
+</tr>
+<tr>
+<td>IoT sensor telemetry</td>
+<td>OK</td>
+<td>OK</td>
+<td>No</td>
+<td>No</td>
+<td>OK if cheap</td>
+</tr>
+<tr>
+<td>MQTT-enabled embedded device</td>
+<td>OK (over WS)</td>
+<td>No</td>
+<td>No</td>
+<td>No</td>
+<td>No (use MQTT direct)</td>
+</tr>
+<tr>
+<td>Job status (one fetch when done)</td>
+<td>Overkill</td>
+<td>OK</td>
+<td>OK</td>
+<td>OK</td>
+<td><strong>Best</strong> (simple)</td>
+</tr>
+<tr>
+<td>AI chatbot token streaming</td>
+<td>OK</td>
+<td><strong>Best</strong> (server→client, simple HTTP)</td>
+<td>No</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Live sports score</td>
+<td>OK</td>
+<td><strong>Best</strong></td>
+<td>OK</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Trading order entry + market data</td>
+<td><strong>Best</strong> (needs client→server orders + server→client ticks)</td>
+<td>No</td>
+<td>No</td>
+<td>No</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<p>A useful heuristic: if the channel is genuinely bidirectional (chat where the user types AND receives) and you control the client, use WebSocket. If it's server-to-client only (a feed of updates, a notification stream, an AI response token-by-token), use SSE — you get reconnect, replay, and HTTP infrastructure for free. If you're targeting an app in the background or a phone that may not have the app running, use APNs/FCM via the platform-native push pipeline. Polling is a last resort or a degenerate-case fallback.</p>
+<h2 id="12-protocol-deep-dive-websocket-vs-sse">§12. Protocol Deep Dive — WebSocket vs SSE</h2>
+<p>The WebSocket-vs-SSE choice is the single most consequential protocol decision in a real-time messaging architecture. People default to WebSocket because it's familiar; many of those projects should have used SSE.</p>
+<p><strong>WebSocket is full-duplex.</strong> Same TCP connection carries client→server and server→client frames. Required when both sides need to push — chat, collaborative editing, gaming.</p>
+<p><strong>SSE is server-only.</strong> Client→server happens over separate HTTP POSTs. This sounds limiting and is, but it has structural advantages:</p>
+<ol>
+<li>
+<p><strong>It's HTTP all the way down.</strong> Caches don't break it. Proxies don't break it. CDNs can handle it (some, like Fastly and Cloudflare, support SSE natively). Corporate firewalls that strip <code>Upgrade: websocket</code> headers don't strip <code>Content-Type: text/event-stream</code>.</p>
+</li>
+<li>
+<p><strong>Reconnect is in the browser.</strong> <code>EventSource</code> reconnects automatically on disconnect, sending <code>Last-Event-ID</code>. The server replays events from that point. The amount of application code needed to ship a reliable SSE client is approximately zero; the same code in WebSocket land is hundreds of lines.</p>
+</li>
+<li>
+<p><strong>HTTP/2 multiplexing.</strong> With HTTP/2 or HTTP/3, multiple SSE streams share a single TCP connection. WebSocket cannot — each WebSocket is its own TCP connection. For browsers that have many tabs to many origins, SSE wins on connection count.</p>
+</li>
+<li>
+<p><strong>It plays nice with existing HTTP load balancers.</strong> ALB, NGINX, Envoy — all handle SSE correctly out of the box. WebSocket requires explicit support (the <code>Upgrade</code> header negotiation), which not every LB ships well.</p>
+</li>
+</ol>
+<p>The "we don't actually need bidirectional, just use SSE" simplification has been adopted by:</p>
+<ul>
+<li><strong>OpenAI's streaming chat API.</strong> ChatGPT's token-by-token streaming is SSE, not WebSocket. The client sends one POST with the prompt; the server streams response tokens as SSE events. Reconnect-and-replay isn't really meaningful here (you wouldn't replay a partial response), but the simplicity wins.</li>
+<li><strong>Cloudflare's dashboard live updates.</strong> They use SSE for streaming logs and live event panels.</li>
+<li><strong>GitHub's live issue comment updates.</strong> SSE-based.</li>
+<li><strong>Many AI-product builders post-2023.</strong> The streaming-response-as-tokens pattern is a near-universal SSE deployment.</li>
+</ul>
+<p>When WebSocket wins: chat, collaborative editing, multiplayer games, signaling for WebRTC, anything where the client needs to push more than an occasional event.</p>
+<p>When SSE wins: feed updates, ticker data, AI streaming, log tailing, dashboards, notifications inbox.</p>
+<h2 id="13-pub-sub-for-cross-node-routing">§13. Pub-Sub for Cross-Node Routing</h2>
+<p>The pub-sub backbone is the heart of every multi-node real-time messaging system. The choice of backbone determines durability semantics, latency, throughput, and operational complexity.</p>
+<p><strong>Redis Pub/Sub.</strong> The classical choice. <code>PUBLISH ch payload</code> to a channel; every subscriber receives it. Subscriptions are connection-bound (a Redis client with <code>SUBSCRIBE</code> becomes pub-sub-only until unsubscribed). Latency: sub-millisecond within a datacenter. Throughput per Redis primary: ~100K-500K publishes/sec. <strong>Durability: zero.</strong> A Redis primary that restarts loses every pub-sub message in flight; a subscriber that disconnects mid-publish loses any frames between disconnect and reconnect. Acceptable for chat (clients reconnect, replay from a separate journal), unacceptable for "missed events must not be lost" semantics.</p>
+<p><strong>Redis Streams.</strong> The modern Redis answer: a durable, ordered log per stream key. <code>XADD stream * field val</code> appends; <code>XREAD BLOCK 0 STREAMS stream $</code> blocks for new entries. Streams have bounded length (<code>MAXLEN ~ 10000</code> trims to the most recent 10K entries). This is the foundation of the replay protocol — gateway holds a cursor into the stream, on reconnect the client tells the gateway its last cursor, gateway reads forward. Latency: low single-digit ms. Throughput: similar to pub-sub; trimming and AOF (Append-Only File) writes add some cost.</p>
+<p><strong>Kafka.</strong> The heavyweight, durable-replayable choice. Topics, partitions, consumer groups. Latency: 5-20 ms typical, can be tuned down with <code>linger.ms=0</code> and <code>batch.size=1</code>. Throughput: millions of messages per second per broker. <strong>Durability: full</strong> — events persist to disk with configurable replication. Used for the cross-region replication leg of large-scale real-time messaging (Slack, Discord pre-Elixir, LinkedIn's internal "courier" system for in-app messaging). Operational cost is real — Kafka clusters need careful tuning.</p>
+<p><strong>NATS (with JetStream).</strong> A middle ground: fast like Redis, durable like Kafka, lighter ops than either. Used by Centrifugo as an alternative backbone; emerging as a popular choice. JetStream is the durability layer; raw NATS Core is pub-sub without persistence.</p>
+<p><strong>Gateway-to-pub-sub mechanics — the "subscription per channel" problem.</strong> Naïve gateway: when client joins room <code>r-99</code>, gateway calls <code>SUBSCRIBE room:r-99</code> on Redis. When client leaves, <code>UNSUBSCRIBE</code>. Result: gateway has thousands of subscriptions, which is fine on Redis. But: 200K gateways × 10K rooms each = 2M subscriptions; Redis can handle it, but the bookkeeping is finicky and disconnect-handling is error-prone.</p>
+<p>The robust pattern: <strong>partitioned subscriptions.</strong> Hash room IDs into N buckets (e.g., 256 channels named <code>bucket:0</code>-<code>bucket:255</code>). Each gateway subscribes to all 256 buckets at startup and never unsubscribes. When a publish happens, the publisher computes <code>bucket = hash(room_id) % 256</code> and publishes to <code>bucket:&lt;n&gt;</code> with the room ID in the payload. Each gateway receives every message in its 256 buckets, filters in-memory for rooms its connected clients are in, and forwards to relevant sockets.</p>
+<p>This trades a small amount of wasted bandwidth (gateways receive messages for rooms they don't have subscribers for) for radically simpler subscription management. It's how Centrifugo and most mature gateways work internally.</p>
+<h2 id="14-presence-system">§14. Presence System</h2>
+<p>Presence is "who is currently online" or "who is currently in this room." Conceptually simple, terrifying at scale.</p>
+<p><strong>Per-client mechanic.</strong> Client opens WebSocket. The WebSocket protocol's ping/pong frames carry the heartbeat — every 25-30 seconds, the gateway sends a ping, the client responds with a pong. If three pongs fail, gateway closes the connection. No application-level heartbeat needed.</p>
+<p><strong>Per-user presence record.</strong> When a client connects, gateway writes <code>presence:user:42 = { gw: 'gw-7', session: 's-abc', joined: 169... }</code> to Redis with a 60-second TTL. Gateway refreshes the TTL every 30 seconds while the connection lives. When the connection closes, gateway deletes the key.</p>
+<p><strong>Per-room presence.</strong> When a client joins room <code>r-99</code>, gateway adds <code>42</code> to the set <code>presence:room:r-99</code>. When they leave or disconnect, gateway removes. A query "who's in <code>r-99</code>" is <code>SMEMBERS presence:room:r-99</code>.</p>
+<p><strong>Cross-fleet aggregation.</strong> Each gateway publishes presence-change events to pub-sub: <code>gw-7 announces user 42 joined r-99</code>. Other gateways with subscribers interested in <code>r-99</code> receive the event and update their local presence cache. This is fanout-amplified again — a 1M-subscriber room with churn (people joining/leaving every second) generates a flood of presence updates.</p>
+<p><strong>Throttling.</strong> No room with more than ~1000 subscribers gets fine-grained presence. Instead, presence is summarized: "1,247 people online" updated every 5 seconds; individual user-online events are not propagated. This is what Slack does for large channels — you don't see individual people leaving, just a count.</p>
+<p><strong>Mass-presence broadcasts — "X is typing".</strong> Naïve: every keystroke sends a <code>TYPING</code> event to all subscribers. Reality: throttle to "first keystroke of typing-session, then mute for 5 seconds, then re-fire if still typing." For huge rooms, drop entirely. Discord and Slack both do this.</p>
+<p><strong>TTL-based eventual cleanup.</strong> The TTL on <code>presence:user:42</code> is the safety net. If a gateway dies without cleanly removing presence (server crash, network partition), the key expires after 60 seconds and presence is correct again. The exact value (60 seconds is common) trades stale-presence latency against heartbeat frequency.</p>
+<h2 id="15-use-case-gallery">§15. Use Case Gallery</h2>
+<p><strong>Chat applications.</strong> Slack, Discord, WhatsApp Web, Telegram, Teams. Tens of millions concurrent globally, per-channel fanout (hundreds of msg/sec in busy channels), presence (typing, online), reconnect-with-replay for flaky mobile. Pattern: WebSocket + Redis or Kafka pub-sub + durable journal (Cassandra/ScyllaDB at Discord, custom log at Slack) + APNs/FCM for backgrounded mobile.</p>
+<p><strong>Live collaborative editing.</strong> Google Docs, Figma, Notion, Linear. Many clients simultaneously editing shared state. Transport: WebSocket. Application: CRDT (Conflict-free Replicated Data Type) or OT (Operational Transform) for convergence without locks. Figma uses Cloudflare Durable Objects (one DO per file) — single-threaded actor model serializes edits naturally. Google Docs uses OT with centralized server; Notion uses CRDT.</p>
+<p><strong>Live trading dashboards.</strong> Robinhood, Coinbase, Bloomberg. Sub-second price ticks and order-book deltas. Mostly server-to-client; SSE is increasingly popular for the HTTP-infra and auto-reconnect wins. Throughput-bound: fast symbols hit hundreds of book updates/sec; common pattern is "full updates for top symbols, batched 100ms summaries for the rest."</p>
+<p><strong>Multiplayer games.</strong> Fortnite, Roblox, MMOs. Server-authoritative state, tick-rate updates. WebSocket in browsers; raw UDP in native clients for lower latency tolerating packet loss. Spatial fanout (nearby players see you, not the world). Photon and Mirror dominate; commodity real-time platforms too generic.</p>
+<p><strong>Live sports / event broadcasts.</strong> ESPN, Twitter Live. Score updates fanned to millions. SSE or WebSocket with hierarchical fanout via managed platforms — Ably built much of their reputation here.</p>
+<p><strong>Social presence.</strong> LinkedIn "Active now", Facebook green dot, Slack presence dots. Low-volume per user, high read fan-in. Solution: only fetch presence for users currently in UI; cache "active in last 5 min" aggressively rather than real-time.</p>
+<p><strong>IoT device telemetry.</strong> Tesla fleet, smart home (Nest, Ring), connected cars, industrial sensors. MQTT dominates — per-message overhead matters when battery-powered devices wake briefly to send a reading. Brokers (EMQX, HiveMQ, AWS IoT Core) hold millions of devices. Pattern: sensor → MQTT broker → Kafka/Kinesis → time-series store (TimescaleDB, InfluxDB) → dashboards via SSE.</p>
+<p><strong>In-app notification inbox.</strong> Bell icon with unread count, list of recent activity. Distinct from APNs/FCM out-of-band push. WebSocket or SSE pushes new notifications live. LinkedIn's bell, Twitter notifications, GitHub notifications all run on this.</p>
+<p><strong>WebRTC signaling.</strong> Video calls need a signaling channel for SDP (Session Description Protocol) offer/answer and ICE candidate exchange. Always WebSocket — bidirectional, low latency, low volume. Twilio Video, Daily.co, LiveKit all run their signaling brokers on WebSocket.</p>
+<h2 id="16-real-world-implementations">§16. Real-World Implementations</h2>
+<p><strong>Slack.</strong> Custom WebSocket gateway tier; each client holds one persistent WebSocket to a regional gateway. Stateful gateways (millions of connections per fleet, tens of thousands per node), channels subscribed via Kafka-like pub-sub backbone. Billions of messages/day, ~10M+ concurrent WebSockets globally. Edge Gateway architecture (multi-layer with regional caches) covered in a publicly-discussed SRECon talk.</p>
+<p><strong>Discord.</strong> Elixir + Phoenix Channels — BEAM VM gives them millions of concurrent processes naturally. Each guild is a process, each user is a process, channel subscriptions are message-passing. Tens of millions of WebSockets concurrently, 5M+ concurrent voice users on spikes. Cassandra/ScyllaDB for message persistence, Rust for hot paths.</p>
+<p><strong>WhatsApp.</strong> FreeBSD + custom Erlang; the 2014 acquisition revealed 2M connections per box. WhatsApp Web connects to the user's <em>phone</em> (relayed through WhatsApp's servers) for end-to-end encrypted delivery — truth on the phone, web client is a relay.</p>
+<p><strong>Pusher Channels.</strong> Managed WebSocket fleet for thousands of customer apps. Billions of messages per day. Used by GitHub Issues for live updates and many SaaS apps for "this changed" events.</p>
+<p><strong>Ably.</strong> Managed real-time platform with strong consistency claims. Hundreds of billions of messages per month. Used by BBC Sports, regulated industries, event broadcasters. Differentiation: multi-region durability, guaranteed delivery with replay buffers.</p>
+<p><strong>PubNub.</strong> Shape similar to Pusher/Ably with heavier edge-presence emphasis. Used by Curbside, telehealth, gaming.</p>
+<p><strong>Figma.</strong> Multiplayer cursors + document collab using Cloudflare Durable Objects + WebSocket. One DO per file, on edge near where editing happens. Cursor positions stream at ~30 Hz, model deltas as they happen — actor-per-document, not connection-per-node.</p>
+<p><strong>Phoenix Channels at scale.</strong> Bleacher Report ran 2M concurrent connections on a small cluster in 2015 — the scale-per-node story that put Elixir on the map for real-time. Phoenix's <code>Presence</code> module uses a CRDT (variant of OR-Sets — Observed-Remove Sets) to gossip presence across nodes without central authority.</p>
+<p><strong>Centrifugo.</strong> Standalone Go binary; the closest thing to "Redis for WebSockets." Used by Mail.ru, various crypto exchanges, gaming platforms. Single node holds ~1M concurrent; multi-node scales linearly via Redis or Nats. One binary, one config — operationally light.</p>
+<p><strong>AWS IoT Core.</strong> Massive MQTT broker fleet. John Deere (tractors), Goodyear (smart tires), utility cooperatives (smart meters) — hundreds of millions of devices. Bills per device-connection-minute and per message.</p>
+<p><strong>Cloudflare Workers + Durable Objects.</strong> Each DO holds WebSockets for one room or actor. Hosted on the edge near first connection. Cloudflare's own dashboard, plus customers building chat/gaming/collab. Scales by room count not user count.</p>
+<p><strong>Twitch Chat.</strong> Historically a custom IRC-based protocol (Internet Relay Chat), with WebSocket gateways translating IRC for browsers. 1M+ concurrent chatters per stream during major events, tens of thousands of messages/sec for popular streams.</p>
+<h2 id="17-summary">§17. Summary</h2>
+<blockquote>
+<p><em>Real-time messaging is a transport class: it solves "deliver this event to all connected clients in under a second," with a connection-stateful, fan-out-shaped architecture pinned by a pub-sub fabric and supported by a durable journal underneath. Pick WebSocket for bidirectional channels, SSE for server-to-client streams, MQTT for IoT, and APNs/FCM for backgrounded mobile. The hard parts are not the protocol but the operational shape: connection storms on deploy, fanout amplification on a million-subscriber room, presence at planetary scale, and the reconnect-with-replay protocol that makes the lossy transport behave like a reliable one.</em></p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>
