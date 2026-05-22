@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Search — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1 class="site-name"><a href="/" style="color:inherit">Yifan Li</a></h1>
+        <p class="site-slogan">Building Systems. Empowering People. Chasing the Horizon. Being Kind.</p>
+        <nav class="nav">
+            <a href="/">Home</a>
+            <a href="/system-design/">System Design</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design/">← Back to System Design</a>
+        <h1 class="article-title">Search</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Backend Components Deep-Dive
+        </div>
+        <div class="article-content">
+<blockquote>
+<p>Component class: search engines built on an inverted index over text and structured fields. Implementations span Apache Lucene (the library) and its derivatives (Elasticsearch, OpenSearch, Solr), alternative engines (Vespa, Tantivy, Manticore), and purpose-built systems (Zoekt / Sourcegraph and GitHub Blackbird for code, Grafana Loki / Quickwit for logs, Twitter Earlybird for tweets, LinkedIn Galene for profiles). The byte-level mechanics in §4 apply to all Lucene-derived engines and broadly to the segment pattern Vespa and Tantivy follow.</p>
+</blockquote>
+<hr>
+<h2 id="1-what-a-search-system-is">§1. What a search system IS</h2>
+<p>A <strong>search system</strong> takes a corpus of documents and a free-form query and returns a <strong>ranked list</strong> of matching documents with low latency. The defining structure is the <strong>inverted index</strong>: a mapping from <strong>term → list of documents containing that term</strong>, augmented with per-doc, per-field metadata sufficient to compute a relevance score and to apply filters, facets, and sorting.</p>
+<p>A search system is a <strong>derived store</strong>, never the source of truth. It sits downstream of a primary database via a change-capture or batch pipeline, and exists to answer queries the primary cannot answer efficiently — fuzzy text matching, ranked retrieval, faceting at scale, geo-distance, hybrid keyword + vector retrieval.</p>
+<h3 id="distinguish-from-adjacent-categories">Distinguish from adjacent categories</h3>
+<ul>
+<li><strong>SQL <code>LIKE '%term%'</code></strong> does a sequential scan; a B+ tree can't use an index on a leading wildcard. Inviable past ~1M rows. Postgres <code>tsvector</code> + GIN (Generalized Inverted Index) is a real inverted index but tops out around ~10M docs without sharding, lacks BM25 (Best Match 25), no native faceting at search-engine latencies.</li>
+<li><strong>Document DB queries</strong> (MongoDB, Couchbase) excel at fetching by ID; bundled text indexes are simpler postings bolted onto the primary. Not optimized for scoring fanout or near-real-time refresh.</li>
+<li><strong>Vector search / ANN (Approximate Nearest Neighbor) engines</strong> (Pinecone, Milvus, pgvector) answer "documents semantically close to this embedding" via HNSW (Hierarchical Navigable Small World) or IVF (Inverted File) graphs. They do <em>not</em> answer "documents containing this term." Modern Lucene-derived engines and Vespa fuse both, but vector-only doesn't replace keyword.</li>
+<li><strong>OLAP (Online Analytical Processing) engines</strong> (Druid, Pinot, ClickHouse) overlap in faceting and aggregation but are tuned for analytical scans, not ranked retrieval over a sparse term space.</li>
+</ul>
+<h3 id="what-a-search-system-is-not-good-for">What a search system is NOT good for</h3>
+<ul>
+<li><strong>Point lookups by primary key</strong> — 5–10× slower than a KV (Key-Value) store; a search query fans out to every shard.</li>
+<li><strong>Source of truth</strong> — segments corrupt; schemas evolve forward-only; cluster loss must be recoverable.</li>
+<li><strong>Strong consistency</strong> — refresh is near-real-time (1s default); read-your-writes is not free.</li>
+<li><strong>Transactional updates</strong> — no multi-document atomicity.</li>
+<li><strong>Sub-millisecond p99</strong> — segment-search with multi-shard fanout can't hit &lt;1ms.</li>
+<li><strong>Sustained &gt;100k writes/sec/shard</strong> — merge cost dominates; specialized engines win (Pinot upsert, Prometheus).</li>
+</ul>
+<hr>
+<h2 id="2-inherent-guarantees-the-contract-by-design">§2. Inherent guarantees — the contract by design</h2>
+<p><strong>Provided:</strong></p>
+<ul>
+<li><strong>Term-based retrieval at scale</strong>: O(posting list length), not O(N).</li>
+<li><strong>Ranking</strong>: BM25 length-normalized TF (Term Frequency) scoring built in; pluggable via function score, script score, or learned-to-rank rerank.</li>
+<li><strong>Near-real-time visibility</strong>: doc indexed at t=0 is searchable at t=1s (configurable). Bounded, not real-time.</li>
+<li><strong>Faceting / aggregation</strong> on indexed fields via doc values (columnar per-field storage). Sub-100ms over millions of matches.</li>
+<li><strong>Horizontal scalability</strong> through sharding; <strong>read availability</strong> through replication.</li>
+</ul>
+<p><strong>Not provided — must be layered on:</strong></p>
+<ul>
+<li><strong>Durability as a primary store.</strong> Translog (Write-Ahead Log) makes individual write recovery work, but the canonical record must live elsewhere. Pattern is always: primary → CDC (Change Data Capture) → search engine.</li>
+<li><strong>Strong consistency.</strong> Replicas may lag by tens of ms to seconds.</li>
+<li><strong>Schema flexibility in place.</strong> Mappings are <strong>forward-only</strong>. Changing an analyzer or field type means building a new index and swapping an alias.</li>
+<li><strong>Idempotent writes by default.</strong> Must encode via <code>external_version</code> (a monotonic source-of-truth sequence number) or accept that retries can clobber newer writes.</li>
+<li><strong>Multi-doc atomicity.</strong> No transactions.</li>
+<li><strong>Privacy / authorization filtering.</strong> Engine returns any matching doc; per-user authorization is the caller's problem.</li>
+</ul>
+<p>Mental model: a search engine is a <strong>scalable, replicated, near-real-time, ranked-retrieval materialization layer</strong>. Everything outside that contract is your problem.</p>
+<hr>
+<h2 id="3-the-design-space">§3. The design space</h2>
+<table>
+<thead>
+<tr>
+<th>Engine</th>
+<th>Storage core</th>
+<th>Primary use cases</th>
+<th>Native vectors</th>
+<th>Operational tradeoffs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Apache Lucene</strong> (library)</td>
+<td>Per-segment FST + PFOR-Delta postings + doc values + stored fields</td>
+<td>Embedded in JVM apps; foundation for ES/Solr</td>
+<td>k-NN via HNSW</td>
+<td>You write the distribution layer</td>
+</tr>
+<tr>
+<td><strong>Elasticsearch / OpenSearch</strong></td>
+<td>Lucene per shard</td>
+<td>General-purpose: logs, products, profiles, observability</td>
+<td>HNSW built-in</td>
+<td>Largest ecosystem; ES is Elastic License, OpenSearch is Apache 2.0 fork</td>
+</tr>
+<tr>
+<td><strong>Apache Solr</strong></td>
+<td>Lucene per core</td>
+<td>Enterprise / catalog / bibliographic search</td>
+<td>KNN (newer)</td>
+<td>ZooKeeper-coordinated; rock-solid in catalog tier</td>
+</tr>
+<tr>
+<td><strong>Vespa</strong> (Yahoo, standalone)</td>
+<td>Custom tensors + posting lists</td>
+<td>E-commerce ranking, ad serving, ML-heavy retrieval, RAG (Retrieval-Augmented Generation)</td>
+<td>First-class</td>
+<td>Single engine for retrieval + ranking + inference; smaller community</td>
+</tr>
+<tr>
+<td><strong>Tantivy</strong> (Rust)</td>
+<td>Lucene-inspired, Rust-native</td>
+<td>Embedded search in Rust; small/mid-scale</td>
+<td>Yes</td>
+<td>Library, not a distributed service; basis for Meilisearch, Quickwit</td>
+</tr>
+<tr>
+<td><strong>Quickwit</strong> (Rust, Tantivy core)</td>
+<td>Tantivy segments on object storage</td>
+<td>Log search on cheap S3 (Simple Storage Service); compute/storage separation</td>
+<td>Limited</td>
+<td>Built for high ingest + cheap retention</td>
+</tr>
+<tr>
+<td><strong>Zoekt</strong> (Google, Sourcegraph)</td>
+<td>Trigram inverted index</td>
+<td>Code search (substring on source)</td>
+<td>No</td>
+<td>Trigram tokenization, not word-level</td>
+</tr>
+<tr>
+<td><strong>GitHub Blackbird</strong></td>
+<td>Custom n-gram inverted index</td>
+<td>GitHub global code search</td>
+<td>No</td>
+<td>Workload-specific; not open source</td>
+</tr>
+<tr>
+<td><strong>Grafana Loki</strong></td>
+<td>Inverted index on labels only; logs as compressed chunks</td>
+<td>Cheap log aggregation</td>
+<td>No</td>
+<td>Brilliant if you only filter by label and grep</td>
+</tr>
+<tr>
+<td><strong>Algolia</strong></td>
+<td>Custom in-memory engine</td>
+<td>Sub-100ms site search up to ~100M records</td>
+<td>Yes (newer)</td>
+<td>Hosted only; cost scales with RAM</td>
+</tr>
+</tbody>
+</table>
+<p><strong>How to read this</strong>: Lucene-derived engines (ES/Solr/OpenSearch) dominate the <strong>general-purpose</strong> tier — heterogeneous documents, varying queries, facets and ranking; reach for them first. <strong>Vespa</strong> earns its place when ranking is the product (e-commerce, ads, RAG retrieval-with-rerank). <strong>Specialized engines</strong> (Zoekt, Blackbird, Loki, Earlybird) exist where tokenization shape doesn't match Lucene's word-level index — code is not English, logs are not articles. <strong>Tantivy / Quickwit / Manticore</strong> are smaller-footprint alternatives. Default L6 pick: <strong>OpenSearch</strong> (license clarity post-2021) or Elasticsearch; specialized only when the workload demands it.</p>
+<hr>
+<h2 id="4-underlying-data-structure-lucene-at-the-byte-level">§4. Underlying data structure — Lucene at the byte level</h2>
+<p>The Lucene segment format is the single most important thing to understand about modern search engines. Vespa and Tantivy diverge in specifics but use the same conceptual primitives.</p>
+<h3 id="41-a-shard-is-one-lucene-index">4.1 A shard is one Lucene index</h3>
+<p>An ES/OpenSearch shard is <em>literally</em> a Lucene index on disk. The engine is a distributed wrapper around N Lucene indexes. A Lucene index is a directory of <strong>segment files</strong>, each segment an immutable mini-index produced by a single flush.</p>
+<pre><code>/data/nodes/0/indices/products_v3/0/index/
+├── _0.cfs          ← segment 0, compound file (all sub-files packed)
+├── _0.cfe          ← segment 0 entry table
+├── _0.si           ← segment 0 segment info
+├── _3.fdt          ← stored fields
+├── _3.fdx          ← stored fields index
+├── _3.tim          ← term dictionary (FST tail)
+├── _3.tip          ← term index (FST root in memory)
+├── _3.doc          ← posting list
+├── _3.pos          ← positions
+├── _3.dvd          ← doc values data
+├── _3.dvm          ← doc values metadata
+├── _3.nvd          ← norms data
+├── _3.fnm          ← field info
+├── segments_42     ← commit point: lists live segments
+└── write.lock
+</code></pre>
+<p>The defining invariant: <strong>every segment is immutable once written</strong>. Updates and deletes are tombstones layered on top of segments; actual reclamation happens at merge time. The merge process is to a search engine what compaction is to an LSM (Log-Structured Merge) tree — and the analogy is exact, because Lucene's segment model is structurally an LSM tree of inverted indexes.</p>
+<h3 id="42-inside-one-segment">4.2 Inside one segment</h3>
+<h4 id="a-term-dictionary-fst-finite-state-transducer">(a) Term dictionary — FST (Finite State Transducer)</h4>
+<p>The term dictionary maps <strong>terms → posting list offsets</strong>. Lucene encodes it as an FST — a DAG (Directed Acyclic Graph) that compresses shared prefixes <em>and</em> suffixes simultaneously, conceptually a minimized trie.</p>
+<pre><code>terms: &quot;engineer&quot;, &quot;engineers&quot;, &quot;engineering&quot;, &quot;england&quot;, &quot;english&quot;
+
+  start ─e─►─n─►─g─┬─i─►─n─►─e─►─e─►─r─►●(eng-pointer)─┐
+                   │                    └─s─►●         │
+                   └─l─►─a─►─n─►─d─►●               (suffix shared)
+                                  └─i─►─s─►─h─►●
+</code></pre>
+<p>Why FST and not a plain B-tree:</p>
+<ul>
+<li><strong>The index part lives in memory</strong> (<code>.tip</code>). The tail (<code>.tim</code>) is on disk, accessed at most once per term lookup.</li>
+<li>For a 1B-doc index with ~10M unique terms per shard, the FST in memory is <strong>~100 MB</strong>, not 10 GB. <strong>50–100× compression</strong> vs a flat sorted term list.</li>
+<li>Lookup is <strong>O(term_length)</strong> byte comparisons; doesn't depend on the number of terms.</li>
+<li>Prefix walks (<code>engin*</code>) are a single FST traversal that emits all matching terms in lex order — cheap autocomplete.</li>
+</ul>
+<p>Trade-off: FST is <strong>append-only</strong>. Can't insert a term mid-FST. Fine because <em>segments are immutable</em>: adding a doc builds a <em>new</em> segment with a <em>new</em> FST.</p>
+<h4 id="b-posting-list-frame-of-reference-pfor-compression">(b) Posting list — frame-of-reference + PFOR compression</h4>
+<p>For each term, the posting list is the sequence of <code>(doc_id, term_freq, positions...)</code> for every doc containing that term. Lucene encodes it with stacked compressions:</p>
+<ol>
+<li><strong>Delta encoding on <code>doc_id</code></strong>: store <code>[12, 47, 89, 142]</code> as <code>[12, 35, 42, 53]</code>. Differences are smaller than absolutes.</li>
+<li><strong>PFOR-Delta (Patched Frame of Reference)</strong> on deltas: pick a bit width that fits most deltas (e.g., 8 bits), bit-pack 128 deltas into a fixed-width block. Outliers ("patches") get a side-channel exception list. Result: ~3 bits/doc for typical lists vs 32 bits/doc uncompressed — <strong>10× compression</strong>.</li>
+<li><strong>Skip pointers</strong> interleaved every 128 docs: <code>(doc_id, file_offset)</code> that lets you jump ahead without decoding intervening blocks. Critical for conjunctions: <code>q = "stainless AND bottle"</code>, <code>stainless</code>'s next at doc 50000 → skip past blocks for 1000, 5000 without decoding. Intersection drops from O(N+M) toward O(min(N,M) × log(max)/skip_interval).</li>
+</ol>
+<pre><code>Posting list for term &quot;engineer&quot;:
+block 0 (docs 0–127):    [bit-packed 128 deltas, 8 bits each = 128 bytes]
+                          skip → (doc_id=145, offset=byte_500)
+block 1 (docs 128–~300): [bit-packed 128 deltas]
+                          skip → (doc_id=380, offset=byte_900)
+...
+Iterator asks &quot;advance past doc 50000&quot; — skip-list jumps straight to
+the right block without decoding 50 prior blocks.
+</code></pre>
+<p>The companion <code>.pos</code> file holds <strong>positions</strong> for phrase queries and proximity scoring; same delta + bit-pack treatment.</p>
+<h4 id="c-doc-values-columnar-per-field-storage">(c) Doc values — columnar per-field storage</h4>
+<p>The inverted index is <strong>term → docs</strong>. For sorting, faceting, aggregating, and scoring with field values, you also need <strong>doc → field value</strong>. That's <code>doc_values</code>: column-oriented arrays, one entry per doc per field.</p>
+<pre><code>docId:  0    1    2    3    4    5    ...
+price: [42, 19, 99, 37, 19, 80, ...]   ← packed column
+       (8 bits if max &lt; 256, 16 otherwise — minimum bit width)
+</code></pre>
+<p>Stored in <code>.dvd</code> / <code>.dvm</code>, mmap'd. This is what makes aggregations work — without doc values, every facet count would have to re-tokenize from the inverted index. The same column-oriented layout is why Druid/Pinot do interactive OLAP.</p>
+<p>Trade-off vs FieldData (the legacy in-heap version): doc values are on-disk and mmap'd, so they don't OOM (Out Of Memory) the JVM. First read is a disk access; the OS page cache fields subsequent reads.</p>
+<h4 id="d-stored-fields-original-document-blob">(d) Stored fields — original document blob</h4>
+<p><code>_source</code> (the original JSON) lives in <code>.fdt</code> / <code>.fdx</code>, LZ4-compressed in 16 KB blocks. Fetched only at phase 2 of a search (the final top-K). Disabling <code>_source</code> for non-display fields saves 30–50% of disk and speeds bulk reindex dramatically. Log search keeps <code>_source</code> (the doc <em>is</em> the point); product catalog may drop it and re-fetch from primary.</p>
+<h4 id="e-norms-per-field-length-normalization">(e) Norms — per-field length normalization</h4>
+<p><code>.nvd</code> stores one byte per doc per field encoding field length (lossily compressed). BM25 uses it for length normalization. Loaded in memory.</p>
+<h3 id="43-the-write-path-one-doc-end-to-end">4.3 The write path — one doc end to end</h3>
+<p>Whether the doc is a Booking.com hotel, an Earlybird tweet, or a Galene profile, the mechanics are the same.</p>
+<pre><code>Step 1: Document arrives at the shard's primary.
+        Doc = {id: 12345, title: &quot;Stainless steel bottle&quot;, ...}
+
+Step 2: Append to translog (per-shard WAL).
+        ┌─────────────────────────────────────────────────────────┐
+        │ translog-{generation}.tlog                              │
+        │ [op=INDEX, seq_no=12834, doc_id=12345, payload=...]     │
+        └─────────────────────────────────────────────────────────┘
+        Write to OS buffer. If translog.durability=request (default),
+        fsync at end of bulk request. ← DURABILITY POINT.
+
+Step 3: Apply to in-memory indexing buffer.
+        - Tokenize text fields (&quot;stainless&quot;, &quot;steel&quot;, &quot;bottle&quot;).
+        - Append to per-thread DocumentsWriter buffer.
+        - RAM only. NOT searchable yet.
+
+Step 4: Replicate to in-sync replicas.
+        Primary forwards op to each replica's translog.
+        Primary waits for replicas to ack their translog write.
+        ← Replicas are durable for the SAME ack.
+
+Step 5: Refresh (every refresh_interval, default 1s).
+        - Flush in-memory buffer to a NEW segment file.
+        - Open a new IndexReader that includes the new segment.
+        - Doc is NOW searchable.
+        - Segment is NOT yet fsync'd; lives in OS page cache.
+
+Step 6: Flush (less frequent, ~5 min or 512 MB of translog).
+        - fsync all segment files.
+        - Write new segments_N commit point.
+        - Roll over to a new translog generation.
+        - Old translog reclaimable.
+        ← FSYNC POINT for segments.
+
+Step 7: Merge (background).
+        - Tiered merge policy picks similar-sized segments.
+        - Concatenates, dedups tombstones, writes one larger segment.
+        - Old segments deleted after merge commits.
+</code></pre>
+<p>What survives a crash:</p>
+<ul>
+<li><strong>Between 1–2</strong>: doc lost; client gets no ack. Fine.</li>
+<li><strong>Between 2–4</strong>: primary has translog, replicas don't. Primary replays translog into the buffer; doc recovered. If primary dies, replica's shard recovery brings it back to step-2.</li>
+<li><strong>Between 4–5</strong>: doc in translog on primary + replicas. Translog replay rebuilds the buffer. Recovered without ever having been searchable — fine, since ack contract is "visible after refresh."</li>
+<li><strong>Between 5–6</strong>: segment in page cache but not on disk. On restart, segment gone, but translog replay re-creates an equivalent.</li>
+<li><strong>After 6</strong>: segment on disk; translog truncated to commit point. Engine opens at the commit point and continues.</li>
+</ul>
+<p>This is why the translog is the durability primitive, not the segment file. <strong>Segments are immutable, fsync'd lazily, and reconstructible. Translog is the WAL and must be fsync'd per request.</strong></p>
+<h3 id="44-why-1-second-refresh">4.4 Why 1-second refresh</h3>
+<p>Each refresh creates a new segment. With 5k writes/sec/shard, a 1s refresh produces a 5000-doc segment — a meaningful unit of work. Each segment carries fixed overhead (FST tip in memory, file handles, metadata). 1s refresh accumulates 3600 segments/hour, <em>which the merger keeps in check</em>; 100ms accumulates 36000/hour and the merger can't keep up — merge CPU crowds out query CPU. Each search visits <em>every live segment</em>; a 100-segment shard is ~30% slower than a 10-segment shard. 1 second is the empirical sweet spot.</p>
+<p>Workload-specific tuning: <strong>bulk reindex / log ingestion</strong> sets <code>refresh_interval: -1</code> during load, re-enables after — 50k → 200k+ docs/sec on the same hardware. <strong>E-commerce catalog</strong>: 5–30s is fine. <strong>Real-time tweet / news search</strong>: 200ms, accept merge cost (Earlybird tuned aggressively).</p>
+<h3 id="45-segment-merge-tiered">4.5 Segment merge — tiered</h3>
+<p>Tiered merge groups segments into size tiers, picks up to <code>max_merge_at_once</code> (default 10) similarly-sized segments and merges them into one larger segment in the next tier. Avoids quadratic merge work; logarithmic segment count growth. Competing alternative is <strong>size-tiered merge</strong> (Cassandra-style) — more aggressive but more write-amplifying. Lucene's tiered merge balances write amp (~2–3× over a doc's lifetime) against query-side segment count.</p>
+<p><strong>Force merge</strong> (<code>_forcemerge?max_num_segments=1</code>) collapses everything to one segment. Good for read-only archives (a closed monthly log index, an immutable historical catalog). Catastrophic on a live index — monopolizes I/O for minutes-to-hours.</p>
+<h3 id="46-why-an-inverted-index-and-not-the-alternatives">4.6 Why an inverted index and not the alternatives</h3>
+<ul>
+<li><strong>vs B+ tree</strong>: <code>text LIKE '%shoes%'</code> requires full scan; leading wildcard isn't selective.</li>
+<li><strong>vs LSM tree with secondary indexes</strong>: LSM gives fast point writes, but multi-term query intersection across secondary indexes is essentially what posting list intersection does — and Lucene does it on PFOR-bit-packed data with skip pointers. ~5–10× less I/O.</li>
+<li><strong>vs in-memory hash map</strong>: works for tiny indexes; blows the heap at billion-doc scale.</li>
+<li><strong>vs HNSW vector alone</strong>: pure ANN can't filter by exact term, doesn't facet cheaply, loses precision on exact identifier matches (SKUs, error codes, names). Modern architecture is hybrid: keyword postings for precise queries, HNSW for semantic similarity, RRF (Reciprocal Rank Fusion) or learned-to-rank combines them.</li>
+</ul>
+<hr>
+<h2 id="5-capacity-envelope-across-scales-and-domains">§5. Capacity envelope across scales and domains</h2>
+<p>Search engines span six orders of magnitude in doc count and four in query rate. The technology is the same; the topology is wildly different.</p>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Example</th>
+<th>Docs</th>
+<th>Index size</th>
+<th>QPS</th>
+<th>Topology</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Small</strong></td>
+<td>Internal wiki, single-team product catalog, hobby project</td>
+<td>10k–1M</td>
+<td>&lt;10 GB</td>
+<td>&lt;100</td>
+<td>Single node, single shard, no replicas; Tantivy or SQLite-FTS in-process</td>
+</tr>
+<tr>
+<td><strong>Mid</strong></td>
+<td>E-commerce mid-market (1M products), Stack Overflow Q&amp;A</td>
+<td>10M–100M</td>
+<td>50–500 GB</td>
+<td>1k–10k</td>
+<td>5–10 shards × 2 replicas, 3–5 nodes</td>
+</tr>
+<tr>
+<td><strong>Large</strong></td>
+<td>LinkedIn Galene (1B profiles, 100k QPS), Booking.com hotels (~2M with hundreds of facets), Yelp businesses</td>
+<td>100M–1B</td>
+<td>1–50 TB</td>
+<td>50k–500k</td>
+<td>50–200 shards × 2–3 replicas, 20–50 nodes, hot/cold tiering, routing partitions</td>
+</tr>
+<tr>
+<td><strong>Giant</strong></td>
+<td>GitHub Blackbird (200B docs, 640 TB), Datadog logs, Earlybird, large-vendor observability</td>
+<td>10B–1T+</td>
+<td>100 TB – multi-PB</td>
+<td>100k+ ingest, 1k–10k query</td>
+<td>Multi-cluster federation, per-region/per-time-bucket indices, compute/storage separation on object stores (Quickwit-style)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="where-the-next-bottleneck-appears">Where the next bottleneck appears</h3>
+<ul>
+<li><strong>Small.</strong> Translog fsync latency. Solo devs set <code>translog.durability=async</code> to push past 10k writes/sec single SSD. No fanout overhead.</li>
+<li><strong>Mid.</strong> Per-shard query cost. A 50 GB shard with 10M docs spends most of its budget in the BM25 scorer.</li>
+<li><strong>Large.</strong> <strong>Fanout tail latency</strong>. Every query touches all shards; slowest dominates. With per-shard 1% chance of &gt;50ms, fanout 100 gives <code>1 - 0.99^100 ≈ 63%</code> chance of crossing 50ms — p99 collapses unless you route to limit fanout. Galene runs ~100 shards × 3 replicas, ~30 data nodes/region, ~100k QPS at p99 ~200ms.</li>
+<li><strong>Giant.</strong> Storage cost vs query rate. At Blackbird scale (200B docs, 640 TB), full hot NVMe is economically painful. Hot/cold split with searchable snapshots on S3; Quickwit's compute-on-S3-segments design exists for this tier.</li>
+</ul>
+<p><strong>Per-shard sweet spot: 20–50 GB.</strong> Below 10 GB, fanout overhead dominates; above 50 GB, query p99 spikes. Targets:</p>
+<ul>
+<li>100M × 2 KB/doc = 200 GB → 10 shards × 20 GB.</li>
+<li>1B × 3 KB/doc = 3 TB → 100 shards × 30 GB.</li>
+<li>200B × 3 KB/doc = 600 TB → tens of thousands of shards, federated.</li>
+</ul>
+<p>Data node sizing: 32–64 vCPU, 128–256 GB RAM, 2–4 TB NVMe. Heap capped at 31 GB (compressed-oops ceiling). Remaining RAM is page cache — and query latency lives or dies in page cache. Size so the <em>working set of posting lists fits</em>.</p>
+<hr>
+<h2 id="6-architecture-in-context">§6. Architecture in context</h2>
+<p>The canonical pattern:</p>
+<pre><code>┌─────────────────────────────────────────────────────────────────────┐
+│                       SOURCE OF TRUTH                                │
+│  ┌─────────────────────────┐    ┌──────────────────────────┐        │
+│  │  Primary DB             │    │  Write service           │        │
+│  │  (Postgres, MySQL,      │◄───┤  (apps write here first) │        │
+│  │   DynamoDB, Espresso,   │    └──────────────────────────┘        │
+│  │   Cassandra...)         │                                         │
+│  └────────────┬────────────┘                                         │
+│               │  WAL / changelog                                     │
+│               ▼                                                      │
+│       ┌──────────────┐                                               │
+│       │  CDC reader  │   (Debezium, Brooklin, DMS, DynamoDB          │
+│       │              │    Streams, Git post-receive hooks for code)  │
+│       └──────┬───────┘                                               │
+└──────────────┼──────────────────────────────────────────────────────┘
+               │
+               ▼
+   ┌───────────────────────────────────────────────────────────────┐
+   │  Kafka topic (or Pulsar / Kinesis / Pub/Sub)                  │
+   │  Partitioned by entity ID, retention 3–30 days                │
+   │  ── replayable, immutable, deduplicated by (key, lsn)         │
+   └────────────────────────┬──────────────────────────────────────┘
+                            │
+                            ▼
+              ┌─────────────────────────────┐
+              │  Indexer (Flink / Samza /   │
+              │   Kafka Streams / bespoke   │
+              │   consumer pool)            │
+              │  - read partition           │
+              │  - enrich / join            │
+              │  - transform → bulk doc     │
+              │  - bulk write w/ idempotent │
+              │    external_version=lsn     │
+              └──────────────┬──────────────┘
+                             │ bulk index over HTTP
+                             ▼
+   ┌───────────────────────────────────────────────────────────────┐
+   │                  SEARCH ENGINE CLUSTER                         │
+   │                                                                │
+   │   ┌──────────┐  ┌──────────┐  ┌──────────┐                    │
+   │   │ Master 1 │  │ Master 2 │  │ Master 3 │   ← voting config  │
+   │   └──────────┘  └──────────┘  └──────────┘     (Raft-like)    │
+   │                                                                │
+   │   ┌────────────┐  ┌────────────┐  ┌────────────┐              │
+   │   │ Coord A    │  │ Coord B    │  │ Coord C    │ ← stateless  │
+   │   └─────┬──────┘  └─────┬──────┘  └─────┬──────┘   fanout     │
+   │         │               │               │                     │
+   │         └───────────────┼───────────────┘                     │
+   │                         ▼                                     │
+   │   ┌──────────────────────────────────────────────────────┐   │
+   │   │  Data nodes, each holding N primary + replica shards │   │
+   │   │  Shard 0 P  Shard 0 R1  Shard 0 R2                   │   │
+   │   │  Shard 1 R  Shard 1 P   Shard 1 R                    │   │
+   │   │  ...                                                  │   │
+   │   │  K primary shards × (1+R) copies                     │   │
+   │   │  routed by hash(entity_id) mod K                     │   │
+   │   └──────────────────────────────────────────────────────┘   │
+   └───────────────────────┬───────────────────────────────────────┘
+                           │
+                           ▼
+                ┌─────────────────────┐         ┌──────────────────┐
+                │  Search API tier    │◄────────│  User request    │
+                │  (BM25 + rerank)    │         │                  │
+                └─────────────────────┘         └──────────────────┘
+                           │ (optional)
+                           ▼
+                ┌─────────────────────┐
+                │  Online feature /   │
+                │  ML model serving   │
+                │  for rerank         │
+                └─────────────────────┘
+</code></pre>
+<p>The labels change per domain: <strong>E-commerce search</strong> — primary = MySQL/DynamoDB catalog, CDC = Debezium, indexer enriches with pricing/inventory, engine = OpenSearch, rerank = personalization ML. <strong>Code search</strong> — primary = Git repos, CDC = post-receive hooks, indexer tokenizes source as trigrams/n-grams, engine = Zoekt / Blackbird, rerank = recency/popularity mix. <strong>Log search</strong> — primary = the emitting app, CDC = filebeat/Fluentd/Vector, Kafka or directly into Logstash, engine = ES / Loki / Quickwit, no rerank. <strong>Profile search</strong> — primary = Espresso, CDC = Brooklin, engine = Galene, rerank = LTR with online feature store.</p>
+<p>Key annotations: <strong>Sharding key consistent top to bottom</strong> — primary sharded by <code>entity_id</code>, Kafka keyed by <code>entity_id</code>, engine routed by <code>hash(entity_id) mod K</code>. <strong>Idempotency</strong> — bulk writes use <code>external_version</code> = source LSN (Log Sequence Number); engine rejects out-of-order via <code>external_gte</code>. <strong>Multi-stage search</strong> — phase-1 BM25 retrieves top ~1000/shard; phase-2 fetches <code>_source</code> for top-K; optional rerank applies ML on merged top-200 or top-500. <strong>Master separation</strong> — master-eligible nodes isolated from data and coord roles; three masters = quorum minimum.</p>
+<hr>
+<h2 id="7-hard-problems-inherent-to-this-technology">§7. Hard problems inherent to this technology</h2>
+<h3 id="71-relevance-vs-freshness-when-stale-signals-corrupt-fresh-retrieval">7.1 Relevance vs freshness — when stale signals corrupt fresh retrieval</h3>
+<p><strong>Problem.</strong> Multiple ranking signals refresh at different cadences: keyword (~1s), filter fields (same), vector embeddings (batch, hours), LTR features (online, seconds-to-minutes). Mixing them gives incoherent results.</p>
+<p><strong>Illustration — e-commerce.</strong> A merchant drops a water bottle's price from $35 to $19. The keyword index sees the change immediately. The vector embedding (computed offline on the description) hasn't changed, so the bottle ranks where it did pre-discount. Net: discount lands in the index but doesn't appear in the ranking until the next batch.</p>
+<p><strong>Naïve fix.</strong> Cut <code>refresh_interval</code> to 100ms and hope. <strong>Why it breaks</strong>: 100ms refresh blows up the merge process (§4.4) — 36000 segments/hour, merger can't keep up, query degrades — and the embedding is <em>still</em> stale.</p>
+<p><strong>Real fix.</strong> Decompose freshness per signal:</p>
+<ul>
+<li><strong>Keyword / filter freshness</strong>: tied to <code>refresh_interval</code>. 1–5 seconds.</li>
+<li><strong>Vector embedding refresh</strong>: route freshly-edited docs through a <em>streaming</em> embedding service that pushes new embeddings into the same index path. Fall back to batch when streaming is delayed.</li>
+<li><strong>LTR (Learning to Rank) features</strong>: separate online feature store keyed by entity ID. Reranker pulls fresh features at query time, NOT from the index. Decouples model freshness from index freshness.</li>
+</ul>
+<h3 id="72-sharding-for-fanout-cost-more-shards-is-not-always-more-performance">7.2 Sharding for fanout cost — more shards is not always more performance</h3>
+<p><strong>Problem.</strong> Growing index pushes per-shard size past 50 GB. Instinct is to bump shard count.</p>
+<p><strong>Illustration — observability log search.</strong> Daily log volume grows 50 TB → 500 TB. Per-day index goes from 10 shards × 5 TB to 100 shards × 500 GB. Query p99 <em>doubles</em>. Why: every search fans to 100 shards; tail-latency probability <code>1 - (1-p)^100</code>; per-shard 1% chance of &gt;50ms → 63% chance of crossing 50ms overall.</p>
+<p><strong>Real fix.</strong> <strong>Routing partitioner</strong> to limit fanout. Log search partitions by <code>(tenant, hour)</code> (fanout 100 → 5–10). Profile search routes by searcher's network cluster (a "search within network" query hits ~10 shards instead of all 100). E-commerce routes by <code>region</code> or <code>category</code> when present.</p>
+<p>Alternative: <strong>two-tier (hot/cold)</strong> indexing. Recently-active entities on a small hot-tier cluster (5–10 shards). Rest on a larger cold-tier (100 shards). 90%+ of queries serve from hot. Galene and Earlybird pattern.</p>
+<h3 id="73-hot-keys-and-hot-queries">7.3 Hot keys and hot queries</h3>
+<p><strong>Problem.</strong> A few terms appear in a huge fraction of docs (or queries). Scoring every match is impossibly expensive.</p>
+<p><strong>Illustration — code search.</strong> A user types <code>function</code> into Sourcegraph. The term appears in tens of millions of files. Naïve scoring touches them all.</p>
+<p><strong>Naïve fix.</strong> Cache top-20 results for "function" with a 60s TTL. <strong>Why it breaks</strong>: personalization defeats the cache (each user gets different results based on repos and permissions), and the cache lags on index rebuild.</p>
+<p><strong>Real fix.</strong> Don't score everything. <strong>Early termination on a sorted index</strong>: maintain postings sorted by a <strong>static prior</strong> (recency, repo popularity, stars). For high-recall queries, score only top <code>M = 10000</code> docs per shard. Prove via <strong>WAND</strong> or Block-Max WAND that no doc beyond M can beat the current top-K. WAND uses upper bounds on per-term scores to skip docs whose maximum possible score is below the current threshold. For "function," might mean scoring 50k docs instead of 50M.</p>
+<p>For non-personalized aggregations ("how many files contain <code>function</code>"), cache <em>counts</em>, not result lists.</p>
+<h3 id="74-mapping-explosion-a-single-bad-ingester-field-takes-the-cluster-down">7.4 Mapping explosion — a single bad ingester field takes the cluster down</h3>
+<p><strong>Problem.</strong> Search engines materialize per-field metadata. Untrusted input that explodes field count blows the cluster state.</p>
+<p><strong>Illustration — observability log search.</strong> A new microservice emits logs with fields named <code>attr.&lt;random_uuid&gt;: &lt;value&gt;</code>. Each line introduces a new field name. After a week, the cluster has 500k unique fields. The engine tracks every field in segment metadata; the cluster state, gossiped between every master and data node, grows to hundreds of MB; master OOMs; cluster red.</p>
+<p><strong>Real fix.</strong> <code>"dynamic": "strict"</code> on indices accepting third-party data — reject unknown fields at ingest. For genuinely free-form key-value data, use a <strong><code>flattened</code> field type</strong>: the whole sub-object is indexed as one field with keys preserved at query time. Set <code>index.mapping.total_fields.limit</code> (default 1000) and <em>fail loudly</em> when exceeded.</p>
+<h3 id="75-eventual-consistency-vs-the-primary-silent-divergence">7.5 Eventual consistency vs the primary — silent divergence</h3>
+<p><strong>Problem.</strong> Index drifts from the primary store and you don't notice until a user complaint.</p>
+<p><strong>Illustration — e-commerce inventory.</strong> A product goes out of stock. Catalog DB commits. CDC event into Kafka. Indexer pulls. Bulk write fails 429 (too many requests). Indexer retries; succeeds. During the failure window, the index served stale "in stock" results; users placed orders the inventory system then rejected.</p>
+<p><strong>Naïve fix.</strong> Retry until accepted; monitor indexer lag. <strong>Why it breaks</strong>: at-least-once + non-idempotent writes = duplicates or out-of-order (a retry might overwrite a <em>newer</em> edit), and silent divergence is undetectable from inside the engine.</p>
+<p><strong>Real fix.</strong> <strong>Idempotent bulk writes</strong> via <code>external_version</code> set to source LSN — engine rejects out-of-order. <strong>Periodic reconciliation</strong>: hourly job samples 0.1% of IDs, alerts on divergence &gt; 0.01%. Treat the engine as a strict materialization: features requiring authoritative data read from the primary. Business-invariant features (inventory, privacy) enforce at the API layer with a live primary read, not on an indexed-field filter.</p>
+<h3 id="76-bulk-reindex-without-downtime-the-alias-swap-pattern">7.6 Bulk reindex without downtime — the alias swap pattern</h3>
+<p><strong>Problem.</strong> Mappings are forward-only. Changing an analyzer (adding synonyms, switching language tokenizers) requires a rebuild.</p>
+<p><strong>Illustration — multi-lingual product search.</strong> A retailer adds Japanese to a previously English-only catalog. The Japanese tokenizer (Kuromoji) requires re-tokenizing all documents. "Stop writes" isn't an option in production.</p>
+<p><strong>Real fix.</strong> Two-phase rebuild with alias swap:</p>
+<ol>
+<li>Create <code>products_v4</code> with new analyzer. Empty.</li>
+<li>Indexer <strong>dual-writes</strong> to <code>products_v3</code> and <code>products_v4</code> simultaneously.</li>
+<li>Backfill <code>products_v4</code> from the primary with a batch indexer. Uses <code>external_version</code> so a stale backfill record can't clobber fresher live edits.</li>
+<li>Once backfill complete and lag is zero, <strong>swap the alias</strong>: <code>products</code> → <code>products_v4</code>. Atomic, no downtime.</li>
+<li>After soak (a few days), delete <code>products_v3</code>.</li>
+</ol>
+<p>Applies identically to LinkedIn profile schema migrations, GitHub repo re-indexing, log roll-overs, Booking.com facet evolution.</p>
+<hr>
+<h2 id="8-failure-mode-walkthrough">§8. Failure mode walkthrough</h2>
+<h3 id="81-shard-primary-loss-mid-write">8.1 Shard primary loss mid-write</h3>
+<p>Primary fsyncs translog op, dies before forwarding to replicas. Master detects via heartbeats, promotes an in-sync replica. Client either got an ack (primary fully forwarded before crash) or not (no ack, retries). With idempotent <code>external_version</code>, retry is safe. <strong>Durability point</strong>: translog fsync on each in-sync replica; primary doesn't ack until replicas fsync.</p>
+<h3 id="82-shard-primary-loss-between-writes">8.2 Shard primary loss between writes</h3>
+<p>Network blip drops primary heartbeat for 30s; master demotes, promotes replica. Demoted primary, on rejoin, queries new primary for current <code>seq_no</code> watermark. Replays local ops with <code>seq_no</code> &gt; watermark; idempotent ones no-op. Resumes as replica. <strong>Durability point</strong>: <code>seq_no</code> per-shard monotonic, stored in translog.</p>
+<h3 id="83-master-death-split-brain-in-a-2-master-cluster">8.3 Master death — split-brain in a 2-master cluster</h3>
+<p>Two master-eligible nodes, network partition: each elects itself; conflicting cluster states; shard assignments diverge. <strong>Real fix — quorum.</strong> Always run odd number ≥ 3. Voting config requires majority. 1-vs-2 partition leaves the minority unable to elect, read-only until heal. Modern ES Zen 2 is essentially Raft for cluster state; Solr uses ZooKeeper. Pre-ES-7, <code>discovery.zen.minimum_master_nodes = (N/2) + 1</code> had to be set explicitly — the canonical split-brain bug.</p>
+<h3 id="84-bulk-index-failure-mid-batch">8.4 Bulk index failure mid-batch</h3>
+<p>Bulk of 500 docs returns HTTP 200 with per-doc status: 487 succeeded, 13 returned <code>409 version conflict</code>. Conflicts are <em>expected</em> — out-of-order CDC with <code>external_version</code> lower than current. Log, increment counter, proceed. NO retry.</p>
+<p>If 13× <code>503</code>: retry those specifically with exponential backoff. Idempotent via <code>external_version</code>.</p>
+<p>If whole bulk times out: re-send entire batch; version check rejects already-applied docs.</p>
+<p><strong>Durability point</strong>. Kafka offset committed <em>after</em> successful bulk. Crash before commit = next consumer starts from prior offset and replays. Kafka offsets + engine version conflicts = exactly-once application.</p>
+<h3 id="85-permanent-shard-loss">8.5 Permanent shard loss</h3>
+<p>All three copies of shard 42 on a single failure domain (cabinet, AZ — Availability Zone) catch fire. Recovery: with snapshots, restore + Kafka replay from snapshot timestamp. Without, full reindex of shard 42's doc range from the primary — <code>hash(entity_id) mod K</code> tells you which IDs. Hours, but bounded. Recoverable because the index is <em>derived</em>. Prevention: anti-affinity rules; never colocate primary + replicas of the same shard on the same host, rack, or AZ.</p>
+<h3 id="86-cascading-merge-storm">8.6 Cascading merge storm</h3>
+<p>Force-merge accidentally on a 30-shard live index; each shard tries to merge to 1 segment; disk I/O saturates; p99 goes from 80ms to 8s. Cancel force-merge tasks (they don't abort cleanly mid-merge but new merge work stops); throttle <code>indices.merge.scheduler.max_thread_count</code>. <strong>Prevention</strong>: don't force-merge live indices. Only on roll-over indices (ILM-managed — Index Lifecycle Management) no longer written to.</p>
+<hr>
+<h2 id="9-why-not-just-sql-like-or-postgres-fts">§9. Why not just SQL <code>LIKE</code> or Postgres FTS</h2>
+<h3 id="91-like-term-instant-rejection">9.1 <code>LIKE '%term%'</code> — instant rejection</h3>
+<p>Leading-wildcard <code>LIKE</code> can't use a B-tree. Full scan: 100M rows × 2 KB = 200 GB at ~500 MB/sec = ~7 min/query. Unviable.</p>
+<h3 id="92-postgres-tsvector-with-gin-more-interesting">9.2 Postgres <code>tsvector</code> with GIN — more interesting</h3>
+<p>Postgres has a real inverted index via GIN.</p>
+<pre><code class="language-sql">CREATE INDEX idx ON products USING gin(to_tsvector('english', title || ' ' || description));
+SELECT * FROM products
+WHERE to_tsvector('english', title || ' ' || description) @@ to_tsquery('stainless &amp; bottle')
+ORDER BY ts_rank(...) DESC LIMIT 20;
+</code></pre>
+<p><strong>Works</strong> up to ~5–10M docs, single Postgres node, simple queries.</p>
+<p><strong>Breaks at 100M+ docs:</strong> (1) no native horizontal sharding — Citus possible, cross-partition <code>ts_rank</code> is awkward. (2) No BM25 — <code>ts_rank</code> is simpler; length normalization and TF saturation matter. (3) Analyzer extensibility painful — custom analyzers, edge-n-grams, multilingual tokenization not first-class. (4) No faceting at query time — <code>GROUP BY</code> after 200M candidates is slow. (5) No hybrid vector + keyword — pgvector exists but blending BM25 + vector + LTR features is awkward. (6) GIN updates expensive — <code>fastupdate</code> stalls on heavy writes; autovacuum pressure and table bloat at 5–10k writes/sec. (7) No NRT (Near-Real-Time) refresh control. (8) No WAND — ranking top-1000 from a 200M-doc posting list requires reading all of them.</p>
+<h3 id="93-use-a-sql-db-plus-a-cache-almost-never">9.3 "Use a SQL DB plus a cache" — almost never</h3>
+<p>Cache works only if queries repeat exactly. With personalization, hit rate is near zero. A cache helps for autocomplete top-K, popular queries, faceted counts on home pages — not as the engine itself.</p>
+<h3 id="94-what-youre-buying-with-lucene-vespa-tantivy">9.4 What you're buying with Lucene / Vespa / Tantivy</h3>
+<p>Pre-built FST term dictionaries and PFOR-compressed posting lists; merge / refresh strategies optimized over 20+ years for query efficiency; a query DSL (Domain-Specific Language) with proximity, phrase, BM25, function scores, vector, geo, percolator — composable; an ecosystem of analyzers, language plugins, k-NN, LTR. Building this on Postgres = reinventing a search engine poorly.</p>
+<hr>
+<h2 id="10-scaling-axes">§10. Scaling axes</h2>
+<h3 id="101-type-1-uniform-expansion">10.1 Type 1 — Uniform expansion</h3>
+<p>More docs, similar query rate per doc.</p>
+<table>
+<thead>
+<tr>
+<th>Scale</th>
+<th>Topology</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>1×</strong> (10M docs, 1k QPS)</td>
+<td>5 shards × 2 replicas, 3 nodes</td>
+</tr>
+<tr>
+<td><strong>10×</strong> (100M, 10k)</td>
+<td>10 shards × 2 replicas, 5–10 nodes</td>
+</tr>
+<tr>
+<td><strong>100×</strong> (1B, 100k)</td>
+<td>100 shards × 3 replicas, 30 data nodes, 3 masters, hot/warm tiering</td>
+</tr>
+<tr>
+<td><strong>1000×</strong> (10B+, 1M)</td>
+<td>Multi-cluster federation; per-region indices; cross-cluster search; cold tier on S3 searchable snapshots</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Inflection points</strong>: 5 TB per shard cluster (must split into multiple indices — per-region, per-time-bucket, per-tenant); 100k QPS total (hot/cold tiering mandatory); 1B docs in one logical index (routing partitioner mandatory); multi-region latency requirements (federate; per-region clusters + cross-cluster search for rare global queries).</p>
+<h3 id="102-type-2-hotspot-intensification">10.2 Type 2 — Hotspot intensification</h3>
+<p>Same dataset, query rate spikes (viral event, breaking news, election day, marketing push).</p>
+<table>
+<thead>
+<tr>
+<th>Pressure</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>10× QPS on same data</strong></td>
+<td>More replicas. 3 → 6 = 2× read capacity per shard at constant write cost.</td>
+</tr>
+<tr>
+<td><strong>Hot query repeats</strong> ("trending")</td>
+<td>App cache (Redis) for top ~100 trending queries. TTL 30s.</td>
+</tr>
+<tr>
+<td><strong>Hot term</strong> ("election", "covid", "function")</td>
+<td>WAND / Block-Max WAND early termination; IndexSorting by static prior.</td>
+</tr>
+<tr>
+<td><strong>Hot writer</strong> (bad shard key)</td>
+<td>Re-shard; finer-grained routing partitioner.</td>
+</tr>
+<tr>
+<td><strong>Coordinator overload</strong></td>
+<td>Add dedicated coord-only nodes. Stateless; cheap.</td>
+</tr>
+</tbody>
+</table>
+<p>The two axes need <em>different</em> fixes. Type 1 = more shards, more storage. Type 2 = more replicas, more caching, smarter early-termination.</p>
+<hr>
+<h2 id="11-decision-matrix-vs-adjacent-categories">§11. Decision matrix vs adjacent categories</h2>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Search engine (ES/Solr/OpenSearch/Vespa/Tantivy)</th>
+<th>Postgres <code>tsvector</code> / SQL FTS</th>
+<th>Vector DB (Pinecone, Milvus, pgvector)</th>
+<th>Specialized (Zoekt, Loki, Quickwit)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Doc count ceiling</strong></td>
+<td>10B+ in one engine; trillions federated</td>
+<td>10M practical; 100M with effort</td>
+<td>100M–1B vectors</td>
+<td>10B+ at their tuned tier</td>
+</tr>
+<tr>
+<td><strong>Query model</strong></td>
+<td>Text + filter + facet + sort + hybrid vector</td>
+<td>Text + filter; weak ranking</td>
+<td>Vector similarity only</td>
+<td>Specialized: trigram / label-only</td>
+</tr>
+<tr>
+<td><strong>Latency p99 (200ms)</strong></td>
+<td>Up to ~1B docs with care</td>
+<td>Misses past ~10M for complex queries</td>
+<td>Hits for vector-only; doesn't filter cleanly</td>
+<td>Hits at their target scale</td>
+</tr>
+<tr>
+<td><strong>Write rate sustained</strong></td>
+<td>50k–500k docs/sec/cluster</td>
+<td>5k–20k tx/sec single node</td>
+<td>1k–10k vectors/sec</td>
+<td>1M+ for log-tuned engines</td>
+</tr>
+<tr>
+<td><strong>Native faceting</strong></td>
+<td>First-class via doc values</td>
+<td>Slow <code>GROUP BY</code></td>
+<td>None</td>
+<td>Limited</td>
+</tr>
+<tr>
+<td><strong>Native ranking</strong></td>
+<td>BM25, custom, LTR plugin, in-engine tensors (Vespa)</td>
+<td><code>ts_rank</code> (basic)</td>
+<td>Cosine / dot-product only</td>
+<td>Custom per use case</td>
+</tr>
+<tr>
+<td><strong>Hybrid keyword + vector</strong></td>
+<td>Yes (ES 8.x, OpenSearch 2.x, Vespa native)</td>
+<td>pgvector bolt-on</td>
+<td>Vector-only</td>
+<td>Some via add-ons</td>
+</tr>
+<tr>
+<td><strong>Operational complexity</strong></td>
+<td>Cluster ops, JVM tuning, mapping discipline</td>
+<td>"It's just Postgres"</td>
+<td>Managed often</td>
+<td>Varies; Loki is famously simple</td>
+</tr>
+<tr>
+<td><strong>Cost at 1B docs</strong></td>
+<td>$$</td>
+<td>$$$ (vertical only)</td>
+<td>$$$$ (vector RAM expensive)</td>
+<td>$ – $$$ per engine</td>
+</tr>
+<tr>
+<td><strong>When to pick</strong></td>
+<td>Default for general text + facet + hybrid</td>
+<td>&lt;10M docs, no facet/personalization</td>
+<td>Semantic similarity dominates</td>
+<td>Tokenization diverges from word-level English</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Thresholds:</strong> &lt;10M docs and simple queries → Postgres <code>tsvector</code>. 10M–1B docs with text + facet + filter → Lucene-derived. 1B+ docs with ranking as the product (e-commerce, ads, RAG) → consider Vespa. Pure semantic similarity → vector-only DB. Code or log search → specialized engine.</p>
+<hr>
+<h2 id="12-use-case-gallery-same-technology-different-shapes">§12. Use case gallery — same technology, different shapes</h2>
+<h3 id="121-e-commerce-product-search-yelp-bookingcom">12.1 E-commerce product search (Yelp, Booking.com)</h3>
+<p>~2M – 200M products / businesses / hotels; faceted search (price, category, rating, geo-distance); personalized ranking; &lt;200ms p99; updates every few seconds. <strong>Variant</strong>: Lucene-derived with heavy doc values for facet counts, geo-distance scoring, BM25 + function scores for "boost by rating." Indexer denormalizes joined pricing/inventory/reviews so the engine doesn't join at query time. Hot tier of trending products; faceted counts cached at home-page level.</p>
+<h3 id="122-code-search-github-blackbird-sourcegraph-zoekt">12.2 Code search (GitHub Blackbird, Sourcegraph + Zoekt)</h3>
+<p>Source code, not English. Users want substring matches (<code>func MyHelper(</code>), regex, symbol search. Word-tokenized Lucene doesn't fit — <code>getUserByEmailAddress</code> needs substring <em>and</em> camel-case decomposition. <strong>Variant</strong>: custom n-gram inverted index (trigrams or longer). Each file is the set of all overlapping 3-grams; intersect to find candidates; verify with regex on matches. <strong>Blackbird at GitHub: 200B documents, 640 TB total, sub-2s p99</strong> for global substring queries — a from-scratch engine because Lucene's word-level model doesn't compose with substring grep. Sourcegraph uses Zoekt (originally Google), similar architecture, smaller scale.</p>
+<h3 id="123-log-observability-search-datadog-elk-loki-quickwit">12.3 Log / observability search (Datadog, ELK, Loki, Quickwit)</h3>
+<p>Millions of log lines/sec ingest, lower query rate (engineers searching ad-hoc), short retention (~30 days hot), cost-sensitive. Three sub-shapes: <strong>ELK / OpenSearch logs</strong> (full inverted index on every field; most flexible, most expensive); <strong>Loki</strong> (index ONLY on labels, log body as compressed chunks, full-text is label-filter-then-grep — ~10× cheaper than ELK); <strong>Quickwit</strong> (Tantivy segments on S3 — decouples compute from storage, $/TB-month 10–20× cheaper than NVMe, trades a few hundred ms latency for order-of-magnitude cost reduction).</p>
+<h3 id="124-profile-and-people-search-linkedin-galene">12.4 Profile and people search (LinkedIn Galene)</h3>
+<p>1B+ profiles; heavy per-searcher personalization; facet-heavy UI; 100k+ QPS; 200ms budget. <strong>Variant</strong>: Galene is a Lucene fork at LinkedIn. Per-searcher personalization in the hot path — every result list is reranked using features specific to the searcher. LTR is part of the search API tier, fed by an online feature store (Pinot or Venice) so model features refresh faster than the index. Routing by network cluster keeps fanout to ~10 shards instead of ~100 for most queries.</p>
+<h3 id="125-real-time-feed-tweet-search-twitter-earlybird">12.5 Real-time feed / tweet search (Twitter Earlybird)</h3>
+<p>Massive write rate (500M tweets/day historical), sub-second freshness, time-decaying relevance. <strong>Variant</strong>: Earlybird was a Lucene-derived in-memory engine with aggressive 100ms refresh. Hot tier holds last few days in RAM; cold tier on disk, rarely queried directly. Sharded by time bucket and user. Tuned for "typical query is for very recent tweets in a small slice of the timeline."</p>
+<h3 id="126-e-commerce-ranking-with-ml-in-the-hot-path-vespa-at-yahoo-shopping">12.6 E-commerce ranking with ML in the hot path (Vespa at Yahoo Shopping)</h3>
+<p>Tens of millions of candidates per query, ML rerank scoring thousands with a gradient-boosted tree or neural model, ~100ms budget. <strong>Variant</strong>: Vespa runs the ML model <em>inside the engine</em> via tensors. Engine fetches the candidate, multiplies its embedding/feature vector against the model in-process, returns top-K — no round-trip to external service. This is why Vespa dominates ML-heavy ranking where round-trip latency would otherwise kill the budget.</p>
+<h3 id="127-hosted-small-to-mid-site-search-algolia">12.7 Hosted small-to-mid site search (Algolia)</h3>
+<p>Up to ~100M records, sub-100ms p99 globally, low operational overhead. <strong>Variant</strong>: custom in-memory engine. Full index in RAM on every search node — the latency win. Cost scales with RAM; doesn't extend to billion-doc scale. For sub-100M site search, hard to beat.</p>
+<hr>
+<h2 id="13-real-world-implementations-with-numbers">§13. Real-world implementations with numbers</h2>
+<ul>
+<li><strong>LinkedIn Galene</strong> — Lucene-derived custom engine. <strong>1B+ profiles, ~100k+ QPS, p99 &lt; 200ms</strong>. Forked Lucene with personalization-aware scoring; federation, network-cluster partitioning, LTR in the hot path.</li>
+<li><strong>GitHub Code Search (Blackbird)</strong> — Custom engine (not Lucene). <strong>200B documents, 640 TB hot index, sub-2s p99</strong> for global substring. Reinvented the tokenizer (n-grams) because Lucene's word-level model doesn't fit code search.</li>
+<li><strong>Sourcegraph + Zoekt</strong> — Open-source code search. Trigram-indexed. Tens of thousands of repos at the typical deployment; same shape as Blackbird, smaller scale.</li>
+<li><strong>Yelp</strong> — Custom Lucene for business search. <strong>~10M businesses, hundreds of facets</strong>, geo + faceted scoring, pre-computed home-page facets, 2-tier hot/cold.</li>
+<li><strong>Booking.com</strong> — Lucene for hotel search. <strong>~2M properties × hundreds of attributes</strong>, p99 &lt; 200ms with 10+ active facets, hybrid keyword + ranking-signal.</li>
+<li><strong>Twitter / X Earlybird</strong> — Custom Lucene fork. <strong>500M tweets/day</strong> historical write rate. Two-tier hot/cold; aggressive refresh.</li>
+<li><strong>Stack Overflow</strong> — Elasticsearch. <strong>~100M Q&amp;A documents</strong>. Canonical mid-large workload on a single ES cluster with thoughtful ops.</li>
+<li><strong>Algolia</strong> — Hosted SaaS, custom in-memory. Sub-100ms p99 globally for sites up to ~100M records.</li>
+<li><strong>Vespa at Yahoo Shopping / Vespa Cloud</strong> — In-engine ranking with tensors. Billions of docs with ML rerank in the hot path; Yahoo Mail/Shopping, ad ranking, increasingly RAG (Retrieval-Augmented Generation) backends.</li>
+<li><strong>Grafana Loki</strong> at large observability SaaS — label-only inverted index. ~10× cheaper than ES-on-logs at equivalent retention.</li>
+<li><strong>Datadog Logs</strong> — ES-backed. <strong>Millions of log lines/sec ingest</strong> at petabyte-scale daily volumes; two-tier hot/archive with on-demand rehydration.</li>
+<li><strong>Quickwit</strong> at Binance / BlaBlaCar — Tantivy on S3. <strong>5–10× cost reduction</strong> vs ES at equivalent log retention.</li>
+<li><strong>Apache Solr</strong> in library catalogs / enterprise CMS — less hot in modern web, still default in many institutional installations.</li>
+</ul>
+<p>The same technology category — inverted-index-based ranked retrieval — covers six orders of magnitude in doc count, half a dozen distinct workload shapes, and stretches from "hobby Tantivy project" to "GitHub's planet-scale code search on a custom engine." The vocabulary (terms, postings, doc values, segments, refresh, merge, fanout) is shared across all of them.</p>
+<hr>
+<h2 id="14-l6-summary-line">§14. L6 summary line</h2>
+<blockquote>
+<p><em>"A search system is an inverted-index-based, ranked-retrieval materialization downstream of a primary store: terms in an FST term dictionary, posting lists PFOR-compressed with skip pointers, doc values for columnar facet/aggregation, immutable per-segment with a translog WAL for write durability and a 1-second refresh as the freshness/throughput knob; you make it fast by shrinking fanout with routing partitions and hot/cold tiers, early-terminating with WAND, and reranking with a model fed by an online feature store; you make it correct by treating it as derived (so cluster loss is recoverable from the source of truth via CDC + Kafka + idempotent external_version), by enforcing forward-only mapping evolution behind alias swaps, and by reconciling against the primary; you make it match the workload by picking from a design space that spans Lucene-derived (ES/Solr/OpenSearch) for general-purpose text + facet + hybrid retrieval, Vespa for ML-in-engine ranking, Tantivy/Quickwit for cost-sensitive log search, and purpose-built engines (Zoekt, Blackbird, Earlybird, Loki) when the tokenization shape — code, logs, tweets, label-only — diverges from word-level English."</em></p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+</body>
+</html>

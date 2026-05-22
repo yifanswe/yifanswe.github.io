@@ -1,0 +1,940 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Feature Flag & Config — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1 class="site-name"><a href="/" style="color:inherit">Yifan Li</a></h1>
+        <p class="site-slogan">Building Systems. Empowering People. Chasing the Horizon. Being Kind.</p>
+        <nav class="nav">
+            <a href="/">Home</a>
+            <a href="/system-design/">System Design</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design/">← Back to System Design</a>
+        <h1 class="article-title">Feature Flag & Config</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Backend Components Deep-Dive
+        </div>
+        <div class="article-content">
+<p>Scope: feature flag and experimentation infrastructure as a technology class — what it is, how it works internally at the byte level, what its design space looks like, and how the same class of system shows up across very different product domains (backend kill switches, mobile rollouts, ML A/B tests, pricing experiments, ranking experiments, regional compliance gates). Named examples throughout: LaunchDarkly, Optimizely, Statsig, Facebook Gatekeeper, LinkedIn LIX (LinkedIn eXperimentation), Uber XP (eXPerimentation Platform), Netflix ABlaze, GrowthBook, Unleash.</p>
+<p>This is a reference about the technology, not a walk-through of one specific experiment.</p>
+<hr>
+<h2 id="1-what-feature-flag-systems-are">§1. What feature flag systems ARE</h2>
+<p>A <strong>feature flag system</strong> is runtime configuration of program behavior. Given a flag key and some context (user, device, request), the system returns a value — a boolean, a variant name, a JSON blob, a number — that the calling code branches on. The point is to separate the <em>deployment</em> of code (which is slow, irreversible per-binary, and tested in CI) from the <em>release</em> of behavior (which must be fast, reversible in seconds, and targetable per user/segment/region).</p>
+<p>A <strong>feature flag</strong> in the narrow sense is an <strong>operational control</strong>: a kill switch, a gradual rollout, a circuit breaker, a per-tenant override. The success criterion is "the change does no harm" — observability, fast rollback, and targeting precision dominate.</p>
+<p>An <strong>experiment</strong> is a feature flag with <strong>statistical analysis on top</strong>: deterministic random assignment of users to variants, exposure logging, outcome metric joining, significance testing. The success criterion shifts from "does no harm" to "estimates a causal effect" — variance reduction, power analysis, and analyzer rigor dominate.</p>
+<p>Both share the same hot path. Both compute <code>(user, flag) → variant</code> on every request that touches the gated code. At scale they share the same in-process evaluator, the same config-distribution plane, and the same exposure pipeline. That is why the same systems — Gatekeeper, LIX, Statsig, LaunchDarkly — serve both jobs.</p>
+<p><strong>Adjacent categories the reader should distinguish carefully</strong>:</p>
+<ul>
+<li><strong>Static configuration management</strong> (Consul, etcd, Spring Cloud Config, YAML deployed with the binary): values that change rarely, target the whole fleet uniformly, no per-user targeting, no experimentation. The control plane resembles a flag system but the evaluation contract is much weaker — "the fleet eventually converges" rather than "this specific user, right now, gets this variant deterministically."</li>
+<li><strong>A/B testing frameworks tied to a single layer</strong> (Google Optimize for web, Firebase Remote Config for mobile, browser-side Optimizely scripts): subsets of full flag/experiment platforms, usually layer-specific (client-only). Lack server-side eval, lack cross-platform consistency, lack deep metric integration.</li>
+<li><strong>Deployment-based gradual rollout</strong> (Kubernetes rolling update, Spinnaker canary, ECS task percentage): rolls out <em>code</em>, not <em>behavior</em>. Cannot target a specific user, cannot run a control vs treatment cohort on the same binary, cannot kill a feature without redeploying.</li>
+<li><strong>Authorization / entitlement</strong> (Open Policy Agent, Zanzibar-style permission systems): also looks like "given a user and a key, return a decision," but the source of truth is a relationship graph, not a rollout policy. The two systems often integrate but are not interchangeable.</li>
+</ul>
+<p><strong>What feature flag systems are NOT good for</strong>:</p>
+<ul>
+<li><strong>Transactional semantics across services.</strong> A flag is not a distributed transaction. Two services evaluating the same flag at the same instant can see different values during a propagation window. If you need "all microservices atomically switch behavior at the same nanosecond," you need a different primitive (typically a coordinated deploy with explicit version handshakes).</li>
+<li><strong>Retroactive variant changes.</strong> Once a user is assigned to a variant and the exposure event is logged, you cannot rewrite history. Recomputing assignment with a new ramp doesn't move the user back in time.</li>
+<li><strong>High-cardinality lookup.</strong> "Return per-user feature embedding" is a feature <em>store</em>, not a flag system. Flags target on attributes; they don't memorize per-user values.</li>
+<li><strong>Long-lived business state.</strong> If you are using a flag for "is this user in the premium plan," that is entitlement, not a flag. Flags should expire; entitlements live forever.</li>
+</ul>
+<p>The class of problem the technology solves: <strong>make behavior change a first-class, governed, observable, reversible runtime operation, distinct from code deployment, with both operational (kill switch) and scientific (A/B) modes supported by the same primitive.</strong></p>
+<hr>
+<h2 id="2-inherent-guarantees">§2. Inherent guarantees</h2>
+<p>What the technology provides by design, and what you must layer on top.</p>
+<p><strong>Guaranteed by design</strong> (any production-grade flag system delivers these or it is not production-grade):</p>
+<ol>
+<li>
+<p><strong>In-process evaluation, sub-millisecond p99.</strong> The evaluator runs as a library inside the application process. Eval is a pure function: hash + rule tree walk + bucket-table lookup. No network call on the hot path. Typical numbers: 300–700 ns p50, 5–10 µs p99 per eval. If a system evaluates flags via remote procedure call (RPC) to a central service on every request, it is the wrong shape and will fail at any nontrivial scale.</p>
+</li>
+<li>
+<p><strong>Deterministic assignment per <code>(user_id, flag_key)</code>.</strong> The same user gets the same variant for the same flag across requests, sessions, devices, app servers, and SDK languages. The assignment IS the storage — there is no per-user table to query because <code>hash(user_id || flag_key) mod 10000</code> is reproducible from inputs alone. This is the trick that lets the system support hundreds of millions of users without storing 100,000 flags × 1B users worth of variant decisions.</p>
+</li>
+<li>
+<p><strong>Gradual rollout safety.</strong> A flag at 1% gives treatment to exactly 1% of users; at 10% it includes the 1% plus 9% more (the original 1% does not flip out); at 50% it includes the 10% plus 40% more. Buckets only ever flow toward the treatment side as the ramp grows. Users do not oscillate.</p>
+</li>
+<li>
+<p><strong>Instant kill.</strong> From operator clicking "kill" in the dashboard to 100% of production servers honoring the new value: under 60 seconds globally, typically under 10 seconds. Without this property a flag system is just slower-to-fix bugs.</p>
+</li>
+<li>
+<p><strong>Default-safe fallback.</strong> If the SDK cannot reach the config plane (cold start, partition, edge outage), it returns the caller-supplied default. It never throws, never blocks the request, never serves an arbitrary value. The default is the conservative, pre-existing behavior.</p>
+</li>
+<li>
+<p><strong>Exposure logging as part of the eval contract.</strong> Every <code>getVariant(user, flag)</code> call automatically emits an exposure event to the analytics pipeline. The caller cannot "forget" to log. If logging is the caller's responsibility, half of all experiments end up with broken data.</p>
+</li>
+<li>
+<p><strong>Auditability.</strong> Every flag change is durably logged with actor, timestamp, before/after state, justification. "Who turned on <code>enterprise_sso_v3</code> for customer X at 2 AM" must be answerable in under a minute.</p>
+</li>
+</ol>
+<p><strong>Must be layered on by the system designer</strong> — the flag system does not give these to you:</p>
+<ul>
+<li><strong>Cross-service transactional behavior change.</strong> If service A and service B both check the same flag and must flip together, you need an orchestrator (a release coordinator, a chained dependency). The flag layer guarantees eventual convergence on the new value, not atomicity.</li>
+<li><strong>Variance reduction in experiments.</strong> Stat-sig pipeline gives you confidence intervals; reducing the noise (CUPED — Controlled-experiment Using Pre-Experiment Data — variance reduction, stratification, interleaving) requires explicit modeling work.</li>
+<li><strong>Flag lifecycle hygiene.</strong> The system can flag stale flags; it cannot delete the dead <code>if</code> branches in your code. That's static analysis + PR bots + team policy.</li>
+<li><strong>Multi-experiment interaction handling.</strong> Layered allocation prevents same-page conflicts only if experiment authors <em>use the layers</em>. The system gives you the primitive; you have to wire it in.</li>
+<li><strong>Cross-platform identity stability.</strong> If the SDK on iOS hashes a <code>device_id</code> and the server SDK hashes a <code>user_id</code>, the same person hits different buckets. The flag system enforces hash portability across SDKs but cannot pick the right identity for your business; that's your call.</li>
+</ul>
+<p>The contract to internalize: <strong>the flag system gives you a deterministic, in-process, fast, reversible, auditable lookup with a fan-out distribution plane and an exposure analytics pipeline. Everything else — governance, cleanup, cross-service coordination, statistical rigor — is your problem and the platform team's problem layered on top.</strong></p>
+<hr>
+<h2 id="3-the-design-space">§3. The design space</h2>
+<p>Three primary axes of variation among real implementations.</p>
+<p><strong>Axis A: SaaS vs internal build.</strong></p>
+<ul>
+<li><strong>SaaS</strong> — LaunchDarkly, Statsig, Optimizely, Split.io, ConfigCat, GrowthBook Cloud. You pay per monthly active user (MAU) and get a managed dashboard, SDKs in every language, push-based propagation, an experiment analyzer, and a sales team. Latency on propagation is typically 100 ms–1 s; eval is in-process so it's microseconds.</li>
+<li><strong>Internal</strong> — Facebook Gatekeeper, LinkedIn LIX, Uber XP, Netflix ABlaze, Airbnb ERF (Experimentation Reporting Framework), Pinterest Helium, Etsy Catapult. Built because at hundreds of millions of users the SaaS cost is absurd, propagation requirements are tighter than any SaaS will commit to, and the experiment platform must integrate deeply with internal metric pipelines (Hive, Pinot, BigQuery, Druid) that no external vendor can natively query.</li>
+<li><strong>Open source self-host</strong> — Unleash, GrowthBook OSS, FF4J, Flagsmith (also offered SaaS). Picked by mid-size shops that want to avoid SaaS pricing but lack the engineering bench to build from scratch. Typically weaker on the experiment-analyzer side; you bring your own metric platform.</li>
+</ul>
+<p>The break-even is approximately <strong>at ~10M MAU or ~$200k/year of SaaS spend</strong>, build internal becomes cost-justified. Below that, SaaS or OSS dominates.</p>
+<p><strong>Axis B: Local eval (SDK pushes config to every app) vs RPC eval (every eval is a network call).</strong></p>
+<ul>
+<li><strong>Local eval</strong> is the standard. The SDK holds a compiled snapshot of all flag rules in memory; eval is a function call. Every modern system uses this on the server side.</li>
+<li><strong>RPC eval</strong> is the wrong shape at scale. Some early systems and some client-side flag products (where shipping rules to a browser leaks information about ongoing experiments) use RPC. The cost is fatal on the server side: 30 flag evals per request × 1 ms RPC = 30 ms latency tax per endpoint. Banned as a default.</li>
+<li><strong>Hybrid client eval</strong> — for browser/mobile clients where the local config snapshot would include rules you don't want to leak, the client SDK calls a server-side eval endpoint <em>once</em> per session and receives the resolved variants. This trades latency for confidentiality and is the right shape for client-side flags.</li>
+</ul>
+<p><strong>Axis C: Flags-only vs flags + experimentation + metrics.</strong></p>
+<ul>
+<li><strong>Flags-only</strong> — old-school FF4J, basic Unleash, plain Consul-backed flag servers. Just key-value config with targeting. Good enough for kill switches and gradual rollout.</li>
+<li><strong>Flags + experimentation</strong> — LaunchDarkly Experimentation, Statsig, Optimizely, Split.io. Adds the exposure pipeline, the metric definitions, the stat engine.</li>
+<li><strong>Flags + experimentation + metric platform</strong> — LIX, Uber XP, Netflix ABlaze, Statsig (with their metric warehouse). The experiment system is the dominant consumer of an internal metric platform; the two are co-designed. This is where you can ask "lift in 7-day retention with 95% confidence" and get an honest answer with CUPED variance reduction in 50 ms.</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Gatekeeper / LIX / XP (internal)</th>
+<th>Statsig (SaaS, ex-FB DNA)</th>
+<th>LaunchDarkly (SaaS, enterprise)</th>
+<th>Unleash (OSS)</th>
+<th>YAML / hardcoded if</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scale ceiling</td>
+<td>~unbounded</td>
+<td>~100M MAU</td>
+<td>~100M MAU</td>
+<td>~10M MAU</td>
+<td>&lt;100k MAU</td>
+</tr>
+<tr>
+<td>Eval latency</td>
+<td>sub-µs</td>
+<td>µs</td>
+<td>µs</td>
+<td>µs</td>
+<td>compile-time const</td>
+</tr>
+<tr>
+<td>Propagation lag</td>
+<td>&lt;5 s global</td>
+<td>&lt;1 s</td>
+<td>&lt;5 s</td>
+<td>&lt;30 s (poll)</td>
+<td>minutes (redeploy)</td>
+</tr>
+<tr>
+<td>Experimentation</td>
+<td>best-in-class</td>
+<td>strong</td>
+<td>good</td>
+<td>basic</td>
+<td>none</td>
+</tr>
+<tr>
+<td>Metric platform integration</td>
+<td>native (Hive/Pinot/Druid)</td>
+<td>bundled</td>
+<td>partner integrations</td>
+<td>bring-your-own</td>
+<td>none</td>
+</tr>
+<tr>
+<td>Op cost</td>
+<td>20–50 engineers</td>
+<td>$$ SaaS</td>
+<td>$$$ SaaS</td>
+<td>$ self-host</td>
+<td>~zero</td>
+</tr>
+<tr>
+<td>Best fit</td>
+<td>hyperscale</td>
+<td>mid-large w/ stat rigor</td>
+<td>enterprise default</td>
+<td>budget/EU/privacy</td>
+<td>trivial startup</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="4-byte-level-mechanics">§4. Byte-level mechanics</h2>
+<p>This is the section that distinguishes shallow flag-system summaries from depth. Three structures matter: the <strong>compiled rule tree</strong> on every app server, the <strong>bucketing function</strong> that gives determinism, and the <strong>columnar exposure store</strong> that powers experiment analytics. Plus on-host config distribution.</p>
+<h3 id="4a-the-compiled-rule-tree">4a. The compiled rule tree</h3>
+<p>The dashboard sees a flag as human-readable rules. The SDK sees a compiled tree. Compilation matters because eval is the hot path.</p>
+<p>Source rule (what the human writes):</p>
+<pre><code>flag: checkout-v2
+  variations: [control, treatment_A, treatment_B]
+  rules (evaluated in order):
+    1. IF email endsWith &quot;@linkedin.com&quot;               -&gt; treatment_A
+    2. IF country IN {US, CA} AND app_version &gt;= 5.0
+         AND tenure_days &gt; 30
+         ramp: {control: 80%, treatment_A: 10%, treatment_B: 10%}
+    3. ELSE                                            -&gt; control
+</code></pre>
+<p>Compiled (what the SDK actually walks):</p>
+<pre><code>RuleNode {
+  conditions: [
+    Cond { attr: &quot;email&quot;, op: ENDS_WITH, values: [&quot;@linkedin.com&quot;] }
+  ],
+  outcome: SINGLE(variation_id=1)        // treatment_A
+} -&gt; RuleNode {
+  conditions: [
+    Cond { attr: &quot;country&quot;,      op: IN_SET,     values_hash: 0xA3F9... },
+    Cond { attr: &quot;app_version&quot;,  op: GTE_SEMVER, value: 5_000_000_000 },
+    Cond { attr: &quot;tenure_days&quot;,  op: GT,         value: 30 }
+  ],
+  outcome: BUCKETED(
+    bucket_table: [
+      (0..7999,    variation_id=0),  // 80% control
+      (8000..8999, variation_id=1),  // 10% treatment_A
+      (9000..9999, variation_id=2)   // 10% treatment_B
+    ],
+    salt: &quot;checkout-v2:rule2&quot;
+  )
+} -&gt; RuleNode {
+  conditions: [],                       // fallthrough
+  outcome: SINGLE(variation_id=0)       // control
+}
+</code></pre>
+<p>Properties the compiler bakes in:</p>
+<ul>
+<li><code>IN_SET</code> clauses with &gt; 8 values are pre-hashed into a perfect-hash table or a Roaring bitmap — O(1) lookup, not a list scan.</li>
+<li><code>country IN {US, CA}</code> becomes a 2-bit bitmap test against an interned country code.</li>
+<li>Semver comparisons are pre-parsed to packed int64 (<code>major*1e10 + minor*1e6 + patch</code>).</li>
+<li>The bucket table is a sorted array of <code>(end_bucket, variation_id)</code> pairs — binary search on the bucket number lands in O(log K) where K is number of variations (usually 2–5).</li>
+</ul>
+<p>The compiled form is roughly 200–500 bytes per flag. For 100k flags that's 20–50 MB in the SDK's heap. mmap-able, cache-friendly, fits in L2/L3 footprint for the hot flags.</p>
+<p><strong>Why a compiled tree, not interpreted JSON.</strong> Re-parsing JSON and matching attribute names by string at every eval would cost 5–10 µs per eval. The compiled tree costs ~300 ns. That's a 30× difference on the hot path, multiplied by ~1.8B evals/sec fleet-wide at LIX scale.</p>
+<p><strong>Trade-off vs alternative: storing a precomputed map of (user, flag) → variant.</strong> O(1) eval but 400 TB of storage (1B users × 100k flags × 4 bytes), plus a remote lookup per eval (banned). The rule tree trades a tiny bit of CPU for zero per-user storage and zero network. At scale, the obviously correct call.</p>
+<h3 id="4b-the-bucketing-function-the-heart-of-determinism">4b. The bucketing function — the heart of determinism</h3>
+<p>Given <code>(user_id, flag_salt)</code>, produce an integer in <code>[0, 9999]</code>:</p>
+<pre><code>fn bucket(user_id: &amp;str, salt: &amp;str) -&gt; u16 {
+    // 1. Concatenate with a sentinel that can't appear in either input
+    let input = format!(&quot;{}\x00{}&quot;, salt, user_id);
+    // 2. Hash with a stable, language-portable function
+    let h = murmur3_128(input.as_bytes());
+    // 3. Take the low 64 bits, modulo 10000 -&gt; 0.01% resolution bucket
+    (h.low64() % 10_000) as u16
+}
+</code></pre>
+<p>Why each choice:</p>
+<ul>
+<li>
+<p><strong>Salt is <code>flag_key</code> (or <code>flag_key:rule_id</code>)</strong>, not the empty string. Two flags must not produce correlated buckets. If both flags hashed only on <code>user_id</code>, a user in the 10% rollout of flag A would <em>also</em> be in the 10% rollout of flag B, and B's "treatment effect" would secretly carry A's effect. Salting decorrelates the buckets.</p>
+</li>
+<li>
+<p><strong>Stable, language-portable hash.</strong> MurmurHash3, xxHash, or SHA-1 truncated. The same function in Java, Python, Go, JavaScript, Rust, Swift, Kotlin must produce the same number. LaunchDarkly uses SHA-1. Unleash uses MurmurHash3. LIX has its own MD5-based hash with a documented spec so client and server SDKs agree. Every platform publishes a <strong>test vector file</strong> — a few hundred <code>(user_id, flag_key) -&gt; bucket</code> triples — and every SDK has a CI check that fails if its implementation drifts.</p>
+</li>
+<li>
+<p><strong>10,000 buckets, not 100.</strong> 100 was the old standard; it caps rollout granularity at 1%, which is too coarse for "safest possible 0.1% canary." 10,000 buckets = 0.01% granularity. Statsig, LaunchDarkly, LIX, Gatekeeper, Optimizely all use 10,000+. Some experimentation-heavy platforms use 1,000,000 buckets for very large experiments where 0.01% is still too coarse.</p>
+</li>
+<li>
+<p><strong>Modulo, not range division.</strong> <code>hash % 10000</code> distributes uniformly when the hash is well-mixed. Some older systems used <code>hash / (UINT_MAX / 10000)</code> which has subtle bias near range boundaries on poorly-mixed hashes.</p>
+</li>
+</ul>
+<p><strong>Determinism in action — the ramp-up case:</strong></p>
+<pre><code>Rollout starts at 1%:
+  bucket 0..99      -&gt; treatment
+  bucket 100..9999  -&gt; control
+  user u_42 bucket 4271 -&gt; control
+
+Rollout bumps to 10%:
+  bucket 0..999     -&gt; treatment
+  bucket 1000..9999 -&gt; control
+  user u_42 bucket 4271 -&gt; control (still)
+
+Rollout at 50%:
+  bucket 0..4999    -&gt; treatment
+  bucket 5000..9999 -&gt; control
+  user u_42 bucket 4271 -&gt; TREATMENT (now flipped, once and only once)
+
+Rollout at 100%:
+  all buckets -&gt; treatment
+  user u_42 -&gt; treatment
+</code></pre>
+<p>Each user crosses the threshold exactly once. <strong>Crucial invariant: buckets already in treatment stay in treatment.</strong> A naïve implementation that re-randomized at each rollout step would cause users to oscillate — that destroys experiment validity <em>and</em> confuses the user ("the new feature appeared and disappeared between page loads").</p>
+<p>For the rare advanced experiment design that needs to re-balance mid-flight (move users between variants in a controlled way), the assignment must be stored durably or the entire ramp re-run. That feature is reserved for specialized platforms (Uber XP, Netflix ABlaze) and rarely surfaces to ordinary teams.</p>
+<h3 id="4c-on-host-config-distribution">4c. On-host config distribution</h3>
+<p>How does the ~30 MB compiled ruleset get to 30,000+ app servers and stay fresh?</p>
+<p>Naïve fan-out: every server polls the flag service every 60 seconds for the full ruleset. Bandwidth: <code>30,000 × 30 MB / 60 s = 15 GB/sec</code> from the origin. Origin melts. Also during the 60-s poll window, half the fleet is on the old ruleset and half on the new — kill-switch propagation worst case is 60 s. Not acceptable.</p>
+<p><strong>Real design — delta push through an edge fan-out tier:</strong></p>
+<pre><code>control plane (MySQL/Postgres)
+   |
+   v
+ruleset compiler (rule tree -&gt; binary blob + diff vs prior version)
+   |
+   v
+origin service (signed snapshots + diffs in S3)
+   |
+   v
+regional edge PoPs (Points of Presence) — terminate SSE / long-poll, hold 100k+ connections each
+   |
+   v hybrid pull+push
+   v  (initial: pull 30 MB snapshot; steady-state: receive 500-byte diffs)
+   |
+SDK in app server (in-process eval, atomic pointer-swap on update)
+</code></pre>
+<p>Steady-state numbers at LIX scale (~100k flags, ~30k app servers, ~500 changes/min):
+- One diff: ~500 bytes (typical flag change is a few rules).
+- One change fanned to 30k servers via N edge PoPs: each edge pushes <code>500 B × (30k / N)</code> per change.
+- Aggregate: <code>500 changes/min × 500 B × 30k = ~125 MB/s</code> of fan-out traffic, distributed across edges. Each edge handles a tiny fraction.
+- Kill switch propagation: dashboard click -&gt; DB commit (~10 ms) -&gt; change stream (~100 ms) -&gt; edge fan-out (~500 ms) -&gt; SDK applies (~10 ms). <strong>End-to-end ~1.1 s p50, &lt; 10 s p99.</strong></p>
+<p>Cold-start cost: <code>30,000 servers × 30 MB = 900 GB</code>. Bad once at fleet boot; trivial in steady state. Edges cache the snapshot from S3 so the origin is hit once per snapshot version per edge, not per server.</p>
+<h3 id="4d-the-exposure-store-columnar-olap">4d. The exposure store — columnar OLAP</h3>
+<p>After every eval the SDK pushes an exposure event:</p>
+<pre><code class="language-json">{
+  &quot;user_id&quot;: &quot;u_42&quot;,
+  &quot;flag_key&quot;: &quot;checkout-v2&quot;,
+  &quot;variant&quot;: &quot;treatment_A&quot;,
+  &quot;rule_matched&quot;: &quot;rule_2&quot;,
+  &quot;ts&quot;: 1715712000123,
+  &quot;country&quot;: &quot;US&quot;,
+  &quot;app_version&quot;: &quot;5.3.1&quot;,
+  &quot;session_id&quot;: &quot;s_abc...&quot;
+}
+</code></pre>
+<p>These hit Kafka (partitioned by <code>user_id</code>) and land in a columnar OLAP (Online Analytical Processing) store — Pinot, Druid, ClickHouse, BigQuery. Why columnar:</p>
+<p>The dominant query is variant comparison:</p>
+<pre><code class="language-sql">SELECT variant, COUNT(DISTINCT user_id), AVG(metric_value)
+FROM exposures_joined_with_outcomes
+WHERE flag_key = 'checkout-v2'
+  AND date BETWEEN '2026-05-01' AND '2026-05-22'
+GROUP BY variant
+</code></pre>
+<p>This touches ~5 columns over potentially billions of rows. Row-based storage (Postgres, MySQL) scans 200 bytes per row to read 30 bytes — 7× wasted I/O. Columnar storage reads only the 4 needed columns, dictionary-compressed.</p>
+<p>Inside Pinot the segment file looks like:</p>
+<pre><code>exposures_2026-05-22.segment
+  metadata.json           (schema, time range, row count)
+  columns/
+    user_id.dict          (dictionary: distinct user IDs -&gt; small ints)
+    user_id.fwd           (forward index: row -&gt; dict_id)
+    flag_key.dict
+    flag_key.fwd
+    flag_key.inv          (HOT — used by every WHERE flag_key = X)
+    variant.dict
+    variant.fwd
+    ts.raw                (sorted; range index)
+  startree.idx            (optional: pre-aggregated cube)
+</code></pre>
+<p>The inverted index on <code>flag_key</code> is the magic. <code>WHERE flag_key = 'checkout-v2'</code> becomes a dictionary lookup + bitmap fetch — sub-millisecond, regardless of total table size. The experiment dashboard returns lift, confidence interval, and p-value in 50–200 ms.</p>
+<p><strong>Trade-off vs LSM (Log-Structured Merge tree) row store:</strong> Cassandra and RocksDB are great for point reads/writes by primary key. Variant comparison doesn't read by primary key; it scans a flag's rows aggregating across users. Columnar wins 10–100× on this access pattern. Conversely, columnar is bad at single-row upsert — but we never upsert exposures, we only append.</p>
+<h3 id="4e-one-full-eval-walkthrough-at-the-byte-level">4e. One full eval walkthrough at the byte level</h3>
+<p>User <code>u_42</code> hits the checkout API. The handler calls <code>flagSDK.getVariant("checkout-v2", userContext)</code>:</p>
+<pre><code>1. SDK reads the compiled rule tree from its in-memory cache.
+   Address: heap pointer to a ~400-byte structure.
+   Cache line hit, since this flag is used often.
+
+2. SDK walks the rule list in order:
+
+   Rule 1: email endsWith &quot;@linkedin.com&quot;?
+     userContext.email = &quot;alice@gmail.com&quot; — NO MATCH.
+
+   Rule 2: country IN {US, CA} AND app_version &gt;= 5.0 AND tenure_days &gt; 30?
+     country = &quot;US&quot; — passes bitmap test.
+     app_version = 5.3.1 (parsed 5_003_001_000) &gt;= 5_000_000_000 — passes.
+     tenure_days = 142 &gt; 30 — passes.
+     All clauses pass -&gt; enter BUCKETED outcome.
+
+3. Bucket computation:
+   salt = &quot;checkout-v2:rule_2&quot;
+   input bytes = &quot;checkout-v2:rule_2\x00u_42&quot;
+   murmur3_128(input) -&gt; 128-bit hash; low 64 bits = 0x9F32A0...
+   hash.low64 % 10_000 = 4271
+
+4. Binary search the bucket table:
+   4271 falls in range [0, 7999] -&gt; variation_id = 0 (control).
+
+5. Resolve variation_id 0 -&gt; &quot;control&quot; string. Return.
+
+6. SDK appends exposure event to a thread-local ring buffer:
+   {user_id:&quot;u_42&quot;, flag_key:&quot;checkout-v2&quot;, variant:&quot;control&quot;,
+    rule_matched:&quot;rule_2&quot;, ts:1715712000123, ...}
+   (~50 ns; no syscall, no allocation)
+
+7. A background flusher drains the ring buffer to Kafka every 1 second
+   or 1000 events, whichever comes first.
+
+8. Total CPU time steps 1–6: ~400 ns p50, ~5 µs p99.
+</code></pre>
+<p>Compare to a naïve "RPC to flag service" path: 1–5 ms p99, a blocked thread, and a failure mode dependency on the flag service. The in-process design is ~1000× faster.</p>
+<h3 id="4f-durability-and-crash-semantics">4f. Durability and crash semantics</h3>
+<p>The SDK is stateless from the host's perspective. If the app server crashes mid-eval, the eval is gone; the user's next request re-evaluates deterministically. There is no per-user state to recover.</p>
+<p>The only durable state the SDK keeps:</p>
+<ul>
+<li><strong>Last-known-good ruleset on local disk</strong> (e.g., <code>/var/cache/lix/ruleset.bin</code>). Used on cold start when the config plane is unreachable. Atomic replacement via <code>rename(2)</code> — partial write cannot corrupt the file. mmap'd on startup for fast availability.</li>
+<li><strong>Exposure ring buffer</strong> in memory only. On crash, unflushed events are lost. That is acceptable because exposure events are best-effort statistical signal, not transactional. Losing 0.001% of exposures does not invalidate an experiment.</li>
+</ul>
+<p>The durability that does matter lives in the <strong>control plane</strong>: when the dashboard commits a flag change, the MySQL/PostgreSQL Write-Ahead Log (WAL) commits before any propagation begins. If the change-stream worker crashes between commit and publication, it replays from the binlog/WAL offset on restart. The audit log replicates separately to S3 + Kafka so it survives even a catastrophic loss of the metadata DB.</p>
+<hr>
+<h2 id="5-capacity-envelope">§5. Capacity envelope</h2>
+<p>The technology covers a 7+ order-of-magnitude range. Cite multiple real deployments.</p>
+<p><strong>Small scale — LaunchDarkly free tier customer, OSS Unleash self-host:</strong>
+- 1k–50k MAU, ~100 flags, single region.
+- Eval is microseconds (in-process SDK works identically at every scale).
+- Propagation: SSE (Server-Sent Events) push, &lt; 1 s typical.
+- Storage: one Postgres, one Redis cache, no analytics pipeline needed.
+- Concrete number: a typical Series-A startup using LaunchDarkly's free tier handles all flag traffic on a $20/month config; the flag system is invisible in their cost stack.</p>
+<p><strong>Mid scale — Statsig customer, Stripe-class company, GrowthBook self-host:</strong>
+- 1M–50M MAU, 1k–5k flags, multi-region.
+- Eval ~500 ns p50 in-process.
+- Propagation: edge-pushed diffs, &lt; 500 ms global.
+- Storage: dedicated config-plane DB, Kafka for exposures, columnar warehouse (BigQuery or Snowflake) for the experiment analyzer.
+- Concrete number: a typical 10M-MAU company running ~50 simultaneous experiments produces ~2B exposures/day, manageable in a single Pinot or Druid cluster of ~20 nodes.</p>
+<p><strong>Large scale — LinkedIn LIX, Uber XP, Netflix ABlaze, Airbnb ERF (Experimentation Reporting Framework):</strong>
+- 100M–1B MAU, 10k–100k flags, global.
+- LIX: ~40,000 active LIX keys, ~billions of evaluations/day, ~30,000+ app servers across regions. Each app server hits ~60k evals/sec at peak, ~4% of one core.
+- Uber XP: ~1,000+ concurrent experiments simultaneously with mutually exclusive layered allocation. Built on Cassandra + Kafka + Pinot.
+- Netflix ABlaze: 100s of concurrent experiments with multi-year holdouts to measure cumulative product impact.
+- Propagation: edge fan-out with SSE, &lt; 2 s global p50, &lt; 10 s p99.</p>
+<p><strong>Giant scale — Facebook Gatekeeper:</strong>
+- Every HHVM (Hip-Hop Virtual Machine) request hits Gatekeeper one or more times. Public talks put it in the range of <strong>hundreds of millions of evaluations per second</strong> fleet-wide.
+- The hottest flag checks are JIT-compiled (Just-In-Time compiled) directly into HHVM bytecode, bringing the eval cost into nanosecond range.
+- The constraint they hit first is exposure logging volume — at 100M evals/sec you cannot log every single exposure to Kafka. Sampling becomes mandatory (1-in-N logging), with the variant decision still deterministic per-user but the <em>log</em> event sampled.</p>
+<p>The bottleneck story by scale tier:</p>
+<table>
+<thead>
+<tr>
+<th>Scale</th>
+<th>First bottleneck</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>100k MAU</td>
+<td>none, anything works</td>
+<td>YAML or Unleash is fine</td>
+</tr>
+<tr>
+<td>10M MAU</td>
+<td>propagation lag if polling</td>
+<td>switch to SSE/edge push</td>
+</tr>
+<tr>
+<td>100M MAU</td>
+<td>config snapshot size + cold start</td>
+<td>compiled rule tree + edge cache</td>
+</tr>
+<tr>
+<td>1B MAU</td>
+<td>exposure volume</td>
+<td>sampling, partitioned Pinot tables</td>
+</tr>
+<tr>
+<td>10B requests/day</td>
+<td>eval CPU on hot flag</td>
+<td>JIT-compile hot rules (Gatekeeper)</td>
+</tr>
+</tbody>
+</table>
+<p>The technology stays the same shape across the range. What changes: rule compilation, propagation push vs poll, exposure sampling, edge fan-out — each tier turns on as the previous one becomes the bottleneck.</p>
+<hr>
+<h2 id="6-architecture-in-context">§6. Architecture in context</h2>
+<p>Canonical pattern, generic across every named system in the gallery:</p>
+<pre><code>            +-------------------------+
+            |   Flag/Experiment UI    |   product manager,
+            |       (Dashboard)       |   on-caller, scientist
+            +------------+------------+
+                         | REST (writes)
+                         v
+        +------------------------------+
+        |   Control Plane API          |
+        |  (auth, RBAC, validation,    |
+        |   audit log writer)          |
+        +-----+--------------------+---+
+              |                    |
+              v                    v
+   +------------------+   +------------------+
+   |  Flag Metadata   |   |   Audit Log      |
+   |  Store           |   |   (S3 + Kafka)   |
+   |  (MySQL/Postgres |   +------------------+
+   |  partitioned by  |
+   |  namespace)      |
+   +--------+---------+
+            | change stream (binlog / WAL)
+            v
+   +-----------------------+
+   |  Ruleset Compiler     |   takes raw rules,
+   |  (rule tree -&gt;        |   emits compact binary blob
+   |  binary blob + diff)  |   + diff against prior version
+   +----------+------------+
+              |
+              v
+   +-------------------------------------+
+   |   Config Distribution Plane          |
+   |   +-------------------------------+  |
+   |   | Origin (signed snapshots in   |  |
+   |   | S3 + diff stream)             |  |
+   |   +--------------+----------------+  |
+   |                  v                   |
+   |   +-------------------------------+  |
+   |   | Regional Edge PoPs            |  |
+   |   | (terminate SSE / long-poll,   |  |
+   |   |  fan-out diffs)               |  |
+   |   +--------------+----------------+  |
+   +------------------+-------------------+
+                      | pull (cold start) + push (diffs)
+                      v
+   +-------------------------------------------------+
+   |   App Server (one of thousands)                 |
+   |                                                 |
+   |  +-------------------------------------------+  |
+   |  |  Flag SDK (in-process)                    |  |
+   |  |  +---------------------------------+      |  |
+   |  |  | Ruleset cache (mmap'd / heap)   |      |  |
+   |  |  | - compiled rule trees           |      |  |
+   |  |  | - bucket tables                 |      |  |
+   |  |  | - segment / cohort indexes      |      |  |
+   |  |  +---------------------------------+      |  |
+   |  |                                           |  |
+   |  |  eval(user, flag) -&gt;                      |  |
+   |  |    hash(user_id || salt) -&gt; bucket        |  |
+   |  |    walk rule tree -&gt; variant              |  |
+   |  |    append exposure -&gt; ring buffer         |  |
+   |  +-----+---------------------+---------------+  |
+   |        | variant             | exposure         |
+   |        v                     v                  |
+   |  application code     async Kafka producer      |
+   +-----------------------------+--------------------+
+                                 | batched (1s / 1000 msgs)
+                                 v
+                    +---------------------------+
+                    |  Exposure Kafka Topic     |
+                    |  (partitioned by user_id) |
+                    +-----------+---------------+
+                                |
+            +-------------------+--------------------+
+            v                   v                    v
+   +--------------+     +---------------+    +-----------------+
+   |  Pinot /     |     |  S3 raw log   |    | Real-time       |
+   |  Druid /     |     |  (long-term   |    | guardrail       |
+   |  ClickHouse  |     |   archive)    |    | monitor (Flink) |
+   | (columnar,   |     +------+--------+    +-----------------+
+   |  partitioned |            |
+   |  by flag_key)|            v
+   +------+-------+    +---------------+
+          |            | Daily Spark / |
+          |            | batch stats   |
+          |            | (significance |
+          |            |  testing)     |
+          |            +-------+-------+
+          v                    v
+   +-----------------------------------------+
+   |   Experiment Analytics UI               |
+   |   (variant comparison, lift, p-values,  |
+   |    guardrail breaches, holdout tracking)|
+   +-----------------------------------------+
+</code></pre>
+<p>Partitioning keys to note:
+- <strong>Flag metadata store</strong>: partitioned by <code>namespace</code> (team) so a single tenant cannot starve others.
+- <strong>Exposure Kafka</strong>: partitioned by <code>user_id</code> so a single user's events land on the same partition — needed for windowed deduplication and per-user treatment-effect coherence.
+- <strong>Pinot / Druid analytics table</strong>: partitioned by <code>(flag_key, date)</code>. The dominant query is <code>WHERE flag_key = X</code> — partitioning serves that read pattern.</p>
+<p>Same shape across LIX, XP, Statsig, LaunchDarkly. Names of components vary; the topology does not.</p>
+<hr>
+<h2 id="7-hard-problems">§7. Hard problems</h2>
+<p>Inherent to the technology, not specific to one workload. Each gets a one-line statement, a naïve fix, a failure walkthrough with concrete state, and the real fix. Illustrations span backend, mobile, ML, pricing, ranking.</p>
+<h3 id="problem-1-low-latency-eval-that-stays-consistent-across-thousands-of-servers-rolloutkill-propagation">Problem 1: Low-latency eval that stays consistent across thousands of servers (rollout/kill propagation)</h3>
+<p>Backend kill-switch scenario: an on-caller flips <code>checkout-v2</code> from 50% to 0% because the iOS app is crashing on 10% of users.</p>
+<p><strong>Naïve fix:</strong> SDKs poll the flag service every 60 s for the full ruleset.</p>
+<p><strong>Why it breaks:</strong> at 30k servers × 30 MB ruleset / 60 s, the origin sees <code>15 GB/sec</code> of egress and melts immediately. Worse, the kill-switch propagation worst case is the poll interval — 60 s — averaging 30 s. During that window a fresh user routed to a server that hasn't polled yet hits the broken flow. iOS crash reports keep pouring in for 30+ seconds after the kill.</p>
+<p><strong>Real fix:</strong> delta-based push through an edge fan-out tier. SDKs hold a persistent SSE connection to a regional edge PoP. The origin emits compact diffs (<code>flag_id, version, ~500 B blob</code>) to each edge; the edge fans out to its connected SDKs in &lt; 500 ms. SDK atomic pointer-swaps the new compiled rule in. Kill-switch propagation: &lt; 2 s p50, &lt; 10 s p99. Bandwidth: 500 B × 30k = 15 MB total per change, distributed across edges.</p>
+<p>Same problem appears for mobile app rollouts (the iOS/Android app phoning home for its config) and for backend service flags. Same fix.</p>
+<h3 id="problem-2-consistent-bucketing-across-java-python-go-and-js-sdks">Problem 2: Consistent bucketing across Java, Python, Go, and JS SDKs</h3>
+<p>ML model A/B scenario: a recommendation system has a server-side ranker written in Go, a real-time scorer written in Python, and a client-side UI in TypeScript. All three need to know "which model variant for this user."</p>
+<p><strong>Naïve fix:</strong> each SDK uses the language's built-in <code>hashCode()</code>.</p>
+<p><strong>Why it breaks:</strong> Java <code>String.hashCode()</code> is a different function from Python <code>hash()</code> is different from Go <code>hash/fnv</code> is different from V8's string hash. The same <code>user_id</code> lands in completely different buckets across services. User <code>u_42</code> is in treatment from the Go ranker's perspective, in control from the Python scorer's perspective, and in some other bucket entirely on the client. The A/B test data is garbage.</p>
+<p>Concrete state: user <code>u_42</code> opens the iOS app, sees treatment recommendations (TypeScript JS hash bucket 23, in the 10% group). They scroll, the Go backend re-ranks (Go FNV bucket 7421, out of the group), and serves them control rankings. The new model's recommendations appear and disappear as the user scrolls.</p>
+<p><strong>Real fix:</strong> a stable, language-portable hash specified by the platform, with published test vectors. MurmurHash3, xxHash, or truncated SHA-1 — all have byte-identical implementations available in every language. The platform publishes a test vector file (<code>[(user_id, flag_key, expected_bucket), ...]</code>), and every SDK has a CI job that fails if its implementation drifts. LIX enforces this with cross-language test vectors checked into the SDK repos.</p>
+<h3 id="problem-3-treatment-stability-across-sessions-and-identity-transitions">Problem 3: Treatment stability across sessions and identity transitions</h3>
+<p>Pricing experiment scenario: an e-commerce site is testing 10% vs 15% bulk discount.</p>
+<p><strong>Naïve fix:</strong> assign at request time using <code>hash(user_id, flag_key)</code>. Stable by construction.</p>
+<p><strong>Why it breaks (subtler than it looks):</strong></p>
+<ul>
+<li>User browses logged out: <code>user_id = anonymous</code>. Their bucket depends on which anonymous identity. They see 10% discount.</li>
+<li>User logs in: bucket recomputes from their real <code>user_id</code>. They see 15%. The price on the same product just changed by 5 points in front of them. They screenshot it and complain on social media.</li>
+<li>A B2B tenant changes their account plan from "free" to "pro" mid-experiment. If the bucketing rule keys off plan, the bucket changes mid-experiment.</li>
+</ul>
+<p><strong>Real fix:</strong> layered identity + sticky overrides for long-lived experiments.</p>
+<ul>
+<li>Define a stable identity per use case. For consumer apps: <code>user_id</code> for logged-in users, <code>device_id</code> for anonymous, with carry-forward on first login (the system links them).</li>
+<li>Bucket on a <em>stable</em> attribute (user_id, account_id). Never bucket on a <em>changeable</em> attribute (plan, country, app version). Changeable attributes are <em>conditions</em>, not the bucketing key.</li>
+<li>For rare long-lived experiments (year-long holdouts, regulatory cohorts), persist the assignment explicitly in a sticky-assignment store. Small table, just the users whose assignment must survive deeper changes.</li>
+</ul>
+<h3 id="problem-4-interleaved-overlapping-experiments">Problem 4: Interleaved (overlapping) experiments</h3>
+<p>Ranking experiment scenario: Feed Team A is testing a new tie-breaker; Feed Team B is testing a new freshness boost. Both run on Feed at the same time.</p>
+<p><strong>Naïve fix:</strong> each experiment hashes on <code>(user_id, flag_key)</code> and is independent. Run them all in parallel.</p>
+<p><strong>Why it breaks:</strong> two experiments on the same surface can interact. A user randomly in (A_new_tiebreaker, B_freshness_boost) vs (A_old, B_no_boost) confounds both experiments — neither isolates its effect cleanly. Real example pattern from Uber/Netflix retrospectives: two homepage experiments each show 1% lift in isolation, but the joint effect when both treatments fire is actually -3% (the changes conflict visually). Each team ships, total business metric drops, nobody can explain why.</p>
+<p><strong>Real fix:</strong> mutually exclusive layers. Define layers (<code>feed_ranker_layer</code>, <code>feed_layout_layer</code>, <code>checkout_layer</code>, etc.). Within a layer, each user is assigned to <em>exactly one</em> experiment. Layered assignment uses a different bucketing scheme: <code>bucket(user_id, layer_id) -&gt; segment -&gt; experiment</code>. Two experiments in the same layer cannot run on the same user. Cross-layer, experiments are independent.</p>
+<p>Google's "Overlapping Experiment Infrastructure" paper (Tang et al., 2010) is the canonical reference. Netflix ABlaze, Uber XP, LIX, and Statsig all ship variants of layered allocation.</p>
+<h3 id="problem-5-ramp-up-safety">Problem 5: Ramp-up safety</h3>
+<p>Mobile feature rollout scenario: a new in-app payment flow on iOS shipping with the app store binary update.</p>
+<p><strong>Naïve fix:</strong> dashboard slider 0% -&gt; 100%, on-caller drags it.</p>
+<p><strong>Why it breaks:</strong>
+- No automated guardrail. A bug at 1% still costs 1% of revenue and 100% of the affected users' trust.
+- Manual ramps happen during business hours; bugs surface at 3 AM. Nobody to ramp down.
+- Change is global instantly — no regional pacing, so a US-only canary cannot catch problems before APAC users get the bug.
+- Mobile app version is a confound: 10% of users on app v5.2 may all see the new flow; the next app store release of v5.3 silently bumps a different population.</p>
+<p><strong>Real fix:</strong> automated rollout policy + guardrail metrics + auto-rollback. Rollout steps are data: <code>[1%, 5%, 25%, 50%, 100%]</code> with <code>hold_duration_minutes</code> between steps. Guardrail metrics (5xx error rate, p99 latency, conversion rate, crash rate) with thresholds. The rollout controller polls metrics at each step; on threshold breach, auto-rollback to the previous step (or 0%). Rollouts run <strong>per region sequentially</strong> — us-west first, then eu-west, then ap-southeast.</p>
+<p>LIX has explicit "auto-ramp" with metric guardrails. Statsig calls them "Pulse" experiments. LaunchDarkly has "Release Guardrails." Same pattern, different names.</p>
+<h3 id="problem-6-flag-debt-death-by-a-thousand-stale-flags">Problem 6: Flag debt — death by a thousand stale flags</h3>
+<p>Universal scenario across every flag system.</p>
+<p><strong>Naïve fix:</strong> trust engineers to clean up.</p>
+<p><strong>Why it breaks:</strong> at 100k flags, ~70k of them sit at 100% rollout for over six months. The code branches still exist. Every code change reasons about both branches. Test matrix explodes. Junior engineers don't know which branch is "live." Eventually a flag at 100% for two years gets accidentally flipped off — production breaks immediately because the OFF branch hasn't been tested in years and references a database column that no longer exists.</p>
+<p>Real-life retrospective from multiple companies: a feature flag is left at 100% for 18 months; a new engineer flips it off "to test something," production breaks.</p>
+<p><strong>Real fix:</strong> lifecycle management as a first-class concept.</p>
+<ul>
+<li>Every flag has a Time-to-Live (TTL) at creation. After 30 days at 100%, auto-flag for cleanup.</li>
+<li>A nightly bot opens PRs that remove the dead branch and the flag.</li>
+<li>The dashboard shows a flag-debt leaderboard per team. Teams with the most stale flags get blocked from creating new ones until cleanup.</li>
+<li>Static analysis: a linter flags any flag-check on a flag at 100% for &gt; N days. CI fails on new code that references already-cleaned-up flags.</li>
+</ul>
+<p>This is the part most flag-system tutorials omit. At scale it is the #1 maintenance burden.</p>
+<hr>
+<h2 id="8-failure-mode-walkthrough">§8. Failure mode walkthrough</h2>
+<h3 id="failure-1-bad-rule-deployed-the-canonical-oh-no-scenario">Failure 1: Bad rule deployed (the canonical "oh no" scenario)</h3>
+<p>Someone bumps <code>checkout-v2</code> from 50% to 100% and the new code has a bug that breaks iOS users in app v5.2.</p>
+<p>Detection: real-time guardrail monitor (Flink job on the Kafka exposure stream) + crash reports + 5xx rate from Application Performance Monitoring (APM). All three should agree within 60 s.</p>
+<p>Recovery: on-caller clicks "kill switch" in dashboard. <code>checkout-v2</code> rule rewritten to <code>ELSE -&gt; control</code>. Propagates in &lt; 10 s via SSE fan-out. iOS clients on next request see control.</p>
+<p><strong>Durability point:</strong> the audit-log entry recording the kill action. Stored to S3 + Kafka before propagation begins, so even if propagation fails mid-flight, the <em>intent</em> is durable and an operator can verify state recovery.</p>
+<h3 id="failure-2-app-server-crashes-mid-eval">Failure 2: App server crashes mid-eval</h3>
+<p>App server SIGKILL'd in the middle of <code>getVariant("checkout-v2", user)</code>.</p>
+<p>Recovery: trivial. Eval is a pure function with no side effects beyond a ring-buffer push. The user's request times out, the load balancer routes to another server, eval recomputes deterministically. Same <code>user_id</code> + same <code>flag_key</code> + same ruleset = same answer. No state lost.</p>
+<p><strong>Durability point:</strong> none needed. Determinism IS the durability story.</p>
+<h3 id="failure-3-app-server-cannot-reach-the-config-plane-cold-start-partition">Failure 3: App server cannot reach the config plane (cold start, partition)</h3>
+<p>A new app server boots but the config plane edge PoP it's routed to is down.</p>
+<p>Recovery sequence:
+1. SDK tries primary edge PoP — timeout after 2 s.
+2. SDK tries secondary edge PoP in another region — assume also unreachable.
+3. SDK falls back to <strong>local on-disk ruleset cache</strong> at <code>/var/cache/&lt;system&gt;/ruleset.bin</code>. Last-known-good snapshot, kept warm by daily sync.
+4. If even that fails (fresh machine, no cache), SDK enters <strong>default-only mode</strong> — every <code>getVariant</code> returns the caller-supplied default. App server is degraded (no targeting, no experiments) but still serves requests.
+5. Background reconnect loop with exponential backoff every 30 s.</p>
+<p><strong>Durability point:</strong> the local on-disk cache file. Atomically replaced via <code>rename(2)</code>. Even a partial write doesn't corrupt — worst case, the file is the previous valid snapshot.</p>
+<h3 id="failure-4-config-plane-db-primary-loss">Failure 4: Config plane DB primary loss</h3>
+<p>MySQL/Postgres primary in the flag metadata store crashes. Semi-sync replica is caught up to within milliseconds.</p>
+<p>Recovery:
+1. DB cluster manager (Orchestrator, MHA, Vitess, Patroni) promotes the replica. Dashboard writes blocked for 5–30 s.
+2. Change-stream worker reconnects to the new primary's binlog/WAL position. If positions don't match (very rare with semi-sync), worker reads from the last committed offset and replays missed events.
+3. SDKs are unaffected — they read from the edge cache, not the DB.</p>
+<p><strong>Durability point:</strong> the binlog/WAL. Once a change is committed to the log on N replicas (semi-sync), it survives primary loss.</p>
+<h3 id="failure-5-network-partition-region-cannot-reach-global-control-plane">Failure 5: Network partition — region cannot reach global control plane</h3>
+<p>Asia-Pacific cuts off from the global control plane. New flag changes in the dashboard cannot reach AP edges.</p>
+<p>Recovery: AP edges keep serving the <strong>last-known-good ruleset</strong> to AP app servers. AP region runs with config frozen at the partition moment. Reads keep flowing; new changes don't propagate to AP until the partition heals. When it heals, the edge replays the change stream from its last version cursor. No merge conflict because flag definitions are owned by the global control plane — AP edges never write, only read.</p>
+<p><strong>Trade-off explicitly named:</strong> during the partition AP is on stale rules. A kill switch flipped during the partition would not reach AP until heal. This is the right call for flag systems — <em>availability over consistency</em> during partition, because the alternative ("AP servers refuse to evaluate flags") breaks every request in AP.</p>
+<p>For the rare AP-specific kill-switch-during-partition need, regional control-plane mirrors with manual override exist (used essentially never in practice but available for compliance).</p>
+<p><strong>Durability point:</strong> the version cursor on each edge. "I am at version 17421" lets each edge resync deterministically.</p>
+<h3 id="failure-6-permanent-loss-of-an-edge-pop">Failure 6: Permanent loss of an edge PoP</h3>
+<p>eu-west edge PoP hardware destroyed.</p>
+<p>Recovery: trivial. Edges are stateless caches of the global control plane. New edge instances boot, sync their ruleset from origin (or another edge), accept SDK connections. SDKs fail over via the SDK's edge list.</p>
+<p><strong>Durability point:</strong> edges hold no durable state. S3-backed ruleset snapshots in the origin are the source of truth.</p>
+<hr>
+<h2 id="9-why-not-hardcoded-if-statements-with-a-whitelist">§9. Why not hardcoded if-statements with a WHITELIST</h2>
+<p>The classical naïve replacement, said in every code review:</p>
+<pre><code class="language-python">if env == &quot;prod&quot; and customer_id in WHITELIST:
+    use_new_checkout = True
+else:
+    use_new_checkout = False
+</code></pre>
+<p>or its cousin in YAML deployed with the binary:</p>
+<pre><code class="language-yaml">features:
+  checkout_v2:
+    enabled: true
+    allowed_customers: [acme, foo_corp, bar_inc]
+</code></pre>
+<p>Works fine for one team, one flag, one product. Utterly fails at scale. Walk through six concrete failures.</p>
+<h3 id="failure-1-no-instant-rollback">Failure 1: no instant rollback</h3>
+<p>T=0: deploy with <code>checkout_v2.enabled = true</code>. Bug ships.</p>
+<p>T=5m: on-call sees error rate spike. Wants to flip the flag.</p>
+<p>T=5m–25m: edit YAML, open PR, get review, merge, trigger deploy, wait for canary, wait for full rollout to thousands of servers. <strong>20+ minutes</strong> to return to safety. Millions of users affected during that window.</p>
+<p>Flag systems fix this with <strong>decoupled deploy from release</strong>: the kill is a 1-second config-plane operation, not a deploy.</p>
+<h3 id="failure-2-no-percentage-rollout">Failure 2: no percentage rollout</h3>
+<p>T=0: <code>checkout_v2.enabled = true</code> deploys, hits 100% of users instantly.</p>
+<p>T=5m: bug affects 100% of users, not 1%. Blast radius is the entire user base.</p>
+<p>With a flag system, the same bug would have been caught at 1% with 100× less user impact.</p>
+<h3 id="failure-3-no-targeting">Failure 3: no targeting</h3>
+<p>PM: "Can we enable this only for premium users in Germany on app version 5.3+?"</p>
+<p>Naïve answer: write a custom <code>if</code> with three nested conditions, hardcoded country codes, version checks. Next time PM wants "Germany OR France," it's another code change + deploy cycle.</p>
+<p>Flag systems make this a dashboard edit, propagating in seconds.</p>
+<h3 id="failure-4-no-experimentation">Failure 4: no experimentation</h3>
+<p>PM: "Is the new checkout actually converting better?"</p>
+<p>Naïve answer: you don't know. You shipped to 100%. You can compare to historical data but you have no concurrent control group — any difference might be a confound (season, marketing campaign, weather).</p>
+<p>Flag systems run simultaneous control vs treatment, measuring lift unambiguously.</p>
+<h3 id="failure-5-deploy-and-release-are-coupled">Failure 5: deploy and release are coupled</h3>
+<p>Every release is a deploy. You cannot test feature X in production with internal users only without deploying to everyone. You cannot dark-launch new code paths to validate performance without making them user-visible.</p>
+<p>Flag systems decouple these: deploy code to 100% of servers while keeping the feature at 0%; or run feature at 100% on backend behavior only (collecting performance data) while gating the UI surface at 0%.</p>
+<h3 id="failure-6-audit-and-governance">Failure 6: audit and governance</h3>
+<p>"Who turned on <code>enterprise_sso_v3</code> for our biggest customer on Saturday?" In the naïve YAML model: nobody knows without git-blaming the YAML, and even then only the merger is identified, not the intent. Flag systems: dashboard audit log with actor, timestamp, justification, ticket link.</p>
+<p>These failures stack. At a 100-engineer or larger company every one of them is a production incident waiting to happen. Which is why every company past that scale builds or buys a flag system.</p>
+<hr>
+<h2 id="10-scaling-axes">§10. Scaling axes</h2>
+<p>Two kinds of growth need two different fixes. Conflating them leads to wrong investments.</p>
+<h3 id="type-1-more-flags-more-apps-distribution-problem">Type 1: more flags, more apps (distribution problem)</h3>
+<p>Going from 1k flags to 100k flags across 100 → 10k → 30k app servers.</p>
+<ul>
+<li><strong>1k flags / 100 services / 1 region:</strong> SDK polls once a minute, full snapshot. Origin is a single Postgres + a thin REST API. Bandwidth trivial.</li>
+<li><strong>10k flags / 1000 services / 3 regions:</strong> poll-based snapshots break down (snapshot ~50 MB, full-fleet poll ~ tens of GB/min). Move to <strong>diff-based push</strong> via SSE. Add regional edge fan-out so origin only emits the canonical diff once per change. Compile rule trees to keep SDK heap footprint flat.</li>
+<li><strong>100k flags / 30k services / global:</strong> sharded control plane (Postgres partitioned by namespace), per-region edge PoPs, signed S3-backed snapshots for cold start. Compiled rule trees become essential — JSON interpretation would be 30× the eval cost. Layered allocation prevents interleaved experiments from confounding each other.</li>
+</ul>
+<p><strong>Inflection point at ~10k flags:</strong> poll-based distribution breaks. Architecture must shift from "SDK pulls" to "control plane pushes diffs through a fan-out tier." Structural change — the SDK changes from stateless poller to stateful subscriber.</p>
+<h3 id="type-2-more-rate-per-flag-gatekeeper-case-eval-cost-problem">Type 2: more rate per flag (Gatekeeper case — eval cost problem)</h3>
+<p>A single flag — say <code>news_feed_ranking_v2</code> — evaluated on every Feed render, 1B requests/day = ~12,000 evals/sec per flag.</p>
+<ul>
+<li><strong>100 evals/sec per flag:</strong> in-memory tree, eval effectively free. No special handling.</li>
+<li><strong>10k evals/sec per flag:</strong> still trivial in-process. MurmurHash3 + 3-deep rule walk is sub-microsecond. ~0.1% of CPU.</li>
+<li><strong>100k evals/sec per flag (per server):</strong> still fine in-process; this is roughly the rate of Gatekeeper's hottest checks. ~10% of one core.</li>
+<li><strong>1M evals/sec per flag (Gatekeeper-class hot flag):</strong> eval cost is real. Batch evals when multiple downstream calls within one request use the same flag (eval once, propagate the variant). Consider <strong>JIT-compiled rule eval</strong> — Facebook actually does this in HHVM, generating bytecode for hot flag rules so eval becomes a handful of instructions.</li>
+</ul>
+<p><strong>Inflection point at ~100k evals/sec per flag:</strong> exposure logging cost becomes nontrivial. Exposure events must be sampled (1-in-N logging, with the variant choice still deterministic per-user but the <em>log</em> event sampled). This is the experimentation-vs-cost trade-off — at extreme rate, you cannot afford to log every eval.</p>
+<p><strong>Inflection point at ~1M evals/sec per flag (fleet-wide):</strong> Kafka exposure topic for that one flag needs its own partition set; Pinot/Druid analytics table needs sub-partition by <code>(flag_key, hour)</code> to keep query latency under a second.</p>
+<h3 id="the-two-fixes-diverge">The two fixes diverge</h3>
+<ul>
+<li>Type 1 is a <strong>distribution problem</strong>: fixed by push-based diffs, compiled rule trees, sharded control plane, edge fan-out.</li>
+<li>Type 2 is an <strong>eval cost and exposure cost</strong> problem: fixed by JIT eval, exposure sampling, partitioned analytics tables.</li>
+</ul>
+<p>Sharding the metadata store to fix a hot-flag problem helps nothing because the metadata store isn't on the eval path. Conversely, JIT-compiling a rule to fix slow propagation helps nothing because compilation happens once and propagation is many-times.</p>
+<hr>
+<h2 id="11-decision-matrix-vs-adjacent-technology-categories">§11. Decision matrix vs adjacent technology categories</h2>
+<p>When to pick a feature flag / experimentation system vs an alternative.</p>
+<table>
+<thead>
+<tr>
+<th>Need</th>
+<th>Feature Flag / Experiment System</th>
+<th>Static Config Mgmt (Consul, etcd)</th>
+<th>A/B Framework Only (Optimize, Firebase RC)</th>
+<th>Deploy-Based Rollout (k8s, Spinnaker)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Per-user targeting</td>
+<td>yes</td>
+<td>no</td>
+<td>yes (limited)</td>
+<td>no</td>
+</tr>
+<tr>
+<td>Percentage rollout</td>
+<td>yes, 0.01% granularity</td>
+<td>no</td>
+<td>yes, layer-specific</td>
+<td>yes, but rolls <em>code</em></td>
+</tr>
+<tr>
+<td>Deterministic bucketing across services</td>
+<td>yes</td>
+<td>n/a</td>
+<td>client-only</td>
+<td>no</td>
+</tr>
+<tr>
+<td>Instant rollback (&lt;10s)</td>
+<td>yes</td>
+<td>seconds-minutes</td>
+<td>yes (client)</td>
+<td>minutes-tens of minutes</td>
+</tr>
+<tr>
+<td>Stat-sig experiment analysis</td>
+<td>yes</td>
+<td>no</td>
+<td>yes</td>
+<td>no</td>
+</tr>
+<tr>
+<td>Cross-service consistency</td>
+<td>best-effort, per-eval</td>
+<td>strong (one source)</td>
+<td>no</td>
+<td>per-deploy</td>
+</tr>
+<tr>
+<td>Audit log per change</td>
+<td>yes</td>
+<td>yes</td>
+<td>partial</td>
+<td>git history</td>
+</tr>
+<tr>
+<td>Eval cost</td>
+<td>sub-µs in-process</td>
+<td>sub-µs in-process</td>
+<td>µs (HTTP for client SDK)</td>
+<td>n/a</td>
+</tr>
+<tr>
+<td>Best for</td>
+<td>feature behavior, experiments, kill switches</td>
+<td>infra config (DB URLs, timeouts)</td>
+<td>client-only A/B (web/mobile UX)</td>
+<td>new code rollouts</td>
+</tr>
+<tr>
+<td>Worst for</td>
+<td>infra config that needs strong consistency</td>
+<td>per-user targeting, experiments</td>
+<td>server-side flags, kill switches</td>
+<td>partial-population targeting</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Decision rules with thresholds:</strong></p>
+<ul>
+<li><strong>Per-user targeting needed?</strong> → flag system. No threshold; if you need it even once, the flag system is the right primitive.</li>
+<li><strong>Need to ramp a single behavior change to &lt;50% of users?</strong> → flag system. Deploy-based rollout cannot target less than the resolution of your deploy unit (typically per-cluster, ~10–25% of fleet at finest).</li>
+<li><strong>Need to measure causal effect of a change on a metric?</strong> → flag system with experimentation. A/B framework with stat-sig pipeline. Cannot be done with config management or deploys.</li>
+<li><strong>Need &lt; 10 s rollback SLA?</strong> → flag system. Deploy-based rollback takes minutes-tens-of-minutes. Static config can be fast but lacks targeting.</li>
+<li><strong>Need strong consistency (all services see the same value at the same instant)?</strong> → not a flag system. Use coordinated deploy or a versioned config handshake.</li>
+<li><strong>&lt; 100k MAU, &lt; 5 simultaneous flags, monolith app?</strong> → YAML or env vars suffice. Don't build a flag platform.</li>
+<li><strong>&gt; 10M MAU or &gt; 50 simultaneous experiments?</strong> → SaaS flag platform (Statsig, LaunchDarkly) or self-host (Unleash, GrowthBook). Past $200k/year of SaaS cost, build internal.</li>
+</ul>
+<p>The matrix forces honesty: a flag system is the right primitive for <em>behavior change with per-user targeting and analytics</em>. It is the wrong primitive for <em>infra config</em>, <em>strong consistency</em>, and <em>pure code rollout</em>.</p>
+<hr>
+<h2 id="12-use-case-gallery">§12. Use case gallery</h2>
+<p>Five domains using the same flag/experimentation technology in five different ways.</p>
+<h3 id="use-case-1-backend-kill-switch-universal">Use case 1: Backend kill switch (universal)</h3>
+<p>Domain: any production backend service.
+Specific demand: instant rollback of a code path, &lt; 10 s globally.
+Variant of the tech: simple boolean flag, no experimentation, no targeting beyond "off vs on." The dashboard exposes a big red button; the audit log captures the actor.
+Where it lives in the stack: every request handler that touches a risky code path is guarded by <code>if (flags.isEnabled("new-pricing-engine", ctx))</code>. The default is the safe path.
+Concrete example: Stripe uses LaunchDarkly to gate every new payment processor integration behind a kill switch. A bug in the new Adyen integration is killed in &lt; 5 s from dashboard click.</p>
+<h3 id="use-case-2-mobile-feature-rollout-iosandroid-phased-release">Use case 2: Mobile feature rollout (iOS/Android phased release)</h3>
+<p>Domain: consumer mobile apps where binaries reach users through app stores with delay.
+Specific demand: gradual rollout of a feature that exists in the v5.3 binary, targeted at users who have updated, ramped over days/weeks while monitoring crash rates.
+Variant of the tech: flag with percentage rollout + app_version condition + crash-rate guardrail + per-region pacing.
+Where it lives in the stack: SDK in the iOS/Android app holds the ruleset; the app checks the flag at feature entry points. Crash reporting feeds the guardrail monitor.
+Concrete example: Uber rolls out a new ride-sharing UX through Uber XP. App versions 5.3+ are eligible; rollout pacing is 1% → 5% → 25% → 50% → 100% with 24-hour holds; crash rate threshold auto-rollback at +0.5 absolute.</p>
+<h3 id="use-case-3-ml-model-ab-recommendation-ranking-scoring">Use case 3: ML model A/B (recommendation, ranking, scoring)</h3>
+<p>Domain: ML systems serving variants of a model to compare lift.
+Specific demand: deterministic, salted bucketing so the same user sees the same model variant on every request; exposure logging joined with model-output metrics (click, watch time, conversion) for offline stat-sig analysis.
+Variant of the tech: flag with multiple variants, each pointing to a model version; deep integration with the metric platform; CUPED variance reduction in the analyzer.
+Where it lives in the stack: the recommendation service evaluates the flag at request time, dispatches to model variant A or B, logs exposure with the request ID; the metric pipeline joins exposures to outcomes on <code>user_id + ts</code>.
+Concrete example: Netflix ABlaze, LIX, Uber XP all routinely run dozens of concurrent ML model A/Bs — Netflix has discussed running hundreds of recommendation experiments simultaneously across home, search, and trailers.</p>
+<h3 id="use-case-4-pricing-experiment-e-commerce-marketplaces">Use case 4: Pricing experiment (e-commerce, marketplaces)</h3>
+<p>Domain: e-commerce or marketplaces testing price elasticity.
+Specific demand: stable bucketing per user across many sessions (so a user does not see the price oscillate); careful identity handling (logged-out users via device_id, logged-in via user_id); strict audit log because pricing decisions are regulated in many jurisdictions.
+Variant of the tech: flag with sticky variant assignment, identity carry-forward on login, regulatory-grade audit trail.
+Where it lives in the stack: pricing service evaluates the flag at price-display time; checkout service evaluates again at purchase time and must return the same variant; exposure logs feed a price-elasticity analyzer.
+Concrete example: Airbnb's pricing experiments through ERF (Experimentation Reporting Framework). Booking.com runs ~1,000 simultaneous experiments, many on pricing surfaces.</p>
+<h3 id="use-case-5-ranking-experiment-feed-search">Use case 5: Ranking experiment (feed, search)</h3>
+<p>Domain: ranked surfaces — News Feed, search results, notification ranking.
+Specific demand: layered allocation so two ranking experiments on the same surface don't confound; deep metric integration including counterfactual metrics ("clicks if treatment were applied"); long-horizon analysis with holdout groups maintained for months.
+Variant of the tech: layered allocation system + experiment scheduler + offline counterfactual evaluator + multi-month holdout cohort store.
+Where it lives in the stack: the ranking service queries the experiment platform once per request for the user's assignment across all relevant layers; logs the assignment and the ranking outcome; offline jobs compute lift with variance reduction.
+Concrete example: Facebook News Feed and LinkedIn Feed both run thousands of ranking experiments per quarter. LinkedIn's Feed Ranking surface has, by public discussion, ~100+ concurrent experiments at any time with layered allocation preventing interactions.</p>
+<h3 id="use-case-6-user-segmentation-enterprise-paywall-gradual-enablement">Use case 6: User segmentation (enterprise paywall, gradual enablement)</h3>
+<p>Domain: B2B SaaS where features are gated by plan tier or per-tenant rollout.
+Specific demand: targeting on stable attributes (plan, tenant_id, customer-success cohort); fine-grained allowlists for early-access; multi-tenant audit ("which features did Goldman Sachs see between dates X and Y").
+Variant of the tech: flag with rich attribute-targeting, large allowlists (1000s of customers), per-tenant audit log queryable for compliance review.
+Concrete example: Salesforce, Atlassian, Notion all gate enterprise features through internal flag systems with tenant-level targeting. The flag system here serves as a hybrid of feature rollout and entitlement — though for hard entitlement (paid vs free) the system of record is usually a separate entitlement service, not the flag system.</p>
+<h3 id="use-case-7-regional-rollout-compliance-gdpr-data-residency">Use case 7: Regional rollout (compliance, GDPR, data residency)</h3>
+<p>Domain: any product subject to regional regulation.
+Specific demand: targeting by region, with strict guarantee that a flag enabled in one region does not bleed into another; per-region audit; the ability to freeze a region's flag state during a regulatory review.
+Variant of the tech: flag with country/region condition as first-class, regional edge PoPs that can be configured to refuse certain flag publications.
+Concrete example: a global social network rolls out a new content recommendation algorithm in the US first, then EU only after legal review. The flag's <code>country IN {EU_set}</code> condition is gated behind a compliance-approval workflow in the dashboard.</p>
+<p>Same technology underneath all seven. Different variants of rule syntax, identity handling, exposure pipeline depth, and stat-sig integration.</p>
+<hr>
+<h2 id="13-real-world-implementations-with-numbers">§13. Real-world implementations with numbers</h2>
+<p>Specific numbers to memorize; these come up in interviews and ground all claims about scale.</p>
+<ul>
+<li>
+<p><strong>Facebook Gatekeeper</strong> (Tang et al., public talks): hundreds of millions of evaluations per second fleet-wide. In-process eval. Hot flag checks JIT-compiled into HHVM (Hip-Hop Virtual Machine) bytecode. Public talks have cited that eval cost dominates the network stack cost on hot paths — they JIT'd the eval to bring it under nanosecond range for the hottest flags. Every page load, every Graph API call, every News Feed ranking call hits Gatekeeper one or more times.</p>
+</li>
+<li>
+<p><strong>LinkedIn LIX</strong> (LinkedIn eXperimentation): over <strong>40,000 active LIX keys</strong> at any time, <strong>billions of evaluations per day</strong>. Integrated with the metric definitions repository (UMP — Unified Metric Platform) and the experiment platform (T-REX historically, now folded into LIX) which runs cohort-based and online experimentation. Push-based SSE propagation. Stat engine supports frequentist + Bayesian with sequential testing. Holdout group system maintained for months.</p>
+</li>
+<li>
+<p><strong>Uber XP</strong> (eXPerimentation Platform): <strong>1,000+ concurrent experiments</strong> simultaneously, with mutually exclusive layers, on global rider/driver population. Built on Cassandra + Kafka + Apache Pinot. Layered allocation. Real-time guardrail monitoring with auto-rollback. CUPED (Controlled-experiment Using Pre-Experiment Data) variance reduction.</p>
+</li>
+<li>
+<p><strong>Netflix ABlaze</strong>: 100s of concurrent experiments. Year-long holdouts to measure cumulative product impact. Public Netflix Tech Blog describes interleaved layered allocation and stratified randomization for power.</p>
+</li>
+<li>
+<p><strong>Airbnb ERF</strong> (Experimentation Reporting Framework): the canonical mid-2010s public reference for experiment infrastructure. Powers hundreds of simultaneous experiments. Published their stat-sig stack in detail.</p>
+</li>
+<li>
+<p><strong>Statsig</strong>: founded by ex-Facebook Gatekeeper team. Sub-second propagation, in-process eval, full experimentation suite. Public benchmarks claim &lt; 100 µs p99 eval. Used by mid-to-large companies wanting Facebook-grade DNA without building it.</p>
+</li>
+<li>
+<p><strong>LaunchDarkly</strong>: enterprise SaaS reference. SSE-based push (&lt; 200 ms typical). Server-side and client-side SDKs in every major language. CDN integration for edge config. Pricing per-MAU caps at low millions for cost-effectiveness; past that, internal builds dominate.</p>
+</li>
+<li>
+<p><strong>Optimizely</strong>: heritage in web-based A/B via JavaScript injection. Expanded to server-side. Strong on web optimization, less deep on backend kill-switch use cases. Sold to enterprise teams that want UX-A/B tooling.</p>
+</li>
+<li>
+<p><strong>GrowthBook</strong>: OSS, stat-rigorous, Bayesian by default. Self-host. Used by mid-size companies that want LaunchDarkly UX with internal data.</p>
+</li>
+<li>
+<p><strong>Unleash</strong>: OSS feature-flag-first (lighter on experimentation). Polled SDK by default (configurable to SSE). Popular in EU markets where data residency rules favor self-host.</p>
+</li>
+<li>
+<p><strong>Pinterest Helium, Etsy Catapult, Spotify GoFlag, Slack Houston, Twitter Mantis flag layer</strong>: every large internet company past ~$1B revenue has an internal flag platform with substantially the same shape. The shape itself is the canonical solution.</p>
+</li>
+</ul>
+<p>If asked in an interview, memorize this triangulation: <strong>Gatekeeper ~100M+ evals/sec, LIX 40k+ flags + billions of evals/day, Uber XP 1k+ concurrent experiments, Netflix year-long holdouts, Statsig sub-100 µs eval, LaunchDarkly SSE propagation &lt; 200 ms.</strong></p>
+<hr>
+<h2 id="14-l6-summary-line">§14. L6 summary line</h2>
+<blockquote>
+<p><em>A feature flag and experimentation system is fundamentally a deterministic, in-process pure function — <code>hash(user_id, salt) -&gt; bucket -&gt; walk compiled rule tree -&gt; variant</code> — replicated to every app server through a push-based config plane with a kill-switch SLA under 60 s globally, paired with a columnar exposure pipeline that turns deterministic assignment into a causal A/B inference engine; the in-process eval invariant, the deterministic bucketing function, and the &lt; 10-second propagation requirement are the three design forces from which every other choice (compiled rule trees, edge fan-out, layered allocation, sticky overrides, columnar exposure storage, auto-rollback guardrails, sampling at extreme rate, flag-debt lifecycle automation) is derived.</em></p>
+</blockquote>
+<hr>
+<h3 id="appendix-a-the-canonical-flag-eval-in-one-paragraph">Appendix A: the canonical flag eval, in one paragraph</h3>
+<p>The SDK on every app server holds a compiled, memory-mapped ruleset (~30 MB for 100k flags). On a <code>getVariant(flag_key, user_context)</code> call, the SDK looks up the flag's compiled rule tree (heap pointer, cache-hot), walks each rule in order checking interned-attribute conditions (country bitmaps, semver packed ints), and on the first matching rule either returns a single variant (allowlist case) or computes <code>bucket = murmur3_128(flag_key:rule_id || user_id) % 10000</code>, binary-searches the bucket table to a variation ID, returns that variation's name, and asynchronously appends an exposure event (user, flag, variant, rule, timestamp, attributes) to a thread-local ring buffer that is flushed to Kafka every second. Total CPU: ~400 ns p50, ~5 µs p99. The ruleset is kept fresh by an SSE subscription to a regional edge Point of Presence (PoP) that fans out diffs from the global control plane within seconds of a dashboard change. If the SSE connection drops, the SDK falls back to the last-known-good ruleset on local disk; if that fails too, it returns the caller-supplied default. The exposure events stream into a <code>(flag_key, date)</code>-partitioned columnar OLAP table (Pinot, Druid, ClickHouse); the experiment analytics UI queries variant-level metric lifts with confidence intervals in 50–200 ms regardless of underlying terabytes of exposure data.</p>
+<h3 id="appendix-b-acronym-expansion-glossary">Appendix B: acronym expansion glossary</h3>
+<ul>
+<li><strong>SDK</strong> — Software Development Kit (the in-process flag library)</li>
+<li><strong>SSE</strong> — Server-Sent Events (one-way HTTP push protocol)</li>
+<li><strong>PoP</strong> — Point of Presence (edge cache location)</li>
+<li><strong>RBAC</strong> — Role-Based Access Control</li>
+<li><strong>OLAP</strong> — Online Analytical Processing (vs OLTP, Online Transaction Processing)</li>
+<li><strong>WAL</strong> — Write-Ahead Log</li>
+<li><strong>MDE</strong> — Minimum Detectable Effect (smallest change an experiment can detect at a given power/sample size)</li>
+<li><strong>MAU</strong> — Monthly Active User</li>
+<li><strong>CUPED</strong> — Controlled-experiment Using Pre-Experiment Data (variance reduction technique)</li>
+<li><strong>JIT</strong> — Just-In-Time compilation</li>
+<li><strong>APM</strong> — Application Performance Monitoring</li>
+<li><strong>MVCC</strong> — Multi-Version Concurrency Control</li>
+<li><strong>LIX</strong> — LinkedIn eXperimentation (LinkedIn's internal feature flag + experimentation platform)</li>
+<li><strong>HHVM</strong> — Hip-Hop Virtual Machine (Facebook's PHP runtime, host of Gatekeeper)</li>
+<li><strong>XP</strong> — Uber's eXPerimentation platform</li>
+<li><strong>UMP</strong> — Unified Metric Platform (LinkedIn's metric definition repository)</li>
+<li><strong>ERF</strong> — Experimentation Reporting Framework (Airbnb's experiment platform)</li>
+<li><strong>T-REX</strong> — LinkedIn's historical experimentation analysis stack, since absorbed into LIX</li>
+<li><strong>OSS</strong> — Open-Source Software</li>
+<li><strong>RPC</strong> — Remote Procedure Call</li>
+<li><strong>TTL</strong> — Time-to-Live</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+</body>
+</html>

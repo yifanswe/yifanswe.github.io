@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Coordination Service — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1 class="site-name"><a href="/" style="color:inherit">Yifan Li</a></h1>
+        <p class="site-slogan">Building Systems. Empowering People. Chasing the Horizon. Being Kind.</p>
+        <nav class="nav">
+            <a href="/">Home</a>
+            <a href="/system-design/">System Design</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design/">← Back to System Design</a>
+        <h1 class="article-title">Coordination Service</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Backend Components Deep-Dive
+        </div>
+        <div class="article-content">
+<p><strong>Component class</strong>: Coordination services / metadata stores — etcd, Apache ZooKeeper, HashiCorp Consul, Google Chubby. The category of strongly-consistent, highly-available, deliberately low-throughput key-value stores that hold the control-plane state for distributed systems.</p>
+<p><strong>Framing</strong>: this doc is about the <em>technology class</em>. Coordination services occupy a distinctive niche in the storage taxonomy — they sit between transactional databases and in-memory caches but are neither. They exist because distributed systems need a single source of truth for a small set of critical questions ("who is the leader?", "where do shards live?", "what is the config?", "who holds this lock?"), and that truth must survive failures without ambiguity. Examples throughout pull from Kubernetes, Kafka, Cassandra, CockroachDB, distributed cron, feature flags, and service mesh.</p>
+<hr>
+<h2 id="1-what-coordination-services-are">§1. What coordination services ARE</h2>
+<p>A <strong>coordination service</strong> is a strongly-consistent, highly-available, distributed key-value store optimized for the storage and dissemination of <em>control-plane</em> metadata. Defining characteristics:</p>
+<ul>
+<li><strong>Tiny dataset, high importance.</strong> Kilobytes to a few gigabytes. Every byte matters — a wrong answer corrupts the entire data plane.</li>
+<li><strong>Low throughput, by design.</strong> Single-leader consensus means ~10,000 writes/sec ceiling. Acceptable because the <em>consumers</em> of coordination state read it far more often than they write it, and the rate of metadata change is bounded by cluster events (deploys, failovers, config changes), not user traffic.</li>
+<li><strong>Linearizable reads and writes.</strong> A successful write is visible to every subsequent read on every replica.</li>
+<li><strong>Watch primitive.</strong> Clients subscribe to keys or prefixes and receive a totally-ordered stream of changes.</li>
+<li><strong>Lease / ephemeral semantics.</strong> Clients hold keys conditional on liveness — when the client dies, the key disappears.</li>
+</ul>
+<h3 id="what-problem-class-do-they-solve">What problem class do they solve?</h3>
+<p>Five problems across every distributed system:</p>
+<ol>
+<li><strong>Leader election</strong> — among N replicas, exactly one holds a lease at a time.</li>
+<li><strong>Service discovery</strong> — endpoints register, consumers watch.</li>
+<li><strong>Distributed locking</strong> — with <strong>fencing tokens</strong> that downstream resources validate.</li>
+<li><strong>Configuration distribution</strong> — write once, propagate via watch.</li>
+<li><strong>Cluster membership</strong> — nodes register with leases, drop out on failure.</li>
+</ol>
+<h3 id="where-they-sit-in-the-stack">Where they sit in the stack</h3>
+<pre><code>        ┌──────────────────────────┐
+        │      Application         │  (user requests)
+        └────────────┬─────────────┘
+                     │
+        ┌────────────▼─────────────┐
+        │      Data plane          │  (DBs, caches, queues)
+        │  millions of ops/sec     │  high throughput
+        └────────────┬─────────────┘
+                     │ asks: who's the leader,
+                     │   what's the config,
+                     │   who owns this shard?
+        ┌────────────▼─────────────┐
+        │  Coordination service    │  (etcd / ZK / Consul)
+        │  ~10k writes/s ceiling   │  low throughput,
+        │  ~GBs of metadata        │  strong consistency
+        └──────────────────────────┘
+</code></pre>
+<h3 id="distinguish-from-adjacent-categories">Distinguish from adjacent categories</h3>
+<ul>
+<li><strong>Transactional database</strong> (MySQL, PostgreSQL): higher write throughput, larger data, rich queries — but no native watches, leases, or coordination primitives.</li>
+<li><strong>Wide-column NoSQL</strong> (Cassandra, HBase): eventually consistent by default, partitioned for terabytes of user data, no consensus on writes.</li>
+<li><strong>In-memory KV</strong> (Redis, Memcached): sub-millisecond reads, but no real consensus — Redis primary-replica replication is async, so the post-failover state is not a consistent prefix of the pre-failover state. Acceptable as a cache, dangerous as a coordinator.</li>
+<li><strong>Object storage</strong> (S3, GCS): huge capacity, read-after-write per object only, no watches, no leases.</li>
+</ul>
+<h3 id="not-good-for">NOT good for</h3>
+<ul>
+<li><strong>High write throughput</strong> (&gt;10k/sec) — quorum fsync gates every commit.</li>
+<li><strong>Large data volume</strong> (&gt;8 GB) — snapshot transfer and in-memory index pressure dominate.</li>
+<li><strong>Low-latency global writes</strong> — cross-region quorum is 30-100 ms minimum.</li>
+<li><strong>Rich query semantics</strong> — flat KV or hierarchical znodes only.</li>
+<li><strong>User data</strong> — classic anti-pattern.</li>
+</ul>
+<hr>
+<h2 id="2-inherent-guarantees">§2. Inherent guarantees</h2>
+<h3 id="provided-by-design">Provided by design</h3>
+<p><strong>Linearizability.</strong> Once a write is acked, every subsequent read on any replica reflects it. Single totally-ordered history. The strongest single-object consistency model.</p>
+<p><strong>No split-brain under partition.</strong> Under any partition, at most one side can commit writes. The other becomes read-only or refuses service. Consensus prevents two simultaneous leaders by construction — a leader needs majority quorum, and a partition cannot produce two majorities.</p>
+<p><strong>Durability via majority quorum.</strong> A committed write survives any minority of replica failures and disk loss on the minority. Requires <code>fsync</code> before ack on a majority — durability point is the slowest fsync of the quorum.</p>
+<p><strong>Watch delivery in order.</strong> Subscribers receive every committed change matching their predicate, in commit order, with no gaps (until a configurable compaction horizon).</p>
+<p><strong>Lease semantics.</strong> Liveness is determined by the <em>coordination service's view</em> (lease heartbeats received), not by gossip — this is what makes locks safely fence-able.</p>
+<h3 id="not-guaranteed-must-be-layered-on">NOT guaranteed (must be layered on)</h3>
+<ul>
+<li><strong>High throughput.</strong> Hard ceiling ~10k writes/sec per Raft group; if you need more, shard the workload.</li>
+<li><strong>Multi-region availability.</strong> Run separate coordination services per region with out-of-band state replication.</li>
+<li><strong>Idempotency of client operations.</strong> If the client doesn't know whether its request succeeded (network drop between commit and ack), it must retry. Application makes operations idempotent — typically via CAS (compare-and-swap) on the revision number.</li>
+<li><strong>SQL-style multi-row transactions.</strong> Multi-key conditional batches (etcd <code>Txn</code>, ZooKeeper <code>multi</code>) exist but are not full ACID across many keys.</li>
+<li><strong>Fast failover.</strong> Leader election takes 150-600 ms on a healthy cluster; applications must tolerate this brief unavailability.</li>
+</ul>
+<hr>
+<h2 id="3-the-design-space">§3. The design space</h2>
+<table>
+<thead>
+<tr>
+<th>System</th>
+<th>Consensus</th>
+<th>Data model</th>
+<th>Watch model</th>
+<th>Bundled extras</th>
+<th>Op footprint</th>
+<th>Famous users</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>etcd</strong></td>
+<td>Raft</td>
+<td>flat KV, MVCC revisions</td>
+<td>streamed, replayable from revision</td>
+<td>none — pure KV</td>
+<td>one Go binary</td>
+<td>Kubernetes, CoreOS lineage</td>
+</tr>
+<tr>
+<td><strong>ZooKeeper</strong></td>
+<td>Zab</td>
+<td>hierarchical znodes</td>
+<td>one-shot triggers</td>
+<td>session model, sequential znodes</td>
+<td>JVM, separate ensemble</td>
+<td>Kafka (legacy), HBase, Hadoop</td>
+</tr>
+<tr>
+<td><strong>Consul</strong></td>
+<td>Raft</td>
+<td>KV + service catalog + DNS</td>
+<td>long-polling</td>
+<td>service discovery, DNS, ACL, mesh</td>
+<td>Go binary + agent fleet</td>
+<td>HashiCorp stack</td>
+</tr>
+<tr>
+<td><strong>Chubby</strong></td>
+<td>Paxos (Multi-Paxos)</td>
+<td>hierarchical files</td>
+<td>event channels</td>
+<td>name service, ACL</td>
+<td>internal Google only</td>
+<td>GFS, Bigtable, Borg</td>
+</tr>
+<tr>
+<td><strong>TiKV PD</strong></td>
+<td>Raft (sharded)</td>
+<td>KV with regions</td>
+<td>streamed</td>
+<td>placement, scheduling</td>
+<td>embedded in TiKV</td>
+<td>TiDB, TiKV</td>
+</tr>
+</tbody>
+</table>
+<h3 id="raft-etcd-consul-tikv-pd-cockroachdb">Raft (etcd, Consul, TiKV PD, CockroachDB)</h3>
+<p>The modern default. Ongaro and Ousterhout's 2014 protocol, designed for understandability. Pieces are well-prescribed: strong leader, randomized election timeouts, log-completeness vote check, two-phase joint-consensus membership changes. Production implementations across etcd, Consul, CockroachDB, TiKV, and Apache Kudu share the same mental model.</p>
+<h3 id="zab-zookeeper-atomic-broadcast">Zab (ZooKeeper Atomic Broadcast)</h3>
+<p>Predates Raft. Structurally similar — leader plus followers, monotonic epoch numbers (analogous to Raft's term). Distinctive: FIFO client order guarantee, explicit recovery phases (discovery → sync → broadcast). Isomorphic to Raft for the consensus part. Differences are surface-level (epoch vs term, znodes vs flat keys) and operational (JVM tuning vs single Go binary).</p>
+<h3 id="paxos-chubby-spanner-internals">Paxos (Chubby, Spanner internals)</h3>
+<p>Lamport's original. Multi-Paxos skips the prepare phase for the common case of a stable leader. Production Paxos exists, but Paxos doesn't prescribe leader election, log replication structure, or membership change — every implementation has rolled its own and gotten subtly different things. Precisely the problem Raft was designed to fix.</p>
+<h3 id="why-etcds-bbolt-b-tree-raft-is-the-modern-default">Why etcd's "BBolt B+ tree + Raft" is the modern default</h3>
+<p>Coordination workloads share four characteristics: (1) small dataset, (2) read-heavy, (3) writes already gated by consensus fsync, (4) range scans over prefixes are common. These point at a <strong>B+ tree</strong> state machine rather than an LSM (Log-Structured Merge) tree. LSM's advantage — absorbing high write throughput by sequential writes — is wasted when Raft fsync is the ceiling. B+ tree gives predictable read latency, clean range scans, mmap-friendly I/O, and no compaction stalls.</p>
+<p>BBolt (fork of Bolt, itself LMDB-inspired) implements a copy-on-write B+ tree. Combined with Raft for log replication and MVCC (Multi-Version Concurrency Control) for revision-based watches, this is the canonical modern stack. Every new coordination service since 2015 — etcd, CockroachDB's stores, TiKV's range storage — has converged on a variant of this design.</p>
+<hr>
+<h2 id="4-byte-level-mechanics-raft-bbolt-mvcc-watch">§4. Byte-level mechanics — Raft, BBolt, MVCC, watch</h2>
+<p>Raft mechanics, BBolt B+ tree page layout, MVCC revision keying, watch implementation, fsync ordering, and a byte-level walkthrough of one write.</p>
+<h3 id="41-raft-consensus-log">4.1 Raft consensus log</h3>
+<p>Raft gives every voter the same <strong>totally ordered log of entries</strong>. Once a log entry is committed (acked by majority quorum), it is applied to the state machine on every node in the same order. The state machine is incidental — Raft provides the log; the state machine consumes it.</p>
+<p>Each Raft entry:</p>
+<pre><code>struct LogEntry {
+    uint64 term;          // election term when created
+    uint64 index;         // monotonic, 1, 2, 3, ...
+    bytes  command;       // serialized state-machine command
+}
+</code></pre>
+<p>Every voter holds three monotonically increasing counters:</p>
+<ul>
+<li><code>commitIndex</code> — highest index known to be committed (acked by majority).</li>
+<li><code>appliedIndex</code> — highest index applied to the state machine.</li>
+<li><code>currentTerm</code> — the election term the node believes it is in.</li>
+</ul>
+<p>Invariant: <code>appliedIndex &lt;= commitIndex &lt;= lastLogIndex</code>.</p>
+<h4 id="leader-election">Leader election</h4>
+<p>Followers start a <strong>randomized election timeout</strong> between 150 and 300 ms (randomization is critical — without it, all followers time out simultaneously and split the vote forever). When the timer fires:</p>
+<ol>
+<li>Transition to candidate; increment <code>currentTerm</code>; vote for self.</li>
+<li>Send <code>RequestVote(term, candidateId, lastLogIndex, lastLogTerm)</code> to peers.</li>
+</ol>
+<p>Each peer votes <code>yes</code> only if (a) it has not voted in this term AND (b) the candidate's log is at least as up-to-date as its own. "Up-to-date" means: candidate's <code>lastLogTerm &gt; yours</code>, OR <code>lastLogTerm == yours AND lastLogIndex &gt;= yours</code>. This is the <strong>log completeness check</strong> — preventing a node with a stale log from becoming leader and overwriting committed entries.</p>
+<p>The candidate wins with <code>floor(N/2) + 1</code> votes (including itself). Transitions to leader, immediately sends heartbeats (empty <code>AppendEntries</code>) to suppress peers' election timers. Split-vote case: both candidates retry at higher term with new randomized timeouts; one usually fires earlier and wins. Election completes in 1-2 cycles, ~300-600 ms.</p>
+<h4 id="log-replication">Log replication</h4>
+<p>Per follower:</p>
+<pre><code>nextIndex[f]  = leader's lastLogIndex + 1 (initial)
+matchIndex[f] = 0 (initial)
+
+loop:
+  prevLogIndex = nextIndex[f] - 1
+  prevLogTerm  = log[prevLogIndex].term
+  entries      = log[nextIndex[f] : nextIndex[f] + batch]
+
+  send AppendEntries(term, leaderId, prevLogIndex, prevLogTerm,
+                     entries, leaderCommit)
+
+  if response.success:
+      matchIndex[f] = nextIndex[f] + len(entries) - 1
+      nextIndex[f]  = matchIndex[f] + 1
+  else:
+      nextIndex[f] -= 1   // mismatch; step back
+</code></pre>
+<p>The follower, on receiving <code>AppendEntries</code>:</p>
+<ul>
+<li>If <code>term &lt; currentTerm</code>: reject.</li>
+<li>If <code>term &gt; currentTerm</code>: update, step down.</li>
+<li><strong>Consistency check</strong>: if <code>log[prevLogIndex].term != prevLogTerm</code>, reject. Leader steps back and retries until matching; follower then truncates and appends.</li>
+<li>Append entries to local log; <code>fsync</code> before responding.</li>
+<li>Update local <code>commitIndex = min(leaderCommit, lastLogIndex)</code>.</li>
+</ul>
+<p><strong>Commit rule</strong> (leader-side): <code>commitIndex</code> advances to the highest index <code>N</code> such that <code>N</code> was created in the <strong>current term</strong> AND a majority of <code>matchIndex[]</code> are <code>&gt;= N</code>. The "current term" restriction is the famous Raft Figure 8 fix — committing entries from prior terms requires committing a current-term entry on top, otherwise a deposed leader can resurrect and overwrite.</p>
+<h4 id="term-and-the-newer-term-wins-invariant">Term and the "newer term wins" invariant</h4>
+<p>Term is a Lamport-like logical clock. Every RPC carries the sender's term. Any node receiving a higher term: updates <code>currentTerm</code>, becomes follower, resets vote. This single invariant — higher term wins, lower term shuts down — prevents two leaders from coexisting. Even an isolated old leader steps down on the first message in a higher term, and since votes for a new term require seeing that term first, the old leader cannot commit anything new.</p>
+<h3 id="42-bbolt-copy-on-write-b-tree">4.2 BBolt — copy-on-write B+ tree</h3>
+<p>After a log entry is committed, etcd applies it to BBolt: a single-file embedded KV store using a copy-on-write B+ tree.</p>
+<h4 id="page-layout">Page layout</h4>
+<pre><code>BBolt file (e.g., default.etcd/member/snap/db)
+─────────────────────────────────────────────────
+ Page 0:  meta page A (root ptr, txn id, freelist, checksum)
+ Page 1:  meta page B (alternate copy — meta pages flip)
+ Page 2:  freelist
+ Page 3+: branch pages and leaf pages
+
+         ┌────────────────────────────────┐
+         │  Branch page (interior node)   │
+         │  ┌──┬──┬──┬──┬──┬──┬──┐        │
+         │  │k1│p1│k2│p2│k3│p3│..│  k+ptr │
+         │  └──┴──┴──┴──┴──┴──┴──┘        │
+         └─────┬───────┬──────────────────┘
+               │       │
+               ▼       ▼
+         ┌──────────┐  ┌──────────┐
+         │ Leaf     │  │ Leaf     │
+         │ k:v k:v  │  │ k:v k:v  │
+         └──────────┘  └──────────┘
+</code></pre>
+<p>4 KB pages. Leaf holds ~30-40 KV pairs. Branching factor <code>b ≈ 30-50</code>. At 8 GB / 4 KB pages = 2M pages, tree is 4-5 levels deep. With the working set in the OS page cache (the whole DB usually fits in RAM), a lookup is essentially a memory access. BBolt mmaps the file; reads are page-fault driven.</p>
+<h4 id="copy-on-write">Copy-on-write</h4>
+<p>When a write transaction mutates a page, BBolt allocates a <em>new</em> page from the freelist and writes the new version there. The parent's pointer is updated to the new child — but the parent must also be COW'd, and so on up to the root. At commit:</p>
+<ol>
+<li>New data pages are written and <code>fsync</code>'d.</li>
+<li>New root is written.</li>
+<li>Meta page is updated to point at the new root and <code>fsync</code>'d.</li>
+<li>Old pages go to the freelist (after no live reader is still referencing them).</li>
+</ol>
+<p>The double-fsync — once for data pages, once for the meta page — is the durability point. After the second fsync, a crash recovers to the new state. Crash between fsyncs: next startup reads the old meta page (still pointing at the old root); partially-written new pages are garbage.</p>
+<h4 id="why-a-b-tree-and-not-lsm">Why a B+ tree and not LSM</h4>
+<p>For LSM (RocksDB, LevelDB) the write path is sequential append to a memtable + commit log, then async compaction. This absorbs 50-100k writes/sec. But:</p>
+<ul>
+<li>Raft fsync already caps writes at ~10k/sec — LSM's write capacity is wasted.</li>
+<li>Read latency on LSM is unpredictable (probe multiple sorted runs + bloom filters).</li>
+<li>Compaction stalls are an operational problem.</li>
+<li>Range scans cross multiple sorted runs and require a merging iterator.</li>
+</ul>
+<p>B+ tree gives O(log_b N) point lookups with predictable cost, range scans along leaves with no merging, and no background compaction. Trade-off: lower max write throughput. Acceptable because Raft already capped it.</p>
+<h3 id="43-mvcc-layer">4.3 MVCC layer</h3>
+<p>etcd exposes a <strong>Multi-Version Concurrency Control</strong> keyspace: every key has a history of revisions. Each put/delete is assigned a globally monotonic <strong>revision number</strong>, which is the Raft log index for that operation:</p>
+<pre><code>revision 100: PUT /a = &quot;x&quot;        (mod=100, ver=1, create=100)
+revision 101: PUT /b = &quot;y&quot;        (mod=101, ver=1, create=101)
+revision 102: PUT /a = &quot;x'&quot;       (mod=102, ver=2, create=100)
+revision 103: DELETE /a           (mod=103, tombstone)
+revision 104: PUT /a = &quot;x''&quot;      (mod=104, ver=1, create=104)
+</code></pre>
+<p>BBolt stores:</p>
+<ul>
+<li><strong>Key bucket</strong>: <code>(/a, 100) -&gt; "x"</code>, <code>(/a, 102) -&gt; "x'"</code>, <code>(/a, 103) -&gt; tombstone</code>, <code>(/a, 104) -&gt; "x''"</code>.</li>
+<li><strong>Index bucket</strong> (in-memory btree): logical key <code>/a</code> → list of revisions with metadata.</li>
+</ul>
+<p>A read at revision <code>r</code> for <code>/a</code> finds the highest revision <code>&lt;= r</code>. A "watch from revision 100" replays every change at revision &gt; 100. <strong>Compaction</strong> (<code>etcdctl compact</code>) discards revisions below a threshold; auto-compaction every 5 minutes is standard.</p>
+<h3 id="44-watch-implementation">4.4 Watch implementation</h3>
+<pre><code>client → etcd: WatchCreate(key=&quot;/pods/&quot;, prefix=true, start_rev=12345)
+</code></pre>
+<p>Server: (1) registers the watch in an in-memory watcher table; (2) if <code>start_rev</code> is past (after compaction), replays from MVCC — the catch-up phase; (3) once caught up, the watcher is <strong>synced</strong> and receives every subsequent matching commit in order.</p>
+<p><strong>Fanout</strong>: 10k watchers × 10k writes/sec all touching a watched prefix = 100M events/sec — far past what etcd can do. This is why systems put aggregators in front of etcd (the Kubernetes apiserver). <strong>Contract</strong>: events delivered in order; clients reconnect with <code>start_rev = last_seen + 1</code>. If disconnected so long that compaction discarded the starting point, etcd returns <code>ErrCompacted</code> and the client does a full resync.</p>
+<h3 id="45-walk-through-one-write-end-to-end">4.5 Walk through one write end-to-end</h3>
+<p>Client issues <code>Put("/locks/job-runner", "node-7", lease=42)</code>.</p>
+<p><strong>Step 1</strong>: Client connects to one of three nodes. If on a follower, the follower returns the leader address. Call the leader <strong>A</strong>.</p>
+<p><strong>Step 2</strong>: A serializes the request as a Raft proposal and appends to its own log as <code>LogEntry { term=15, index=98234, command=&lt;bytes&gt; }</code>.</p>
+<p><strong>Step 3 — leader WAL fsync</strong>: A appends the new entry to its <code>wal/</code> segment file, then <code>fsync</code>s. <strong>This is the leader's durability point.</strong> Latency: ~1 ms on NVMe.</p>
+<p><strong>Step 4 — leader sends AppendEntries</strong> (in parallel with step 3):</p>
+<pre><code>AppendEntries {
+  term: 15, prevLogIndex: 98233, prevLogTerm: 15,
+  entries: [new entry at 98234], leaderCommit: 98233
+}
+</code></pre>
+<p><strong>Step 5 — followers WAL fsync and respond</strong>: B and C verify <code>prevLogIndex/prevLogTerm</code>, append, <code>fsync</code>, respond <code>success=true</code> with <code>matchIndex=98234</code>.</p>
+<p>In a 3-node cluster, A needs 1 follower ack (A + 1 follower = majority of 3). As soon as <strong>either</strong> B or C responds, the entry is committed.</p>
+<p><strong>Step 6</strong>: A sees <code>matchIndex[B]=98234</code>, advances <code>commitIndex</code> to 98234.</p>
+<p><strong>Step 7 — apply to BBolt</strong>: A's apply loop opens a write transaction, inserts MVCC entries (<code>key_bucket[("/locks/job-runner", 98234)] = "node-7"</code>), updates the in-memory index, associates the key with lease 42. Commits the BBolt transaction → BBolt's own fsync sequence (data pages → meta page).</p>
+<p><strong>Step 8</strong>: A responds to the client with revision 98234.</p>
+<p><strong>Step 9</strong>: Followers eventually apply when they see <code>leaderCommit=98234</code> on the next heartbeat.</p>
+<p><strong>Crash recovery at each step</strong>:</p>
+<ul>
+<li>Before step 3 fsync: nothing. Client times out. No node has the entry.</li>
+<li>After step 3, before step 4: A has the entry, B and C don't. New election may propagate or discard depending on whose log overtakes.</li>
+<li>After step 5: entry durable on 2 of 3 → committed. Next leader has it.</li>
+<li>Between steps 7 and 8: client doesn't know. Must retry; revision-based CAS handles idempotency.</li>
+</ul>
+<hr>
+<h2 id="5-capacity-envelope-illustrated-across-deployments">§5. Capacity envelope, illustrated across deployments</h2>
+<p>Back-of-envelope ceilings for a 3-node etcd-class Raft cluster on modern hardware (NVMe SSD, 10 Gbps network, intra-DC).</p>
+<h3 id="write-throughput-10ksec-sustained-30k-peak">Write throughput: ~10k/sec sustained, ~30k peak</h3>
+<p>Per write critical path: leader fsync 0.5-2 ms (NVMe), network RTT 0.2 ms intra-rack to 10 ms intra-region, follower fsync (parallel) 0.5-2 ms, apply fsync ~0.3 ms. <strong>End-to-end ~2 ms p50, ~8-10 ms p99.</strong> Past ~10k/sec sustained, fsync queues blow up and Raft heartbeats miss deadlines.</p>
+<p>Compare a sharded MySQL: a single primary does 20-40k writes/sec, a 64-shard cluster does 1.2M+. The coordination service is 100x slower on writes than a sharded OLTP database — by deliberate design, every write pays for a quorum fsync.</p>
+<h3 id="data-size-ceiling-8-gb">Data size ceiling: ~8 GB</h3>
+<p>etcd documents 2 GB default, 8 GB hard ceiling. Past that: BBolt becomes hard to compact/snapshot; a new follower joining at 8 GB / 1 Gbps takes 64 s of streaming during which it's not contributing to quorum; the in-memory MVCC index outgrows comfortable RAM.</p>
+<h3 id="watch-fanout-10k-streams">Watch fanout: ~10k streams</h3>
+<p>A single etcd cluster sustains ~10k active watch streams over gRPC, several hundred thousand individual key watches (prefix watches count as one stream). Event throughput tracks write throughput — every commit fans out to N matching watchers.</p>
+<h3 id="illustration-across-deployments">Illustration across deployments</h3>
+<p><strong>Kubernetes etcd, small (~100 nodes)</strong>: 100 MB state, 100-500 writes/sec, ~50 watchers. 3-node etcd, ~1 ms write latency.</p>
+<p><strong>Kubernetes etcd, large (5,000+ nodes; GKE, OpenAI training fleets)</strong>: 2-6 GB state, 5-10k writes/sec peak, hundreds of long-lived watches via the apiserver. 3- or 5-node, ~5 ms write p99. Aggressive compaction mandatory; CRDs and events sometimes sharded out.</p>
+<p><strong>Kubernetes etcd, very large (Alibaba, ByteDance: 100k+ nodes)</strong>: approaching 8 GB. Multiple apiserver replicas absorbing watch fanout. Dedicated SRE rotations on etcd health.</p>
+<p><strong>Kafka KRaft (3.3+, 2022)</strong>: pre-KRaft, LinkedIn-scale Kafka with 200k+ partitions hit the ZooKeeper wall — hundreds of thousands of znodes, watch fanout from every broker, controller failover taking <em>minutes</em> because the new controller had to scan the ZK tree. KRaft moved metadata into a Kafka topic (<code>__cluster_metadata</code>) backed by embedded Raft. Controller failover dropped to single-digit seconds; Kafka now scales past <strong>1M+ partitions per cluster</strong>.</p>
+<p><strong>HashiCorp Consul, service mesh</strong>: tens of thousands of services, ~5k writes/sec, watches from every proxy sidecar (potentially 50k+ proxies). Bundled SWIM gossip handles liveness without putting heartbeat traffic on Raft.</p>
+<p><strong>ZooKeeper for legacy Hadoop / HBase</strong>: a few MB of state, low write rate, hundreds of watchers. Legacy because the JVM operational footprint is heavier than etcd's.</p>
+<p><strong>Google Chubby cells (5-node Paxos)</strong>: lock hold times in <em>hours</em> — coarse-grained locks, not microsecond mutex replacements. Holds GFS master leases, Bigtable tablet ownership, Borg master locks.</p>
+<hr>
+<h2 id="6-architecture-in-context">§6. Architecture in context</h2>
+<p>The canonical pattern: a small Raft cluster (3 or 5 nodes), with optional <strong>aggregator layers</strong> between clients and the service to absorb watch fanout. Sharding, partitioning, and replication of <em>user</em> data happen at the data plane below; the coordination service itself is replicated by consensus only.</p>
+<pre><code>   ┌────────────────────────────────────────────┐
+   │   Coordination Service Cluster             │
+   │   3 or 5 voters (odd number for quorum)     │
+   │                                            │
+   │   ┌────────┐                                │
+   │   │ NODE A │  ← elected LEADER              │
+   │   │  WAL   │  ── AppendEntries ──┐          │
+   │   │ BBolt  │                     │          │
+   │   └────┬───┘                     │          │
+   │        │ heartbeat (50 ms)       ▼          │
+   │   ┌────▼───┐                  ┌────────┐    │
+   │   │ NODE B │ ←────────────────│ NODE C │    │
+   │   │  WAL   │                  │  WAL   │    │
+   │   │ BBolt  │                  │ BBolt  │    │
+   │   └────────┘                  └────────┘    │
+   └────────────────┬───────────────────────────┘
+                    │ gRPC (HTTP/2 multiplexed)
+        ┌───────────▼─────────────┐
+        │   Aggregator layer      │ (kube-apiserver,
+        │   - multiplexes watches │  Consul agent fleet,
+        │   - caches reads        │  optional but
+        │   - rate-limits writes  │  standard at scale)
+        └───────────┬─────────────┘
+                    │
+       ┌────────────┼────────────┐
+       │            │            │
+   ┌───────┐    ┌───────┐    ┌───────┐
+   │ watch │    │ lock+ │    │ config│
+   │ /pods │    │ fence │    │ read  │
+   └───────┘    └───────┘    └───────┘
+</code></pre>
+<p>Annotations:</p>
+<ul>
+<li><strong>Sharding key for writes</strong>: there isn't one. All writes go through the single leader. Total order is required; horizontal write scaling is explicitly given up.</li>
+<li><strong>Sharding key for reads</strong>: clients may read from any voter for <em>serializable</em> reads; reads from the leader (with read-index) are linearizable. etcd defaults to linearizable.</li>
+<li><strong>Replication</strong>: synchronous to majority quorum. 3 nodes → 2 acks. 5 nodes → 3 acks. Tolerates <code>(N-1)/2</code> failures.</li>
+<li><strong>Aggregator layer</strong>: standard in production. Without it, every client connects directly and exhausts watch capacity. The Kubernetes apiserver is the canonical example; Consul's agent fleet plays a similar role.</li>
+</ul>
+<h3 id="cluster-sizing">Cluster sizing</h3>
+<ul>
+<li><strong>3 nodes</strong> — standard. Tolerates 1 failure. Lower commit latency (one follower ack).</li>
+<li><strong>5 nodes</strong> — for tolerating 2 failures (Chubby defaults to 5). Higher commit latency.</li>
+<li><strong>7+ nodes</strong> — almost never right. Latency grows with slowest-of-quorum; fault tolerance grows sub-linearly.</li>
+</ul>
+<p>The asymmetry: <strong>adding nodes makes writes slower, not faster.</strong> Opposite of a normal database — the control-plane characteristic.</p>
+<hr>
+<h2 id="7-hard-problems-inherent-to-this-technology">§7. Hard problems inherent to this technology</h2>
+<h3 id="problem-1-write-throughput-ceiling">Problem 1 — Write throughput ceiling</h3>
+<p><strong>Naïve fix.</strong> "Add more nodes to scale writes." Walk through: 3-node etcd at 10k writes/sec, p99 = 8 ms. Add 2 nodes → 5; quorum = 3; writes need 2 follower acks; the slowest of 2 followers gates each commit. Result: <strong>higher p99 latency</strong> (~12 ms), throughput drops or stays flat. Made it worse.</p>
+<p><strong>Illustration</strong> — <em>Kubernetes apiserver during mass churn</em>. Node drain on a 5,000-node cluster generates pod status updates faster than etcd's 10k/sec.</p>
+<p><strong>Real fix</strong>: (1) reduce write rate at the source (batch, coalesce, move ephemeral state out); (2) shard at the workload level (Kubernetes does this for events); (3) for genuinely huge metadata, switch topology to embedded sharded consensus (CockroachDB-style).</p>
+<p>The L6 point: <strong>a Raft group's write throughput is fundamentally bounded by quorum fsync. You don't scale a Raft group; you make more Raft groups.</strong></p>
+<h3 id="problem-2-watch-storm-fanout-amplification">Problem 2 — Watch storm / fanout amplification</h3>
+<p><strong>Naïve fix.</strong> Send each event from etcd to every interested client.</p>
+<p><strong>Illustration</strong> — <em>Kubernetes apiserver, 5,000-node cluster</em>. 200k Pods; every kubelet, controller, and operator watches the Pod resource. 10k writes/sec × 10k watchers = 100M events/sec. At ~1 KB per event, 100 GB/sec of egress vs ~3.75 GB/sec aggregate network capacity. 25x over budget.</p>
+<p><strong>Real fix</strong>. The apiserver does <strong>watch aggregation</strong>: one etcd watch per resource type, then fanout to thousands of apiserver clients. Etcd sees O(resource_types) watches, not O(clients). Same pattern appears in Consul (agent fleet shields the Raft cluster) and Kafka (KRaft controller talks to brokers; brokers talk to clients).</p>
+<p>Lesson: <strong>the coordination service is not the fan-out engine.</strong></p>
+<h3 id="problem-3-split-brain-prevention-under-partition">Problem 3 — Split-brain prevention under partition</h3>
+<p><strong>Naïve fix.</strong> "Let both sides keep serving."</p>
+<p><strong>Illustration</strong> — <em>service mesh control plane during a rack switch failure</em>. Consul cluster across racks; top-of-rack switch fails, isolating the leader. If the isolated leader keeps acking writes, on heal the divergent histories corrupt service registrations.</p>
+<p><strong>Walk through</strong>: leader A at term 15, commitIndex=1000; partition isolates A; A keeps receiving writes, cannot get majority. If a buggy impl "optimistically" acks: A's log has 1001-1050 optimistic, B+C elect new leader at term 16, B's log has 1051-1100 committed. On heal, A sees term 16, steps down, truncates 1001-1050. <strong>Clients who saw 1001-1050 acked are wrong.</strong></p>
+<p><strong>Real fix</strong>: minority side <strong>refuses writes</strong>. After ~3 election timeouts without majority, even lease-based linearizable reads stop. CP under partition (Consistency over Availability). Being wrong is worse than being slow.</p>
+<h3 id="problem-4-scale-limits-past-8-gb">Problem 4 — Scale limits past 8 GB</h3>
+<p><strong>Naïve fix.</strong> "Increase the data quota." Every problem gets worse: snapshot transfer (16 GB / 1 Gbps = 128 s), MVCC index outgrows RAM, compaction stalls.</p>
+<p><strong>Illustration</strong> — <em>Kafka pre-KRaft at LinkedIn</em>. ZooKeeper znode count crossed several hundred thousand; controller failover took minutes. Same shape of problem in a different system.</p>
+<p><strong>Real fix — topology change</strong>: identify what's growing; move it out (events, large CRDs, secrets that shouldn't be there); if genuinely massive metadata, switch to embedded sharded consensus (CockroachDB / TiKV pattern).</p>
+<h3 id="problem-5-cross-region-coordination">Problem 5 — Cross-region coordination</h3>
+<p><strong>Naïve fix.</strong> "Stretch the etcd cluster across regions — 5 nodes, 3 in A, 2 in B."</p>
+<p><strong>Illustration</strong> — <em>global service discovery</em>. Leader in A; quorum = 3; if both A-followers are momentarily slow, every commit waits for a B-follower at 30+ ms RTT. p99 much worse. Partition between regions: B (2 nodes) cannot form quorum → read-only and stale.</p>
+<p><strong>Real fix</strong>: <strong>don't.</strong> Coordination is single-region. Each region has its own coordination service. For cross-region awareness, replicate state out-of-band (Kafka topic, CDC, eventually consistent).</p>
+<p>The L6 point: <strong>Raft is not a multi-region protocol.</strong> Spanner / CockroachDB / YugabyteDB cheat by running many Raft groups (one per shard) placed regionally — they don't run one Raft group across regions.</p>
+<h3 id="problem-6-disk-corruption-single-node-data-loss">Problem 6 — Disk corruption / single-node data loss</h3>
+<p><strong>Naïve fix.</strong> Restart and catch up via Raft log.</p>
+<p><strong>Walk through</strong>: Node B's SSD develops a bit flip in BBolt's meta page. WAL intact, BBolt unreadable. B refuses to start. Cluster is 2 of 3 — one more failure and it's down.</p>
+<p><strong>Real fix</strong>: <code>etcdctl member remove B</code>, wipe data dir, <code>etcdctl member add B-prime</code>, start with <code>--initial-cluster-state=existing</code>. B-prime receives full snapshot, catches up via log replay, rejoins. Plus backups: <code>etcdctl snapshot save</code> produces point-in-time backups; RPO = backup cadence.</p>
+<hr>
+<h2 id="8-failure-modes">§8. Failure modes</h2>
+<h3 id="leader-crashes-mid-write">Leader crashes mid-write</h3>
+<p>State: A is leader at term 15, has appended entry 5000 to WAL, sent AppendEntries. B fsync'd and acked. A crashes before responding to client.</p>
+<p>Recovery: B and C detect missing heartbeat; election timeout; B becomes candidate. B has entry 5000; B's <code>lastLogIndex=5000</code>. B wins election at term 16. B propagates entry 5000 to C (if needed), commits at term 16. When A reboots, sees term 16, steps down.</p>
+<p><strong>Durability point</strong>: B's fsync at step 3. Once a follower has fsync'd, the entry survives leader death — Raft's log completeness rule guarantees the next leader has all committed entries.</p>
+<h3 id="minority-partition">Minority partition</h3>
+<p>State: 5-node cluster, A is leader. Partition isolates A+B from C+D+E.</p>
+<p>A's side (minority): only 2 of 5 — A cannot commit. Reads (if served by A) continue with stale data until lease expires (~10 s default), then stop.</p>
+<p>C+D+E (majority): election, new leader at term 16, accepts writes.</p>
+<p>Heal: A sees term 16, steps down, truncates any uncommitted entries past divergence, catches up.</p>
+<p><strong>Durability point</strong>: nothing was committed on A's side. Uncommitted entries are safe to discard because they were never acked.</p>
+<h3 id="slow-disk-on-a-single-node">Slow disk on a single node</h3>
+<p>State: B's disk degrades — fsyncs take 200 ms instead of 1 ms. Leader A sends AppendEntries to B and C; C fsyncs in 1 ms, A has majority, commits. B is permanently lagging; <code>matchIndex[B]</code> falls behind. Cluster works but no longer tolerates further failures.</p>
+<p><strong>Detection</strong>: <code>etcd_disk_backend_commit_duration_seconds</code>, <code>etcd_network_peer_send_failures_total</code>. <strong>Mitigation</strong>: replace B's disk; rejoin as fresh member.</p>
+<h3 id="snapshot-transfer-overload">Snapshot transfer overload</h3>
+<p>State: B offline a long time. Leader's log has been compacted past B's <code>nextIndex</code>. Leader must send a snapshot — full BBolt file (~8 GB) over the network. During transfer, B is not contributing to quorum. If B is one of 3, you are operating with 2-of-3, tolerating 0 failures.</p>
+<p><strong>Mitigation</strong>: keep <code>--snapshot-count</code> low enough that nodes don't fall too far behind. Don't let nodes stay offline for long. For very large state, replace members one at a time, never in parallel.</p>
+<h3 id="permanent-participant-loss">Permanent participant loss</h3>
+<p>State: lose 2 of 5 permanently. Quorum now 3 of 3 — one more failure brings the cluster down.</p>
+<p>Recovery: replace lost members one at a time. For each: <code>member remove</code>, then <code>member add</code>, then start replacement with <code>--initial-cluster-state=existing</code>. Each replacement triggers snapshot transfer. Never parallelize — that risks data divergence; this is what Raft's joint-consensus membership change protocol was designed to prevent.</p>
+<hr>
+<h2 id="9-why-not-redis-setnx-for-distributed-locks">§9. Why not Redis SETNX for distributed locks</h2>
+<p>A junior engineer says: "I'll just use Redis SETNX for distributed locks. Sub-millisecond latency, already deployed." Let's walk through why this is wrong.</p>
+<h3 id="failure-1-gc-pause-scheduling-delay-breaks-lease-semantics">Failure 1 — GC pause / scheduling delay breaks lease semantics</h3>
+<pre><code class="language-python"># Naïve Redis lock
+if redis.set(&quot;lock:account:X&quot;, worker_id, nx=True, ex=30):
+    do_critical_section()   # transfer $500
+    redis.delete(&quot;lock:account:X&quot;)
+</code></pre>
+<p>Worker A acquires at t=0. Java GC pause (or kernel scheduler delay, or hypervisor steal) lasting 35 seconds. Redis key expires at t=30. Worker B SETNX succeeds at t=31, starts its critical section. A wakes up at t=35 still believing it holds the lock; A proceeds with the transfer. <strong>Both A and B execute the critical section simultaneously.</strong> Account X is debited twice.</p>
+<p>Fix: <strong>fencing tokens</strong> — every acquisition returns a monotonically increasing token; the downstream resource refuses operations with a token less than the most recent it has seen:</p>
+<pre><code class="language-python">token = redis.incr(&quot;lock:counter:account:X&quot;)
+if redis.set(&quot;lock:account:X&quot;, token, nx=True, ex=30):
+    db.transfer(amount=500, fencing_token=token)
+    # DB checks: token &gt;= last token seen for this account
+</code></pre>
+<h3 id="failure-2-redis-failover-loses-the-counter">Failure 2 — Redis failover loses the counter</h3>
+<p>Redis is typically run with async replication primary→replica.</p>
+<ol>
+<li>Worker A: <code>incr counter</code> → 42. Acquires lock with token 42.</li>
+<li>Primary crashes <em>before</em> replicating the increment.</li>
+<li>Replica promoted. Its counter is still at 41.</li>
+<li>Worker B: <code>incr counter</code> → 42 (again!). Acquires lock with token 42.</li>
+<li><strong>Two workers, both with fencing token 42.</strong> The DB's "must be &gt;= last seen" check doesn't help — both have the same token.</li>
+</ol>
+<p>The core failure: <strong>Redis's replication is not consensus.</strong> Async means the post-failover state is not a consistent prefix of the pre-failover state. Counters can go backward. Locks can be granted twice.</p>
+<h3 id="failure-3-redlock-and-the-kleppmann-critique">Failure 3 — Redlock and the Kleppmann critique</h3>
+<p>Antirez proposed Redlock — acquire the lock on a majority of N independent Redis nodes, with strict time bounds. Martin Kleppmann's 2016 critique:</p>
+<ul>
+<li>Redlock relies on bounded clock drift. NTP sync, hypervisor pause, leap second — safety fails.</li>
+<li>Redlock cannot provide monotonic fencing tokens unique across failures; each Redis node has its own counter and they don't agree.</li>
+<li>A GC pause on the client still breaks Redlock because expiration is wall-clock based.</li>
+</ul>
+<h3 id="why-coordination-services-get-this-right">Why coordination services get this right</h3>
+<ol>
+<li><strong>Every operation goes through consensus.</strong> Lock acquisition is a Raft log entry, ordered globally, durable on majority.</li>
+<li><strong>Fencing tokens come from the Raft commit index</strong> (or etcd's revision, or ZooKeeper's zxid). Monotonically increasing across all failures. Even on leader change, the new leader's commit index continues where the old one left off.</li>
+<li><strong>Lease semantics tied to consensus.</strong> Expiry is determined by the coordination service's view of client liveness, not by the client's local clock.</li>
+<li><strong>Linearizability.</strong> The lock either holds or it doesn't.</li>
+</ol>
+<p>The L6 answer: <strong>"Redis SETNX is a fast single-node primitive. Coordination is a multi-node consensus problem. If 'low-latency lock' is the real requirement, the fix is to reduce contention, not to weaken consistency."</strong></p>
+<hr>
+<h2 id="10-scaling-axes">§10. Scaling axes</h2>
+<p>Two distinct axes, different inflection points, different fixes.</p>
+<h3 id="type-1-uniform-growth-more-clients-more-watches">Type 1 — uniform growth (more clients, more watches)</h3>
+<p><strong>Baseline (1x)</strong>: 1k clients, 100 watches, 1k writes/sec, 100 MB state. Single 3-node cluster. Boring happy place.</p>
+<p><strong>10x</strong> (10k clients, 1k watches, 5k writes/sec): pressure is <strong>watch fanout</strong>, not throughput. Each commit emits hundreds of events. <strong>Fix</strong>: aggregator layer (apiserver pattern). One aggregator process (or several, horizontally scaled) maintains the etcd watches and re-broadcasts to clients. etcd sees ~10 watches; aggregator handles 10k connections. Topology unchanged at the etcd layer.</p>
+<p><strong>100x</strong> (100k clients — every kubelet in a giant cluster): aggregator is now the bottleneck. <strong>Scale the aggregator horizontally</strong> — multiple apiservers, each handling a client slice. They all watch the same etcd. etcd is still 3 nodes. <strong>Do not scale etcd horizontally for client load.</strong></p>
+<h3 id="type-2-state-growth-more-keys-larger-values">Type 2 — state growth (more keys, larger values)</h3>
+<p><strong>10x</strong> (state from 100 MB to 1 GB): pressure is snapshot transfer time, compaction stalls, MVCC index memory. <strong>Fix</strong>: aggressive compaction (<code>etcdctl compact</code>), identify and prune noisy resource types (Kubernetes events example).</p>
+<p><strong>100x</strong> (state past 8 GB): <strong>structural inflection</strong>. Cannot keep growing one cluster. Options:</p>
+<ol>
+<li><strong>Shard at the workload level</strong> — multiple coordination clusters, each owning a subset of the keyspace, with aggregator layer doing routing. Kubernetes events-sharding is the lightweight version.</li>
+<li><strong>Replace backend entirely</strong> — k3s/k0s use SQLite/MySQL/Postgres via <code>kine</code>. Loses true consensus semantics; appropriate only for small or edge clusters.</li>
+<li><strong>Embedded sharded consensus</strong> — CockroachDB / TiKV pattern. Every key range is its own Raft group; thousands of Raft groups run in parallel. Metadata scales to TB+. Cost is enormous engineering complexity.</li>
+</ol>
+<p>The interesting thing about scaling a coordination service is that <strong>most of the moves are anti-patterns at the consensus layer.</strong> You don't scale up; you scale <em>away</em>.</p>
+<hr>
+<h2 id="11-decision-matrix-vs-adjacent-categories">§11. Decision matrix vs adjacent categories</h2>
+<table>
+<thead>
+<tr>
+<th>Need</th>
+<th>Coordination service (etcd)</th>
+<th>Redis</th>
+<th>DB row lock</th>
+<th>DNS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Distributed lock with fencing</strong></td>
+<td>Yes — Raft index = token</td>
+<td>No — counter can go backward on failover</td>
+<td>Possible via single DB <code>SELECT FOR UPDATE</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td><strong>Service discovery — small fleet</strong></td>
+<td>Yes — watch on service prefix</td>
+<td>Possible but stale on failover</td>
+<td>DB + polling</td>
+<td>Yes if eventually consistent OK</td>
+</tr>
+<tr>
+<td><strong>Service discovery — large fleet</strong></td>
+<td>Yes if aggregated</td>
+<td>No</td>
+<td>DB bottleneck</td>
+<td>Yes — DNS scales naturally</td>
+</tr>
+<tr>
+<td><strong>Leader election</strong></td>
+<td>Yes — lease + revision</td>
+<td>Unsafe (async replication)</td>
+<td>Fragile via single-row CAS</td>
+<td>No</td>
+</tr>
+<tr>
+<td><strong>Config distribution</strong></td>
+<td>Yes — watch on prefix</td>
+<td>No reliable watch</td>
+<td>DB + cache + invalidation, complex</td>
+<td>No</td>
+</tr>
+<tr>
+<td><strong>Cluster membership</strong></td>
+<td>Yes</td>
+<td>Unsafe</td>
+<td>Possible</td>
+<td>No</td>
+</tr>
+<tr>
+<td><strong>High-throughput KV</strong></td>
+<td>No — 10k/sec ceiling</td>
+<td>Yes — 100k/sec single node</td>
+<td>Possible but slower</td>
+<td>No</td>
+</tr>
+<tr>
+<td><strong>User data</strong></td>
+<td>No — ~8 GB limit</td>
+<td>No — RAM limit, async repl</td>
+<td>Yes</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<h3 id="thresholds">Thresholds</h3>
+<ul>
+<li><strong>&lt; 100 services, eventually consistent OK</strong> → DNS is fine.</li>
+<li><strong>100-10k services, real-time updates</strong> → coordination service with aggregator (Consul, etcd).</li>
+<li><strong>Need fencing tokens</strong> → coordination service. Redis cannot give monotonic counters across failover.</li>
+<li><strong>Lock without fencing</strong> → if you really don't need fencing, Redis SETNX is faster. But pause and ask: do you really not need fencing? Most distributed-lock requirements that look benign actually do.</li>
+<li><strong>Both high throughput and consensus</strong> → embedded sharded consensus (CockroachDB style), not "use etcd."</li>
+</ul>
+<hr>
+<h2 id="12-use-case-gallery">§12. Use case gallery</h2>
+<h3 id="121-kubernetes-api-server-backing-store-etcd">12.1 Kubernetes API server backing store (etcd)</h3>
+<p>Every Kubernetes cluster runs a single etcd cluster as the sole persistent store for <em>all</em> cluster state — Pods, Nodes, Services, ConfigMaps, Secrets, CustomResources, leases, controller bookmarks. The kube-apiserver is the only thing that talks to etcd. Controllers reconcile by watching the apiserver, which multiplexes their watches off a small number of etcd watches per resource type. Textbook control-plane design: aggregator (apiserver) in front of a tiny consensus core (etcd).</p>
+<h3 id="122-kafka-kraft-metadata-embedded-raft">12.2 Kafka KRaft metadata (embedded Raft)</h3>
+<p>Kafka 3.3+ embeds its own Raft quorum into controller nodes, replacing the external ZooKeeper ensemble Kafka used from 2011 to 2022. Cluster metadata (broker membership, topic configs, partition assignments) lives in an internal topic (<code>__cluster_metadata</code>) backed by Raft. Controller failover went from minutes to seconds. The lesson: <strong>at extreme scale, embedding consensus into the system itself is often better than running an external coordination service</strong> — controller state can be loaded by log replay rather than full tree scan.</p>
+<h3 id="123-hashicorp-consul-service-mesh">12.3 HashiCorp Consul + service mesh</h3>
+<p>Consul bundles a 5-node Raft cluster (KV + service catalog) with a SWIM-based gossip layer for peer liveness. Raft holds authoritative state; gossip handles the high-frequency "is X alive" without burdening Raft. Service mesh proxies (Envoy via Connect) consume the catalog via the local Consul agent, which acts as a per-host aggregator. "Coordination service plus aggregator fleet" in pure form.</p>
+<h3 id="124-cassandra-cluster-topology-gossip-lightweight-paxos">12.4 Cassandra cluster topology (gossip + lightweight Paxos)</h3>
+<p>Cassandra uses gossip for the bulk of cluster awareness (node liveness, range ownership) but relies on <strong>embedded Paxos</strong> for the few operations that need linearizability — schema changes, lightweight transactions (LWT). LWTs use Paxos directly between Cassandra nodes for compare-and-set semantics. Hybrid: gossip for fast eventual coordination, embedded Paxos for the few strong-consistency operations.</p>
+<h3 id="125-tikv-cockroachdb-embedded-raft-sharded-consensus">12.5 TiKV / CockroachDB embedded Raft (sharded consensus)</h3>
+<p>These systems don't use a separate coordination service for user data. Every key range (a "region" in TiKV, a "range" in CockroachDB) is its own Raft group. A cluster runs <strong>thousands of Raft groups in parallel</strong>, each managing ~64-96 MB and replicated across 3-5 nodes. A separate, smaller coordination service (TiDB's Placement Driver; CockroachDB's internal <code>liveness</code> range) handles cluster-level metadata. The design that scales coordination semantics to petabytes by partitioning the consensus problem itself.</p>
+<h3 id="126-distributed-cron-scheduled-job-leader-election">12.6 Distributed cron / scheduled job leader election</h3>
+<p>A canonical small use: 10 worker nodes agree on which runs the nightly batch. Each tries to acquire a lease on <code>/jobs/nightly-rollup/leader</code>. The winner runs the job; the others poll. If the leader dies mid-job, its lease expires; another node grabs it and re-runs. 20 lines in etcd's client library. Variants everywhere: Airflow scheduler election, Kafka MirrorMaker, any single-active worker pattern.</p>
+<h3 id="127-feature-flag-config-distribution">12.7 Feature flag / config distribution</h3>
+<p>The feature-flag service holds current values in a coordination service. Application instances watch the flag prefix. When an operator updates a flag, every instance receives the watch event and updates in-process config within milliseconds. Much better than polling a DB every N seconds because (a) propagation is immediate and (b) the watch contract guarantees no missed updates. LaunchDarkly-class systems and many homegrown flag systems use etcd or Consul for this.</p>
+<hr>
+<h2 id="13-real-world-implementations-with-numbers">§13. Real-world implementations with numbers</h2>
+<p><strong>Kubernetes (etcd)</strong>. Every K8s cluster runs a 3- or 5-node etcd. Largest known: Alibaba and ByteDance publicly run clusters past 100,000 nodes; OpenAI training fleets and Google GKE customers in the same range. State 2-6 GB, occasionally 8 GB. Peak write rates 5-10k/sec during mass churn. Watch fanout via the apiserver is the architecturally important layer.</p>
+<p><strong>Kafka KRaft (replacing ZooKeeper, 2022)</strong>. Pre-KRaft, LinkedIn-scale Kafka with 200k+ partitions hit the ZooKeeper wall — hundreds of thousands of znodes, watch fanout from every broker, controller failover in <em>minutes</em>. KRaft replaced this with an embedded Raft quorum and <code>__cluster_metadata</code> topic. Controller failover dropped to single-digit seconds; Kafka now scales past 1M+ partitions per cluster.</p>
+<p><strong>Google Chubby (2006, Burrows et al.)</strong>. 5-node Paxos quorums inside Google datacenters. Substrate for GFS master locking, BigTable tablet ownership, BorgMaster election, and (notoriously) a name service used so widely that "the name service is unavailable" became a Google-internal failure category. Lock hold times in <em>hours</em> — coarse-grained, low contention.</p>
+<p><strong>HashiCorp Consul</strong>. Service discovery + KV + health checks. 5-node Raft for KV+catalog; SWIM gossip for liveness. WAN federation lets Consul span regions for the catalog (not for strongly-consistent KV across regions). Scales to tens of thousands of services and proxy sidecars.</p>
+<p><strong>Apache ZooKeeper (Kafka pre-KRaft, HBase, Hadoop)</strong>. The original Java-based coordination service. Used by Kafka (pre-3.3), HBase (region assignment), Hadoop YARN (RM HA), Solr (collection metadata). Handles ~10-50k writes/sec. Modern systems migrate away because the JVM operational footprint is heavier than etcd's and the one-shot watch model is harder to reason about than etcd's replayable revision-based watch.</p>
+<p><strong>TiKV / TiDB (embedded sharded Raft)</strong>. Raft group per "region" (~96 MB). A 500-node TiKV cluster runs &gt;100k Raft groups in parallel. The Placement Driver (PD) is a separate 3-node etcd cluster for cluster-level metadata.</p>
+<p><strong>CockroachDB</strong>. Every range (~64 MB) is its own Raft group; a 100-node cluster runs tens of thousands of Raft groups; at scale, &gt;100k. Internal <code>liveness</code> and <code>system</code> ranges hold cluster-level metadata.</p>
+<p><strong>etcd in <code>kine</code> (k3s / k0s)</strong>. k3s swaps etcd for a SQL backend (SQLite, MySQL, Postgres) via a translation layer called <code>kine</code>. Works for small/edge clusters but loses true consensus semantics — relies on the underlying DB's consistency model. Useful as a reminder that the <em>interface</em> (Kubernetes' KV usage) is separable from the <em>implementation</em> (real Raft vs DB row locks).</p>
+<hr>
+<h2 id="14-l6-summary-line">§14. L6 summary line</h2>
+<blockquote>
+<p><em>Coordination services are a deliberately tiny, deliberately slow, deliberately CP class of strongly-consistent KV stores — etcd, ZooKeeper, Consul, Chubby — built on a single Raft (or Zab, or Paxos) group with quorum-fsync writes, capped at ~10k writes/sec and ~8 GB of state, designed to hold the control-plane truth that every other distributed component depends on; they are not databases, caches, or queues, but the consensus log that resolves "who's the leader, where do the shards live, what's the config, who holds this lock," with linearizability, fencing tokens that survive failover, and ordered watch streams; you don't scale them up — you scale them away by fronting them with an aggregator for watch fanout, pruning what doesn't belong, and switching to embedded sharded consensus (CockroachDB / TiKV / Kafka KRaft) when one Raft group is no longer enough — because only a real consensus log gives you a counter that never goes backward.</em></p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+</body>
+</html>

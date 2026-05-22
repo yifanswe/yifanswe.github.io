@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Observability — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1 class="site-name"><a href="/" style="color:inherit">Yifan Li</a></h1>
+        <p class="site-slogan">Building Systems. Empowering People. Chasing the Horizon. Being Kind.</p>
+        <nav class="nav">
+            <a href="/">Home</a>
+            <a href="/system-design/">System Design</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design/">← Back to System Design</a>
+        <h1 class="article-title">Observability</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Backend Components Deep-Dive
+        </div>
+        <div class="article-content">
+<blockquote>
+<p>A Staff/L6 technology reference. Observability is the class of systems that collect, store, and query telemetry from production software so humans (and increasingly machines) can diagnose what is happening. It is not one product; it is a tripod of three pillars — metrics, logs, traces — each with a distinct storage engine forced by a distinct access pattern. This doc covers the class.</p>
+</blockquote>
+<hr>
+<h2 id="1-what-observability-is">§1. What Observability Is</h2>
+<p>Observability is <strong>telemetry collection + storage + query for diagnosing production systems</strong>. The output of an observable system is the ability to answer questions you didn't know you were going to ask, in production, without redeploying — distinguishing it from classical "monitoring," which only answers questions you wired dashboards for ahead of time.</p>
+<p>An observability stack does three things: <strong>instrumentation</strong> (SDK in-process — OpenTelemetry, Datadog agent, Prometheus client lib, Sentry SDK), <strong>transport and storage</strong> (telemetry shipped async into per-pillar storage tiers), and <strong>query/alerting</strong> (dashboards, ad-hoc investigations, threshold or error-budget alerts).</p>
+<h3 id="the-three-pillars">The three pillars</h3>
+<p>Not three views of the same data — three different data types with different volume, shape, and query patterns.</p>
+<ul>
+<li><strong>Metrics.</strong> Pre-aggregated numeric time-series. Low volume per data point (one float + one timestamp + a label set), high cardinality if labels run wild. Access pattern: range scan over a labeled series, often aggregated (<code>sum</code>, <code>rate</code>, <code>histogram_quantile</code>). Used for dashboards, SLO (Service Level Objective) tracking, most alerts. Example: <code>http_requests_total{service="checkout",status="500"}</code> sampled every 10 seconds.</li>
+<li><strong>Logs.</strong> Free-form or structured text events emitted by application code. High volume (the biggest chunk of an observability bill), variable content, queries mix grep-style substring search with structured filters. Used for incident forensics, audit trails, and increasingly product analytics. Example: a JSON line <code>{"ts":"...","level":"ERROR","service":"payment","trace_id":"abc","msg":"stripe API returned 500"}</code>.</li>
+<li><strong>Traces.</strong> Causal chains of work across services. A trace is a tree of spans, each span a (start_time, duration, service, operation, attributes, parent_span_id) tuple. Volume scales with <code>requests × span_count_per_request</code>, so sampling is mandatory at any non-trivial scale. Used for "where did this request spend its time." Example: one user click producing 20 spans across api-gateway → auth → checkout → payment → stripe.</li>
+</ul>
+<h3 id="where-it-sits-and-what-it-isnt">Where it sits and what it isn't</h3>
+<p>Observability lives <strong>alongside</strong> the application, not inside the request path. Done right, it's invisible to user latency; done wrong, a synchronous log flush wedges the application. It is <strong>not</strong> a substitute for testing, <strong>not</strong> a transactional system (telemetry is best-effort — dropping 0.01% of metric samples on restart is fine), <strong>not</strong> a single-product question ("install Datadog" is sourcing, not design; the technology choices — pull vs push, full-text vs label index, head vs tail sampling — exist regardless of vendor), and <strong>not</strong> real-time × full-fidelity × unbounded retention × cheap. Every platform picks two of those four and trades the rest.</p>
+<hr>
+<h2 id="2-inherent-guarantees-per-pillar">§2. Inherent Guarantees per Pillar</h2>
+<p>Each pillar has a contract — what it provides by design and what you cannot have. The trap is assuming guarantees the technology doesn't make.</p>
+<p><strong>Metrics.</strong> <em>You get:</em> cheap aggregation, predictable storage, fast range queries by label. <code>rate(http_requests_total[5m]) by (service)</code> over thousands of series returns in milliseconds because the TSDB (Time-Series Database) is structurally optimized for this shape. <em>You don't get:</em> per-event detail — once you've incremented a counter, you cannot ask "which specific user caused this?"; that information was discarded at aggregation. High cardinality is also not free; each unique label-value combination is its own series. <em>Must be layered:</em> SLO definitions, alerting rules, exemplars (a histogram-bucket pointer to a sample trace).</p>
+<p><strong>Logs.</strong> <em>You get:</em> the full event payload, durably stored, queryable by any indexed field. Logs are the "ground truth" of what each service saw and did. <em>You don't get:</em> cheap — log volume dwarfs metrics by 50-200x in bytes. You also don't automatically get correlation; a log line is just a string unless the application stamps <code>trace_id</code>, <code>service</code>, <code>user_id</code>. <em>Must be layered:</em> structured schema, trace context propagation, retention tiering, PII (Personally Identifiable Information) scrubbing, per-service rate limits.</p>
+<p><strong>Traces.</strong> <em>You get:</em> causal structure. Given a trace_id you can reconstruct the full tree of who called whom, with timing for each hop. The only pillar that natively expresses "the latency came from the third gRPC call to payment." <em>You don't get:</em> complete coverage. Tracing without sampling is uneconomical above ~10k requests/sec; whatever you didn't sample doesn't exist. <em>Must be layered:</em> sampling strategy (head/tail/hybrid), trace context propagation across HTTP, gRPC, Kafka, Espresso CDC (Change Data Capture), cron — every async boundary.</p>
+<p><strong>The bound you can't escape:</strong> <strong>real-time × full-fidelity × unbounded retention × cheap — pick two.</strong> Metrics give up detail (pre-aggregate). Logs give up retention (tier to cold). Traces give up coverage (sample). Cost determines how aggressively each pillar pays the toll.</p>
+<hr>
+<h2 id="3-the-design-space">§3. The Design Space</h2>
+<p>The class has axes. Pick a position on each.</p>
+<p><strong>Axis A: collection model — pull vs push.</strong> Pull (Prometheus) — the TSDB scrapes <code>/metrics</code> on a schedule. Strength: cardinality and rate bounded by scraper config. Weakness: must reach every target — breaks behind NAT (Network Address Translation), firewalls, or for short-lived batch jobs. Push (Datadog agent, StatsD, OTLP/HTTP) — the application sends telemetry to a collector. Strength: works for serverless, batch, cross-region. Weakness: a runaway client can DDoS the platform; mitigated by per-tenant rate limits. Most large platforms are hybrid — Prometheus pulls long-running services, OTLP receivers handle short-lived jobs.</p>
+<p><strong>Axis B: log indexing strategy.</strong>
+- <em>Inverted index per word</em> (ELK = Elasticsearch + Logstash + Kibana, OpenSearch, Splunk). Sub-second full-text grep. Storage 1.5-3x raw; operational cost high (Lucene shards, JVM tuning).
+- <em>Label index only</em> (Loki, Grafana Cloud Logs). Index a small set of labels (service, level, region); payload as compressed chunks. Cheap. Grep scans chunks at query time — fine for <code>service=api last 1h</code>, bad for global string search.
+- <em>Columnar</em> (ClickHouse, Apache Pinot for logs, Honeycomb's Retriever). Row per log line, column per JSON field. Fast SQL aggregations, cheap storage via columnar compression. Weak at substring grep on free text, strong at "how often does X happen by category."
+- <em>Object-store + Parquet</em> (CloudWatch Logs Insights, Athena, Snowflake on logs). Cheapest storage; query latency seconds-to-minutes. Compliance retention, not incident grep.</p>
+<p><strong>Axis C: trace sampling.</strong> <em>Head</em> — decide at trace start, propagate with request. Cheap, cannot preferentially keep errors. <em>Tail</em> — every span emitted, buffered by trace_id ~30s, decision keeps errors + slow + p% random. Expensive in memory; requires partitioning all spans of a trace to one collector. <em>Hybrid</em> — head at 10% then tail on the remainder. Most production platforms.</p>
+<p><strong>Axis D: storage tier model.</strong> <em>Hot-only</em> (Monarch holds metrics in RAM regionally; cheap to query, expensive to scale). <em>Tiered</em> (Prometheus + Thanos: 2h blocks NVMe, older to S3; Loki: recent chunks local SSD, older in object storage). <em>Object-store native</em> (Tempo: Parquet in S3, bloom-filter index; cheapest, highest cold-read latency).</p>
+<p><strong>Axis E: instrumentation framework.</strong> Vendor-specific SDKs (Datadog agent, New Relic) — rich auto-instrumentation, lock-in. <strong>OpenTelemetry (OTel)</strong> — vendor-neutral, CNCF (Cloud Native Computing Foundation) project; Google, Microsoft, AWS, Datadog, Splunk, Honeycomb, New Relic all back it. Default pick in 2026 if you don't want lock-in.</p>
+<h3 id="comparison-table">Comparison table</h3>
+<table>
+<thead>
+<tr>
+<th>Variant</th>
+<th>Collection</th>
+<th>Index strategy</th>
+<th>Cost shape</th>
+<th>Best for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prometheus + Mimir</td>
+<td>pull</td>
+<td>inverted label index, Gorilla chunks</td>
+<td>low storage, cardinality-bounded</td>
+<td>metrics for any long-running fleet</td>
+</tr>
+<tr>
+<td>Datadog (SaaS)</td>
+<td>push agent</td>
+<td>proprietary columnar TSDB + log columnstore</td>
+<td>high $/GB, low ops</td>
+<td>shops that buy not build</td>
+</tr>
+<tr>
+<td>ELK / OpenSearch</td>
+<td>push</td>
+<td>full-text Lucene inverted</td>
+<td>high $/GB, high ops</td>
+<td>strong full-text needs, smaller volume</td>
+</tr>
+<tr>
+<td>Loki + Grafana</td>
+<td>push</td>
+<td>label-only + zstd chunks in S3</td>
+<td>low $/GB, slower grep</td>
+<td>large fleets with grep-not-aggregate logs</td>
+</tr>
+<tr>
+<td>ClickHouse / Pinot for logs</td>
+<td>push (Kafka)</td>
+<td>columnar, per-column indexes</td>
+<td>low $/GB, fast aggregations</td>
+<td>SQL log analytics, dashboards</td>
+</tr>
+<tr>
+<td>Honeycomb</td>
+<td>push</td>
+<td>columnar event store</td>
+<td>medium $/GB, ad-hoc query strength</td>
+<td>high-cardinality wide-event analysis</td>
+</tr>
+<tr>
+<td>Jaeger / Cassandra</td>
+<td>push, sampled</td>
+<td>trace_id partitioned LSM</td>
+<td>bounded by sample rate</td>
+<td>per-request causal investigation</td>
+</tr>
+<tr>
+<td>Tempo + S3</td>
+<td>push, sampled</td>
+<td>Parquet + bloom filter in object store</td>
+<td>very low $/GB</td>
+<td>cheap long-retention traces</td>
+</tr>
+<tr>
+<td>Honeycomb Retriever</td>
+<td>push, often unsampled</td>
+<td>columnar wide events</td>
+<td>medium-high $/GB</td>
+<td>"ask weird questions" workflows</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="4-byte-level-per-pillar">§4. Byte-Level Per Pillar</h2>
+<p>This is where most observability writeups hand-wave with "stores time-series data." Each pillar has a different engine, and the engine choice is forced by the access pattern.</p>
+<h3 id="41-metrics-prometheus-tsdb-with-gorilla-compression">4.1 Metrics — Prometheus TSDB with Gorilla compression</h3>
+<p>The Prometheus TSDB is a custom append-only time-series engine derived from Facebook's <strong>Beringei</strong> / Gorilla paper (VLDB 2015). It is the de facto reference design — M3DB, VictoriaMetrics, InfluxDB IOx, Mimir, Cortex, and Datadog's internal TSDB all use the same family of techniques.</p>
+<p><strong>Why a custom engine and not RocksDB or InnoDB?</strong> Four facts force the choice: (1) writes are append-only with monotonically increasing timestamps; (2) float values within one series are highly correlated; (3) reads are almost always range scans over a labeled series; (4) cardinality is the dominant cost driver, not throughput. An LSM (Log-Structured Merge) tree forces compaction overhead and duplicates the series identifier in every record. A B+ tree wastes space on internal nodes and is terrible at random writes. The Prometheus TSDB is best understood as <strong>a specialized append-only LSM with a custom value codec (Gorilla) and coarse block-level compaction (the 2h block merge)</strong>.</p>
+<p><strong>On-disk block layout (one 2-hour chunk):</strong></p>
+<pre><code>block/
+  meta.json                         # block ID, time range, stats
+  chunks/
+    000001                          # raw chunks file (binary)
+    000002
+  index                             # inverted index of label values
+  tombstones                        # deleted ranges (rare)
+
+A chunk inside chunks/000001:
+  +---------+-----------+---------+-----------+----------------+
+  | header  | timestamp | first   | timestamp | ... compressed |
+  | (series | header    | sample  | delta of  | delta-of-delta |
+  |  ref)   | base      | (full)  | delta     | + XOR floats   |
+  +---------+-----------+---------+-----------+----------------+
+   ~10 B     ~10 B       ~16 B     ~1-4 b/sample  ~1-12 b/sample
+</code></pre>
+<p>The "1.37 bytes/sample" Gorilla figure comes from the steady state of this format averaged over many real Facebook samples. Compared to a naive 16 bytes/sample encoding (8B timestamp + 8B float), Gorilla is <strong>roughly 12x denser</strong>. At a 9M-samples/sec fleet, that's 12 MB/sec vs 144 MB/sec — the difference between a small TSDB cluster and a 100-node beast.</p>
+<p><strong>Gorilla — timestamp half (delta-of-delta).</strong> Scrapes happen on a fixed schedule. If t1=1000, t2=1010, t3=1020, deltas are 10, 10, 10. The delta-of-delta is 0, 0, which encodes in <strong>1 bit per sample</strong>. A late scrape (10.001s) makes delta-of-delta a small int, encoded in 7-9 bits. Worst case ~32 bits.</p>
+<p><strong>Gorilla — float half (XOR).</strong> For values that change slowly (CPU at 47.3, then 47.5, then 47.6), XOR of consecutive IEEE 754 floats has many leading and trailing zeros. Gorilla encodes XOR results as <code>(leading_zeros, meaningful_bits, value)</code>. Identical to previous → <strong>1 bit</strong>. Small change → ~12-20 bits. Large change → up to 64 bits. Average ~7-11 bits.</p>
+<p><strong>Inverted label index.</strong> A query like <code>sum(rate(http_requests_total{service="api",region="us-east-1"}[5m]))</code> must find all series matching <code>service="api" AND region="us-east-1"</code>. The TSDB maintains a posting-list index from <code>(label_name, label_value) → sorted list of series_IDs</code>. Label intersection is a posting-list AND — the same primitive Lucene uses for search. O(min(a, b)) merge scan, fast. This is also where cardinality explosions hurt — each new unique value adds a posting list entry.</p>
+<p><strong>Head block + WAL (Write-Ahead Log).</strong> In-memory state for the current ~2h window lives in a hash table of <code>series_id → most_recent_chunk</code>. New samples append to the open chunk. Every sample is also written to a WAL on disk before acknowledgment. fsync batches every ~1s (configurable) — pre-fsync, a crash loses up to 1s of samples (acceptable for monitoring). On crash recovery, WAL replay rebuilds the head block.</p>
+<p><strong>Walk through one scrape end-to-end.</strong></p>
+<pre><code>1. App exposes /metrics:
+   http_requests_total{service=&quot;api&quot;,status=&quot;200&quot;} 4823 1716391200000
+
+2. Scraper (HTTP GET every 10s): parse text → (metric + sorted label kv) hashes
+   to series_id → append (timestamp, value) to open chunk in head block →
+   append WAL record (series_id, timestamp, value).
+
+3. WAL hits page cache; fsync batches every ~1s. Pre-fsync crash loses ≤1s.
+
+4. Open chunk reaches 120 samples (~20 min) → close it, Gorilla-encode →
+   new chunk opens. Closed chunks stay in head-block RAM.
+
+5. Every 2h the head block is &quot;cut&quot; — closed chunks flush to a persistent
+   block. Inverted label index rebuilt. WAL truncated.
+
+6. After 24h, persistent blocks compact into larger blocks and ship to
+   long-term storage (S3 via Thanos/Mimir).
+</code></pre>
+<p><strong>Cardinality is the kill switch.</strong> Space scales with cardinality, not sample rate. Doubling scrape interval halves storage; doubling cardinality doubles storage AND inverted-index size AND head-block RAM AND query latency. <code>user_id</code> with 100M values → 100M series; at ~1 KB per open chunk that's 100 GB of RAM in the head block alone. Prometheus OOMs (out of memory) long before. Cardinality 1-10M per instance is fine; above 10M shard (Mimir) or drop the label.</p>
+<h3 id="42-logs-three-competing-storage-models">4.2 Logs — three competing storage models</h3>
+<p><strong>Model A: full inverted index per word (ELK / OpenSearch / Splunk).</strong> Every word tokenized and added to a Lucene inverted index. Storage ~1.5-3x raw. Query latency for <code>level=ERROR AND message:"connection refused"</code> is millisecond-class via posting-list intersection. Cost at 85 TB/day is brutal: 1000+ nodes, many TB of RAM for hot indexes. ELK shines below ~1 TB/day; above that the cost curve breaks.</p>
+<p><strong>Model B: index labels, scan the rest (Loki).</strong> Only <code>service</code>, <code>host</code>, <code>level</code>, <code>region</code> indexed; log content stored as zstd-compressed chunks addressed by label-set. Query <code>{service="api"} |= "connection refused"</code>: (1) label index finds chunks for <code>service="api"</code> in the time range; (2) for each chunk, fetch from S3, decompress, grep. Works because most queries scope by service+time first, indexing per word is what's expensive (skipped here), and S3 parallel reads are easy. Loki's labels match Prometheus's — cross-pillar consistency for free.</p>
+<pre><code>Loki:
+  /index/   # (label-set hash, time range) → chunk references
+  /chunks/  # zstd-compressed payload, one chunk = one label-set + 1-2h
+            # production: S3, GCS, ABS
+</code></pre>
+<p><strong>Model C: columnar (ClickHouse, Pinot, Honeycomb's Retriever).</strong> Row per log line, column per JSON field. Per-column indexes make <code>SELECT count() FROM logs WHERE service='api' AND level='ERROR' GROUP BY error_code</code> return sub-second on TB/day clusters. LinkedIn's log analytics runs logs → Kafka → Pinot for exactly this — most "how often does X happen" queries are SQL aggregations, not grep.</p>
+<p><strong>Decision rule.</strong> Grep-heavy → Loki. SQL-aggregation-heavy → Pinot/ClickHouse. Ad-hoc full-text and budget isn't a constraint → ELK. Very-long-term compliance, infrequent queries → Parquet on object storage with Athena/Snowflake. At scale you run multiple; LinkedIn pipes one Kafka stream into both Loki-equivalent (grep) and Pinot (analytics).</p>
+<h3 id="43-traces-partition-by-trace_id-sampled">4.3 Traces — partition by trace_id, sampled</h3>
+<p><strong>Storage shape.</strong> Each span is a record:</p>
+<pre><code>(trace_id, span_id, parent_span_id, service, operation,
+ start_ns, duration_ns, status, attributes:{k:v}, events:[...])
+</code></pre>
+<p>The dominant query is "give me all spans for trace_id=X." Less commonly: "find traces where service=payment had duration &gt; 2s and status=ERROR in the last hour."</p>
+<p>For trace_id lookup, a key-value store keyed by trace_id is perfect. Jaeger originally used <strong>Cassandra (LSM tree, partition key = trace_id)</strong>. Modern Tempo writes <strong>Parquet files to S3</strong> and uses a Bloom-filtered index. Cassandra and S3 Parquet are both well-suited to "lots of writes, occasional point lookup by key."</p>
+<p>For the search query ("find traces where..."), you need a secondary index — typically a small Lucene/Elasticsearch index that holds just the searchable span attributes plus a pointer to the full span payload in cheap storage. Honeycomb takes a different route — its Retriever stores every span as a row in a columnar DB and indexes nothing specifically, relying on columnar scan speed to make "ad-hoc queries on traces" the primary workflow.</p>
+<p><strong>Partition by trace_id is non-negotiable for tail sampling.</strong> Why: tail sampling decisions are made on the full set of spans for a trace_id. If span 1 of trace abc lands on collector A and span 2 lands on collector B, neither collector can decide whether to keep the trace. Kafka topic partitioned by <code>trace_id</code> ensures all spans of a trace hash to the same partition and are read by the same consumer.</p>
+<p><strong>Head vs tail sampling.</strong> <em>Head:</em> flip a coin at trace start; sampled flag propagates via <code>traceparent</code>. Cheap, zero coordination, cannot preferentially keep errors (you don't know yet). <em>Tail:</em> every span emitted, collector buffers by trace_id ~30s, then decides — keep all if any span has <code>status=ERROR</code> or duration &gt; 2× service p99, else random p. Catches the interesting traces; needs memory to buffer and trace_id partitioning so all spans of a trace land on one collector. <em>Hybrid (most production):</em> SDK head-samples at 10% (drops 90% before the wire), collector tail-samples on top, keep all errors/slow plus 1% random. Net ~1.5%, 100% of the interesting traces.</p>
+<p><strong>Walk through one trace assembly.</strong></p>
+<pre><code>1. api-gateway receives HTTP, no traceparent. Generates trace_id=abc123,
+   span_id=001, sampled=1. Starts span &quot;POST /api/checkout&quot;.
+
+2. api-gateway → auth gRPC, sends traceparent: 00-abc123-001-01.
+   auth creates span_id=002, parent=001.
+
+3. api-gateway → checkout (span 003) → payment (004) → stripe (005).
+   Each span reported async to local OTel SDK buffer.
+
+4. SDK batches (512 spans or 5s) → OTLP/gRPC → local OTel Collector →
+   regional Collector → Kafka topic &quot;traces&quot; partitioned by trace_id.
+
+5. Tail-sampling consumer for the partition reads spans, buffers per-trace_id.
+   After 30s (or all spans seen), applies tail policy.
+
+6. Kept traces:
+   - Cassandra: row key=trace_id, column key=span_id, value=span proto
+   - Tempo: append to a Parquet file in S3 + Bloom filter + trace_id→offset index.
+
+7. Query &quot;show me trace abc123&quot; → point lookup → ~1000 spans →
+   UI assembles tree via parent_span_id pointers.
+</code></pre>
+<hr>
+<h2 id="5-capacity-envelope">§5. Capacity Envelope</h2>
+<p>The whole point of this section is that observability spans about <strong>six orders of magnitude</strong> in scale, and the engine choice depends on which tier you're in.</p>
+<p><strong>Small — startup, single product line.</strong> 10-50 application containers; ~30K active series, ~3K samples/sec; ~10 MB/sec, ~1 TB/day logs; ~1K spans/sec head-sampled. Single Prometheus, single ELK, Jaeger on Cassandra on a handful of m5.large boxes. Budget &lt; $5K/month. One engineer part-time. Bottleneck: single ELK node hits I/O ceiling around 10 MB/sec sustained.</p>
+<p><strong>Mid — Grafana Cloud customer, mid-size SaaS.</strong> 1-5K containers; 3-15M active series, 300K-1.5M samples/sec; ~1 GB/sec, ~85 TB/day logs; 100-500K spans/sec post-sample. Mimir / Cortex for metrics with sharding, Loki for logs, Tempo for traces, object storage cold tier. Team of 2-4. Bottleneck: single Prometheus hits cardinality ceiling around 5-10M active series; shard via Mimir.</p>
+<p><strong>Large — LinkedIn, Datadog customer, mid-tier hyperscaler.</strong> 30-100K containers; 50-500M active series, 5-50M samples/sec; <strong>LinkedIn ~10 PB/day log ingestion across the fleet, ~115 GB/sec sustained</strong>; 1-10M spans/sec post-sample, billions/day. Sharded Mimir, multi-cluster Loki + Pinot for logs, multi-region Tempo with tail sampling. Dedicated org of 10-30. Bottleneck: Kafka if you didn't dedicate per-pillar clusters; logs at 6 GB/sec on one Kafka is fine, logs + traces on the same cluster asks for back-pressure cascades.</p>
+<p><strong>Giant — Google, Meta.</strong>
+- <em>Google Monarch (VLDB 2020):</em> in-memory globally-replicated TSDB, hierarchical regional zones, <strong>~1 trillion samples/sec ingestion peak</strong>; replaces Borgmon.
+- <em>Datadog:</em> publicly reports <strong>trillions of metric points per day</strong> across its customer-aggregate platform — at 10 trillion/day that's ~115M points/sec.
+- <em>Cloudflare logs at ~1 trillion log records/day</em>, analytics on ClickHouse.
+- <em>Meta's Scuba (VLDB 2013):</em> in-memory wide-event store at petabyte scale, sub-second aggregations across billions of events.</p>
+<p>At this tier the question stops being "can we store it" and becomes "can we afford to keep it." Retention costs dominate ingest costs; aggressive downsampling and tiered cold storage are structural, not optional.</p>
+<hr>
+<h2 id="6-architecture-in-context">§6. Architecture in Context</h2>
+<p>The canonical pattern. Not one product's full system — the shape every observability platform converges on.</p>
+<pre><code>   ┌────────────────┐                                          ┌─────────────────────┐
+   │  Application   │                                          │  Metrics store      │
+   │   (Java/Go/Py) │                                          │  Prometheus / Mimir │
+   │ ┌────────────┐ │      pull /metrics                       │  shard by job+host  │
+   │ │ OTel SDK   │─┼──────────────────────► [Scrapers] ──────►│  - WAL              │
+   │ │ metrics    │ │      every 10s                           │  - Head block       │
+   │ └────────────┘ │                                          │  - 2h blocks → S3   │
+   │ ┌────────────┐ │                                          └─────────────────────┘
+   │ │ OTel SDK   │ │      OTLP/gRPC                                ▲
+   │ │ traces     │─┼─────────► [OTel Collector] ──────────────────┤ exemplars
+   │ │ (sampled)  │ │      head-sample 1%      │                    │ metric ↔ trace
+   │ └────────────┘ │                          │                    │
+   │ ┌────────────┐ │                          ├──► [Kafka: traces] │
+   │ │ Structured │ │      OTLP logs           │   partition by     ▼
+   │ │ logger     │─┼─────────► [Fluent Bit] ──┤   trace_id    [Trace store]
+   │ │ (JSON)     │ │                          │                Cassandra/Tempo/S3
+   │ └────────────┘ │                          │                indexed by trace_id
+   └────────────────┘                          │                sampled head + tail
+                                               │
+                                               ├──► [Kafka: logs]
+                                               │    partition by   ┌─────────────────────┐
+                                               │    service.name   │ Log store           │
+                                               │                   │ Loki labels + S3    │
+                                               ├───────────────────┤ chunks (hot)        │
+                                               │                   │ OR Pinot/Clickhouse │
+                                               │                   │ for log analytics   │
+                                               ▼                   └─────────────────────┘
+                                  [Tail-sampling decision engine]           │
+                                  buffers spans 30s,                        │
+                                  keeps errors + slow + 1% random      ┌────▼─────────┐
+                                                                       │ Cold tier S3 │
+                                                                       │ Parquet      │
+                                                                       │ day+service  │
+                                                                       └──────────────┘
+
+         ┌──────────────────────────────────────────────────────────┐
+         │ Query / alert plane (Grafana / Alertmanager / PagerDuty) │
+         │   - dashboards join metrics/logs/traces                  │
+         │   - exemplars: hop metric → trace → log                  │
+         │   - SLO multi-window burn-rate alerts                    │
+         └──────────────────────────────────────────────────────────┘
+</code></pre>
+<p><strong>Staff-level callouts.</strong> <em>Three pillars, three pipelines, three storage tiers, no shared fate</em> — a backed-up log Kafka cluster cannot stall the metrics path; the metrics path stays alive when the log path melts. <em>Sampling at multiple stages</em> — SDK head sampling (1-10%), Collector tail sampling (keep errors + slow), storage retention tiering — each cuts another order of magnitude. <em>Kafka in the middle for logs and traces, not metrics</em> — metrics are pulled (scraper WAL is enough buffer); logs and traces are pushed and bursty, so Kafka absorbs variance. <em>Partition keys named explicitly</em> — metrics shard by job+host, logs partition by service.name, traces partition by trace_id (required for tail sampling). <em>Exemplars are the bridge</em> — a Prometheus exemplar attached to a histogram bucket carries a trace_id; click a slow p99 bucket → jump to one specific trace → jump to its logs. The cross-pillar workflow only works if trace_id is stamped on metrics, logs, and spans.</p>
+<hr>
+<h2 id="7-hard-problems-inherent-to-observability">§7. Hard Problems Inherent to Observability</h2>
+<p>Six fundamental challenges that anyone deploying this technology will face, regardless of product choice. Each illustrated with a different domain.</p>
+<h3 id="71-cardinality-explosion-kills-metrics">7.1 Cardinality explosion (kills metrics)</h3>
+<p><em>Domain: payments incident debugging.</em> The payments team wants "p99 latency per merchant." They add <code>merchant_id</code> as a label on <code>payment_duration_seconds</code>. 5M active merchants × status × method × region → cardinality goes from 50K to 50M overnight. Prometheus's head block hits 50 GB and OOMs. The platform pages, not the original incident.</p>
+<p><em>Naïve fix.</em> Add RAM. Buys days, not months — cardinality is unbounded.</p>
+<p><em>Real fix.</em> (1) <strong>Cardinality enforcement at ingestion</strong> — TSDB tracks active series per tenant; exceed budget (e.g., 100K series per service) → refuse new series, alert owner. Mimir has <code>per_user_series_limit</code>. (2) <strong>Aggregation rules</strong> — pre-aggregate high-cardinality dimensions in a stream processor (Flink, Materialize), store top-100 merchants as a metric, push the rest into a wide-event store. (3) <strong>Tracing is the answer for per-entity slices</strong> — "p99 for this merchant" is a trace/wide-event query, not a metric query. (4) <strong>Cardinality alerts</strong> — alert when series count grows &gt;2x in 24h; catches bad deploys before OOM.</p>
+<h3 id="72-cost-of-full-log-indexing">7.2 Cost of full log indexing</h3>
+<p><em>Domain: security and audit logging.</em> The security team needs full-text grep across all auth events: "did this attacker IP show up anywhere in 90 days?" They push 100% into Elasticsearch with full-text indexing. 50 TB/day raw → 100 TB/day indexed. ES cluster grows to 1500 nodes. Cost overtakes the rest of the platform.</p>
+<p><em>Naïve fix.</em> Reduce retention. Helps but doesn't fix the structural problem — they're paying to index 99% of data that's never queried.</p>
+<p><em>Real fix.</em> <strong>Tier by query pattern.</strong> Recent 7 days in ELK for fast grep (~3 TB hot). 8-90 days in Loki + S3 chunks — grep is slower (10-30s) but acceptable for forensics. 90 days+ in Parquet on S3, queried via Athena. Most security workflows tolerate seconds-to-minutes grep on older data; the fast-index tier just needs to cover the active investigation window.</p>
+<h3 id="73-head-based-vs-tail-based-trace-sampling-choosing-wrongly">7.3 Head-based vs tail-based trace sampling — choosing wrongly</h3>
+<p><em>Domain: ML model serving.</em> The ML team is debugging "why does the recommendation model occasionally return empty results for 0.1% of requests." 1% head sampling. Out of 10K affected requests, 100 sampled — none of the 100 hit the bug. Team is blind.</p>
+<p><em>Naïve fix.</em> Increase head sample to 50%. Volume goes up 50x; storage and Kafka cost balloon. Storing massive amounts of perfectly boring traces.</p>
+<p><em>Real fix.</em> <strong>Tail sampling.</strong> Every span to a collector. Buffer by trace_id for 30s. Keep: 100% errors, 100% slow, 100% where <code>recommendation_count == 0</code>, plus 1% random for baseline. Storage ~1.5x old head rate, coverage of "interesting" traces 100%. Cost: collector tier must partition by trace_id and needs RAM for the buffering window. At 60M spans/sec, 30s buffer ≈ 1.8B spans, ~2-4 TB RAM aggregated.</p>
+<h3 id="74-trace-context-propagation-across-async-boundaries">7.4 Trace context propagation across async boundaries</h3>
+<p><em>Domain: gaming server crash investigation.</em> A live-ops engineer debugs "user's item purchase didn't credit." Flow: HTTP → Kafka → async worker → Espresso write → CDC stream → ledger reconciliation. Six async hops. Trace ends at "request enters Kafka"; every downstream span is an orphan.</p>
+<p><em>Naïve fix.</em> Include trace_id in the Kafka message body. Half-right — loses span hierarchy; SDK doesn't wire consumer spans as children.</p>
+<p><em>Real fix.</em> <strong>OTel-defined trace context propagation across every boundary.</strong> HTTP/gRPC: <code>traceparent</code> header (W3C standard). Kafka: <code>traceparent</code> and <code>tracestate</code> as Kafka message <strong>headers</strong>. Producer SDK attaches on send; consumer SDK reads them and creates a span with <code>parent_span_id = producer's span_id</code>, link type <code>FOLLOWS_FROM</code> (not <code>CHILD_OF</code> — parent already completed). Espresso/Pinot CDC: trace context in the CDC envelope. Scheduled jobs (cron, Flink, batch): scheduler creates a root span; job inherits trace_id from trigger metadata.</p>
+<h3 id="75-alert-fatigue">7.5 Alert fatigue</h3>
+<p><em>Domain: any SRE oncall rotation.</em> ~200 active alert rules. Pager fires 40 times/week, most transient bumps that self-resolve in 90 seconds. Engineers stop reading alerts. The next real incident goes unnoticed for 20 minutes.</p>
+<p><em>Naïve fix.</em> Tune thresholds tighter. Tunes the noise but doesn't fix structural — alerting on causes (CPU &gt; 80%, queue depth &gt; 1000) means alerting on symptoms that may or may not affect users.</p>
+<p><em>Real fix.</em> <strong>SLO-driven multi-window burn-rate alerts.</strong> Define user pain: "99.9% of requests 2xx-3xx and &lt;500ms over rolling 28 days." Compute error budget. Page at 14.4x burn rate over 1h (month's budget in a day), 6x over 6h (4 days), ticket at 3x over 24h. ~5 alerts per service instead of 200; each represents real user impact. Cause-based alerts move to ticket → dashboard. <em>Alert when users are hurting, not when a metric is high</em> — the SRE discipline applied to alerting.</p>
+<h3 id="76-biased-sampling">7.6 Biased sampling</h3>
+<p><em>Domain: mobile app crash analytics.</em> Crashlytics/Sentry samples at 10% with key <code>device_id mod 10</code>. Months later the team finds iOS device_id distribution is skewed (timestamp-derived seed correlates with launch time). The 10% sample is now skewed toward Android. Crash trends say "Android has 3x more crashes" when rates are equal — iOS samples are systematically missing.</p>
+<p><em>Naïve fix.</em> Stratified sampling per platform. Treats one symptom.</p>
+<p><em>Real fix.</em> <strong>Sampling keys must be uniformly distributed.</strong> W3C Trace Context recommends 128 bits of randomness on trace_id; use a cryptographic-quality RNG, not timestamp-derived. <strong>Monitor for bias</strong> — per-partition span rate, per-platform sample rate, per-region sample rate. Any category materially hotter than others means the hash or sampling key is broken. Observability of the observability platform.</p>
+<hr>
+<h2 id="8-failure-modes">§8. Failure Modes</h2>
+<p>The platform itself is a distributed system. It fails. Systematic walkthrough.</p>
+<h3 id="collector-backpressure">Collector backpressure</h3>
+<p><em>Scenario.</em> OTel Collectors are CPU-pinned on tail sampling. Span ingestion lags. Kafka queues fill up.</p>
+<p><em>Recovery.</em></p>
+<ol>
+<li>Circuit breaker on the Collector: when CPU &gt; 80% for &gt; 1 minute, switch to degraded mode — <em>drop the random-sample portion</em> but keep error/slow traces. Cuts ingest ~80% while preserving high-value traces.</li>
+<li>Kafka tiered storage — once disk fills, oldest segments offload to S3. Traces retrievable but with higher latency.</li>
+<li>Auto-scaling on the Collector tier triggered by Kafka consumer lag or CPU.</li>
+</ol>
+<p><em>Durability point.</em> Traces are still in Kafka. Worst case is delayed assembly, not loss.</p>
+<h3 id="storage-tier-full">Storage tier full</h3>
+<p><em>Scenario.</em> Prometheus disk fills overnight because someone deployed a new label that exploded a single metric to 50M series.</p>
+<p><em>Recovery.</em></p>
+<ol>
+<li>Storage hard limit — Prometheus stops accepting new samples (it does <strong>not</strong> crash). Old data still queryable.</li>
+<li>Cardinality monitoring catches the explosion within minutes; alert pages the owning service team.</li>
+<li>Service rollback or hot-fix the bad label.</li>
+<li>Once cardinality returns to normal, the next 2h block boundary clears the head block; disk pressure resolves.</li>
+</ol>
+<p><em>Durability point.</em> Persistent 2h blocks already on disk and replicated to S3 (Thanos/Mimir). The head block is rebuildable from the WAL.</p>
+<h3 id="biased-sampling-silent-dropout">Biased sampling silent dropout</h3>
+<p><em>Scenario.</em> Trace_id distribution skewed → one Kafka partition gets 10x normal load → buffer overflows → that partition's traces preferentially drop. Specific region's traces systematically missing.</p>
+<p><em>Recovery.</em> No live recovery — past traces are lost. Forward fix: detect bias proactively via per-partition span-rate alerts and re-shard if the hash function is broken.</p>
+<p><em>Durability point.</em> None for dropped traces. Prevent via invariant 4 (sampling decisions auditable) and proactive bias detection.</p>
+<h3 id="missing-trace_id-in-logs">Missing trace_id in logs</h3>
+<p><em>Scenario.</em> A new service deployed without the OTel logger handler. Its logs don't carry trace_id. During an incident, you can't pivot from trace → logs for that service.</p>
+<p><em>Recovery.</em></p>
+<ol>
+<li>Detect via a CI check: every service's structured-log format must contain a <code>trace_id</code> field. Reject deploys without it.</li>
+<li>For the in-progress incident, fall back to time-range + service-name filter. Higher noise but works.</li>
+</ol>
+<p><em>Durability point.</em> This is an SDLC (Software Development Life Cycle) invariant, not a runtime one. Fix is in the deploy pipeline.</p>
+<h3 id="multi-region-partition">Multi-region partition</h3>
+<p><em>Scenario.</em> us-east-1 loses connectivity to the central observability platform in us-west-2 for 20 minutes.</p>
+<p><em>Recovery.</em></p>
+<ol>
+<li>Per-region OTel Collectors have local Kafka buffers. They keep buffering during the partition.</li>
+<li>Per-region Prometheus instances keep scraping locally; regional Grafana queries keep working.</li>
+<li>When the link heals, Collectors flush the backlog. The metrics store backfills (Thanos sidecars accept out-of-order blocks).</li>
+<li>Alerts that fired during the partition were fired by the <strong>regional Alertmanager</strong> via a secondary alerting channel (PagerDuty fallback over a different network path).</li>
+</ol>
+<p><em>Durability point.</em> Per-region storage. Built to degrade per region, not require a globally consistent view.</p>
+<hr>
+<h2 id="9-why-not-the-obvious-simpler-alternative-ssh-and-tail-the-logs">§9. Why Not the Obvious Simpler Alternative — "SSH and tail the logs"</h2>
+<p>This is the actual mental model many engineers grew up with. It worked when "the application" was one process on one host. It categorically breaks the moment you have more than one service or more than one host.</p>
+<p>A customer reports "checkout failed at 2:34 PM Eastern." You ssh into api-gateway. You don't know which of 800 hosts served their request. You tail random hosts; nothing. After 20 minutes grep'ing 800 hosts you find a candidate on host 437. The log says "downstream timeout" — doesn't say which downstream. The flow involves auth, checkout, payment, fraud, inventory. You ssh each. checkout says "called payment, got 500." Payment is 200 hosts. You grep. Two hours in, you find: "stripe API returned 5xx after 30s." But without traces you can't reconstruct which request that was, what user, what params, what DB state. You give up. MTTR (Mean Time To Resolution) is essentially infinite.</p>
+<p>Scale that to an incident affecting 10,000 customers, where you're computing impact radius. Or where the request crossed an async Kafka hop. Or where half the logs have rotated off the host because retention is 24h. This is the wall. The observability stack exists to replace SSH-and-grep with structured, correlated, queryable data. Every component — central log aggregation, trace_id propagation, metrics dashboards, SLO alerting — is a brick in that wall.</p>
+<hr>
+<h2 id="10-scaling-axes">§10. Scaling Axes</h2>
+<h3 id="type-1-uniform-growth-more-services-more-hosts">Type 1: uniform growth (more services, more hosts)</h3>
+<p>Same per-host telemetry, more hosts. Mostly horizontal fixes. <strong>1x (1K hosts):</strong> single Prometheus (~3M series), single ELK (~3 TB/day), single Jaeger Cassandra. One SRE. <strong>10x (10K hosts):</strong> Prometheus at cardinality ceiling; shard via federation or move to Mimir/Cortex. Logs move off pure ELK or grow it to 200 nodes (painful). Traces still fit in Cassandra with tighter sampling. <strong>100x (100K hosts):</strong> multi-region everything. Per-region Prometheus aggregated to global Mimir via remote-write. Logs through Kafka into multi-tier (Loki + Pinot). Traces at 0.1% head + tail. Team 5-10 engineers.</p>
+<p>Inflection points where topology must structurally change: past 1M series per instance → shard TSDB; past 1 GB/sec log ingest → move off pure full-text; past 10M spans/sec post-sample → partition traces by trace_id, multi-shard tail sampling; past 3 regions → per-region storage with cross-region query federation.</p>
+<h3 id="type-2-hotspot-intensification-cardinality-explosion-from-a-bad-label">Type 2: hotspot intensification (cardinality explosion from a bad label)</h3>
+<p>Same hosts, but one service emits 100x more series because a deploy added a bad label. Horizontal scaling doesn't help — the problem is concentrated in one tenant. Fix shape: <strong>per-service cardinality quotas enforced at ingest</strong> — "checkout" has a budget of 100K series; new deploy emits 5M → TSDB refuses new series and pages the owning team. <strong>Per-service rate limits on log and span ingest</strong> — runaway service can't drown the platform. <strong>Pre-prod cardinality CI checks</strong> — simulate metric output and count cardinality before merge; fail CI if a service doubles. Type-2 growth is harder than Type-1 because it's bursty, attributable to specific deploys, and can be 10-100x steady-state in seconds. The TSDB must be hostile to bad neighbors.</p>
+<hr>
+<h2 id="11-decision-matrix">§11. Decision Matrix</h2>
+<h3 id="per-pillar">Per pillar</h3>
+<table>
+<thead>
+<tr>
+<th>Workload</th>
+<th>Best fit</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Aggregate numeric time-series, low cardinality</td>
+<td>Prometheus / Mimir TSDB</td>
+<td>Gorilla compression, inverted label index, optimized for label slicing</td>
+</tr>
+<tr>
+<td>Aggregate time-series, very high cardinality (per-user, per-merchant)</td>
+<td>Honeycomb wide events / Pinot</td>
+<td>Columnar scan beats label-index when cardinality &gt; 10M</td>
+</tr>
+<tr>
+<td>Log search, ad-hoc grep over labeled streams</td>
+<td>Loki</td>
+<td>Label-only index keeps cost manageable at TB/day</td>
+</tr>
+<tr>
+<td>Log analytics (SQL aggregations, dashboards)</td>
+<td>Pinot / ClickHouse</td>
+<td>Columnar, streaming ingest from Kafka, sub-minute freshness</td>
+</tr>
+<tr>
+<td>Powerful full-text log queries, smaller volume</td>
+<td>Elasticsearch / Splunk</td>
+<td>Lucene power, expensive but unmatched search UX</td>
+</tr>
+<tr>
+<td>Per-request causal chains, named lookup by trace_id</td>
+<td>Jaeger / Tempo</td>
+<td>trace_id partitioning, sampling, span tree assembly</td>
+</tr>
+<tr>
+<td>Ad-hoc multi-dimensional trace analysis</td>
+<td>Honeycomb Retriever</td>
+<td>Columnar event store, query weird questions</td>
+</tr>
+<tr>
+<td>Continuous profiling</td>
+<td>Pyroscope / Parca</td>
+<td>Continuous low-overhead CPU/heap profiles</td>
+</tr>
+<tr>
+<td>Black-box / synthetic</td>
+<td>Pingdom-style probes</td>
+<td>External reachability, not a substitute for internal pillars</td>
+</tr>
+<tr>
+<td>Mobile/crash analytics</td>
+<td>Crashlytics / Sentry</td>
+<td>Built-in symbolication, native crash grouping, mobile SDK</td>
+</tr>
+</tbody>
+</table>
+<h3 id="build-vs-buy">Build vs buy</h3>
+<p><strong>Buy Datadog / New Relic / Splunk</strong> if you're small-to-mid, value time-to-instrumented over $/GB, accept lock-in. Below ~1 PB/day total telemetry, SaaS is often cheaper than the headcount to operate the equivalent. <strong>Build on open source (OTel + Mimir + Loki + Tempo + Pinot)</strong> if you're large enough that vendor markup × volume &gt; your engineering cost, you have regulatory/data-locality requirements vendor can't meet, or your access patterns don't fit vendor pricing (Honeycomb prices on events; 1T events/day pays them more than your AWS bill). Past ~10 PB/day, build math usually wins. <strong>Hybrid</strong> (most realistic): OTel SDK everywhere, open source for bulk storage (metrics + logs), SaaS for specialized analytics (Honeycomb for high-cardinality wide events, Sentry for mobile crashes).</p>
+<p><strong>Pick of picks for a green-field large-scale platform.</strong> OpenTelemetry SDK → OTel Collector → Kafka (per-pillar clusters) → (Mimir for metrics) + (Loki + Pinot for logs) + (Tempo with tail sampling for traces) → Grafana for unified query → Alertmanager for SLO-burn alerting. No vendor lock-in (OTel), independent pillar failure domains (separate Kafka), economical at &gt;10 PB/day log scale (Loki + Pinot beats ELK), tail sampling for trace coverage (Tempo).</p>
+<hr>
+<h2 id="12-use-case-gallery">§12. Use Case Gallery</h2>
+<p>Five different products, five different ways the same three-pillar tech is applied. The technology is the subject; these are illustrations.</p>
+<p><strong>SRE incident response — payments platform.</strong> Stripe-class payment processor. SRE oncall paged via SLO burn-rate alert on <code>payment_success_rate</code>. Hop into a Grafana dashboard. Histogram of <code>payment_duration_seconds</code> shows exemplars on the p99 bucket — click one, land on a specific trace. Trace shows <code>payment → fraud-check → external-bank</code>; fraud-check is the slow span. Logs tagged with that trace_id show "cache miss → DB query took 4s." Root cause in 8 minutes; MTTD (Mean Time To Detect) under 2 min, MTTR (Mean Time To Resolution) under 15. Three pillars compress an hours-long debug into a ten-minute walk.</p>
+<p><strong>Business KPI monitoring — e-commerce dashboards.</strong> A Shopify-class merchant uses Datadog dashboards to track real-time GMV (Gross Merchandise Value), conversion rate, cart abandonment. App emits <code>orders_completed_total</code>, <code>cart_abandoned_total</code>; dashboards <code>rate()</code> over 1-minute windows. Dashboards owned by the business team, not engineering. Same TSDB that serves SRE alerts serves these dashboards — different labels and query windows. Same tech, different consumer.</p>
+<p><strong>Security audit logging — financial services compliance.</strong> A bank retains every auth event, transaction, and admin action for 7 years (regulatory). 5 TB/day. Hot tier (30 days in Elasticsearch) for active investigation. Warm tier (30d-1y in Loki + S3) for forensic grep. Cold tier (1-7y in Parquet on S3 + Glacier). Splunk is the buy-vs-build incumbent here — many banks pay $20-50M/year for compliance certifications and audit trail features.</p>
+<p><strong>ML model monitoring — recommendation drift.</strong> A recommendation model in production. Monitor: input feature distributions (drift), output distribution (degenerate?), per-request latency (slower as index grows?), business outcome (driving clicks?). Distributions are high-cardinality wide events — Honeycomb-shape store. Latency is metrics — Prometheus histogram. Outcome is a metric joined with a click log. Three pillars × ML. When the model goes degenerate at 3 AM, all three cooperate to identify feature pipeline vs model vs data quality.</p>
+<p><strong>Distributed tracing for slow-request debugging — Honeycomb's home turf.</strong> SaaS company sees p99 latency spike. Engineer opens Honeycomb. <code>heatmap(duration) WHERE service=api</code> — spike concentrated in a window. Add <code>GROUP BY customer_id</code> — one customer dominates. Add <code>GROUP BY endpoint</code> — one endpoint. Drill into a slow trace: api → search → vector-store → object-storage. Vector-store fetch is the slow hop. Opens vector-store dashboard, finds a deploy 5 minutes earlier. Rolls back. Total time: 4 minutes. High-cardinality wide-event analysis is the workflow Honeycomb's columnar Retriever optimizes for — and the workflow aggregated metrics dashboards cannot serve.</p>
+<p><strong>Mobile app crash analytics — Crashlytics / Sentry.</strong> Every crash generates a report with stack trace, device info, OS version, breadcrumbs. SDK uploads on next connectivity. Server-side, crashes are grouped by stack signature, weighted by user impact. Devs see "top 10 crashes by user impact in v3.2.1." Event-shaped telemetry (one crash = one structured record), not metric-shaped. Storage is a columnar event store — same family as Honeycomb's Retriever, tuned for the mobile crash workflow. 100% sampling for crashes (rare, high-value).</p>
+<p><strong>Product analytics on log data — LinkedIn's Pinot for logs.</strong> Growth team wants "users who completed onboarding yesterday, by country, by device." Historically a custom pipeline question. With Pinot for logs it becomes SQL on the log stream — <code>SELECT count(DISTINCT user_id) FROM logs WHERE event='onboarding_complete' AND date='2026-05-21' GROUP BY country, device</code>. Columnar storage and per-column indexes return sub-second on TB-day clusters. Logs become a product analytics substrate — a use case the original "logs are for incident debugging" model never anticipated.</p>
+<hr>
+<h2 id="13-real-world-implementations-with-numbers">§13. Real-World Implementations with Numbers</h2>
+<ul>
+<li><strong>Google Monarch (VLDB 2020).</strong> Globally-distributed in-memory TSDB. Hierarchical regional zones, each holding its own data; aggregator queries fan out. <strong>~1 trillion samples/sec ingestion peak.</strong> Replaces Borgmon. Lesson: in-memory beats disk for hot metrics; regional autonomy beats global consistency.</li>
+<li><strong>Facebook Beringei / Gorilla (VLDB 2015).</strong> Paper introducing delta-of-delta + XOR float compression. Drove Gorilla-shape chunks in Prometheus TSDB, M3DB, VictoriaMetrics, InfluxDB IOx. The <strong>1.37 bytes/sample</strong> figure for steady-state metrics is from this paper.</li>
+<li><strong>Google Dapper (OSDI 2010).</strong> Original distributed tracing paper. Established <strong>head sampling at 0.01-0.1%</strong> as the default. Modern observability still leans on Dapper's model — trace_id, span hierarchy, context propagation.</li>
+<li><strong>LinkedIn's log pipeline.</strong> <strong>~10 PB/day of log ingestion</strong> across the fleet — ~115 GB/sec sustained. Pipeline: app → Kafka → tiered storage. <strong>Pinot for log analytics</strong> delivers sub-second SQL on 10+ TB/day per cluster; replaces ELK for aggregation use cases.</li>
+<li><strong>Datadog.</strong> Publicly reports <strong>trillions of metric points per day</strong>, billions of traces/day, exabytes of logs over its history. Sharded TSDB on Cassandra-like LSM trees with custom Gorilla-like codecs. Tail sampling is a managed APM feature.</li>
+<li><strong>Honeycomb's columnar Retriever.</strong> Pioneered "events not traces" — every span is a row in a proprietary columnar store. Ad-hoc query language (<code>heatmap(duration) WHERE service=api GROUP BY customer_id</code>) supports very high cardinality natively. Better for "ask weird questions," worse for "show me one trace tree."</li>
+<li><strong>Cloudflare logs.</strong> <strong>~1 trillion log records/day</strong> via ClickHouse-based analytics. Seconds-class aggregation at this volume — order of magnitude cheaper than Elasticsearch.</li>
+<li><strong>Uber Jaeger.</strong> Open-sourced from Uber. trace_id-partitioned Cassandra early on; now offers ClickHouse and Elasticsearch backends. Default head sampling 0.1% across the Uber fleet.</li>
+<li><strong>Lyft Envoy + observability.</strong> Envoy emits rich metrics, logs, tracing out of the box. The "service mesh has built-in observability" pattern (Envoy + Istio) means no app-side instrumentation for L7 (Layer 7) telemetry.</li>
+<li><strong>Sentry.</strong> Open source error tracking — full stack traces and breadcrumbs. ~100M+ events/day SaaS tier. Storage on Snuba (ClickHouse-based wide-event store).</li>
+<li><strong>OpenTelemetry.</strong> Vendor-neutral instrumentation. CNCF graduated project, backed by Google, Microsoft, AWS, Splunk, Datadog, New Relic, Honeycomb. The Staff bet: instrument with OTel, change backends as economics shift.</li>
+</ul>
+<hr>
+<h2 id="14-l6-summary-line">§14. L6 Summary Line</h2>
+<blockquote>
+<p><em>"Observability is three pillars, three storage engines, three failure domains — never one product. Metrics live in a Gorilla-compressed TSDB sharded by series hash with hard cardinality quotas. Logs split across label-indexed chunk stores (Loki) for grep and columnar stores (Pinot, ClickHouse) for SQL aggregation — never a full-text index at petabyte scale. Traces ride OTLP through Kafka partitioned by trace_id into a tail-sampling tier that keeps 100% of errors and slow plus a small random sample. Correlation lives in the trace_id stamped on every metric exemplar, every log line, every span. Alerts are SLO-burn-driven so the pager fires when users are hurting, not when a metric is high. The pillars degrade independently; the platform survives the failures it exists to diagnose."</em></p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+</body>
+</html>
