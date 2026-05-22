@@ -1,0 +1,909 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OLAP / Analytical Data Stores — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/backend-fundamentals/">← Back to Backend Fundamental Components</a>
+        <h1 class="article-title">OLAP / Analytical Data Stores</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Backend Fundamental Components
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>A technology reference on OLAP (OnLine Analytical Processing) data stores — what they are, how their columnar engines work at the byte level, where the design space splits between cloud warehouses, real-time analytics engines, and lakehouse query layers, and when to pick which. Use cases (business intelligence dashboards, real-time product analytics, customer-facing analytics, ML feature pipelines, log analytics, marketing attribution) appear throughout as illustrations of the same class of technology bent to fit different workloads.</p>
+</blockquote>
+<hr>
+<h2 id="1-what-olap-storage-is">§1. What OLAP Storage Is</h2>
+<p>An <strong>OLAP store</strong> is a database whose physical layout, execution engine, and durability model are all optimized for one workload: <strong>scanning huge fact tables, filtering, grouping, and aggregating</strong>. Where an OLTP (OnLine Transaction Processing) database commits a small mutation in 1 ms and serves a point lookup in 5 ms, an OLAP store reads ten billion rows in two seconds and returns a <code>SUM(revenue) GROUP BY country</code>. The defining property is "answers analytical questions over the entire dataset in human-tolerable time, not in hours."</p>
+<p>Three orthogonal shifts separate OLAP from OLTP:</p>
+<ul>
+<li><strong>Columnar storage instead of row storage.</strong> A row store (B+ tree of 16 KB pages, each holding ~60 full rows) is built for "give me this one row." A column store keeps each column in its own contiguous file or page run, so a query touching only 3 of 200 columns reads only 1.5% of the table — a 60x I/O reduction before compression.</li>
+<li><strong>Bulk writes instead of small transactions.</strong> OLAP ingests batches (a million rows from S3, an hour of streamed events, a daily ETL load). Per-row UPDATE with row-level locking is anti-pattern; the engine is built around large appends and full-segment rewrites.</li>
+<li><strong>No multi-row ACID across writers, by design.</strong> OLAP gives per-batch or per-snapshot atomicity, not point-isolation between 10,000 concurrent debit transactions. The cost saved on locking and MVCC (Multi-Version Concurrency Control) garbage is spent on scan-and-aggregate throughput.</li>
+</ul>
+<p>OLAP sits at one corner of a four-way analytical-storage design space:</p>
+<ul>
+<li><strong>Columnar OLAP warehouses (the focus of this doc).</strong> Snowflake, BigQuery, Redshift, Databricks SQL, ClickHouse, StarRocks, Apache Doris, Pinot, Druid, Trino+Iceberg, Spark SQL+Delta, DuckDB. Column-oriented, compressed, vectorized execution, optimizer over a large statistical model of the data. Built for <code>SELECT col1, col2, SUM(col3) FROM huge_table WHERE col4 &gt; X GROUP BY col5</code>.</li>
+<li><strong>OLTP relational databases.</strong> MySQL InnoDB, PostgreSQL, Oracle, SQL Server. B+ tree, row-oriented, strong ACID. Excellent for the small mutable state that drives a product (account balance, user profile, cart). Awful for <code>SELECT COUNT(*) FROM orders WHERE created_at &gt; NOW() - INTERVAL '90 days'</code> over 100 B rows. See <code>01_databases.md §1</code>.</li>
+<li><strong>HTAP (Hybrid Transactional/Analytical Processing) stores.</strong> TiDB, SingleStore, Unistore (Snowflake's experiment), Oracle HeatWave. Bolt a column store onto an OLTP engine via a delta-stage + column-store, or vice versa. Promise: one system for both. Reality: the column store is real-time-ish (seconds-stale), one workload usually starves the other, and the cost-per-row is the union of OLTP and OLAP costs. Used when "ETL freshness" is the bottleneck and the team explicitly wants to avoid a separate warehouse.</li>
+<li><strong>Search engines.</strong> Elasticsearch, OpenSearch, Solr. Inverted indexes for text relevance + filter aggregations. Optimized for "find the 10 best matches for a free-text query." Can do facet aggregations but pays a 10–100x cost vs columnar OLAP at the same data size and is bad at multi-column <code>GROUP BY</code>. See <code>03_search.md</code>.</li>
+<li><strong>Time-series databases.</strong> Prometheus, InfluxDB, TimescaleDB, M3DB, VictoriaMetrics, Honeycomb's columnar engine. Specialized for <code>(timestamp, metric, tags) → value</code> with high-cardinality label indexes, downsampling, and TTL (Time-To-Live) eviction. OLAP can serve time-series, but TSDBs (Time-Series DBs) win on storage cost per data point and on rate-style queries (<code>rate(http_requests_total[5m])</code>). See <code>10_observability.md §3</code>.</li>
+</ul>
+<p>This doc focuses on the <strong>columnar OLAP corner</strong> because that is where the byte-level mechanics matter most and where the modern data stack converges. We'll contrast lakehouse formats (Iceberg, Delta, Hudi) against integrated warehouses (Snowflake, BigQuery) and against single-purpose real-time OLAP engines (Pinot, Druid, ClickHouse).</p>
+<p><strong>What OLAP is NOT good for:</strong></p>
+<ul>
+<li><strong>Low-latency point lookups.</strong> Reading one row by primary key from a columnar store re-assembles N columns from N separate files. A ClickHouse point lookup at p99 is ~30–50 ms; a Postgres B+ tree lookup is &lt;1 ms. If your workload is "render a profile page given a user ID," OLAP is the wrong tool.</li>
+<li><strong>High-concurrency small writes.</strong> A row-by-row UPDATE in Snowflake or ClickHouse re-writes a column file, often with a copy-on-write semantics. Per-row OLTP throughput on a columnar engine is ~10–100 ops/sec/cluster — five orders of magnitude below OLTP. Bulk-load or stream into immutable segments and let compaction handle merges.</li>
+<li><strong>ACID across multiple writers.</strong> Most OLAP gives <strong>per-batch atomic</strong> (a load either fully visible or fully invisible) and <strong>snapshot isolation per query</strong>. Two concurrent updates to overlapping data is a "last writer wins" or a conflict-and-abort situation, not the OLTP-style serialization of millions of debits and credits.</li>
+<li><strong>Sub-millisecond freshness.</strong> Lakehouse pipelines (Kafka → Flink → Iceberg) deliver data at ~minute freshness. Streaming OLAP (Pinot, Druid) reaches sub-second. Nothing in OLAP territory delivers OLTP-style "the write is queryable in microseconds at single-row granularity."</li>
+<li><strong>Storing 10 MB blobs in a column.</strong> A VARCHAR full of base64 PDFs destroys compression and ruins scan throughput. Use object storage for blobs; OLAP stores the path.</li>
+</ul>
+<p>Mental model: an OLAP store is the <strong>secondary, derived, analytical view</strong> of the truth that lives in OLTP. The OLTP source emits a change stream (CDC — Change Data Capture); a pipeline reshapes it into wide denormalized fact tables in columnar format; the OLAP engine serves "report queries" — business intelligence dashboards, real-time product analytics, ML training feature joins, customer-facing analytics dashboards, ad-hoc data-science exploration. Get the OLTP source right; everything analytical can be rebuilt from its change log.</p>
+<hr>
+<h2 id="2-inherent-guarantees">§2. Inherent Guarantees</h2>
+<p>What columnar OLAP provides by design, and what must still be layered above it.</p>
+<h3 id="provided-by-design">Provided by design</h3>
+<ul>
+<li><strong>Fast aggregation over billions of rows.</strong> A modern engine scans 1–10 GB/sec/node and produces a <code>GROUP BY</code> result over 10 B rows in seconds. ClickHouse benchmarks at ~2 GB/sec/core on aggregation; BigQuery slot allocation routinely scans terabytes in tens of seconds.</li>
+<li><strong>High compression, 5–20x.</strong> Per-column compression (dictionary + run-length + delta + general-purpose Zstandard) over the columnar layout typically gives 5–10x compression for transactional fact tables and 20–50x for sparse logs or status columns. The math: column data is locally similar, so entropy coders work brilliantly.</li>
+<li><strong>Predicate pushdown via zone maps / metadata.</strong> Each storage granule (a row-group, micro-partition, or segment) carries <code>min</code>, <code>max</code>, <code>null_count</code>, and often histograms / bloom filters per column. A query with <code>WHERE event_date = '2026-05-21'</code> may skip 99.9% of the table without reading data.</li>
+<li><strong>Snapshot isolation per query.</strong> A query sees a frozen view of the table as of its start time. Concurrent inserts and table mutations are visible only after a snapshot commit; in-flight readers never see partial writes.</li>
+<li><strong>Late-binding schema for raw data.</strong> Many OLAP engines and lakehouse formats (Iceberg, Parquet) let you store JSON / VARIANT / Map<String, String> columns and project keys at query time. Schema-on-read. Lets analysts add new fields without a schema migration.</li>
+<li><strong>Per-batch / per-snapshot atomicity.</strong> A load of 100 M rows is either visible or invisible; never half-visible. Iceberg commits a new snapshot atomically via metadata pointer swap; Snowflake micro-partition commits via metadata transaction; BigQuery streaming buffer commits at flush.</li>
+</ul>
+<h3 id="must-be-layered-above">Must be layered above</h3>
+<ul>
+<li><strong>OLTP-style point-row consistency.</strong> If a single user's account balance must be exact and immediately readable everywhere, that lives in OLTP, not OLAP. The warehouse is a derived view, intrinsically a few seconds-to-minutes stale.</li>
+<li><strong>End-to-end pipeline correctness.</strong> OLAP gives you snapshot isolation; it does not give you "every transaction from the OLTP system reached the warehouse exactly once." Exactly-once ingestion lives at the stream-processor / CDC layer, with idempotent keys and offset checkpointing — see <code>04_stream_processing.md §6</code>.</li>
+<li><strong>Workload isolation between tenants.</strong> A heavyweight query from team A can saturate a shared cluster and degrade team B. Multi-tenancy needs warehouse-level "virtual warehouses" (Snowflake), per-team slot reservations (BigQuery), or per-cluster isolation. The engine doesn't auto-fairness across tenants.</li>
+<li><strong>Data quality and schema evolution discipline.</strong> A wrong column type or a deleted upstream field silently corrupts downstream tables and dashboards. Schema-on-read does not save you from human error; data contracts at the ingestion edge do.</li>
+<li><strong>Cost governance.</strong> Pay-per-query engines (BigQuery) bill on bytes scanned; idle-but-allocated clusters (Snowflake virtual warehouses, Redshift) bill per uptime. A runaway dashboard can scan a petabyte and bill $5,000 in an hour. Quotas, cost tagging, slot limits — layered above the engine.</li>
+<li><strong>PII (Personally Identifiable Information) governance, row-level security, column masking.</strong> Columnar engines provide RBAC (Role-Based Access Control) and column masks as a feature, but enforcing GDPR (General Data Protection Regulation) deletion across snapshots, replicas, and downstream BI extracts is a data-governance problem above the engine.</li>
+<li><strong>Backup / point-in-time recovery.</strong> Snowflake's Time Travel + Fail-safe is the strongest built-in (90 + 7 days). Iceberg gives you snapshot history. Most engines need an explicit retention policy and an external "is the daily backup actually restorable" drill.</li>
+</ul>
+<p>Synthesis: the OLAP engine guarantees <strong>per-snapshot atomic, columnar-fast aggregation with predicate skipping</strong> on the data you give it. The fidelity of that data, the freshness of the pipeline, the isolation between tenants, the cost ceiling, and the regulatory governance are all the platform team's problem.</p>
+<hr>
+<h2 id="3-the-design-space">§3. The Design Space</h2>
+<p>Five distinct flavors of OLAP store; they diverge along compute/storage coupling, target query latency, ingestion model, and operational ownership.</p>
+<h3 id="cloud-data-warehouses-snowflake-bigquery-redshift-databricks-sql">Cloud data warehouses (Snowflake, BigQuery, Redshift, Databricks SQL)</h3>
+<p><strong>Snowflake.</strong> Fully-managed warehouse-as-a-service. Decoupled architecture: data lives in S3 as immutable micro-partitions (~16 MB each, columnar, compressed); compute is "virtual warehouses" (clusters of EC2 nodes) that you size up/down/pause; metadata is a centralized Snowflake-operated FoundationDB store. Strong on time-travel, zero-copy cloning, cross-account data sharing. Read-mostly with strong support for MERGE/UPDATE. Pricing: credits per warehouse-second + storage.</p>
+<p><strong>BigQuery.</strong> Google's serverless warehouse. Built on Dremel (the paper that started the columnar-OLAP wave). No clusters; you submit a query and Google's scheduler reserves "slots" (units of CPU) from a shared pool, scans columnar storage (Capacitor format) on Colossus (Google's distributed filesystem), and returns results. Decoupled storage and compute, but the compute is invisible — there are no nodes you operate. Pricing: bytes scanned (on-demand) or reserved slot capacity.</p>
+<p><strong>Redshift.</strong> Amazon's warehouse, originally a fork of ParAccel. Two generations: classic (shared-storage cluster) and <strong>RA3 nodes</strong> that decouple compute from storage (data in Redshift Managed Storage on S3). Strong PostgreSQL-compatible SQL surface. Pricing: per node-hour + RMS storage.</p>
+<p><strong>Databricks SQL (and the wider Databricks platform).</strong> Lakehouse approach. Data lives in <strong>Delta Lake</strong> format on the customer's S3 / ADLS / GCS (Google Cloud Storage); compute is Photon (Databricks' vectorized C++ engine) running on Spark clusters. Same engine serves SQL workloads, notebooks, ML training. Strong story for "one platform for warehouse + lakehouse + ML."</p>
+<p>These four converge on the same architecture: <strong>shared-nothing-compute over shared-storage</strong>. Storage is object storage (S3, GCS, ADLS) with columnar files (Parquet, ORC, or proprietary). Compute is a scale-out cluster that you size per workload. Metadata (table layout, snapshots, statistics) is in a centralized catalog.</p>
+<h3 id="self-hosted-olap-engines-clickhouse-starrocks-apache-doris">Self-hosted OLAP engines (ClickHouse, StarRocks, Apache Doris)</h3>
+<p><strong>ClickHouse.</strong> Yandex-origin (now ClickHouse Inc. / open source), C++, single-node-or-clustered. The performance king on raw CPU efficiency — vectorized execution with hand-written SIMD (Single Instruction Multiple Data) kernels, ~2 GB/sec/core scan rates. Strong story for log analytics, customer-facing analytics, time-series-ish workloads. Coupled compute and storage in the classic architecture (data on local NVMe per node); newer ClickHouse Cloud decouples to S3.</p>
+<p><strong>StarRocks.</strong> Originally a fork of Apache Doris by ex-Baidu engineers, now its own project. MySQL-protocol-compatible, MPP (Massively Parallel Processing) architecture, vectorized engine. Strong real-time materialized view support; data can be ingested from Kafka and made queryable in seconds.</p>
+<p><strong>Apache Doris.</strong> Same family as StarRocks (shared origin). MPP, MySQL-compatible, focus on real-time analytics for internet companies (Baidu, ByteDance internal use).</p>
+<p>These three are the "you operate it" tier. Cheaper at scale than cloud warehouses (no per-credit billing) but you carry the ops burden — capacity planning, replica management, version upgrades, failure recovery.</p>
+<h3 id="real-time-analytics-engines-pinot-druid">Real-time analytics engines (Pinot, Druid)</h3>
+<p><strong>Apache Pinot.</strong> Born at LinkedIn (2014, originally for "Who's Viewed Your Profile" and feed analytics), now Apache. Designed for <strong>sub-100 ms p99</strong> aggregation queries on streaming-ingested data with hundreds of thousands of QPS (Queries Per Second). Architecture: immutable segments, columnar with inverted indexes per column, Helix-based coordinator. Strong story for customer-facing real-time dashboards (Uber's order map, LinkedIn's analytics tab).</p>
+<p><strong>Apache Druid.</strong> Born at Metamarkets (~2011), Apache since 2018. Same niche as Pinot — real-time OLAP with streaming ingest. Architecture: segment files (columnar with bitmap indexes), Historical / MiddleManager / Broker / Coordinator nodes. Used at Netflix (clickstream), Airbnb (search-funnel analytics), Lyft.</p>
+<p>These two overlap heavily; both target <strong>sub-second aggregation on data that arrived seconds ago</strong>. Differences in operational story, indexing tradeoffs, and SQL maturity drive the choice.</p>
+<h3 id="federated-query-engines-trino-presto-spark-sql-duckdb">Federated query engines (Trino, Presto, Spark SQL, DuckDB)</h3>
+<p><strong>Trino (formerly PrestoSQL) and Presto.</strong> Originated at Facebook (2012) for ad-hoc analytics on Hive tables. Trino is the active community fork; PrestoDB is the Meta-led continuation. Architecture: <strong>separation of compute from any specific storage</strong> — Trino has connectors for Hive/Iceberg, PostgreSQL, MySQL, Kafka, Cassandra, MongoDB, S3 directly. You can <code>JOIN</code> a Postgres table against an Iceberg fact table against a Kafka topic in a single SQL statement.</p>
+<p><strong>Spark SQL.</strong> General-purpose distributed compute engine; SQL is one of its surfaces. More batch-friendly than Trino (longer-running jobs, fault-tolerant via lineage), used heavily in ETL (Extract-Transform-Load) and ML training pipelines.</p>
+<p><strong>DuckDB.</strong> Single-node, embedded ("SQLite for analytics"). Vectorized engine, reads Parquet / CSV / Arrow / Iceberg directly. Used as a data-science workhorse on laptops and as an embedded engine inside other tools (dbt, Mode, Mother Duck for cloud).</p>
+<p>These engines do not own the storage. They are query layers over external storage (lakehouse tables, object storage, federated databases). Coupled with Iceberg or Delta they form the <strong>lakehouse</strong> pattern: warehouse-grade SQL on commodity object storage with open file formats.</p>
+<h3 id="lakehouse-table-formats-iceberg-delta-lake-hudi">Lakehouse table formats (Iceberg, Delta Lake, Hudi)</h3>
+<p>Not engines, but <strong>table formats</strong> — metadata layers that turn a pile of Parquet files in S3 into a real "table" with snapshot isolation, schema evolution, time travel, and ACID per commit.</p>
+<p><strong>Apache Iceberg.</strong> Netflix origin, vendor-neutral. Snapshot + manifest tree (see §4). Dominant choice in 2024–2026 for new lakehouses. Read/write support: Trino, Spark, Flink, Snowflake (now), BigQuery (now), Databricks (via interop), Athena, ClickHouse.</p>
+<p><strong>Delta Lake.</strong> Databricks origin, open-sourced. Snapshot + transaction log (<code>_delta_log</code>). Native to Databricks; broader engine support has grown (Trino, Spark, Snowflake via Iceberg interop, Flink).</p>
+<p><strong>Apache Hudi.</strong> Uber origin. Built for upsert-heavy workloads (rider-and-driver state updates flowing through ride-matching). Two table types: <strong>Copy-on-Write</strong> (rewrite affected files at write) and <strong>Merge-on-Read</strong> (write delta log, merge at read). Strong on streaming upserts; the others have caught up since.</p>
+<h3 id="comparison-table">Comparison table</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Cloud warehouse (Snowflake)</th>
+<th>BigQuery</th>
+<th>Self-hosted (ClickHouse)</th>
+<th>Real-time (Pinot/Druid)</th>
+<th>Lakehouse (Trino+Iceberg)</th>
+<th>Single-node (DuckDB)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Compute / storage coupling</td>
+<td>Decoupled</td>
+<td>Decoupled (serverless)</td>
+<td>Coupled (classic) / decoupled</td>
+<td>Coupled</td>
+<td>Decoupled</td>
+<td>Single node</td>
+</tr>
+<tr>
+<td>Target query latency</td>
+<td>Seconds-to-minutes</td>
+<td>Seconds-to-minutes</td>
+<td>Sub-second to seconds</td>
+<td>&lt;100 ms p99</td>
+<td>Seconds-to-minutes</td>
+<td>Sub-second on small data</td>
+</tr>
+<tr>
+<td>Ingest latency</td>
+<td>Minutes (Snowpipe ~1m)</td>
+<td>Seconds (streaming buf)</td>
+<td>Seconds (Kafka engine)</td>
+<td>Sub-second (real-time segment)</td>
+<td>Minutes (commit cadence)</td>
+<td>Manual</td>
+</tr>
+<tr>
+<td>Concurrency model</td>
+<td>Virtual warehouses</td>
+<td>Slot pool</td>
+<td>Per-cluster</td>
+<td>Broker fanout</td>
+<td>Coordinator + workers</td>
+<td>Single user</td>
+</tr>
+<tr>
+<td>Storage format</td>
+<td>Proprietary micro-partitions</td>
+<td>Capacitor (proprietary)</td>
+<td>MergeTree (open)</td>
+<td>Pinot/Druid segments (open)</td>
+<td>Parquet + Iceberg/Delta</td>
+<td>Parquet / native</td>
+</tr>
+<tr>
+<td>Time travel</td>
+<td>90 days (Time Travel)</td>
+<td>7 days</td>
+<td>Limited</td>
+<td>Limited</td>
+<td>Unlimited (Iceberg snapshots)</td>
+<td>N/A</td>
+</tr>
+<tr>
+<td>Updates / deletes</td>
+<td>Native MERGE</td>
+<td>Native MERGE</td>
+<td>Mutations (rewrite parts)</td>
+<td>Limited (UPSERT in Pinot)</td>
+<td>MERGE via Iceberg/Delta</td>
+<td>Native</td>
+</tr>
+<tr>
+<td>Cost model</td>
+<td>Credits per warehouse-second</td>
+<td>Bytes scanned / slots</td>
+<td>Per-node</td>
+<td>Per-node</td>
+<td>Per-node + S3</td>
+<td>Free (open source)</td>
+</tr>
+<tr>
+<td>Ops burden</td>
+<td>Low (managed)</td>
+<td>None (serverless)</td>
+<td>High</td>
+<td>High</td>
+<td>Medium (cluster + catalog)</td>
+<td>Low (just a library)</td>
+</tr>
+<tr>
+<td>Sweet spot</td>
+<td>BI on TB-PB</td>
+<td>BI on TB-PB</td>
+<td>Customer-facing logs/events</td>
+<td>&lt;100ms real-time dashboards</td>
+<td>Open warehouse, ML pipelines</td>
+<td>Notebooks, data science</td>
+</tr>
+</tbody>
+</table>
+<p>Synthesis: every cell's value is driven by the engine's central design choice. Pinot picks coupled storage with bitmap indexes because &lt;100 ms p99 means you can't pay for S3 round-trips. Snowflake picks decoupled storage because the workload is BI, and 200 ms more on cold-cache scans is acceptable in exchange for "you can resize compute in 5 seconds." Trino picks no storage at all because its job is to federate across whatever already exists.</p>
+<hr>
+<h2 id="4-byte-level-mechanics">§4. Byte-Level Mechanics</h2>
+<p>The depth section. We zoom into columnar storage layout, compression codecs, zone maps, vectorized execution, Parquet file format, and the Iceberg manifest tree. We walk one aggregation query end-to-end.</p>
+<h3 id="41-columnar-layout-row-major-vs-column-major">4.1 Columnar layout: row-major vs column-major</h3>
+<p>A row-oriented store (InnoDB, PostgreSQL) writes rows contiguously on a page. A 200-column table with rows of 256 B has each row's 200 column values adjacent in memory:</p>
+<pre><code>Row-major (one InnoDB 16 KB page):
+┌───────────────────────────────────────────────────────────────┐
+│ Row 1: col1 col2 col3 ... col200  Row 2: col1 col2 col3 ...   │
+│        │    │    │         │                                  │
+│        adjacent in memory, one row = one contiguous chunk     │
+└───────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>A column-oriented store stores each column in its own contiguous run. For the same 200-column table, you get 200 separate "column files" (or 200 contiguous column chunks within a row group):</p>
+<pre><code>Column-major (one Parquet row group, simplified):
+┌─────────────────────────────────────────────────────────┐
+│ col1: [val_1, val_2, val_3, ..., val_N]   ← contiguous  │
+│ col2: [val_1, val_2, val_3, ..., val_N]   ← contiguous  │
+│ col3: [val_1, val_2, val_3, ..., val_N]                 │
+│ ...                                                     │
+│ col200: [val_1, val_2, val_3, ..., val_N]               │
+└─────────────────────────────────────────────────────────┘
+</code></pre>
+<p>The key consequence: a query <code>SELECT col5, col10, SUM(col17) FROM t WHERE col5 = 'US'</code> reads <strong>only the byte ranges for col5, col10, col17</strong>. If each column is 1% of total table bytes, the query reads ~3% of the data — a 30x I/O reduction before compression even kicks in.</p>
+<p>The next consequence: <strong>locality within a column is much higher than locality within a row</strong>. All <code>country_code</code> values are likely to be one of ~200 strings; all <code>event_type</code> values one of ~50; all <code>timestamp</code> values monotonically increasing. Per-column compression exploits this brutally.</p>
+<h3 id="42-compression-codec-stack">4.2 Compression codec stack</h3>
+<p>A modern columnar engine doesn't use one compressor — it composes lightweight codecs tailored to the column's data shape, then optionally applies a general-purpose entropy coder on top.</p>
+<p><strong>Dictionary encoding.</strong> For low-cardinality columns (<code>country_code</code>, <code>event_type</code>, <code>status</code>), build a dictionary mapping each distinct value to a small integer ID. Store the dictionary once, and replace the column values with the IDs. A <code>country_code</code> column of 1 B values × 8 bytes = 8 GB becomes 1 B × 1 byte (for 256 distinct countries) + dictionary = ~1 GB. <strong>8x reduction</strong>.</p>
+<p><strong>Run-length encoding (RLE).</strong> For columns where consecutive values often repeat (e.g., after sorting by <code>country_code</code>: 1 B "US", then 200 M "GB", then ...). Store <code>(value, count)</code> pairs. A column with 1000 distinct runs over 1 B rows compresses to ~16 KB.</p>
+<p><strong>Bit-packing.</strong> For dictionary-encoded columns where the dictionary fits in K bits (256 entries → 8 bits, 64 entries → 6 bits), pack the IDs at bit-level. Bit-packing on a 5-bit dictionary across 1 B rows saves 3 bits per row vs a full byte = ~375 MB saved per column.</p>
+<p><strong>Delta encoding.</strong> For sorted or monotonic numeric columns — most commonly <strong>timestamps</strong>. Store <code>(start, delta_1, delta_2, ...)</code>. For an event-stream timestamp column at second resolution, deltas are small integers fitting in 4–8 bits each.</p>
+<p><strong>Delta-of-delta.</strong> Two-level delta. Used in Gorilla (Facebook's in-memory time-series engine, now generalized into Prometheus/M3DB/InfluxDB IOx). For a regular-cadence metric ("CPU usage sampled every 10s"), most timestamp deltas equal 10 seconds; delta-of-delta is 0. Compresses a 64-bit timestamp into ~1 bit on average for steady cadences.</p>
+<p><strong>Gorilla encoding (for floats).</strong> Facebook's Gorilla paper trick: XOR each float64 with the previous, then store the number of leading zero bytes + significant bytes. Stationary or slowly-changing metrics (memory usage, throughput) compress 10–20x because consecutive samples differ in only the last few bytes.</p>
+<p><strong>Zstandard / LZ4 / Snappy on top.</strong> After the structural codecs, run a general-purpose entropy coder over the result. Zstd at level 3 is the modern default — ~500 MB/sec compress, ~2 GB/sec decompress, 2–4x further reduction. Snappy is faster but compresses less; LZ4 is fastest. Parquet defaults vary by engine; ZSTD is the modern default in Iceberg/Delta.</p>
+<p><strong>The cumulative effect.</strong> A real production fact table (event logs, ~50 columns, ~256 B/row uncompressed): per-column codecs give ~5x; Zstd on top gives ~2x; total ~10x. A 10 TB raw fact table on S3 is ~1 TB in Parquet. Snowflake reports typical compression of 3-5x on production tables (their own micro-partition format with their codec stack).</p>
+<pre><code>Column &quot;country_code&quot; compression path (1 B rows):
+Raw VARCHAR     8 GB    8-byte strings
+Dictionary →    1 GB    8-bit IDs + small dictionary
+Bit-pack →      125 MB  bit-packed to actual bit-width
+Zstd →          ~15 MB  entropy coding on the bit-packed bytes
+                ───
+                ~530x reduction on a perfectly-skewed column
+</code></pre>
+<h3 id="43-zone-maps-minmax-indexes-and-sparse-primary-keys">4.3 Zone maps, MinMax indexes, and sparse primary keys</h3>
+<p>A columnar engine doesn't index every row. It indexes <strong>granules</strong> — fixed-size chunks of consecutive rows (~8192 rows in ClickHouse, ~1024 rows in Pinot, ~1 M rows per row group in Parquet).</p>
+<p>Each granule carries per-column metadata:</p>
+<ul>
+<li><strong>Min and max of the column within the granule.</strong> A <code>WHERE event_date BETWEEN '2026-05-01' AND '2026-05-07'</code> query checks each granule's <code>min</code> and <code>max</code>; if the granule's range doesn't intersect, skip it entirely.</li>
+<li><strong>Null count.</strong></li>
+<li><strong>Distinct count (sometimes).</strong></li>
+<li><strong>Bloom filter (optional).</strong> For point-equality predicates (<code>WHERE user_id = 42</code>), a bloom filter per granule rules out granules with no chance.</li>
+<li><strong>Histogram (optional).</strong> Snowflake's clustering keeps approximate distributions per micro-partition for the optimizer.</li>
+</ul>
+<pre><code>ClickHouse MergeTree, simplified granule layout:
+
+┌────────────────────────────────────────────────────────────┐
+│ Part (~10-100 GB, one logical chunk on disk)               │
+│   ┌──────────────────────────────────────────────────────┐ │
+│   │ Granule 0:                                           │ │
+│   │   col1.bin bytes [0..L1]   col2.bin bytes [0..L2]    │ │
+│   │   ...                                                │ │
+│   │ Mark file: col1: min=10, max=99, NULL=0              │ │
+│   │            col2: min='2026-05-01', max='2026-05-01'  │ │
+│   ├──────────────────────────────────────────────────────┤ │
+│   │ Granule 1:                                           │ │
+│   │   col1.bin bytes [L1..L1+L1']                        │ │
+│   │   ...                                                │ │
+│   │   Mark file: col1: min=100, max=199                  │ │
+│   └──────────────────────────────────────────────────────┘ │
+│                                                            │
+│   Primary key index (sparse): one entry per granule        │
+│     granule_0 → (col1=10, col2='2026-05-01')               │
+│     granule_1 → (col1=100, col2='2026-05-01')              │
+│     ...                                                    │
+└────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>The <strong>primary key index</strong> in a columnar OLAP engine is fundamentally different from an OLTP B+ tree. It is <strong>sparse</strong> — one entry per granule, not per row. For an 8192-row granule, the PK index is ~8000x smaller than an OLTP per-row index. The query plan uses the PK index to binary-search to the right granule, then scans within. Point lookups can't use this to find one row in &lt;1 ms — they find one <em>granule</em> (~8000 rows) in &lt;1 ms and then have to scan ~8000 rows.</p>
+<p>This is why OLAP is anti-pattern for point lookups: the index granularity is wrong by design.</p>
+<h3 id="44-vectorized-execution-and-simd">4.4 Vectorized execution and SIMD</h3>
+<p>The classic execution model — <strong>tuple-at-a-time</strong> — processes one row at a time through the operator tree (Volcano-style iterators). Each row pays the overhead of virtual function calls, branch mispredictions, and L1 cache misses on every operator boundary.</p>
+<p>The modern model — <strong>vectorized execution</strong> — processes a <strong>batch</strong> (typically 1024 or 4096 values) through each operator at once. The operator's inner loop becomes a tight scalar or SIMD-vector loop over an array of column values.</p>
+<p>Concrete: filtering <code>WHERE price &gt; 100</code>.</p>
+<pre><code class="language-c">// Tuple-at-a-time (slow)
+while (next_row(row)) {
+  if (row-&gt;price &gt; 100) emit(row);
+}
+// Each iteration: virtual call, branch, possible cache miss.
+// Throughput: ~10–50 M rows/sec/core.
+
+// Vectorized (fast)
+for (int i = 0; i &lt; 1024; i++) {
+  selection[i] = (price[i] &gt; 100);
+}
+emit(selection);
+// Inner loop: 1024-element-wide SIMD compare + bitmask in &lt;100 nanoseconds on AVX-512.
+// Throughput: ~1–5 GB/sec/core on integer columns.
+</code></pre>
+<p><strong>SIMD instructions.</strong> Intel AVX-512 (Advanced Vector Extensions) processes 64 bytes at once — 16 int32 values, 8 int64 values, 64 byte values per instruction. ClickHouse, DuckDB, Databricks Photon, BigQuery's Capacitor engine all use AVX-512 (or AVX2 on older hardware) intensively. Aggregations (SUM, COUNT, MIN, MAX), filters (predicate evaluation), arithmetic (price * quantity), and hashing (group-by) all parallelize.</p>
+<p>Vectorized execution + tight columnar layout + SIMD is why a modern engine scans 1–10 GB/sec/core. This is 10–100x faster than tuple-at-a-time on the same hardware. The whole "columnar OLAP is fast" story rests on this.</p>
+<h3 id="45-parquet-file-structure">4.5 Parquet file structure</h3>
+<p>Parquet is the dominant on-disk columnar format. Layout (one file):</p>
+<pre><code>Parquet file (typical, 128–1024 MB on disk):
+
+┌────────────────────────────────────────────────────────────┐
+│ Magic number: &quot;PAR1&quot; (4 bytes)                             │
+├────────────────────────────────────────────────────────────┤
+│ Row Group 0  (~128 MB uncompressed, ~1 M rows)             │
+│   ┌──────────────────────────────────────────────────────┐ │
+│   │ Column chunk for col1                                │ │
+│   │   ┌────────────────────────────────────────────────┐ │ │
+│   │   │ Page 0: dictionary page                        │ │ │
+│   │   │ Page 1: data page (encoded values)             │ │ │
+│   │   │ Page 2: data page                              │ │ │
+│   │   │ ...                                            │ │ │
+│   │   └────────────────────────────────────────────────┘ │ │
+│   │ Column chunk for col2  → ...                         │ │
+│   │ Column chunk for col3  → ...                         │ │
+│   │ ...                                                  │ │
+│   └──────────────────────────────────────────────────────┘ │
+├────────────────────────────────────────────────────────────┤
+│ Row Group 1                                                │
+│ Row Group 2                                                │
+│ ...                                                        │
+├────────────────────────────────────────────────────────────┤
+│ Footer:                                                    │
+│   File metadata:                                           │
+│     Schema definition                                      │
+│     Row groups[]:                                          │
+│       - byte_offset, byte_length                           │
+│       - num_rows                                           │
+│       - column_metadata[]:                                 │
+│           - col_name, encoding, codec                      │
+│           - statistics: min, max, null_count               │
+│           - byte_offset, compressed_size, uncompressed_size│
+│           - bloom_filter offset (Parquet 1.12+)            │
+│   Footer length (4 bytes)                                  │
+│   Magic: &quot;PAR1&quot; (4 bytes)                                  │
+└────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>Key properties:</p>
+<ul>
+<li><strong>Self-describing.</strong> Each file is independently readable. The footer holds the full schema + statistics for every row group.</li>
+<li><strong>Row groups are independent.</strong> A query can skip a row group entirely based on footer statistics, parallelize across row groups in different files, and read column chunks for only the projected columns.</li>
+<li><strong>Page is the I/O unit.</strong> Pages are ~1 MB. A query that needs only the first 10 K rows of a 1 M-row row group reads only the first ~1 MB of each projected column.</li>
+<li><strong>Footer at the end.</strong> Annoying for streaming writes (you can't write the footer until you've written all row groups), but the convention is to read the file by <code>seek</code> to the last 8 bytes, read footer length and magic, then <code>seek</code> back and read the footer, then <code>seek</code> again to the data ranges. <strong>3 round trips on S3</strong> before data fetches start — a performance gotcha for many-small-file workloads.</li>
+<li><strong>ORC (Optimized Row Columnar) is the alternative.</strong> Originated in Hive/Hortonworks. Same general structure (file with stripes ~ Parquet row groups, columns within stripes, footer at end). More aggressively optimized for Hive-era predicate pushdown. Modern lakehouses standardize on Parquet because of broader engine support; ORC is still common in older Hadoop estates.</li>
+</ul>
+<h3 id="46-iceberg-manifest-tree-table-semantics-over-parquet">4.6 Iceberg manifest tree — table semantics over Parquet</h3>
+<p>Parquet alone is "files in S3." To make a real table — with <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, snapshot isolation, schema evolution, time travel — you need a metadata layer above the files. Iceberg's solution: a <strong>multi-level manifest tree</strong>, all in object storage, all updated by atomic pointer swaps.</p>
+<pre><code>Iceberg metadata hierarchy (in S3 alongside the data):
+
+table_root/
+├── metadata/
+│   ├── v1.metadata.json  ← initial metadata
+│   ├── v2.metadata.json
+│   ├── ...
+│   └── version-hint.text ← points to latest version number
+│
+│   v42.metadata.json:
+│     {
+│       &quot;table_uuid&quot;: &quot;...&quot;,
+│       &quot;current-snapshot-id&quot;: 12345,
+│       &quot;snapshots&quot;: [
+│         { &quot;snapshot-id&quot;: 12345,
+│           &quot;timestamp-ms&quot;: ...,
+│           &quot;manifest-list&quot;: &quot;snap-12345-mlist.avro&quot;,
+│           &quot;summary&quot;: { &quot;added-files&quot;: 17, &quot;deleted-files&quot;: 3 } },
+│         { &quot;snapshot-id&quot;: 12344, ... },
+│         ...
+│       ],
+│       &quot;schema&quot;: { ... },
+│       &quot;partition-spec&quot;: { ... },
+│       &quot;sort-order&quot;: { ... }
+│     }
+│
+├── metadata/snap-12345-mlist.avro
+│     manifest list (one entry per manifest file):
+│     [
+│       { &quot;manifest_path&quot;: &quot;manifest-001.avro&quot;,
+│         &quot;added_data_files_count&quot;: 5,
+│         &quot;partitions&quot;: [ { &quot;lower_bound&quot;: &quot;2026-05-01&quot;, &quot;upper_bound&quot;: &quot;2026-05-01&quot; } ] },
+│       { &quot;manifest_path&quot;: &quot;manifest-002.avro&quot;, ... },
+│       ...
+│     ]
+│
+├── metadata/manifest-001.avro
+│     manifest file (one entry per data file):
+│     [
+│       { &quot;data_file&quot;: &quot;data/dt=2026-05-01/part-0001.parquet&quot;,
+│         &quot;file_size_bytes&quot;: 524288000,
+│         &quot;record_count&quot;: 1042000,
+│         &quot;partition&quot;: { &quot;dt&quot;: &quot;2026-05-01&quot; },
+│         &quot;column_stats&quot;: {
+│           &quot;user_id&quot;: { &quot;min&quot;: 1, &quot;max&quot;: 99999, &quot;null_count&quot;: 0 },
+│           &quot;country&quot;: { &quot;min&quot;: &quot;AD&quot;, &quot;max&quot;: &quot;ZW&quot;, &quot;null_count&quot;: 12 }
+│         } },
+│       ...
+│     ]
+│
+└── data/
+    ├── dt=2026-05-01/part-0001.parquet
+    ├── dt=2026-05-01/part-0002.parquet
+    ├── ...
+</code></pre>
+<p>The chain: <strong>table metadata → snapshot → manifest list → manifest files → data files</strong>.</p>
+<p><strong>Why three levels.</strong> A single flat list of all data files in the table doesn't scale — a 1 PB table can have millions of Parquet files. A two-level tree (manifest list → manifest files) lets the engine:</p>
+<ul>
+<li>Read the snapshot's metadata.json (1 KB).</li>
+<li>Read the manifest list (1–10 MB).</li>
+<li>Skip manifests whose partition bounds don't intersect the query predicate (most are skipped).</li>
+<li>Read only the relevant manifest files (each ~1 MB, listing ~1000 data files with stats).</li>
+<li>Use per-file stats to skip data files.</li>
+<li>Read only the matching Parquet files, then use Parquet's row-group stats to skip row groups within them.</li>
+</ul>
+<p>This is a <strong>four-level zone-map hierarchy</strong>: partition → file → row-group → page. Each level prunes ~10–100x. A 1 PB table with a tight predicate often scans &lt;100 MB.</p>
+<p><strong>Snapshot isolation via pointer swap.</strong> A write transaction:</p>
+<ol>
+<li>Writes new Parquet files to <code>data/</code>.</li>
+<li>Writes a new manifest file pointing to them.</li>
+<li>Writes a new manifest-list file referencing the old manifests (unchanged ones) + the new manifest.</li>
+<li>Writes a new <code>v43.metadata.json</code> referencing the new manifest list.</li>
+<li><strong>Atomically updates <code>version-hint.text</code> to "43"</strong> (or, in catalog-based deployments, atomically updates the catalog row for this table to point to <code>v43.metadata.json</code>).</li>
+</ol>
+<p>Step 5 is the <strong>commit point</strong>. Until it happens, no reader sees the new data. After it happens, all new readers see the new snapshot atomically; in-flight readers continue on their original snapshot (they hold the old metadata.json reference and ignore the new manifest list). <strong>Snapshot isolation, without locks, on object storage.</strong></p>
+<p><strong>Time travel.</strong> Old snapshot files are not deleted until a retention threshold passes. <code>SELECT * FROM t FOR VERSION AS OF 12343</code> opens the table at snapshot 12343 (manifest list, manifests, and data files all immutable and still present in S3). Iceberg defaults to retaining snapshots for 5 days; configurable.</p>
+<p><strong>Schema evolution.</strong> Each snapshot carries a schema version; column adds, renames, drops are metadata-only operations that produce a new snapshot with a new schema. Old snapshots remain readable under their original schema.</p>
+<p><strong>Hidden partitioning.</strong> Iceberg stores the partition function (e.g., <code>bucket(16, user_id)</code>, <code>day(event_ts)</code>) in the table metadata. Queries say <code>WHERE event_ts &gt; '2026-05-01'</code> and Iceberg auto-applies the partition predicate. The user never says <code>WHERE event_dt = '2026-05-01'</code> (the partition column in Hive). This decouples partitioning from query syntax; partitioning evolution doesn't require rewriting queries.</p>
+<p>Delta Lake uses a similar idea with a different metadata format — a <code>_delta_log/</code> directory of JSON commit files and Parquet checkpoint files. Hudi uses a <code>.hoodie/</code> directory with timeline files. All three solve the same problem (table semantics over files in object storage); Iceberg's manifest tree is the dominant choice in 2026 because of breadth of engine support and operational simplicity at PB+ scale.</p>
+<h3 id="47-one-concrete-query-walked-end-to-end">4.7 One concrete query, walked end-to-end</h3>
+<p>A real query against an Iceberg+Trino lakehouse:</p>
+<pre><code class="language-sql">SELECT country, SUM(revenue) AS total_revenue
+FROM clickstream_events
+WHERE event_date BETWEEN '2026-05-01' AND '2026-05-07'
+  AND event_type = 'purchase'
+GROUP BY country
+ORDER BY total_revenue DESC
+LIMIT 20;
+</code></pre>
+<p>Table: partitioned by <code>event_date</code>, 10 B rows over a year, ~50 columns, ~5 TB Parquet.</p>
+<ol>
+<li><strong>Parse, plan.</strong> Trino coordinator builds plan: <code>Scan → Filter → Aggregate → Sort → Limit</code>. Filter pushed to scan.</li>
+<li><strong>Read table metadata</strong> (<code>v_latest.metadata.json</code>, then manifest list ~5 MB).</li>
+<li><strong>Prune manifests by partition bounds.</strong> 7 days of 365 → ~99% skipped.</li>
+<li><strong>Read 7 relevant manifests</strong> (~7 MB total) listing data files with per-file column stats.</li>
+<li><strong>Prune data files</strong> by <code>event_type</code> min/max — ~30% drop. After: ~1000 files (~700 GB) out of ~50 K (~5 TB). <strong>~85% of bytes skipped.</strong></li>
+<li><strong>Schedule splits.</strong> Coordinator divides files among workers, one row-group per task.</li>
+<li><strong>Per-worker read.</strong> Open Parquet file (HTTP GET footer first, then data ranges); skip row groups within file via footer stats (~30% further pruning); read only the 4 projected columns; decompress pages; decode into Arrow vectors.</li>
+<li><strong>Vectorized filter.</strong> SIMD compare <code>event_type == 'purchase'</code> across 1024-row batches (~100 ns per batch on AVX-512).</li>
+<li><strong>Partial aggregate.</strong> Hash by <code>country</code>, accumulate <code>SUM(revenue)</code> in a per-worker hash table.</li>
+<li><strong>Shuffle</strong> partial results by <code>hash(country) % N</code>.</li>
+<li><strong>Final aggregate.</strong> Sum partial sums per country (~250 country rows total).</li>
+<li><strong>Sort, limit.</strong> Coordinator sorts and returns top 20.</li>
+</ol>
+<p><strong>Wall clock on a 50-worker Trino cluster:</strong> ~3–10 seconds for ~700 GB effective scan, dominated by S3 GET latency. Aggregation itself at ~5 GB/sec/node runs in ~60 ms wall time after parallelization.</p>
+<p><strong>Byte-level total.</strong> Out of 5 TB of table data, ~700 GB Parquet downloaded → ~150 GB after column projection → ~30 GB after row-group skipping. Final output: ~480 bytes (20 rows × 24 bytes). <strong>Without columnar layout, manifest pruning, and vectorized execution, the same query reads 5 TB and takes hours. With them, 30 GB and 5 seconds.</strong></p>
+<hr>
+<h2 id="5-capacity-envelope">§5. Capacity Envelope</h2>
+<p>What columnar OLAP can do, illustrated across very different scales. The same family of technology covers six orders of magnitude.</p>
+<p><strong>DuckDB on a laptop — GB scale.</strong> A data scientist runs DuckDB in a Jupyter notebook on a MacBook Pro M3 (16 GB RAM, NVMe). 50 GB of Parquet from S3 cached locally; aggregations over ~500 M rows in 1–5 seconds. ~6 GB/sec scan rate on a single chip; 1 B-row TPC-H Q1 in ~2 seconds. Concurrent users: 1. Cost: zero (open-source).</p>
+<p><strong>ClickHouse self-hosted — TB scale.</strong> A SaaS analytics company runs a 16-node ClickHouse cluster on AWS i4i.4xlarge (16 vCPU, 128 GB RAM, 7.5 TB NVMe each). ~120 TB compressed (~5 PB uncompressed equivalent). ~1000 QPS, p99 ~500 ms. Ingest ~2 M events/sec via Kafka. Plausible Analytics publicly runs their entire product on this scale.</p>
+<p><strong>Snowflake at mid-large enterprise — TB-to-PB scale.</strong> A retailer with thousands of analytics users. Virtual warehouses: 4–8 size-large clusters (~8 nodes each), scaled up during BI peak hours, paused overnight. ~50–500 TB compressed; ~5 PB raw. Dashboard query: 2–10 seconds. ETL: 5–30 minutes. Concurrency: ~200–500 concurrent queries. Cost: $1 M–$10 M/year typical.</p>
+<p><strong>Netflix Iceberg + Trino — exabyte scale.</strong> ~hundreds of PB to low exabytes on S3 in Iceberg (~500 PB disclosed 2023). Trino interactive (~1000+ nodes), Spark batch (tens of thousands of jobs/day), Flink streaming. Queries from 1-second metadata lookups to multi-hour ML training. Iceberg was born at Netflix in 2017 to fix Hive's metadata scaling at this size.</p>
+<p><strong>Meta Presto, Google BigQuery — exabyte scale.</strong> Meta runs Presto on hundreds of thousands of CPUs over &gt;300 PB; the dominant interactive engine inside Facebook. BigQuery is likely the largest known OLAP system — exabytes of customer data on Capacitor/Colossus, queries scanning multiple PB in seconds, millions of queries/day.</p>
+<p><strong>Apache Pinot at LinkedIn / Uber — real-time, multi-PB.</strong> LinkedIn Pinot for member-facing dashboards: ~200 K QPS, p99 &lt;50 ms, tens of PB. Uber Pinot + Druid: ~600 K QPS at peak, sub-100 ms p99. Different OLAP shape than Snowflake — "tens-of-ms-fast over PB" via coupled storage and per-column bitmap indexes, not Snowflake's "seconds-fast over PB" via cheap S3.</p>
+<p><strong>Capacity envelope: GB on a laptop to exabytes at hyperscale — six orders of magnitude wide.</strong> Storage engine details (columnar, compressed, vectorized) are the same on a DuckDB process as on a BigQuery slot. What scales is the partitioning, manifest layering, and distributed coordinator wrapping the engine.</p>
+<hr>
+<h2 id="6-architecture-in-context">§6. Architecture in Context</h2>
+<p>The canonical modern OLAP architecture, the <strong>Lakehouse pattern</strong>. Not "the X system" — the shape that recurs across analytics platforms in 2024–2026.</p>
+<pre><code>                ┌────────────────────────────────────────┐
+                │   OLTP source systems                  │
+                │   (MySQL / PostgreSQL / DynamoDB /     │
+                │    MongoDB / app-level events)         │
+                └─────────────┬──────────────────────────┘
+                              │
+                              │ CDC (Change Data Capture)
+                              │ Debezium / Brooklin / native
+                              │
+                              ▼
+                ┌────────────────────────────────────────┐
+                │   Kafka (or equivalent log)            │
+                │   Per-table topics, ordered by         │
+                │   primary key partition                │
+                └─────────────┬──────────────────────────┘
+                              │
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+        ┌──────────┐    ┌──────────┐    ┌──────────┐
+        │ Stream   │    │ Real-time│    │ Batch    │
+        │ processor│    │ OLAP     │    │ ETL      │
+        │ (Flink)  │    │ (Pinot,  │    │ (Airflow │
+        │          │    │  Druid)  │    │  + Spark)│
+        └────┬─────┘    └────┬─────┘    └────┬─────┘
+             │               │ direct        │
+             │               │ ingest        │
+             ▼               │               ▼
+        ┌────────────────────┴──────────────────────┐
+        │   Lakehouse: Iceberg / Delta / Hudi       │
+        │   on S3 / GCS / ADLS                      │
+        │                                           │
+        │   Bronze (raw) → Silver (cleaned)         │
+        │     → Gold (aggregated / materialized)    │
+        └─────────────────┬─────────────────────────┘
+                          │
+            ┌─────────────┼─────────────┬────────────────┐
+            ▼             ▼             ▼                ▼
+        ┌─────────┐  ┌─────────┐  ┌─────────────┐  ┌───────────┐
+        │ Trino   │  │ Spark   │  │ Snowflake / │  │ DuckDB    │
+        │ (inter- │  │ SQL     │  │ BigQuery    │  │ (laptops, │
+        │  active │  │ (batch  │  │ (managed    │  │  embedded)│
+        │  SQL)   │  │  ETL/ML)│  │  warehouse) │  │           │
+        └────┬────┘  └────┬────┘  └─────┬───────┘  └─────┬─────┘
+             │            │             │                │
+             ▼            ▼             ▼                ▼
+        ┌────────────────────────────────────────────────────┐
+        │   Consumers: BI tools (Tableau, Looker), data      │
+        │   science notebooks, ML training, reverse ETL      │
+        │   to operational systems, customer-facing analytics│
+        └────────────────────────────────────────────────────┘
+</code></pre>
+<p>The canonical layers: <strong>OLTP source</strong> is the truth (account balances, orders); <strong>CDC</strong> captures changes (Debezium, Brooklin, DynamoDB Streams); <strong>Kafka</strong> is the durable, replayable backbone; <strong>stream processor</strong> (Flink, Spark Streaming) materializes Kafka topics into Iceberg/Delta with exactly-once semantics, committing every 30s–5min; <strong>real-time OLAP</strong> (Pinot, Druid) ingests directly from Kafka for sub-second-freshness use cases; <strong>batch ETL</strong> (Airflow + Spark) runs longer transformations producing <strong>Bronze → Silver → Gold</strong> medallion-architecture tables; <strong>query engines</strong> (Trino, Spark, Snowflake, BigQuery, DuckDB) read the lakehouse tables — the table is the integration point. <strong>Consumers</strong> are BI dashboards, notebooks, ML pipelines, customer-facing analytics, and reverse-ETL.</p>
+<p><strong>Lambda vs Kappa variants.</strong> Lambda (Marz, 2014) runs batch + speed layers in parallel, queries merging both — two implementations, two drift opportunities. Kappa (Kreps, 2014) runs one streaming pipeline and replays from Kafka to backfill. The diagram above is Kappa; Flink + Iceberg + Trino is the modern default.</p>
+<hr>
+<h2 id="7-hard-problems-inherent-to-olap">§7. Hard Problems Inherent to OLAP</h2>
+<p>Seven fundamental challenges. Each shows up regardless of which warehouse or engine you pick; illustrating examples come from across domains.</p>
+<h3 id="71-joins-at-scale">7.1 Joins at scale</h3>
+<p><strong>One line.</strong> A <code>JOIN</code> between two large tables triggers a hash table or a shuffle that may not fit in memory or in network bandwidth.</p>
+<p><strong>Where it shows up.</strong> A marketing-attribution query joins <code>clicks</code> (100 B rows) against <code>purchases</code> (1 B rows) by <code>user_id</code>. A risk model joins <code>transactions</code> (10 B rows) against <code>accounts</code> (1 M rows) by <code>account_id</code>. An ML pipeline joins <code>events</code> (50 B rows) against <code>feature_table</code> (1 M user features) by <code>user_id</code>.</p>
+<p><strong>Naïve plan.</strong> Cross-product: for every <code>clicks</code> row, scan all <code>purchases</code>. 100 B × 1 B = 10²⁰ comparisons. Heat death of the universe before it returns.</p>
+<p><strong>Real fix.</strong> The optimizer picks one of three strategies based on table sizes and join keys.</p>
+<ul>
+<li><strong>Broadcast (replicated) join.</strong> When one side is small (&lt;1 GB after filters), the small side is replicated to every worker; each worker hash-joins its slice of the big side against the in-memory small side. Cost: O(big_side_scan + N_workers × small_side_size). Used for fact-against-small-dimension joins (e.g., <code>events</code> ⨝ <code>products</code>).</li>
+<li><strong>Shuffle join.</strong> Both sides are large. Hash both by the join key, redistribute rows to N partitions, hash-join within each partition. Cost: O(both_sides_scan + both_sides_network). Used when neither side is broadcastable.</li>
+<li><strong>Bucketed join.</strong> If both tables are pre-bucketed (Iceberg's <code>bucket(N, user_id)</code> partition spec) on the join key, no shuffle is needed — corresponding buckets join directly. Free, when applicable.</li>
+</ul>
+<p><strong>The "100 B × 1 M" cross-join disaster.</strong> A common pitfall: the optimizer mis-estimates the small side as "huge," picks a shuffle join, and the shuffle phase moves 100 B rows over the network. 10 TB of data shuffled at 10 GB/sec across the cluster = 1000 seconds of pure network time. The fix: explicit hint to the optimizer (<code>/*+ BROADCAST(small_table) */</code>) or pre-collect stats so the optimizer picks the right plan. Bad joins are the single biggest cause of "query that should take 10 seconds takes 4 hours."</p>
+<h3 id="72-cardinality-estimation-for-query-planning">7.2 Cardinality estimation for query planning</h3>
+<p><strong>One line.</strong> The optimizer's chosen plan depends on its estimate of row counts at each operator; bad estimates cause bad plans.</p>
+<p><strong>Where it shows up.</strong> A query with <code>WHERE event_date = '2026-05-20' AND user_country = 'JP' AND event_type = 'purchase'</code> could match 100 rows or 100 M rows depending on the day, country, and type. The optimizer must guess to pick the right plan.</p>
+<p><strong>Naïve estimate.</strong> Assume column predicates are independent: <code>selectivity(date) × selectivity(country) × selectivity(type)</code>. Often wrong by orders of magnitude — <code>country='JP'</code> and <code>event_type='cart_view'</code> are correlated (Japan has higher e-commerce engagement); the joint selectivity is not the product.</p>
+<p><strong>Why it breaks.</strong> The optimizer estimates a join's left side at 1000 rows, picks a broadcast join, allocates 100 MB for the hash table. Reality: 100 M rows. Hash table OOMs (out of memory); the worker crashes; the query restarts from scratch with a different plan; total wall time goes from a target 5 s to 30 minutes.</p>
+<p><strong>Real fix.</strong> Multi-pronged:</p>
+<ul>
+<li><strong>Statistics collection.</strong> Engines maintain per-column histograms, NDV (Number of Distinct Values) estimates, and most-common-value frequencies. Snowflake auto-collects on micro-partition writes; BigQuery uses ZetaSQL's optimizer over column statistics in metadata; Spark requires <code>ANALYZE TABLE</code>.</li>
+<li><strong>Multi-column statistics.</strong> Joint histograms (PostgreSQL's <code>CREATE STATISTICS</code>) capture correlations between columns. Often expensive, used selectively.</li>
+<li><strong>Adaptive query execution (AQE).</strong> Spark 3+, Snowflake's adaptive planner, Databricks Photon's runtime adaptation. The engine starts a plan, observes actual row counts during the first stages, and re-plans downstream stages. Turns "wrong plan = disaster" into "wrong plan = slow start, then re-plan."</li>
+<li><strong>Manual hints.</strong> Production-critical queries often carry hints to override the optimizer when stats are known to be misleading.</li>
+</ul>
+<h3 id="73-data-skew">7.3 Data skew</h3>
+<p><strong>One line.</strong> Even with hashed partitioning, a few keys account for most of the rows; one worker gets 90% of the work.</p>
+<p><strong>Where it shows up.</strong> A click-stream <code>GROUP BY user_id</code> finds one bot account with 1 B events out of 10 B total. A SaaS analytics <code>GROUP BY tenant_id</code> finds one mega-customer driving 30% of all rows. A multiplayer game <code>GROUP BY game_session_id</code> has one viral session with 100x median traffic.</p>
+<p><strong>Naïve fix.</strong> Hash partition by the GROUP BY key. Spreads keys evenly across workers — but the <strong>rows per key</strong> are unevenly spread, so a worker holding the heavy key holds most of the rows.</p>
+<p><strong>Why it breaks.</strong> Concrete: 100 workers, shuffle-aggregating 10 B rows. Theoretical balance: 100 M rows/worker. Reality (skewed key): one worker holds 1 B (the bot's events) + ~90 M (random other keys) ≈ 1.1 B rows. Wall time = (1.1 B rows) / (1 worker's throughput) = 10x the expected. The other 99 workers idle for 90% of the query.</p>
+<p><strong>Real fix.</strong> <strong>Salting</strong> the skewed key. For the known-hot key, append a random 0..N-1 suffix at write or at the partial aggregation step. The hot key becomes N "shards" — <code>bot_user_id:0</code>, <code>bot_user_id:1</code>, ..., <code>bot_user_id:15</code> — each landing on a different worker. After local aggregation, a final reduce step de-salts and combines: 16 partial sums per shard → one total per logical key.</p>
+<pre><code>Without salting:                 With salting (N=16):
+worker_0 [user_42:1B rows] ⨯     worker_0 [user_42:0, 62M rows] ✓
+worker_1 [other 90M rows] ✓      worker_1 [user_42:1, 62M rows] ✓
+worker_2 [other 90M rows] ✓      ...
+...                              worker_15 [user_42:15, 62M rows] ✓
+                                 ↓
+                                 Final reduce: sum across user_42:0..15
+</code></pre>
+<p>Trino and Spark have automatic skew detection (AQE, dynamic partition coalescing); manual salting is still common for known-pathological cases.</p>
+<h3 id="74-data-freshness-vs-cost">7.4 Data freshness vs cost</h3>
+<p><strong>One line.</strong> Going from "hourly batch ETL" to "sub-second streaming ingest" can cost 10–100x more compute.</p>
+<p><strong>Where it shows up.</strong> A daily dashboard with 24-hour-stale data is fine for finance reporting; useless for fraud detection. Real-time fraud needs &lt;1-second visibility into transactions. ML model training needs hourly fresh features; online inference needs sub-second.</p>
+<p><strong>Naïve fix.</strong> Stream everything. Run Flink jobs continuously; commit to Iceberg every 30 seconds; query the lakehouse for everything.</p>
+<p><strong>Why it breaks.</strong> Continuous streaming commits produce <strong>small files</strong>. A table with 30-second commits and 100 partitions produces 100 × (86400/30) = 288,000 files per day. After a year: 100 M small files. File listing alone (S3 LIST is paginated at 1000 keys per call) takes minutes; query planning becomes "list 100 M keys to find the right partition." The "small-file problem" is the lakehouse's #1 chronic disease.</p>
+<p><strong>Real fix.</strong> Tiered freshness:</p>
+<ul>
+<li><strong>Hot tier (real-time):</strong> sub-second freshness via Pinot/Druid, ingested directly from Kafka. Limited retention (~7–30 days).</li>
+<li><strong>Warm tier (minute freshness):</strong> Flink → Iceberg with 1–5 minute commits. Background compaction merges small files into larger ones nightly (10K files of 1 MB → 100 files of 100 MB).</li>
+<li><strong>Cold tier (hourly/daily):</strong> batch ETL produces day-partitioned tables for the long history; ad-hoc analytics queries hit this.</li>
+<li><strong>Federated query</strong> to unify: a dashboard query joins real-time tier (last hour) with warm tier (last day) with cold tier (older). Pinot can federate to Iceberg natively; Trino spans both as connectors.</li>
+</ul>
+<p>The cost ratio: real-time tier is ~10–100x more expensive per GB than cold tier, because (a) you pay for always-on streaming compute, (b) you pay for the inverted indexes that enable &lt;100ms queries. Use it only for the slice that needs that freshness.</p>
+<h3 id="75-multi-tenancy-and-workload-isolation">7.5 Multi-tenancy and workload isolation</h3>
+<p><strong>One line.</strong> A heavy query from team A can saturate a shared cluster and degrade team B's dashboards.</p>
+<p><strong>Where it shows up.</strong> A data scientist's exploratory <code>SELECT *</code> on a 100 TB table saturates Snowflake's shared warehouse, freezing every CFO dashboard. An ad-hoc Trino query joins three large tables badly and consumes 80% of cluster CPU for an hour.</p>
+<p><strong>Naïve fix.</strong> "Just be careful." Doesn't scale past 10 users; queries from misbehaving sources are common.</p>
+<p><strong>Real fix.</strong> Workload isolation primitives:</p>
+<ul>
+<li><strong>Snowflake virtual warehouses.</strong> Each team or job class gets its own warehouse — a separate compute cluster sharing the storage layer. Sized independently; one warehouse's load can't touch another. Common pattern: BI warehouse (auto-scale, peak hours), ETL warehouse (large, night), data-science warehouse (small, on-demand).</li>
+<li><strong>BigQuery reservations / slot pools.</strong> Reserved slot capacity per project or department. Idle slots flex into other projects (fair-share); committed slots are guaranteed.</li>
+<li><strong>Trino resource groups.</strong> Queries from each group get a CPU/memory share. A misbehaving group can be capped at 30% of the cluster, preventing it from saturating.</li>
+<li><strong>Per-query memory limits.</strong> Trino's <code>query.max-memory-per-node</code>, Snowflake's <code>STATEMENT_TIMEOUT_IN_SECONDS</code>, BigQuery's <code>maximumBytesBilled</code>. Force the bad query to fail rather than degrade the cluster.</li>
+</ul>
+<p>A production OLAP platform team's #1 ongoing job is <strong>tuning these policies as workloads evolve</strong>.</p>
+<h3 id="76-schema-evolution">7.6 Schema evolution</h3>
+<p><strong>One line.</strong> Add, rename, or drop a column on a 1 PB table — without rewriting the data.</p>
+<p><strong>Where it shows up.</strong> Product adds a new event field; analytics needs to track it. A column type needs to change from <code>INT</code> to <code>BIGINT</code> (counter overflowed). A column rename for clarity. A column drop for GDPR compliance (<code>PII_email</code> must be permanently deleted).</p>
+<p><strong>Naïve fix.</strong> <code>ALTER TABLE</code>. In Hive (pre-Iceberg), <code>ALTER TABLE</code> was metadata-only but had <strong>positional column matching</strong> — adding a column in the middle re-numbered subsequent columns, causing readers to misinterpret existing Parquet files (Parquet stores by position, not name). Adding <code>created_at</code> between <code>id</code> and <code>name</code> made all existing rows appear shifted. Silent data corruption.</p>
+<p><strong>Real fix.</strong> <strong>Iceberg and Delta both use column IDs</strong> instead of column positions. Each column has a stable ID at table-creation; renames change the name → ID mapping in metadata; the underlying Parquet column chunk is identified by ID. Adding a column anywhere is metadata-only; existing files don't reference the new column ID, and reads default to NULL. Renaming a column is a metadata update of the name → ID mapping, no file rewrite.</p>
+<p>For type changes (INT → BIGINT), Iceberg allows widening conversions (INT → BIGINT, FLOAT → DOUBLE) as metadata-only. Narrowing or incompatible changes require a column-add + backfill + column-drop dance.</p>
+<p>For column drops with GDPR-level deletion (must be permanently irrecoverable, not just hidden), the rewrite cost is paid — but it's a one-time job (<code>OPTIMIZE table ... REWRITE</code>), not blocking.</p>
+<h3 id="77-time-travel-and-snapshot-retention">7.7 Time travel and snapshot retention</h3>
+<p><strong>One line.</strong> Querying "the table as it was yesterday" is useful for debugging, recovery, and ML reproducibility; but old snapshots cost storage and metadata complexity.</p>
+<p><strong>Where it shows up.</strong> A bug deletes 10 M rows from a production table at 2 AM. A data scientist needs to reproduce a model trained on yesterday's data. A compliance audit asks "what did this table look like on 2025-12-31?"</p>
+<p><strong>Naïve fix.</strong> Daily backups. Coarse-grained, slow to restore, often not actually tested.</p>
+<p><strong>Real fix.</strong> <strong>Per-snapshot time travel.</strong> Iceberg keeps every commit's metadata; querying <code>FOR VERSION AS OF &lt;id&gt;</code> or <code>FOR TIMESTAMP AS OF &lt;ts&gt;</code> opens the table at that snapshot's manifest list. Cost: old data files must be retained (no garbage collection) for the retention window. Snowflake's Time Travel: 90 days for Enterprise+. Snowflake Fail-safe (a separate 7-day disaster-recovery tier behind Time Travel): for catastrophic recovery, you call Snowflake support to restore.</p>
+<p><strong>Operational gotcha.</strong> Time travel storage cost can dominate the table's actual size. A 1 TB table with hourly updates of 1% of rows = 240 GB/day of new files; over 90 days = ~22 TB of retained-file storage for 1 TB of "current" data. Tuning snapshot retention is a real cost lever.</p>
+<hr>
+<h2 id="8-failure-modes">§8. Failure Modes</h2>
+<p>Five archetypal OLAP failure scenarios; recovery procedure for each.</p>
+<h3 id="81-query-out-of-memory-oom">8.1 Query out-of-memory (OOM)</h3>
+<p><strong>Scenario.</strong> A <code>GROUP BY</code> query's hash table exceeds available worker memory. Common when (a) cardinality estimation is wrong, (b) the GROUP BY key has high cardinality (e.g., <code>GROUP BY user_id</code> on 1 B users), (c) joins explode in cardinality.</p>
+<p><strong>Failure mode.</strong> The worker crashes (<code>OutOfMemoryError</code>). The coordinator either fails the query or retries it. If many workers OOM, the cluster goes into a thrash spiral.</p>
+<p><strong>Recovery.</strong> Engines have several mechanisms:</p>
+<ul>
+<li><strong>Spill to disk.</strong> Trino, Spark, ClickHouse, Snowflake — when the in-memory hash table exceeds a threshold, spill the partial state to local NVMe. Trino's "spill-to-disk" doubles query time for large GROUP BY but prevents OOM.</li>
+<li><strong>Adaptive partitioning.</strong> Detect skewed hash buckets and re-partition them at runtime.</li>
+<li><strong>Per-query memory limits.</strong> Fail loud, fast — let the user shrink the query.</li>
+</ul>
+<p><strong>Durability point.</strong> The query is idempotent (read-only); restart from scratch with adjusted parameters.</p>
+<h3 id="82-one-bad-query-freezes-the-warehouse">8.2 One bad query freezes the warehouse</h3>
+<p><strong>Scenario.</strong> A cross-join with no predicate. A query joining three 100B-row tables. A buggy dbt model that scans entire history.</p>
+<p><strong>Failure mode.</strong> The bad query consumes 100% of cluster CPU / memory / network. Other queries either queue (BigQuery) or compete and slow proportionally (Snowflake without virtual-warehouse isolation; Trino without resource-group caps). Dashboards across the company go red.</p>
+<p><strong>Recovery.</strong> Two layers:</p>
+<ul>
+<li><strong>Real-time kill.</strong> Operator finds the offending query (<code>SHOW QUERIES</code> / Snowflake's QUERY_HISTORY / BigQuery's INFORMATION_SCHEMA.JOBS) and aborts it. Manual; pager-duty-driven.</li>
+<li><strong>Permanent fix.</strong> Apply per-query limits (max bytes scanned, max execution time, max memory) and per-user/team resource caps to prevent recurrence.</li>
+</ul>
+<p><strong>Durability point.</strong> Read-only queries — abort costs nothing. Write queries (MERGE, COPY) have batch atomicity — abort rolls back the entire commit; partial data never visible.</p>
+<h3 id="83-cdc-lakehouse-pipeline-lag">8.3 CDC → lakehouse pipeline lag</h3>
+<p><strong>Scenario.</strong> Debezium → Kafka → Flink → Iceberg pipeline. Flink is supposed to commit every 60 s. A backpressure surge (Iceberg compaction stall, S3 throttling, Flink GC pause) causes commits to fall behind. Lag grows from seconds to minutes to hours.</p>
+<p><strong>Failure mode.</strong> Queries against the lakehouse see stale data. A dashboard says "revenue today = $3 M" when the truth is "$5 M" because the last 2 hours of orders aren't materialized yet.</p>
+<p><strong>Recovery.</strong>
+- <strong>Detect:</strong> monitor <code>current_time - max(commit_timestamp)</code> continuously; alert at &gt;5 minutes.
+- <strong>Investigate:</strong> is Flink GC-thrashing? Is Iceberg's snapshot commit blocking on metadata? Is S3 throttling writes (S3's prefix-level rate limits)?
+- <strong>Apply backpressure relief:</strong> scale Flink TaskManagers; tune commit batch size; rate-limit upstream Kafka if necessary.
+- <strong>Catch up:</strong> Flink replays from its committed Kafka offset; no data loss as long as Kafka retention exceeds the lag.</p>
+<p><strong>Durability point.</strong> Kafka is the durability point for CDC. As long as Flink's offset is durable (Flink's exactly-once checkpoints — see <code>04_stream_processing.md §6</code>), the data is recoverable.</p>
+<h3 id="84-schema-drift-breaks-downstream-tables">8.4 Schema drift breaks downstream tables</h3>
+<p><strong>Scenario.</strong> An upstream service adds a new field to the <code>purchase_events</code> event. The new field is a non-nullable INT (a service-team mistake). The CDC pipeline propagates the new column to Bronze. The dbt model that builds Silver doesn't know about the new column, but a SELECT * downstream of it breaks.</p>
+<p><strong>Failure mode.</strong> Pipeline writes start failing with type errors. Dashboards depending on the Silver table go to "0 rows" until the schema mismatch is resolved.</p>
+<p><strong>Recovery.</strong>
+- <strong>Schema contract enforcement at the producer:</strong> the service should not be able to add a non-nullable field without a data-platform review.
+- <strong>Iceberg's schema evolution:</strong> since Iceberg uses column IDs, the new column is added as nullable, defaults to NULL for old rows. Downstream models that don't reference it are unaffected. Only models that explicitly use the new field need updating.
+- <strong>Schema-on-read engines (DuckDB, Trino with JSON columns):</strong> can defer schema resolution to query time. Trade structure rigor for flexibility.
+- <strong>Investigation pattern:</strong> check <code>metadata_log_entries</code> table in Iceberg for the offending commit; identify the upstream pipeline that introduced the breaking change.</p>
+<p><strong>Durability point.</strong> Iceberg snapshots are immutable; rolling back to the pre-drift snapshot via time travel restores the dashboard while the team fixes the upstream contract.</p>
+<h3 id="85-file-listing-slowness-on-s3">8.5 File-listing slowness on S3</h3>
+<p><strong>Scenario.</strong> A table has 50 partitions × 100,000 commits × ~10 small files per commit = ~50 M Parquet files. Query planning needs to know which files match the query's predicate. The naïve approach: S3 LIST against the partition prefix.</p>
+<p><strong>Failure mode.</strong> S3's LIST is paginated at 1000 keys per call; listing a partition with 1 M files takes 1000 sequential LIST calls × ~200 ms = 200 s of planning time before the query even starts. Iceberg's manifest tree avoids this for Iceberg-managed tables, but <strong>direct queries over Hive-style partitioned Parquet (or Iceberg tables polluted by external writers bypassing the manifest)</strong> can hit this.</p>
+<p><strong>Recovery.</strong>
+- <strong>Use a real table format (Iceberg/Delta) with metadata manifests; don't rely on S3 LIST.</strong> This is the single biggest reason the lakehouse moved from Hive to Iceberg.
+- <strong>Compaction.</strong> Background jobs merge small files into larger ones, reducing total file count by 100x.
+- <strong>Partitioning discipline.</strong> Don't over-partition (one partition per day, not per minute).</p>
+<p><strong>Durability point.</strong> Files in S3 are immutable; compaction is a write+swap operation, atomically committed via Iceberg's manifest update. If compaction fails mid-way, the new files become orphans (cleaned by garbage collection); the old files remain referenced by the current snapshot.</p>
+<hr>
+<h2 id="9-why-not-just-run-analytics-on-the-oltp-database">§9. Why Not Just Run Analytics on the OLTP Database</h2>
+<p>The naïve alternative: "we already have PostgreSQL; just run analytics on the production replica." Five interlocking reasons it fails:</p>
+<ol>
+<li><strong>Locks and replica lag.</strong> A 30-minute analytical scan holds an MVCC snapshot for 30 minutes; PostgreSQL's autovacuum cannot reclaim dead row versions; tables bloat, write throughput collapses (see <code>01_databases.md §7.5</code>). Reading from a replica avoids the lock cost but adds replica lag.</li>
+<li><strong>IOPS exhaustion.</strong> <code>SELECT * FROM orders</code> over 100 B rows reads ~30 TB of B+ tree pages. At 100 K IOPS, that's 50 minutes of saturated I/O. Same scan on Snowflake reads ~3 TB of compressed Parquet, zone-map skips 90%, scans ~300 GB at 5 GB/sec/node × 8 nodes = ~8 seconds. <strong>375x faster.</strong></li>
+<li><strong>Row-major layout is wrong for scans.</strong> A 200-column row store reading 3 columns still reads all 200 columns per row — <strong>89% of I/O wasted</strong>. Columnar reads only the 3.</li>
+<li><strong>No vectorization.</strong> Postgres processes rows one at a time; ClickHouse processes 1024-row batches through SIMD kernels. 10–50x CPU efficiency gap even before I/O.</li>
+<li><strong>Concurrency death spiral.</strong> Ten concurrent analytical queries on the OLTP replica serialize on buffer pool, WAL writer, I/O scheduler. Buffer pool is sized for the OLTP hot working set; analytical scans evict it; OLTP latency p99 jumps 100x.</li>
+</ol>
+<p><strong>Concrete walkthrough.</strong> <code>SELECT date_trunc('day', created_at), COUNT(*) FROM orders WHERE created_at &gt; NOW() - INTERVAL '90 days' GROUP BY 1</code> on a 100B-row PostgreSQL: 1 hour of degraded production, replica 30 minutes behind, p99 800 ms (was 5 ms). Same query on Snowflake with the data in Parquet micro-partitions: 5 seconds, zero impact on the OLTP source. The "warehouse" metaphor is deliberate — it's where you take data to do work that would damage the OLTP store.</p>
+<hr>
+<h2 id="10-scaling-axes">§10. Scaling Axes</h2>
+<p>How OLAP scales, on two distinct axes.</p>
+<h3 id="type-1-more-data-more-queries-uniform-growth">Type 1: more data, more queries (uniform growth)</h3>
+<p>Dataset grows from 1 TB to 100 TB; QPS from 10 to 1000. Same workload shape.</p>
+<p><strong>Modern fix: decouple compute from storage.</strong> Storage scales effectively without limit on S3/GCS/ADLS (~$23/TB/month S3 Standard, 10x cheaper in IA/Glacier; a 100 PB lake is ~$2 M/month). Compute scales by adding capacity — Snowflake resizes warehouse from L to XL to XXL in seconds (no data migration); BigQuery increases slot reservations; Trino adds workers.</p>
+<p><strong>Inflection points.</strong> ~1 TB: DuckDB or small Snowflake suffice. ~100 TB: multi-node cluster; partition pruning and compaction critical. ~10 PB: lakehouse architecture essential; Iceberg manifest tree replaces Hive file listing. ~exabytes (Meta, Google, Netflix): custom catalog scaling, tiered storage (S3 hot / Glacier cold), federated query across multiple catalogs.</p>
+<p>Cost story: <strong>storage scales linearly and is cheap; compute scales with query load and is expensive.</strong> A 100 PB lake with low query rate costs less than a 10 TB lake with high query rate.</p>
+<h3 id="type-2-one-query-needs-more-compute-hotspot">Type 2: one query needs more compute (hotspot)</h3>
+<p>A complex 5-way JOIN over hundreds of TB needs more compute than one warehouse delivers in reasonable time.</p>
+<p><strong>Fix: distributed query execution.</strong> Every modern OLAP engine is <strong>MPP (Massively Parallel Processing)</strong>. Scan parallelism by row group or partition; shuffle parallelism via hash redistribution; aggregation parallelism via partial-then-final.</p>
+<p><strong>Inflection points.</strong> Adding workers gives diminishing returns past the shuffle width (a query with 100 shuffle partitions uses ~100 workers efficiently; more helps marginally). Network bandwidth ceilings shuffle-heavy queries (10 TB shuffle across 100 workers at 10 Gbps = 8 seconds of network alone). Fix: pre-bucketed tables eliminate shuffles, or change join order to reduce intermediate size. For massive queries: BigQuery dynamically allocates thousands of slots; Trino at Meta provisions hundreds of elastic worker nodes per query.</p>
+<p><strong>Type 1 + Type 2 interaction.</strong> If both axes grow, workload isolation (§7.5) becomes critical — each heavy query gets its own warehouse; lakehouse storage serves all warehouses transparently.</p>
+<hr>
+<h2 id="11-decision-matrix">§11. Decision Matrix</h2>
+<p>When to pick which OLAP variant. Use cases come from across domains.</p>
+<table>
+<thead>
+<tr>
+<th>If you need...</th>
+<th>Pick</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Managed BI platform, hands-off ops, mid-large enterprise</td>
+<td>Snowflake</td>
+<td>Best-in-class managed experience, mature ecosystem, decoupled compute/storage</td>
+</tr>
+<tr>
+<td>Serverless, no-ops, deep Google integration</td>
+<td>BigQuery</td>
+<td>True serverless; no clusters to manage; bytes-scanned pricing aligns with usage</td>
+</tr>
+<tr>
+<td>Customer-facing real-time analytics, &lt;100 ms p99 SLAs</td>
+<td>Pinot</td>
+<td>Inverted indexes + bitmap indexes; designed for the latency target</td>
+</tr>
+<tr>
+<td>Customer-facing real-time, time-series-heavy</td>
+<td>Druid</td>
+<td>Similar to Pinot; mature ecosystem at Netflix, Lyft</td>
+</tr>
+<tr>
+<td>Self-hosted high-performance OLAP, log/event analytics, cost-sensitive</td>
+<td>ClickHouse</td>
+<td>Fastest open-source engine on CPU efficiency; cheap at scale if you can operate it</td>
+</tr>
+<tr>
+<td>Open lakehouse, mixed batch + streaming + ML, vendor-neutral</td>
+<td>Trino + Iceberg</td>
+<td>Open file format, multiple engines, federation, no vendor lock-in</td>
+</tr>
+<tr>
+<td>Databricks ecosystem, Spark-native, ML-heavy</td>
+<td>Databricks SQL</td>
+<td>Photon + Delta integrate tightly; one platform for data + ML</td>
+</tr>
+<tr>
+<td>Local analytics, notebooks, embedded</td>
+<td>DuckDB</td>
+<td>Single binary; reads Parquet/Iceberg from S3; fast on TB-scale single-node</td>
+</tr>
+<tr>
+<td>Cheap, simple, batch ETL with Spark</td>
+<td>Spark SQL</td>
+<td>Batch-friendly fault tolerance; first-class lakehouse support</td>
+</tr>
+<tr>
+<td>MySQL-compatible OLAP for ByteDance-style internet workloads</td>
+<td>StarRocks / Doris</td>
+<td>MySQL protocol; real-time materialized views</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Thresholds.</strong></p>
+<ul>
+<li><strong>&lt;1 TB total data:</strong> DuckDB or a single ClickHouse node is enough. Don't pay Snowflake.</li>
+<li><strong>1–100 TB:</strong> managed warehouse (Snowflake, BigQuery, Databricks) is the default unless you specifically need real-time (&lt;1s) or low ops cost.</li>
+<li><strong>100 TB–10 PB:</strong> lakehouse (Iceberg + Trino + Spark) becomes attractive for vendor flexibility; managed warehouses are still strong choices.</li>
+<li>
+<p><strong>10+ PB:</strong> open lakehouse is the modern default at hyperscale (Netflix, Apple, LinkedIn).</p>
+</li>
+<li>
+<p><strong>Query latency SLA p99 &lt;100 ms with high QPS:</strong> Pinot/Druid. Snowflake/BigQuery can't hit this.</p>
+</li>
+<li><strong>Query latency SLA p99 ~1 s with moderate QPS:</strong> ClickHouse for self-hosted; Snowflake/BigQuery for managed.</li>
+<li>
+<p><strong>Query latency SLA seconds-to-minutes:</strong> anything works; pick on cost and ops.</p>
+</li>
+<li>
+<p><strong>Concurrency &gt;1000 concurrent users:</strong> Snowflake virtual warehouses, BigQuery slots, or per-team isolated clusters. Don't share one warehouse.</p>
+</li>
+<li>
+<p><strong>Concurrency &lt;100:</strong> any single cluster is fine.</p>
+</li>
+<li>
+<p><strong>Hands-on ops team:</strong> ClickHouse, StarRocks, self-hosted Trino are great.</p>
+</li>
+<li><strong>No ops team:</strong> Snowflake or BigQuery only.</li>
+</ul>
+<hr>
+<h2 id="12-ingestion-patterns">§12. Ingestion Patterns</h2>
+<p>Five patterns for loading data into OLAP. Each is right for a specific freshness / volume / cost point.</p>
+<h3 id="batch-etl-airflow-spark-warehouse">Batch ETL (Airflow → Spark → warehouse)</h3>
+<p>The classic pattern, still dominant for "yesterday's data is fine." Airflow schedules a DAG (Directed Acyclic Graph) at daily/hourly cadence; each task is a Spark job reading source data, transforming it, and writing to the warehouse (Parquet to S3 / COPY INTO Snowflake / <code>bq load</code>). Freshness: hours-to-daily. Cost: cheap (~$0.50–$2/TB). Failure handling: idempotent reruns. Common at banks, retailers, traditional enterprises for daily/weekly BI.</p>
+<h3 id="cdc-streaming-debezium-kafka-flink-iceberg">CDC streaming (Debezium → Kafka → Flink → Iceberg)</h3>
+<p>The modern default for sub-minute freshness without paying for true real-time. <strong>Debezium</strong> (or LinkedIn's Brooklin, Maxwell, native CDC) reads the OLTP source's logical replication / binlog and emits per-row change events to Kafka. <strong>Flink</strong> consumes, transforms, and writes to Iceberg/Delta/Hudi at 30 s–5 min commit cadence. Freshness: sub-minute. Cost: 5–10x batch ETL. Exactly-once via Flink's two-phase commit + Iceberg atomic snapshot (see <code>04_stream_processing.md §6</code>). Common at e-commerce (real-time inventory), SaaS (usage dashboards), fintech (intra-day reconciliation).</p>
+<h3 id="real-time-ingest-kafka-pinotdruid-directly">Real-time ingest (Kafka → Pinot/Druid directly)</h3>
+<p>For sub-second freshness on real-time-OLAP engines. Kafka producers publish events; Pinot/Druid ingest directly and events become queryable within seconds. Freshness: sub-second. Cost: highest (~10–50x batch) — engines maintain per-event memory + indexes. Storage tiered: real-time segments in memory + local disk; historical on S3. Common at customer-facing real-time dashboards (Uber, LinkedIn, Stripe).</p>
+<h3 id="bulk-copy-load-from-s3">Bulk COPY / LOAD from S3</h3>
+<p>For periodic large loads from partners, vendors, external pipelines. Data lands as Parquet/CSV in S3; a <code>COPY INTO</code> / <code>bq load</code> / <code>INSERT INTO ... SELECT FROM staged</code> imports. Freshness tied to upstream cadence. Cheap and idempotent. Common for data sharing between organizations and on-prem → cloud migrations.</p>
+<h3 id="reverse-etl-warehouse-operational-systems">Reverse ETL (warehouse → operational systems)</h3>
+<p>The opposite direction: take aggregated analytics back to operational systems. <strong>dbt</strong> materializes aggregated tables (<code>customer_360</code>, <code>lead_score</code>, <code>churn_risk</code>); <strong>Hightouch / Census</strong> sync them to Salesforce, Marketo, Zendesk, internal app databases. Analytics produces insights → reverse-ETL pushes them to product features (personalization, marketing). Freshness usually hourly. Common in "modern data stack" deployments running data-driven product loops.</p>
+<hr>
+<h2 id="13-lakehouse-table-formats-deep-dive">§13. Lakehouse Table Formats Deep Dive</h2>
+<p>The three contenders for "table format on top of object storage" — Iceberg, Delta Lake, Hudi.</p>
+<h3 id="apache-iceberg">Apache Iceberg</h3>
+<p><strong>Origin.</strong> Netflix, 2017. Apache top-level 2020. Built to fix Hive's atomic-rename and metadata-scaling problems at PB scale.</p>
+<p><strong>Architecture.</strong> Manifest tree (see §4.6): metadata.json → manifest list → manifest files → data files. Each commit is an atomic pointer swap on the latest metadata.json (or catalog row).</p>
+<p><strong>Strengths.</strong> Vendor-neutral (engine support across Trino, Spark, Flink, Snowflake, BigQuery, Athena, ClickHouse, DuckDB, Databricks); hidden partitioning (partition function in metadata; users don't write partition predicates explicitly); schema evolution by column ID (safe adds, renames, drops); snapshot isolation and time travel; branching and tagging (Iceberg 1.0+); manifest scales to exabytes (tested at Netflix and Apple).</p>
+<p><strong>Weaknesses.</strong> Catalog can have brief consistency issues during commits (Hive Metastore, AWS Glue); modern catalogs (Nessie, Iceberg REST, Unity) are stronger. Compaction is the user's responsibility — periodic OPTIMIZE jobs, no built-in always-on compactor.</p>
+<p><strong>Dominant in 2026.</strong> Used by Netflix, Apple, LinkedIn, Tencent, Adobe, AWS, Stripe.</p>
+<h3 id="delta-lake">Delta Lake</h3>
+<p><strong>Origin.</strong> Databricks, 2019. Linux Foundation 2020.</p>
+<p><strong>Architecture.</strong> Per-table <code>_delta_log/</code> directory containing ordered JSON files (one per commit) describing add/remove operations on data files, and periodic Parquet "checkpoint" files that snapshot the full table state.</p>
+<p><strong>Strengths.</strong> Tight Databricks integration (Photon, Auto Loader, Live Tables, Delta Sharing — first-class); Z-ordering (multi-dimensional clustering for better pruning on multi-column predicates than partition pruning alone); Change Data Feed (built-in CDC output via <code>table_changes()</code>); DELETE and MERGE with deletion vectors (bitmap-based soft deletes, Delta 3+).</p>
+<p><strong>Weaknesses.</strong> Databricks-centric ecosystem; portability less mature than Iceberg. <code>_delta_log</code> can grow large on heavily-updated tables; checkpoint frequency tuning matters.</p>
+<p>Strong choice when you're already on Databricks, or when Delta-specific features are first-class.</p>
+<h3 id="apache-hudi">Apache Hudi</h3>
+<p><strong>Origin.</strong> Uber, 2016. Built for <strong>upsert-heavy</strong> workloads — ride state, driver position changing constantly.</p>
+<p><strong>Architecture.</strong> Per-table <code>.hoodie/</code> directory with timeline files. Two table types: <strong>Copy-on-Write (CoW)</strong> rewrites affected Parquet files (read-optimized, write-expensive); <strong>Merge-on-Read (MoR)</strong> appends to a row-level delta log in Avro, reads merge with the base Parquet on the fly (write-cheap, read pays merge cost).</p>
+<p><strong>Strengths.</strong> Best-in-class upsert performance; incremental queries ("all rows changed since timestamp T") efficient; async compaction.</p>
+<p><strong>Weaknesses.</strong> Smaller ecosystem; complex operational model (two table types + compaction + cleaner + archival).</p>
+<p><strong>Used at:</strong> Uber (origin), TikTok, large CDC-driven lakehouses where upsert volume dominates.</p>
+<h3 id="the-format-wars-20242026-status">The format wars (2024–2026 status)</h3>
+<ul>
+<li><strong>2017–2020:</strong> Hive dominant; Iceberg/Delta/Hudi emerged in parallel.</li>
+<li><strong>2021–2023:</strong> Three-way race; each format added features (time travel, schema evolution, deletion vectors). Engine support fragmented.</li>
+<li><strong>2024–2026:</strong> Convergence. <strong>Snowflake added native Iceberg read/write</strong> (2023). <strong>Databricks added Iceberg interop via UniForm</strong> — Delta files with Iceberg-compatible metadata (2023). <strong>BigQuery added native Iceberg support</strong> (2024). Walls came down.</li>
+</ul>
+<p>Strategic shift: <strong>the storage layer is becoming a commodity</strong>. Iceberg is the dominant interop format; vendors compete on compute engines and managed experiences, not lock-in via storage. A 2026 lakehouse commonly has one copy of Iceberg data on S3, read by Snowflake for BI, Databricks for ML, Trino for ad-hoc, Flink for streaming write, and DuckDB for laptop exploration.</p>
+<hr>
+<h2 id="14-query-engines-deep-dive">§14. Query Engines Deep Dive</h2>
+<h3 id="trino-presto">Trino / Presto</h3>
+<p><strong>Origin.</strong> Facebook, 2012. Open-sourced 2013. <strong>Split into two forks in 2018:</strong> PrestoSQL (now Trino) led by the original founders + community; PrestoDB continues at Meta. Today Trino is the dominant community fork.</p>
+<p><strong>Architecture.</strong> Coordinator + workers. Queries decomposed into stages (scan, filter, partial-aggregate, shuffle, final-aggregate, sort). Workers stream tuples between stages via in-memory pipelines — fast, but no fault tolerance per query.</p>
+<p><strong>Strengths.</strong> Federation (~50+ connectors: query Postgres + Iceberg + Kafka + Cassandra in one SQL); fast on interactive queries (sub-second small, seconds large); battle-tested at Meta, Netflix, LinkedIn, Lyft, Uber, Pinterest, Airbnb.</p>
+<p><strong>Weaknesses.</strong> No mid-query fault tolerance by default (until recent fault-tolerant-execution mode); one worker dies during a long query → whole query restarts. All-in-memory shuffle by default; memory pressure is a tuning lever.</p>
+<p><strong>Capacity.</strong> Meta runs Presto at exabyte scale; LinkedIn runs Trino at PB scale on hundreds of nodes per cluster.</p>
+<h3 id="spark-sql">Spark SQL</h3>
+<p><strong>Origin.</strong> Databricks (Berkeley AMPLab), 2014.</p>
+<p><strong>Architecture.</strong> RDD (Resilient Distributed Dataset) / DataFrame model on top of Spark's executor framework. Query plans become DAGs of stages; failures restart only the failed partition.</p>
+<p><strong>Strengths.</strong> Fault tolerance via RDD lineage (critical for long-running batch); general-purpose (SQL, DataFrames, ML, streaming in one engine); lakehouse-native (first-class Iceberg, Delta, Hudi); Adaptive Query Execution (runtime re-planning based on observed stage sizes).</p>
+<p><strong>Weaknesses.</strong> Higher latency than Trino on short interactive queries (JVM/task overhead); heavier ops footprint.</p>
+<p><strong>Capacity.</strong> Netflix runs Spark for ETL at exabyte scale; Databricks runs Photon (vectorized Spark SQL replacement) for SQL workloads as fast as Trino.</p>
+<h3 id="duckdb">DuckDB</h3>
+<p><strong>Origin.</strong> CWI Amsterdam, 2018. Same lab as MonetDB / Vectorwise.</p>
+<p><strong>Architecture.</strong> Single-process, embedded library. Vectorized engine inspired by MonetDB/X100. Reads Parquet, CSV, Arrow, JSON, Iceberg directly from S3.</p>
+<p><strong>Strengths.</strong> Zero setup (<code>pip install duckdb</code>); fast (TPC-H Q1 on 1 B rows in 2 seconds on a MacBook M3, ~6 GB/sec scan rate); no cluster (just a library); polyglot bindings.</p>
+<p><strong>Weaknesses.</strong> Single-node ceiling (~10 TB on big machines); single-user concurrency.</p>
+<p><strong>Growing role.</strong> Mother Duck (cloud DuckDB), serverless analytics, dbt local development. DuckDB is becoming the "first tier" of analytics — analysts pull a TB of Parquet to a laptop for exploration, then push to Snowflake/BigQuery for production.</p>
+<h3 id="snowflakes-engine">Snowflake's engine</h3>
+<p><strong>Architecture.</strong> Proprietary. Decoupled compute (virtual warehouses) from storage (S3 micro-partitions). Per-warehouse local SSD cache. Custom vectorized engine in C++. FoundationDB-backed metadata.</p>
+<p><strong>Strengths.</strong> Zero-copy clones (cloning a 100 TB database is a metadata pointer copy); Time Travel + Fail-safe (90 days of snapshot recovery built in); multi-cluster warehouses (one warehouse can have N clusters for concurrency); data sharing across accounts without copy; built-in MERGE/UPDATE/DELETE.</p>
+<p><strong>Weaknesses.</strong> Closed format historically (Iceberg interop now reduces this); per-credit pricing can be expensive at high concurrency.</p>
+<h3 id="bigquery">BigQuery</h3>
+<p><strong>Origin.</strong> Google, 2010 (public). Built on <strong>Dremel</strong> (paper 2010). Storage on <strong>Capacitor</strong> (Google's columnar format) on <strong>Colossus</strong> (Google's distributed file system).</p>
+<p><strong>Architecture.</strong> Serverless. Queries enter a global slot scheduler; slots (CPU units) are allocated from a shared pool or your reserved capacity. Storage and compute decoupled at the most extreme level — even within a query, slots and storage are completely independent.</p>
+<p><strong>Strengths.</strong> True serverless (no clusters, no nodes); massive scale per query (PB scanned in seconds); strong GCP integration; BigQuery ML lets you train models in SQL.</p>
+<p><strong>Weaknesses.</strong> Capacitor is Google-only (mitigated by recent Iceberg support); slot model opaque, cost prediction tricky; cold-start on slot allocation hurts sub-second targets.</p>
+<p><strong>Capacity.</strong> Likely the world's largest OLAP system. Queries scanning multiple PB; total data under management in the exabytes.</p>
+<hr>
+<h2 id="15-use-case-gallery">§15. Use Case Gallery</h2>
+<p>Seven different products / domains, same family of technology applied differently.</p>
+<h3 id="1-business-intelligence-dashboards-tableau-looker-on-snowflakebigquery">1. Business Intelligence dashboards (Tableau, Looker on Snowflake/BigQuery)</h3>
+<p>A retailer's CFO opens a Tableau dashboard showing weekly revenue by region. Tableau issues 5–10 SQL queries to Snowflake; each scans tens to hundreds of GB of pre-aggregated Gold tables. Latency: 2–10 seconds per query. Data flow: OLTP → CDC → Kafka → Flink → Iceberg Bronze → Spark → Silver → dbt → Gold; Snowflake reads Gold via Iceberg interop. <strong>Pattern: aggregated tables (Gold tier) served by managed warehouse to interactive dashboards.</strong></p>
+<h3 id="2-real-time-analytics-dashboards-uber-order-map-linkedin-feed-analytics">2. Real-time analytics dashboards (Uber order map, LinkedIn feed analytics)</h3>
+<p>Uber's operations dashboard shows live ride supply/demand by city, updated every few seconds. Ride state changes flow through Kafka into <strong>Pinot</strong>, which serves aggregation queries with &lt;100 ms latency. LinkedIn's "Who's Viewed Your Profile" tab is built on Pinot at similar scale — hundreds of thousands of QPS, p99 &lt;50 ms. <strong>Pattern: streaming ingest into real-time-OLAP engine for sub-second freshness + sub-100ms query latency.</strong></p>
+<h3 id="3-ml-feature-pipelines-warehouse-feature-store-online-serving">3. ML feature pipelines (warehouse → feature store → online serving)</h3>
+<p>A recommender system. Offline features (user_watch_time_30d, user_genre_affinity_vector) computed daily in Spark from the warehouse. Results land in a feature store: offline (Iceberg) for training-time joins, online (Redis or DynamoDB) for serving-time lookups. <strong>Pattern: warehouse as offline feature compute layer; specialized stores for online serving.</strong></p>
+<h3 id="4-customer-facing-analytics-stripe-sigma">4. Customer-facing analytics (Stripe Sigma)</h3>
+<p>Stripe Sigma lets merchants run SQL on their own payment data. The engine (Trino-derivative at Stripe) enforces row-level security per merchant_id. Payments flow Stripe Postgres → CDC → warehouse → per-merchant projections. Latency: seconds-to-minutes per query. <strong>Pattern: multi-tenant OLAP with row-level filtering; merchants are the end users.</strong></p>
+<h3 id="5-cohort-and-funnel-analysis-amplitude-mixpanel">5. Cohort and funnel analysis (Amplitude, Mixpanel)</h3>
+<p>Product analytics tools let PMs build cohorts ("users who signed up in March AND activated AND purchased") and funnels. Behind both Amplitude and Mixpanel: <strong>ClickHouse</strong> clusters (publicly disclosed). Events ingested in real-time; cohort/funnel queries are SQL-with-time-window-semantics over event streams. Per-column compression on <code>event_type</code>/<code>user_id</code> gives 20–50x storage savings. <strong>Pattern: event-stream analytics on ClickHouse with custom DSL.</strong></p>
+<h3 id="6-log-analytics-honeycomb-datadog-clickhouse-for-logs">6. Log analytics (Honeycomb, Datadog, ClickHouse for logs)</h3>
+<p>Logs are the highest-volume analytical workload: tens of TB/day of structured events. <strong>Honeycomb</strong> built its own columnar engine in Go with sparse indexes for high-cardinality event attributes. <strong>Datadog</strong> moved from Elasticsearch to a custom columnar store. <strong>ClickHouse-for-logs</strong> at Cloudflare, Uber, ByteDance. <strong>Pattern: columnar storage with attribute-level indexes optimized for "find events matching predicate X over the last hour."</strong> See <code>10_observability.md §5</code>.</p>
+<h3 id="7-marketing-attribution">7. Marketing attribution</h3>
+<p>A marketer wants the path of touchpoints across channels for today's conversions. Requires joining <code>events</code> (clicks, opens, impressions — billions of rows) against <code>conversions</code> (millions) over <code>user_id</code> and time, then applying time-decay/Markov-chain attribution math. Too heavy for real-time; freshness budget is "morning report on yesterday." <strong>Pattern: heavy batch ETL in Spark materializes a <code>customer_journey</code> table; BI dashboards query it on Snowflake/BigQuery.</strong></p>
+<hr>
+<h2 id="16-real-world-implementations">§16. Real-World Implementations</h2>
+<p>Named systems shipping OLAP at scale, across diverse use cases.</p>
+<p><strong>Snowflake — the largest data warehouse business.</strong> ~10,000 enterprise customers as of public 2024 disclosures; ~$3 B+ annual revenue. Customers span finance (Capital One), healthcare (CVS), retail (Walmart). Single-customer deployments routinely reach hundreds of TB to several PB; the largest approach exabyte-scale. Snowflake's architecture (decoupled compute + S3-backed micro-partitions + FoundationDB metadata) defined the modern cloud warehouse playbook.</p>
+<p><strong>Google BigQuery — multi-exabyte serverless.</strong> Google's internal + customer data totals tens of exabytes (estimated). Single queries scan PB in seconds. Used by Spotify, Twitter (pre-X), Carrefour, and most major Google services. The Dremel paper (2010) is foundational to modern OLAP.</p>
+<p><strong>Netflix Iceberg + Trino — exabyte-scale lakehouse.</strong> ~hundreds of PB on S3 in Iceberg format (low exabytes as of 2024–2026). Trino is the interactive query layer (~thousands of nodes globally); Spark for batch ETL; Flink for streaming. Iceberg was created at Netflix in 2017 to fix Hive metastore scaling. ~500 PB disclosed in 2023.</p>
+<p><strong>Meta Presto — exabyte-scale warehouse.</strong> Meta runs Presto on hundreds of thousands of CPUs. Public disclosures: &gt;300 PB warehouse, &gt;300K queries/day; Presto is the dominant interactive query layer inside Facebook for analytics.</p>
+<p><strong>LinkedIn Pinot — real-time OLAP origin.</strong> Pinot was born at LinkedIn (2014) for "Who's Viewed Your Profile": hundreds of thousands of QPS, p99 &lt;50 ms, on PB-class data. Today LinkedIn runs Pinot for member-facing analytics (profile views, post analytics, recruiter dashboards) — hundreds of Pinot clusters internally.</p>
+<p><strong>Uber Pinot + Druid.</strong> ~600 K QPS at peak for marketplace and rider/driver dashboards on Pinot; Druid for time-series (M3 metrics platform). Both serve customer-facing real-time analytics.</p>
+<p><strong>Pinterest Druid — ad analytics.</strong> Advertisers see real-time impressions, clicks, conversions on campaigns. Druid's bitmap-index-per-column fits ad-attribute filtering well; tens of TB of fresh data, sub-second queries.</p>
+<p><strong>ByteDance ClickHouse — internet-scale event analytics.</strong> Publicly disclosed: one of the world's largest ClickHouse deployments — tens of thousands of CPUs, hundreds of PB, internal analytics across TikTok and Douyin.</p>
+<p><strong>Cloudflare ClickHouse — log analytics.</strong> Hundreds of TB/day of HTTP request log ingest; trillions of historical requests for security/performance investigation. Also backs DNS Analytics and Workers Analytics Engine customer products.</p>
+<p><strong>Plausible Analytics ClickHouse.</strong> Full product (tens of thousands of customer dashboards, billions of page views) on a single ClickHouse cluster. Small team, big scale, low cost — ClickHouse's "operate well, save 10x vs Snowflake" thesis.</p>
+<p><strong>Databricks Delta + Photon.</strong> ~10,000+ enterprise customers. Single customers run multi-PB Delta lakehouses. Photon is Databricks' vectorized C++ engine, replacing JVM-based Spark SQL.</p>
+<p><strong>Stripe Sigma.</strong> Merchants run SQL on their own payment data. Backed by an internal Trino-derived engine over Parquet on S3, with row-level security per merchant.</p>
+<p>The numbers — from a single ClickHouse node at Plausible to multi-exabyte BigQuery at Google — span more than six orders of magnitude on the same family of technology (columnar, compressed, vectorized, snapshot-atomic on bulk writes). What varies is the operational layer (managed vs self-hosted), the freshness budget (sub-second vs hourly), and the integration (federated vs warehouse-native). The byte-level mechanics are the same.</p>
+<hr>
+<h2 id="17-summary">§17. Summary</h2>
+<blockquote>
+<p><em>Columnar OLAP is what you get when you keep relational SQL's interface but discard everything in row-store machinery that exists to support per-row transactions, then bend the storage engine around bulk scans: per-column files for I/O reduction, per-column codec stacks for 5–20x compression, zone maps for predicate-driven skipping, sparse granule indexes for scan-not-point, vectorized SIMD execution for cache- and pipeline-friendly aggregation, and snapshot-atomic-bulk-write semantics in place of OLTP's row-level ACID. The result is an engine that answers <code>SUM ... GROUP BY</code> over a trillion rows in seconds — and is correspondingly terrible at returning one row by primary key in five milliseconds. Modern variants split across cloud warehouses (Snowflake, BigQuery — managed and decoupled), self-hosted engines (ClickHouse, StarRocks — operate-yourself and fast), real-time OLAP (Pinot, Druid — sub-100ms on streaming-ingested data), and the lakehouse pattern (Iceberg + Trino + Spark on object storage — open file format, multi-engine, vendor-neutral). They converge on the same byte-level story: columnar Parquet on S3, ZSTD-compressed, organized into manifest trees that prune queries at four levels (partition → file → row-group → page), executed by vectorized engines processing 1024 values at a time on SIMD lanes. Pick by the freshness SLA, the query latency budget, the ops envelope, and where on the cost-vs-control axis the team sits — and remember that OLAP is always a derived view of the truth that lives in OLTP; get the source right, and any analytical store can be rebuilt from its change log.</em></p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

@@ -1,0 +1,1082 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Object Storage — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/backend-fundamentals/">← Back to Backend Fundamental Components</a>
+        <h1 class="article-title">Object Storage</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Backend Fundamental Components
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>A technology reference on object storage — what it is, how it works at the byte level, where the design space splits, when to pick which variant. Use cases (static asset hosting, video/media catalogs, data lakes, ML model and training data stores, backups, user-uploaded files) appear throughout as illustrations of the same class of technology bent to fit different workloads.</p>
+</blockquote>
+<hr>
+<h2 id="1-what-object-storage-is">§1. What Object Storage Is</h2>
+<p>An <strong>object store</strong> is a flat key-to-opaque-blob (Binary Large OBject) store at planet scale. The contract is small: give it a bucket and a key string, hand it bytes (up to 5 TB), and it persists them with <strong>eleven nines</strong> of durability and serves them back to anyone with read permission, anywhere, indefinitely. It is the system underneath anything where the unit of access is a <strong>file-sized blob</strong> rather than a row or a record.</p>
+<p>The contract is also defined by what it does <strong>not</strong> do:</p>
+<ul>
+<li>No mid-object reads/writes. A <code>GET</code> returns the whole object (or a byte range); a <code>PUT</code> writes the whole object. No in-place edit.</li>
+<li>No semantics over content. A 5 GB Apache Parquet file, a 2 KB JPEG, a 200 GB Iceberg snapshot, a 4 MB XGBoost (eXtreme Gradient Boosting) model pickle — all opaque bytes. Schema lives elsewhere (Hive Metastore, Iceberg catalog, a database row).</li>
+<li>No POSIX (Portable Operating System Interface) semantics. No <code>fsync</code>, no <code>open()</code> returning a file descriptor, no directory inodes, no hard links, no <code>rename()</code>. Console "folders" are a fiction over key prefixes.</li>
+<li>No multi-object transactions. Two <code>PUT</code>s are two independent operations; no <code>BEGIN; PUT a; PUT b; COMMIT;</code>.</li>
+</ul>
+<p>Object storage sits at one corner of a four-way design space among <strong>bytes-at-rest</strong> technologies:</p>
+<ul>
+<li><strong>Block storage</strong> — AWS EBS (Elastic Block Store), GCE Persistent Disk, Azure Managed Disks. Raw disk to one host; random reads/writes at the sector (4 KB) level; tied to one VM. Filesystems run on top. Latency ~100µs–1ms; tens of TB per volume. Right for DB data files, OS root volumes, Redis AOF (Append-Only File) logs. Wrong for "share this video with 30M viewers."</li>
+<li><strong>File storage</strong> — NFS (Network File System), AWS EFS (Elastic File System), Azure Files, GCP Filestore. POSIX over the network: directories, file handles, byte-level I/O, locks. Latency a few ms; PB range. Right for HPC (High-Performance Computing) scratch, legacy apps, shared config. Wrong for billions of small objects — EFS costs ~10x S3 per GB.</li>
+<li><strong>Object storage</strong> — S3, Google Cloud Storage (GCS), Azure Blob, R2 (Cloudflare's S3-compatible offering), MinIO, Ceph RADOS Gateway. The subject of this doc.</li>
+<li><strong>Databases / structured storage</strong> — schemas, transactions, queries, secondary indexes. Wrong for 2 MB image blobs (they ruin the buffer pool — see <code>01_databases.md</code>); wrong for 80 GB model artifacts; wrong for a petabyte of Parquet.</li>
+</ul>
+<p>Mental model: block storage is "a fast local disk for one server"; file storage is "a shared disk for many servers"; databases are "structured tables for fast lookup"; object storage is "infinite cheap durable space for everything that doesn't fit the other three."</p>
+<p><strong>What object storage is NOT good for:</strong></p>
+<ul>
+<li><strong>Low-latency point reads.</strong> S3 <code>GET</code> is ~30–80ms p50 from inside the same region, ~150–300ms p99. For "render this page in 50ms," put a CDN (Content Delivery Network) or in-memory cache in front.</li>
+<li><strong>Transactional updates.</strong> No multi-object atomicity. If your invariant is "balance moves between two accounts," do that in a database.</li>
+<li><strong>Querying inside objects.</strong> S3 Select and Athena scan whole objects and bill by bytes scanned. If you need "select * where user_id = 42," put data in a database or columnar warehouse.</li>
+<li><strong>Append-heavy small writes.</strong> 100-byte log lines at 100k/sec = 100k separate <code>PUT</code>s = request charges (~$0.50/million) + 100k metadata slots. Buffer locally, write 64 MB batches.</li>
+<li><strong>Filesystem semantics.</strong> No <code>rename()</code>. "Renaming" a 10 TB folder is N <code>COPY</code> + N <code>DELETE</code> calls — the most-burned data-lake anti-pattern.</li>
+<li><strong>Random read/write inside a 5 GB file.</strong> Range <code>GET</code> reads fine; mutation requires re-uploading the whole thing.</li>
+</ul>
+<p>The canonical role: object storage is the <strong>passive durable layer</strong> at the bottom of the stack. The data lake, the model registry, the image-CDN origin, the database's nightly backups, the user-uploaded files — all live here. The repeated pattern: the database holds <strong>metadata pointing at the object</strong>; the object holds the <strong>bytes</strong>.</p>
+<hr>
+<h2 id="2-inherent-guarantees">§2. Inherent Guarantees</h2>
+<p>What the technology provides by design, and what must still be layered above it.</p>
+<h3 id="provided-by-design">Provided by design</h3>
+<ul>
+<li><strong>Strong read-after-write consistency for all operations.</strong> For S3 since December 2020 — before that, S3 had eventual consistency for overwrites and deletes, forcing application-level workarounds (sentinel keys, immutable naming). Today all S3 ops — <code>PUT</code>, <code>GET</code>, <code>LIST</code>, <code>DELETE</code>, <code>HEAD</code> — are strongly consistent. GCS, Azure Blob, R2, and modern MinIO have been strongly consistent since launch. The historical "list-after-write" weirdness is gone.</li>
+<li><strong>Eleven nines of durability</strong> (99.999999999%). Expected annual loss ~1 byte per 100 billion. Mechanism: replication, erasure coding, AZ (Availability Zone) separation.</li>
+<li><strong>Effectively unlimited capacity.</strong> No bucket size limit. AWS reports S3 holds over 280 trillion objects.</li>
+<li><strong>Per-object availability</strong> at the SLA tier (Service Level Agreement) — S3 Standard 99.99% monthly; One Zone IA (Infrequent Access) 99.5%; Glacier tiers a separate SLA on retrievals.</li>
+<li><strong>Regional or multi-region scope.</strong> A bucket lives in one region across AZs; cross-region copies are explicit (S3 CRR — Cross-Region Replication, GCS dual-region buckets).</li>
+<li><strong>Versioning</strong> as opt-in: each <code>PUT</code> to the same key creates a new version; old versions retained by policy.</li>
+</ul>
+<h3 id="must-be-layered-above">Must be layered above</h3>
+<ul>
+<li><strong>Low-latency reads.</strong> 50–150ms p50, hundreds of ms p99 from outside the region. For sub-50ms reads, put a CDN in front (CloudFront, Cloudflare, Fastly) or cache in memory.</li>
+<li><strong>Cross-object transactions.</strong> "Update object A and B atomically" is the application layer's job. The pattern (Apache Iceberg, Delta Lake, Apache Hudi): write new files with unique names, then atomically flip a metadata pointer in a catalog.</li>
+<li><strong>Query inside objects.</strong> Iceberg / Delta / Hudi catalogs, Athena / BigQuery / Snowflake, or pull into a database. Object storage doesn't index.</li>
+<li><strong>Rich metadata.</strong> S3 metadata is a flat KV map (<code>x-amz-meta-*</code>). Anything beyond key/size/last-modified — owner, parent post, moderation status — goes in a real database.</li>
+<li><strong>Quota and rate management.</strong> S3 doesn't refuse writes when you've spent too much money; it bills you. Cost guardrails live in IAM (Identity and Access Management) or the application.</li>
+<li><strong>Encryption with customer-managed keys.</strong> Default SSE-S3 (Server-Side Encryption with S3-managed keys) is automatic; SSE-KMS (Key Management Service), SSE-C (Customer-provided), and client-side require explicit work (§13).</li>
+<li><strong>Multi-region read/write semantics.</strong> S3 MRAP (Multi-Region Access Point) is eventually consistent across regions. Active-active is its own design problem (§7.3).</li>
+<li><strong>Lifecycle and tiering decisions.</strong> Provider gives tools (lifecycle policies, storage classes); deciding what to keep where for how long is the designer's call (§12).</li>
+<li><strong>Permissions hygiene.</strong> IAM policies, bucket policies, ACLs (Access Control Lists, legacy), pre-signed URLs, Public Access Blocks. "S3 bucket leak" is the most common cloud-misconfiguration breach class.</li>
+</ul>
+<p>Synthesis: the technology guarantees <strong>bytes you wrote come back, intact, forever</strong> with strong consistency. Everything else — fast reads, transactional semantics, query, rich metadata, encryption, cost — is the system designer's problem.</p>
+<hr>
+<h2 id="3-the-design-space">§3. The Design Space</h2>
+<p>Variants differ in pricing, ecosystem, and a few protocol details, but they all conform to one of two flavors of the <strong>S3 API</strong>: the AWS-original S3 REST API, or a re-implementation of it.</p>
+<h3 id="hyperscaler-managed">Hyperscaler managed</h3>
+<ul>
+<li><strong>AWS S3 (Simple Storage Service)</strong> — launched March 2006. The protocol everyone else copies. Eleven nines durability; 99.99% Standard availability; six storage classes. Trillions of objects, exabytes. Strongly consistent since Dec 2020. The benchmark.</li>
+<li><strong>Google Cloud Storage (GCS)</strong> — same conceptual model. Distinctive: dual-region/multi-region buckets with transparent replication (no CRR setup); bucket-wide versioning; tiers are Standard, Nearline (30-day min), Coldline (90-day min), Archive (365-day min). Strong consistency from day one.</li>
+<li><strong>Azure Blob Storage</strong> — three blob types: Block (S3-equivalent), Append (optimized for log appends), Page (EBS-equivalent, backs VM disks). Hot / Cool / Cold / Archive tiers. Strong consistency. Tight integration with Azure Active Directory RBAC (Role-Based Access Control), SQL Server, Office 365.</li>
+</ul>
+<h3 id="s3-compatible-alternatives">S3-compatible alternatives</h3>
+<ul>
+<li><strong>Cloudflare R2</strong> — launched 2022. Defining feature: <strong>zero egress fees</strong>. S3 charges ~$0.09/GB egress to the internet; R2 charges $0. For public-asset and large-dataset workloads, that's a 10–100x cost reduction. Storage ~$0.015/GB/mo. S3-API-compatible. Catch: limited tiering, smaller ecosystem.</li>
+<li><strong>Backblaze B2</strong> — launched 2015. Storage ~$0.006/GB/mo, egress $0.01/GB. S3 API. Bandwidth alliance with Cloudflare gives effectively zero egress to the Cloudflare network. Well-regarded for backup.</li>
+<li><strong>Wasabi</strong> — single tier, $0.0059/GB/mo, no egress fees, no API call fees. "All-in" predictable pricing. Trade-off: no tiered options, smaller global footprint.</li>
+<li><strong>DigitalOcean Spaces</strong> — S3-compatible at $5/mo for 250 GB + 1 TB egress. Small workloads.</li>
+</ul>
+<h3 id="self-hosted">Self-hosted</h3>
+<ul>
+<li><strong>MinIO</strong> — open-source, S3-API-compatible, single Go binary. Scales from a home lab to multi-PB. Common in air-gapped environments, on-prem data lakes, local-dev S3 stand-in. Erasure coding configurable. AGPL (Affero General Public License) v3 community edition.</li>
+<li><strong>Ceph + RADOS Gateway</strong> — open-source distributed storage with object, block, and file interfaces. RADOS (Reliable Autonomic Distributed Object Store) is the underlying layer; <code>radosgw</code> puts an S3 REST API on top. Used at CERN (exabyte scale), DigitalOcean Spaces (Ceph-backed for years), many universities. Higher operational complexity than MinIO; more flexible.</li>
+<li><strong>OpenStack Swift</strong> — original (2010), historically eventual consistency. Used at Rackspace, eBay. Declining as the field consolidates around S3-API-compatible MinIO/Ceph.</li>
+</ul>
+<h3 id="comparison-table">Comparison table</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>AWS S3</th>
+<th>GCS</th>
+<th>Azure Blob</th>
+<th>R2</th>
+<th>MinIO (self-hosted)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Storage cost (Standard, USD/GB/mo)</td>
+<td>$0.023</td>
+<td>$0.020</td>
+<td>$0.018</td>
+<td>$0.015</td>
+<td>hardware cost</td>
+</tr>
+<tr>
+<td>Egress cost (USD/GB to internet)</td>
+<td>$0.09</td>
+<td>$0.12</td>
+<td>$0.087</td>
+<td>$0.00</td>
+<td>bandwidth cost</td>
+</tr>
+<tr>
+<td><code>PUT</code> cost (per 1k requests)</td>
+<td>$0.005</td>
+<td>$0.005</td>
+<td>$0.0055</td>
+<td>$4.50/M class A</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>GET</code> cost (per 1k requests)</td>
+<td>$0.0004</td>
+<td>$0.0004</td>
+<td>$0.0004</td>
+<td>$0.36/M class B</td>
+<td>none</td>
+</tr>
+<tr>
+<td>Durability</td>
+<td>11 9s</td>
+<td>11 9s</td>
+<td>11 9s (LRS: 11 9s, GRS: 12 9s)</td>
+<td>11 9s</td>
+<td>depends on EC config</td>
+</tr>
+<tr>
+<td>Strong consistency</td>
+<td>Yes (since 2020)</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Max object size</td>
+<td>5 TB</td>
+<td>5 TB</td>
+<td>~4.77 TB (block blob)</td>
+<td>5 TB</td>
+<td>configurable</td>
+</tr>
+<tr>
+<td>Storage tiers</td>
+<td>6 (Standard → Deep Archive)</td>
+<td>4 (Standard → Archive)</td>
+<td>4 (Hot → Archive)</td>
+<td>1</td>
+<td>1 (tiers via lifecycle)</td>
+</tr>
+<tr>
+<td>Multi-region replication</td>
+<td>CRR (configurable)</td>
+<td>Dual/multi-region buckets</td>
+<td>GRS / RA-GRS</td>
+<td>Future</td>
+<td>manual</td>
+</tr>
+<tr>
+<td>Versioning</td>
+<td>Yes (opt-in)</td>
+<td>Yes (bucket-level)</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Object Lock (WORM)</td>
+<td>Yes</td>
+<td>Bucket Lock</td>
+<td>Immutability policies</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Typical use</td>
+<td>General</td>
+<td>Google ecosystem, ML</td>
+<td>Microsoft ecosystem</td>
+<td>Public asset serving</td>
+<td>On-prem, air-gapped</td>
+</tr>
+</tbody>
+</table>
+<p>The pattern: <strong>storage cost is converging</strong> at $0.015–$0.023/GB/mo across hyperscalers; <strong>egress cost is where the actual money is</strong>. A 100 TB content library serving 1 PB/month of egress costs $90,000/month on S3, $0 on R2 — that gap dwarfs the $230 storage difference. R2's pricing model is a deliberate disruption of "egress as a customer-retention moat."</p>
+<hr>
+<h2 id="4-byte-level-how-object-storage-actually-works-internally">§4. Byte-Level: How Object Storage Actually Works Internally</h2>
+<p>The depth section. We zoom into the storage layer and explain the actual mechanics — erasure coding, the prefix sharding model that drives the throughput limits, multipart upload byte choreography, pre-signed URL HMAC (Hash-based Message Authentication Code) math, versioning, and a single <code>PUT</code> byte-by-byte.</p>
+<h3 id="41-whats-actually-in-a-bucket-keys-and-a-flat-namespace">4.1 What's actually in a bucket: keys and a flat namespace</h3>
+<p>The "folders and files" mental model is fiction. A bucket is a <strong>flat KV map</strong> from string keys to opaque bytes plus a tiny metadata blob. Forward slashes are just bytes; <code>users/42/avatar.jpg</code> is one key, not three nested directories. The S3 console parses slashes to render a tree, but the storage layer doesn't know.</p>
+<p>Consequences:</p>
+<ul>
+<li>No <code>rename()</code>. "Moving" <code>users/42/</code> to <code>users/v2/42/</code> is N copies + N deletes. For a billion-object prefix, a multi-day job.</li>
+<li>Console "renames" secretly do the copy-delete dance.</li>
+<li>No folder-level permissions. Bucket policies use prefix string matching (<code>arn:aws:s3:::my-bucket/users/42/*</code>).</li>
+</ul>
+<p>A key is up to 1024 bytes (S3) or 1024 characters (GCS). Per-object metadata: key, version-id, size, content-type (MIME — Multipurpose Internet Mail Extensions), last-modified, etag (MD5 of content or multipart-derived hash), storage class, encryption headers, user <code>x-amz-meta-*</code> headers (a few KB).</p>
+<h3 id="42-erasure-coding-how-11-nines-actually-happen">4.2 Erasure coding: how 11 nines actually happen</h3>
+<p>Object storage advertises "eleven nines of durability." Where do the nines come from? The answer is <strong>erasure coding</strong> — Reed-Solomon — applied across many disks and AZs, replacing or supplementing classical replication.</p>
+<p><strong>Naive approach: triple replication.</strong> Store three copies. To lose data, all three disks must die simultaneously. Disk failure rate ~2%/year on commodity SATA (Serial ATA); 3-of-3 simultaneous failure is small. Cost: <strong>3x storage overhead</strong>. At exabyte scale this matters a lot.</p>
+<p><strong>Erasure coding does better.</strong> Reed-Solomon takes a data block of size D and produces D + P fragments; any D of D+P suffice to reconstruct. Common deployed configurations:</p>
+<ul>
+<li><strong>(10, 4)</strong> — 10 data + 4 parity. Tolerates 4 simultaneous losses. Overhead 1.4x. Stronger than 3x replication and 2x cheaper.</li>
+<li><strong>(6, 3)</strong> — MinIO default. 1.5x overhead.</li>
+<li><strong>(17, 3)</strong> — used in Meta's f4 cold storage. 1.18x overhead, tolerates 3 losses.</li>
+</ul>
+<p><strong>The math sketch.</strong> Reed-Solomon is finite-field linear algebra over GF(256) (a Galois field of 256 elements). The D data bytes are polynomial coefficients; D + P fragments are evaluations at D + P points; any D points let you Lagrange-interpolate the polynomial and recover coefficients. Arithmetic is XOR (eXclusive OR) and GF multiplication, ~GB/sec per core with AVX (Advanced Vector Extensions).</p>
+<p><strong>Spreading across failure domains.</strong> Erasure coding is necessary but not sufficient — fragments must spread across <strong>independent failure domains</strong> (different disks, racks, power circuits, AZs). S3 stripes a single object's fragments across multiple AZs in a region. The Dec 2017 US-East-1 outage (§8) demonstrated this works: surviving AZs still served GETs.</p>
+<p><strong>Concrete numbers</strong> for an (e.g.) (9, 6) scheme across 3 AZs:</p>
+<pre><code>Object O is 100 MB. Encode into 15 fragments of ~11.1 MB each.
+   AZ-1: fragments 1..5
+   AZ-2: fragments 6..10
+   AZ-3: fragments 11..15
+
+A GET reconstructs from any 9 of 15 → typically reads from 2 of 3 AZs.
+
+Failure scenarios:
+   Lose 1 disk      → 14 of 15 left. Fine.
+   Lose 1 rack      → fine if rack held &lt;7 fragments.
+   Lose 1 AZ        → 10 of 15 left. Still readable (need 9). Repair re-encodes lost fragments elsewhere.
+   Lose 2 AZs       → 5 left, below threshold. DEGRADED. Recovery from other regions' copies if CRR.
+</code></pre>
+<p><strong>Durability math.</strong> With 2%/year disk failure rate, repair time in hours, and (10, 4) across independent failure domains, expected per-object annual loss probability is ~10⁻¹¹ — the eleven-nines number.</p>
+<p><strong>Hot vs cold trade-off.</strong> EC has a cost: reading an object requires reading D fragments instead of one. For hot reads, this is bandwidth amplification. S3 Standard uses lower-overhead schemes or replication for the active tier; Glacier Deep Archive uses extreme EC (high D, very long repair budgets) on different media (tape libraries, SMR — Shingled Magnetic Recording — drives) optimized for cost.</p>
+<h3 id="43-the-prefix-sharding-model-where-5500-put-3500-get-per-prefix-comes-from">4.3 The prefix sharding model: where 5500 PUT / 3500 GET per prefix comes from</h3>
+<p>S3's published limit is <strong>3,500 GET / HEAD per second per prefix</strong> and <strong>5,500 PUT / POST / COPY / DELETE per second per prefix</strong>. What's a "prefix" and where do the numbers come from?</p>
+<p><strong>Internal architecture</strong> (publicly described in AWS re:Invent talks): S3 partitions the keyspace by <strong>hashing on the key prefix</strong>. A bucket's namespace is divided into many shards (or "index partitions"); each owns a contiguous range of the hashed prefix space, and runs on one set of metadata + storage servers. <strong>The 3500/5500 number is one shard's envelope.</strong></p>
+<p>Shards auto-split — S3 detects sustained hot prefixes and splits the range so load spreads. The split is gradual (minutes to hours, longer for bursty wide loads), and during the lag you throttle.</p>
+<p><strong>Concrete failure mode.</strong> Common data-lake anti-pattern:</p>
+<pre><code>s3://my-lake/year=2026/month=05/day=22/hour=14/file-000.parquet
+s3://my-lake/year=2026/month=05/day=22/hour=14/file-001.parquet
+... 10,000 files written per hour, all under the same prefix
+</code></pre>
+<p>First ~5 chars (<code>year=</code>) are constant; the hash clusters all files in one shard. At burst &gt;5500/sec, you get <code>503 SlowDown</code> with backoff hints. The job "slows randomly" because S3 is throttling.</p>
+<p><strong>Fix: hash-prefix the key.</strong></p>
+<pre><code>s3://my-lake/a3f7/year=2026/month=05/day=22/hour=14/file-000.parquet
+s3://my-lake/b9e2/year=2026/month=05/day=22/hour=14/file-001.parquet
+</code></pre>
+<p>Prepending a 4-char hex hash from <code>MD5(filename)[:4]</code> spreads keys across 65k prefix buckets; each shard sees ~1/65k of the traffic. Bucket throughput becomes effectively unbounded.</p>
+<p>Modern table formats (Iceberg, Delta, Hudi) write paths like <code>s3://lake/db/table/data/00000-12-abc123/file.parquet</code> where a hash segment is built in. Hive-style partition tables need explicit guidance.</p>
+<p><strong>Bucket-wide envelope.</strong> No documented upper bound — "unlimited, limited by distinct-prefix count." Netflix, Lyft, Uber have published &gt;100,000 GET/sec sustained against a single well-distributed bucket.</p>
+<h3 id="44-multipart-upload-mechanics-the-5-gb-single-put-limit">4.4 Multipart upload mechanics: the 5 GB single-PUT limit</h3>
+<p>A single <code>PUT Object</code> request maxes at <strong>5 GB</strong>. To upload an object larger than 5 GB (up to the 5 TB object limit), you use <strong>multipart upload</strong>. Even for objects 100 MB ~ 5 GB, multipart is recommended for parallelism.</p>
+<p><strong>The flow.</strong></p>
+<pre><code>1. Client → S3:  CreateMultipartUpload(bucket, key)
+                 ← UploadId (a server-side handle)
+
+2. Client splits the file into N parts, each 5 MB–5 GB:
+       part 1: bytes 0 .. P1
+       part 2: bytes P1 .. P2
+       ...
+       part N: bytes Pn-1 .. EOF
+
+3. Client uploads each part independently (in parallel, with retries):
+       UploadPart(bucket, key, UploadId, partNumber=1, body=&lt;part 1&gt;)
+            ← ETag1
+       UploadPart(bucket, key, UploadId, partNumber=2, body=&lt;part 2&gt;)
+            ← ETag2
+       ...
+       UploadPart(bucket, key, UploadId, partNumber=N, body=&lt;part N&gt;)
+            ← ETagN
+
+4. Client → S3:  CompleteMultipartUpload(bucket, key, UploadId, [(1, ETag1), (2, ETag2), ..., (N, ETagN)])
+                 ← S3 atomically assembles the parts in order, stores the
+                   resulting object, returns the multipart ETag and version-id.
+                   ETag for multipart = MD5 of concatenated part MD5s, with -N suffix.
+</code></pre>
+<p>Parts can be uploaded <strong>in any order, retried independently, paused and resumed across days</strong>. Until <code>CompleteMultipartUpload</code>, parts are "staging" — visible only via <code>ListParts(uploadId)</code>, not <code>GET</code>. Complete is the atomic switch: before, no object; after, full object visible.</p>
+<p><strong>Why this exists.</strong> Three reasons:</p>
+<ol>
+<li><strong>The 5 GB single-PUT limit.</strong> Large HTTP bodies are awkward — TCP connections drop, proxies impose size limits, no resume mechanism. Multipart turns a 5 TB upload into 1000 × 5 GB chunks.</li>
+<li><strong>Parallelism.</strong> One TCP connection saturates ~50 MB/sec due to congestion control and HTTP/1.1 single-stream limits. Ten 100 MB parts in parallel reach ~500 MB/sec on a fast link.</li>
+<li><strong>Resumability.</strong> A 100 GB upload that fails at 80 GB resumes from part 17, not zero.</li>
+</ol>
+<p><strong>5 MB minimum, etag math.</strong> Non-final parts must be ≥ 5 MB. The multipart etag is:</p>
+<pre><code>multipart_etag = MD5(MD5(part1) || MD5(part2) || ... || MD5(partN)) || &quot;-N&quot;
+</code></pre>
+<p>Not the MD5 of the assembled object — common source of "client-side checksum doesn't match etag" bugs.</p>
+<p><strong>Garbage from failed uploads.</strong> Start a multipart, never <code>Complete</code> or <code>Abort</code> → parts stage <em>forever</em>, you pay storage. Common cost leak: a buggy retry that opens a new multipart instead of resuming. Detect with <code>ListMultipartUploads</code>; lifecycle policy to auto-abort &gt;N days.</p>
+<h3 id="45-pre-signed-urls-hmac-signed-query-parameters-for-time-limited-access">4.5 Pre-signed URLs: HMAC-signed query parameters for time-limited access</h3>
+<p>A pre-signed URL is an S3 URL with cryptographic-signature query parameters. Anyone holding it can perform the operation it's signed for (GET, PUT, DELETE) without their own AWS credentials, until expiry.</p>
+<p><strong>Mechanism (S3 v4 signature, simplified).</strong></p>
+<pre><code>1. Application has (access_key, secret_key) and decides:
+       op=PUT, bucket=uploads, key=user-42/avatar.jpg,
+       expires=900s, headers=Content-Type: image/jpeg
+
+2. Build canonical_request from (method, URI, query params, headers, payload-hash).
+3. Build string_to_sign = &quot;AWS4-HMAC-SHA256\n&lt;date&gt;\n&lt;scope&gt;\nSHA256(canonical_request)&quot;
+4. Derive signing key by HMAC-chain:
+       date_key    = HMAC-SHA256(&quot;AWS4&quot;+secret_key, &quot;20260522&quot;)
+       region_key  = HMAC-SHA256(date_key, &quot;us-east-1&quot;)
+       service_key = HMAC-SHA256(region_key, &quot;s3&quot;)
+       signing_key = HMAC-SHA256(service_key, &quot;aws4_request&quot;)
+5. signature = HMAC-SHA256(signing_key, string_to_sign)
+6. Build URL:
+       https://uploads.s3.amazonaws.com/user-42/avatar.jpg
+         ?X-Amz-Algorithm=AWS4-HMAC-SHA256
+         &amp;X-Amz-Credential=AKIA.../20260522/us-east-1/s3/aws4_request
+         &amp;X-Amz-Date=20260522T143000Z
+         &amp;X-Amz-Expires=900
+         &amp;X-Amz-SignedHeaders=host;content-type
+         &amp;X-Amz-Signature=&lt;hex&gt;
+7. Client PUTs directly to S3, never touching the app server.
+</code></pre>
+<p>S3 verifies: same canonical request, same string-to-sign, same signing key (S3 has access to the secret_key derivation). Signature matches + not expired → allow.</p>
+<p><strong>Why this is so useful.</strong> Without pre-signed URLs, every upload passes through your app server (client → app → S3); 10 MB × 10k concurrent uploads saturates app server bandwidth. With pre-signed URLs, client → app (200-byte signed URL) → client → S3 directly. This is how Notion, Slack, Discord, and every modern web app handle large uploads.</p>
+<p><strong>Security properties.</strong> The URL <strong>is</strong> the credential — anyone holding it has the rights until expiry. Deliver over HTTPS only; never email. Keep expiry short (15 min upload, 1 hr download). Signature includes HTTP method — a GET-signed URL can't PUT.</p>
+<h3 id="46-the-list-operations-are-eventually-consistent-history">4.6 The "list operations are eventually consistent" history</h3>
+<p>Before December 2020, S3 was famously confusing:</p>
+<ul>
+<li><code>PUT</code> of a new object → strongly consistent.</li>
+<li><code>PUT</code> overwriting → <strong>eventually consistent</strong>. GET could return old or new for seconds.</li>
+<li><code>DELETE</code> → eventually consistent. GET could still find a deleted object.</li>
+<li><code>LIST</code> → eventually consistent. New objects might miss a listing for seconds.</li>
+</ul>
+<p>This caused a bug class: write → list to confirm → see empty list → retry → duplicate writes. Hadoop/Spark spent years building workarounds (S3Guard, EMRFS consistent view) because "I wrote a file, I should see it" was violated.</p>
+<p><strong>December 2020:</strong> AWS shipped <strong>strong read-after-write for all operations</strong>. GCS and Azure Blob have been strongly consistent since launch (~2010). Older code may carry S3-specific workarounds you can now remove.</p>
+<h3 id="47-object-versioning-internals">4.7 Object versioning internals</h3>
+<p>Versioning is <strong>opt-in per bucket</strong> in S3. When enabled, each <code>PUT</code> to the same key creates a new version with a unique server-assigned <code>version-id</code>. <code>GET</code> returns the current version; older versions accessible via <code>?versionId=...</code>.</p>
+<pre><code>Bucket: my-bucket / Key: user-42/avatar.jpg
+   v_abc123  ← current  (2026-05-22, 12 KB)
+   v_xyz789               (2026-04-15, 11 KB)
+   v_def456               (2026-03-01, 10 KB)
+
+All three versions stored as independent objects, each at full storage cost.
+</code></pre>
+<p><strong>DELETE under versioning.</strong> A normal <code>DELETE</code> (no version-id) doesn't remove anything — it adds a <strong>delete marker</strong> as the new current version. <code>GET</code> returns 404; older versions readable explicitly. Permanent purge needs <code>DELETE</code> per version-id or a lifecycle rule.</p>
+<p><strong>Why versioning matters.</strong> Three reasons:</p>
+<ul>
+<li><strong>Accidental delete/overwrite recovery.</strong> Wrong-source <code>cp</code> → without versioning, file gone; with versioning, <code>GET --version-id</code> rolls back.</li>
+<li><strong>Audit and provenance.</strong> "What was this object at 2026-04-12T14:00?" Look up the version active then.</li>
+<li><strong>Concurrency safety.</strong> Etag-conditional writes (<code>PutObject</code> with <code>If-Match: &lt;etag&gt;</code>) prevent lost updates when writers race.</li>
+</ul>
+<p><strong>Cost implication.</strong> A 1 TB bucket with versioning and frequent updates can accumulate 5 TB of old versions in a year. Lifecycle rules purging non-current versions after 30 / 90 / 365 days are standard.</p>
+<h3 id="48-one-concrete-put-operation-byte-by-byte">4.8 One concrete <code>PUT</code> operation, byte by byte</h3>
+<p>Walk a single <code>PUT Object</code> end to end. The example: uploading a 250 MB user video. Same machinery underlies any blob upload (ML model to a registry, Parquet to a data lake, database backup).</p>
+<ol>
+<li><strong>App server</strong> accepts upload, validates auth/size/content-type. Picks multipart (10 × 25 MB) for parallelism.</li>
+<li><strong>App → S3</strong>: <code>CreateMultipartUpload(bucket=videos, key=user-42/clip-987.mp4, ContentType=video/mp4)</code> → <code>UploadId=abc-123</code>. S3 allocates a metadata slot keyed by <code>(bucket, key, upload-id)</code>.</li>
+<li><strong>App slices</strong> 250 MB into 10 × 25 MB parts.</li>
+<li><strong>For each part i in 1..10 (in parallel):</strong>
+   - <code>UploadPart</code> HTTP <code>PUT</code> to <code>.../clip-987.mp4?partNumber=i&amp;uploadId=abc-123</code>. Compute Content-MD5; S3 verifies.
+   - Over TLS (Transport Layer Security), through S3's frontend (re:Invent says "200+ microservices"), via load balancer to a regional frontend server.
+   - Frontend <strong>erasure-codes</strong> the 25 MB into ~14 fragments of ~1.8 MB; distributes across storage nodes in 3 AZs; each <code>fsync</code>s to NVMe (Non-Volatile Memory Express) or HDD (Hard Disk Drive — colder tiers).
+   - Frontend writes <code>(upload-id, part-number, etag, size, fragment-locations)</code> to the metadata service.
+   - <code>200 OK</code> + <code>ETag: "&lt;hex MD5&gt;"</code>. App stores <code>(part-number, etag)</code>.</li>
+<li><strong>App → S3</strong>: <code>CompleteMultipartUpload(... Parts=[(1, etag1), ..., (10, etag10)])</code>.</li>
+<li><strong>S3 atomically assembles.</strong> Metadata operation, not data copy — fragments already durable; complete writes an index entry pointing at the ordered parts:</li>
+</ol>
+<p><code>Index entry:
+     bucket=videos, key=user-42/clip-987.mp4, version-id=v_&lt;...&gt;,
+     parts=[part-1-loc, ..., part-10-loc], size=250MB,
+     etag="&lt;multipart-etag&gt;-10", last-modified=&lt;now&gt;</code></p>
+<ol start="7">
+<li><strong>Index write is the durability point.</strong> S3 replicates the index entry to a quorum of metadata replicas (consensus internally, similar in spirit to Paxos/Raft). Once acked, success.</li>
+<li><strong>App receives <code>200 OK</code></strong> with etag and version-id. Subsequent <code>GET</code> assembles fragments and streams them.</li>
+</ol>
+<p><strong>Crash scenarios.</strong></p>
+<ul>
+<li><strong>Network drop on one part.</strong> Client retries <code>UploadPart</code> (idempotent per <code>(upload-id, part-number)</code>); new upload replaces staging part.</li>
+<li><strong>Crash between <code>UploadPart</code> 7 and <code>Complete</code>.</strong> Restart → <code>ListParts(uploadId)</code> returns parts 1-3 uploaded; resume from 4.</li>
+<li><strong>Crash after step 6 before client ack.</strong> Client retries <code>Complete</code>; idempotent if parts list identical.</li>
+<li><strong>Abandoned upload.</strong> Parts stage forever; lifecycle rule "abort &gt;7 days" auto-cleans.</li>
+</ul>
+<p><strong>Durability invariant.</strong> <code>200 OK</code> from <code>Complete</code> means the metadata index entry is replicated to a quorum of metadata replicas, data fragments are fsync'd to a quorum of storage nodes across 3 AZs. The 11 nines come from EC + AZ distribution + metadata quorum combined.</p>
+<hr>
+<h2 id="5-capacity-envelope">§5. Capacity Envelope</h2>
+<p>What this technology can do, illustrated across very different scales.</p>
+<p><strong>Startup — 100 GB.</strong> A SaaS with 10k users × 10 MB = 100 GB. ~$2.30/mo on S3 Standard. Direct uploads via pre-signed URL. A few <code>PUT</code>s/min, single-digit <code>GET</code>s/sec. No CDN needed initially. "Set up a bucket, hand out signed URLs, forget about it." Next bottleneck: nothing for years.</p>
+<p><strong>Small-to-mid — TB scale, CDN-fronted.</strong> A growing image catalog — Instagram's first year, Pinterest's early pins. ~10 TB of images, billions of objects, served via CloudFront / Cloudflare at &gt;95% cache hit. Origin sees thousands of GETs/sec; CDN serves the rest. ~$230/mo storage + bandwidth. Bottleneck: viral event explodes cache miss rate, S3 throttles hot prefixes — fix by hash-prefixing keys.</p>
+<p><strong>Mid — Dropbox, Notion, Discord at PB.</strong> Tens of TB to multi-PB. Hundreds of <code>PUT</code>s/sec sustained, thousands of <code>GET</code>s/sec to origin. Multiple buckets by region or tenant. Heavy multipart, pre-signed URLs for browser uploads, CDN for reads. $10k-100k/mo.</p>
+<p><strong>Large — Netflix, YouTube, Instagram catalogs.</strong> Netflix's catalog: single-digit PB masters + tens of PB encoded variants. YouTube stores exabytes. Instagram reported 60 billion photos by 2017 (&gt;200 billion now); Pinterest &gt;100 billion pins. Multi-EB on S3/GCS/proprietary. Millions of <code>GET</code>s/sec aggregate. Custom CDNs (Netflix Open Connect) absorb most reads before they reach the object store.</p>
+<p><strong>Hyperscaler — S3 itself.</strong> Publicly: over <strong>280 trillion objects</strong> and <strong>100 million+ requests/sec</strong> in aggregate (2023). Exabytes of data across many regions, multiple AZs each, thousands of storage nodes per AZ.</p>
+<p>The range — 100 GB at cents/month to EB at millions of QPS — spans <strong>six orders of magnitude</strong>. The same API and storage class serve a hobby project and the Netflix catalog. What scales: prefix spread, CDN posture, lifecycle strategy. The protocol does not.</p>
+<hr>
+<h2 id="6-architecture-in-context">§6. Architecture in Context</h2>
+<p>The canonical pattern for object storage in a production system. Not "the X system" — the shape that recurs across image hosting, video streaming, data lakes, ML pipelines, backup systems.</p>
+<pre><code>                            ┌──────────────────────────────┐
+                            │  Browser / mobile client     │
+                            │  uploads files, fetches      │
+                            │  media, downloads exports    │
+                            └──────────┬─────────┬─────────┘
+                                       │         │
+                  (1) request signed URL          (4) PUT or GET directly
+                                       │         │           to object storage
+                                       ▼         │
+                            ┌──────────────────────────────┐
+                            │   Application server         │
+                            │   (stateless, horizontal)    │
+                            │   - authenticate user        │
+                            │   - validate request         │
+                            │   - return pre-signed URL    │
+                            └────────┬────────────┬────────┘
+                                     │ (2)        │ (3) write
+                                     │            │   metadata row
+                                     │            ▼
+                                     │  ┌────────────────────────┐
+                                     │  │  Transactional DB      │
+                                     │  │  (Postgres / MySQL)    │
+                                     │  │  - object_key          │
+                                     │  │  - uploaded_by_user    │
+                                     │  │  - mime_type, size     │
+                                     │  │  - status, moderation  │
+                                     │  └────────────────────────┘
+                                     │
+                                     ▼ (5) hand out signed URL
+                            ┌──────────────────────────────┐
+                            │  CDN (CloudFront, Cloudflare,│
+                            │  Fastly) — pull-through cache│
+                            │  for public/anonymous reads  │
+                            └──────────┬───────────────────┘
+                                       │ (cache miss)
+                                       ▼
+                            ┌──────────────────────────────┐
+                            │  Object storage              │
+                            │  (S3 / GCS / Azure Blob /R2) │
+                            │                              │
+                            │  bucket: user-uploads-prod   │
+                            │   ├─ a3f7/2026-05-22/...     │
+                            │   ├─ b9e2/2026-05-22/...     │
+                            │   └─ c1d8/2026-05-22/...     │
+                            │                              │
+                            │  Lifecycle:                  │
+                            │    30d → IA tier             │
+                            │    365d → Glacier            │
+                            │  Versioning: ON              │
+                            │  Encryption: SSE-KMS         │
+                            │  Public access: BLOCKED      │
+                            └──────────────────────────────┘
+                                       │
+                                       ▼  (async; for derived workloads)
+                            ┌──────────────────────────────┐
+                            │  CDC / event notifications   │
+                            │  S3 → SQS / SNS / EventBridge│
+                            │  triggers post-processing:   │
+                            │  - virus scan                │
+                            │  - thumbnail generation      │
+                            │  - transcoding              │
+                            │  - data lake ingest          │
+                            └──────────────────────────────┘
+</code></pre>
+<p>The object store (right side) holds the <strong>bytes</strong>. A transactional database holds <strong>metadata</strong> with the object key as the foreign-key pointer. Around it cluster:</p>
+<ul>
+<li><strong>A CDN</strong> in front for public read traffic. Cache hit rates of 90-99% mean origin sees a fraction of total reads.</li>
+<li><strong>A pre-signed URL flow</strong> for client-direct uploads and downloads, offloading bandwidth from the application server.</li>
+<li><strong>An event-notification path</strong> (S3 Event Notifications → SNS — Simple Notification Service — or Lambda or SQS — Simple Queue Service — or EventBridge) that triggers downstream processing: virus scanning, thumbnail generation, image moderation, transcoding, data lake ingestion.</li>
+<li><strong>A lifecycle policy</strong> that ages data into cheaper tiers automatically.</li>
+<li><strong>A versioning + access-control posture</strong> that protects against accidental deletion and accidental public exposure.</li>
+</ul>
+<p>This shape recurs across:</p>
+<ul>
+<li>A user-generated content app (Instagram, Notion, Slack).</li>
+<li>A data lake (Iceberg / Delta / Hudi tables on S3, queried by Athena / Trino / Spark).</li>
+<li>An ML pipeline (training data in S3, model artifacts in S3, fine-tuning checkpoints in S3).</li>
+<li>A backup system (database snapshots, log archives, encrypted backups).</li>
+</ul>
+<p>The metadata-DB-plus-object-storage pattern is the universal answer to "I have lots of big things and want to find them by key and serve them efficiently."</p>
+<hr>
+<h2 id="7-hard-problems-inherent-to-object-storage">§7. Hard Problems Inherent to Object Storage</h2>
+<p>Six fundamental challenges. Each shows up regardless of use case; illustrating examples come from across domains.</p>
+<h3 id="71-prefix-hot-spotting">7.1 Prefix hot-spotting</h3>
+<p><strong>One line.</strong> Writes concentrate under one prefix, saturating one internal shard and getting throttled.</p>
+<p><strong>Where it shows up.</strong> A Hive-style data lake writes hourly partitions: <code>year=2026/month=05/day=22/hour=14/part-000-of-10000.parquet</code>. A logging pipeline: <code>logs/2026/05/22/14/&lt;host&gt;.json.gz</code>. A clickstream: <code>events/yyyy/mm/dd/hh/&lt;batch&gt;.avro</code>.</p>
+<p><strong>Why it breaks.</strong> Every key starts with ~20 identical chars. Hash puts them in one shard. At 6000 writes/sec → <code>503 SlowDown</code>; Spark slows 5x. AWS support says "spread your prefix."</p>
+<p><strong>Fix: hash-prefix.</strong> Prepend <code>MD5(filename)[:4]</code>:</p>
+<pre><code>s3://lake/a3f7/year=2026/month=05/day=22/hour=14/part-000.parquet
+s3://lake/b9e2/year=2026/month=05/day=22/hour=14/part-001.parquet
+</code></pre>
+<p>Four hex chars → 65,536 shards → effectively unbounded bucket throughput. Modern table formats (Iceberg, Delta, Hudi) build hash segments into their paths automatically. S3 also auto-splits long-lived hot prefixes over minutes-to-hours; for burst workloads, hash-prefixing is the only fix.</p>
+<h3 id="72-cost-explosion-from-listings">7.2 Cost explosion from listings</h3>
+<p><strong>One line.</strong> Naive <code>ls</code> over a huge tree is slow, expensive, and often the bottleneck.</p>
+<p><strong>Where it shows up.</strong> A backup-rotation job runs <code>aws s3 ls s3://bucket/backups/ --recursive</code>. A data-lake planner lists all files in a partition. A monitoring script does <code>s3 ls</code> every minute. <code>ListObjectsV2</code> returns ~1000 keys per call; for 100M keys, 100,000 calls.</p>
+<p><strong>Why it breaks.</strong> LIST costs $0.005 per 1000 calls → $0.50 per full scan, $720/mo if run every minute. Wall time is bounded by call rate — at 100/sec, 17 minutes per scan. Anything waiting blocks.</p>
+<p><strong>Fix: sideboard index, not LIST.</strong></p>
+<ul>
+<li><strong>DB index.</strong> Your transactional DB already has rows for each object key. Query it.</li>
+<li><strong>S3 Inventory.</strong> S3 emits daily/weekly CSV/Parquet inventories at ~$0.0025/M objects. Read the inventory, not the live listing.</li>
+<li><strong>Iceberg / Delta / Hudi manifests.</strong> Table formats maintain their own file lists.</li>
+</ul>
+<p>Principle: <strong>LIST is for ad-hoc exploration, not the hot path.</strong> If you LIST more than a few times an hour over a non-trivial prefix, you're doing it wrong.</p>
+<h3 id="73-multi-region-consistency-and-latency">7.3 Multi-region consistency and latency</h3>
+<p><strong>One line.</strong> Cross-region replication is async, eventually consistent, and adds tens to hundreds of ms.</p>
+<p><strong>Where it shows up.</strong> A global company stores uploads in <code>us-east-1</code>, serves Europe from a CDN; cache misses pay ~80ms RTT. DR setup: writes in us-east-1 must show up in us-west-2 fast. Compliance copies a data lake across regions.</p>
+<p><strong>Why it breaks.</strong> S3 CRR is async — after a <code>PUT</code> in us-east-1, us-west-2 lags minutes (15-min SLA with S3 Replication Time Control / RTC). A <code>GET</code> in us-west-2 right after a <code>PUT</code> in us-east-1 may 404. No native multi-master.</p>
+<p><strong>Fix patterns.</strong></p>
+<ul>
+<li><strong>Single source of truth, CDN fanout.</strong> Writes to one region; CloudFront caches reads globally. Cache misses pay cross-region latency. Default for static assets.</li>
+<li><strong>Active-active with conflict-free naming.</strong> Each region writes to its own bucket/prefix; metadata DB knows which region owns each object. Failover replays the pointer.</li>
+<li><strong>S3 MRAP (Multi-Region Access Point).</strong> Single endpoint over multi-region replicas; eventual cross-region, last-write-wins for writes. Read-heavy global workloads.</li>
+<li><strong>GCS dual/multi-region buckets.</strong> Natively replicated; either region reads/writes with strong consistency, paying ~50-100ms cross-region quorum on writes.</li>
+</ul>
+<p>There's no perfect answer; pick which region pays the tax.</p>
+<h3 id="74-lifecycle-management-getting-tiers-right">7.4 Lifecycle management — getting tiers right</h3>
+<p><strong>One line.</strong> Aging to cheaper tiers is a recurring cost problem; wrong policy means money lost or fast access gone.</p>
+<p><strong>Where it shows up.</strong> A SaaS keeps everything in Standard at $0.023/GB; 100 TB at $2300/mo, but 90% untouched in 6 months. Backup retains 30 dailies in Standard; only the latest is ever read. ML dataset is hot for 2 weeks, then a cold reference.</p>
+<p><strong>Why it breaks.</strong> Two ways:</p>
+<ul>
+<li><strong>"Keep everything hot."</strong> 1 PB Standard = $23k/mo vs $1k/mo Deep Archive — $264k/yr.</li>
+<li><strong>"Move everything to Glacier."</strong> Deep Archive restore is 12 hours; bulk retrieval $0.02/GB → $20 to restore 1 TB.</li>
+</ul>
+<p><strong>Fix: tiered policy.</strong></p>
+<pre><code>0-30 days:     S3 Standard ($0.023/GB)
+30-90 days:    S3 Standard-IA ($0.0125/GB)
+90-365 days:   S3 Glacier Instant Retrieval
+365 days+:     S3 Glacier Deep Archive
+</code></pre>
+<p><strong>Intelligent-Tiering</strong> automates the decision: S3 monitors access and moves objects between tiers. Small monitoring fee ($0.0025/1000 objects/mo, waived &gt;128 KB).</p>
+<p><strong>Edge cases.</strong> Min storage durations (IA 30d, Glacier Instant 90d, Deep Archive 180d) — putting a 2-day-old object in Glacier costs more than Standard. Lifecycle rules apply by prefix or tag, not per-object. Versioning interacts: rules on noncurrent versions purge old.</p>
+<h3 id="75-permissions-and-the-layered-access-model">7.5 Permissions and the layered access model</h3>
+<p><strong>One line.</strong> IAM policies (identity-based), bucket policies (resource-based), ACLs (legacy), and pre-signed URLs (delegated), all layered. Misconfiguration is the most common cloud-data leak.</p>
+<p><strong>Where it shows up.</strong> A bucket made public for a build script also holds PII (Personally Identifiable Information). A migration grants <code>s3:*</code> to an IAM role; the role is later attached to a vulnerable service. A pre-signed URL leaks into a browser history. The 2019 Capital One breach — SSRF (Server-Side Request Forgery) → EC2 instance role with <code>s3:GetObject</code> → exfiltration.</p>
+<p><strong>Why it breaks.</strong> Four layers interact:</p>
+<ul>
+<li><strong>IAM policy</strong> — on a principal (user, role, group).</li>
+<li><strong>Bucket policy</strong> — on the bucket (cross-account too).</li>
+<li><strong>ACLs</strong> — legacy; new buckets default "Bucket Owner Enforced" disables them.</li>
+<li><strong>Pre-signed URLs</strong> — whoever holds it.</li>
+</ul>
+<p>Effective permissions = union, with deny winning. Public access happens through <code>Principal: *</code> policy, an ACL granting "All Users", or a leaked signed URL.</p>
+<p><strong>Fix.</strong></p>
+<ul>
+<li><strong>Account-level Public Access Block.</strong> Post-Capital One safety net; rejects any policy/ACL granting public access.</li>
+<li><strong>IAM for services, bucket policies for cross-account, no ACLs.</strong></li>
+<li><strong>Short-lived pre-signed URLs.</strong> 15 min upload, 1 hr download.</li>
+<li><strong>Least-privilege IAM.</strong> Read <code>bucket/users/&lt;user-id&gt;/*</code>, not the whole bucket.</li>
+<li><strong>AWS Access Analyzer.</strong> Weekly review of policies granting external access.</li>
+<li><strong>CloudTrail + S3 Access Logs.</strong> Alert on large downloads, new IP ranges.</li>
+</ul>
+<h3 id="76-egress-cost-as-a-tax">7.6 Egress cost as a tax</h3>
+<p><strong>One line.</strong> Cloud providers charge $0.05-$0.12/GB for bytes leaving — often dwarfing storage cost.</p>
+<p><strong>Where it shows up.</strong> A media company serves 500 TB/mo of video. Storage for 200 TB catalog: $4,600/mo. Egress at $0.09/GB: $45,000/mo — 10x storage. A SaaS exports 10 TB/mo to on-prem: $900/mo. An ML team copies 100 TB cross-region (us-east-1 → us-west-2): $2,000 per copy at $0.02/GB.</p>
+<p><strong>Why it breaks.</strong> Egress is the <strong>lock-in mechanism</strong>. Migrating 1 PB from S3 to GCS = ~$90,000. Asymmetry (free ingress, expensive egress) keeps data in place.</p>
+<p><strong>Fix.</strong></p>
+<ul>
+<li><strong>CDN in front.</strong> CloudFront → S3 internal at $0.02/GB; CloudFront egress at $0.085. 95% cache hit drops real S3 egress 20x.</li>
+<li><strong>R2 / Backblaze / Cloudflare bandwidth alliance.</strong> If your business is bandwidth (public video, dataset distribution, AI model hosting), R2's $0/GB egress is a 10-100x cost reduction.</li>
+<li><strong>VPC endpoints / private link.</strong> Same-region EC2 → S3 via VPC Endpoint doesn't traverse the internet; egress free.</li>
+<li><strong>Compute close to data.</strong> Query / train / analyze in the bucket's region.</li>
+<li><strong>Negotiate.</strong> Large customers (&gt;$100k/mo egress) get custom discounts.</li>
+</ul>
+<p>The egress tax is structural; awareness changes which provider, region, and CDN you pick.</p>
+<hr>
+<h2 id="8-failure-mode-walkthrough">§8. Failure Mode Walkthrough</h2>
+<p>Object storage fails. The mechanisms differ from a database failure, but the recovery story is similar in shape: durability points, replay from logs, rollback to a prior version.</p>
+<h3 id="81-region-outage">8.1 Region outage</h3>
+<p><strong>Scenario.</strong> The Dec 4, 2017 S3 us-east-1 outage. An engineer running a routine debug command typed a parameter wrong; an unintended subset of S3 subsystems was restarted; cascading dependencies brought down the S3 metadata service in us-east-1 for ~4 hours. Many AWS services (which themselves depended on us-east-1 S3 for their own data) also went down — including the AWS service health dashboard, which couldn't update because <em>it</em> depended on us-east-1 S3.</p>
+<p><strong>What happens.</strong> Every <code>GET</code> and <code>PUT</code> to S3 us-east-1 returns 5xx. Anything in your application that depends on S3 fails. CDN cache hits keep serving (cache survives origin loss); cache misses fail.</p>
+<p><strong>Recovery.</strong></p>
+<ul>
+<li><strong>For reads:</strong> CDN cache reduces blast radius. If your assets are warmed in a CDN, most users see no impact.</li>
+<li><strong>For writes:</strong> Buffer writes locally; queue for retry when S3 returns. Application servers stash uploads on local EBS / EFS / Redis and replay when S3 is healthy.</li>
+<li><strong>Multi-region preemptively:</strong> Cross-Region Replication or dual-region buckets, with the application capable of failing over. The 2017 outage motivated many teams to add multi-region replication.</li>
+</ul>
+<p><strong>Durability point.</strong> Even during the outage, <strong>no data was lost</strong> — the 11-nines durability is per object, independent of API availability. After the outage, all objects were readable again. The outage was an availability event, not a durability event.</p>
+<h3 id="82-prefix-hot-spot-throttling">8.2 Prefix hot-spot throttling</h3>
+<p><strong>Scenario.</strong> A nightly batch job writes 50,000 Parquet files per hour into <code>s3://lake/year=2026/month=05/day=22/</code>. At 8000 writes/sec, S3 returns <code>503 SlowDown</code> on ~30% of the writes.</p>
+<p><strong>What happens.</strong> The job's exception count grows; the Spark / Glue / Hadoop client backs off, retries, eventually completes 2x slower or fails partway.</p>
+<p><strong>Recovery during the run.</strong> Exponential backoff with jitter. The S3 SDK's default retry strategy handles this — but the job's wall time grows. You hit the lateness SLA and the downstream analytics jobs starve.</p>
+<p><strong>Real fix.</strong> Hash-prefix the keys (§7.1). For an in-progress job, work-around: split the write into multiple prefixes manually (<code>bucket/p1/...</code>, <code>bucket/p2/...</code>, ...). For ongoing fix: refactor the partitioning scheme.</p>
+<h3 id="83-lifecycle-policy-that-deleted-data">8.3 Lifecycle policy that deleted data</h3>
+<p><strong>Scenario.</strong> An engineer writes a lifecycle policy intended to clean up temporary upload staging: "delete objects in <code>tmp/</code> prefix after 30 days." A misconfiguration applies the rule to the whole bucket or to a wrong prefix.</p>
+<p><strong>What happens.</strong> Thirty days after the policy is applied, S3 silently deletes all matching objects. No warning. The discovery is usually "users complaining their data is gone" days or weeks later.</p>
+<p><strong>Recovery.</strong></p>
+<ul>
+<li><strong>If versioning was on:</strong> Each "delete" was a delete-marker; the underlying object versions are intact. Restoration: enumerate the delete markers, delete <em>them</em> (which restores the previous version as current). Tedious for many keys but recoverable.</li>
+<li><strong>If versioning was off:</strong> Data is gone. Restoration only possible from backups (cross-account, cross-bucket, or off-cloud).</li>
+<li><strong>MFA Delete on bucket:</strong> If enabled, no lifecycle policy can permanently delete versions; an MFA-authenticated user must approve. Strong protection against this category.</li>
+</ul>
+<p><strong>Prevention.</strong></p>
+<ul>
+<li><strong>Always enable versioning on important buckets.</strong> The 5-50% storage cost increase pales next to one accidental delete event.</li>
+<li><strong>Lifecycle policies in IaC (Infrastructure as Code)</strong> with code review. No console-edited lifecycle rules.</li>
+<li><strong>Test lifecycle rules in dry-run / staging buckets first.</strong></li>
+</ul>
+<h3 id="84-accidental-public-bucket-the-s3-leak-archetype">8.4 Accidental public bucket (the "S3 leak" archetype)</h3>
+<p><strong>Scenario.</strong> A bucket containing customer PII is misconfigured with public read. Discovered by a security researcher running an S3 bucket enumerator; reported publicly; brand damage.</p>
+<p><strong>What happens.</strong> Anyone on the internet can <code>GET</code> any object in the bucket. Personally Identifiable Information, credentials, internal documents — whatever's in the bucket. Detection of who's accessed it is via S3 Access Logs (if enabled) or CloudTrail Data Events (if enabled), often after the fact.</p>
+<p><strong>Recovery.</strong></p>
+<ul>
+<li><strong>Immediate remediation:</strong> Disable public access on the bucket. Verify with <code>aws s3api get-bucket-policy-status</code> and Public Access Block.</li>
+<li><strong>Rotate any credentials that may have been exposed.</strong></li>
+<li><strong>Notify affected users</strong> per GDPR / CCPA / state breach laws (jurisdiction-specific timelines).</li>
+<li><strong>Audit logs</strong> for what was accessed; the access logs (if enabled) are critical evidence.</li>
+</ul>
+<p><strong>Prevention.</strong></p>
+<ul>
+<li><strong>Account-level Public Access Block.</strong> Blocks any bucket-level public access regardless of policy. A safety net for human error.</li>
+<li><strong>Periodic audits</strong> (AWS Access Analyzer, third-party tools like Spectral / Wiz / Lacework) for buckets with public access.</li>
+<li><strong>Tagging buckets with data-classification tags</strong> (<code>Tier=PII</code>, <code>Tier=Public</code>). Alerts on PII buckets becoming public.</li>
+</ul>
+<h3 id="85-object-overwrite-without-versioning">8.5 Object overwrite without versioning</h3>
+<p><strong>Scenario.</strong> A user uploads a new version of their avatar; the application <code>PUT</code>s to the same key. Two minutes later the user reports the upload failed and asks for the previous avatar back. Without versioning, the old image is gone.</p>
+<p><strong>Recovery.</strong></p>
+<ul>
+<li><strong>With versioning:</strong> <code>aws s3api list-object-versions --prefix users/&lt;user-id&gt;/avatar.jpg</code> returns both versions; restore the previous one.</li>
+<li><strong>Without versioning:</strong> Backup or nothing.</li>
+</ul>
+<p><strong>Prevention.</strong> Enable versioning on user-content buckets.</p>
+<h3 id="86-etag-mismatch-on-in-flight-uploads">8.6 ETag mismatch on in-flight uploads</h3>
+<p><strong>Scenario.</strong> A large file is being uploaded via multipart; the upload is in progress when the application crashes. On restart, a different client (maybe a different user retry) starts a new multipart for the same key. Both completes succeed; the visible object is from whichever completed last; the staging parts of the loser pile up indefinitely.</p>
+<p><strong>Recovery.</strong></p>
+<ul>
+<li><strong>Detect orphan multiparts:</strong> <code>ListMultipartUploads</code> per bucket. Anything older than a few days that's not actively progressing is orphan.</li>
+<li><strong>Lifecycle rule:</strong> "Abort multipart uploads incomplete after 7 days." Standard hygiene.</li>
+</ul>
+<p><strong>Prevention.</strong> Use a unique <code>UploadId</code> per user session and per file version; don't share. Use S3 Object Lock if accidental overwrites are a high-risk concern (financial records, compliance documents) — Object Lock makes an object immutable for a retention period.</p>
+<hr>
+<h2 id="9-why-not-just-store-files-on-a-filesystem">§9. Why Not Just Store Files on a Filesystem</h2>
+<p>The obvious naive replacement for object storage is "a Linux box with a big disk." Let's walk through why this breaks.</p>
+<p><strong>Setup.</strong> A startup with user uploads. They set up an EC2 instance with a 10 TB EBS volume, mount it at <code>/data</code>, and <code>cp</code> uploaded files there. The application serves files via nginx static file serving.</p>
+<p><strong>Failure mode 1: single point of failure.</strong> The EC2 instance dies. The EBS volume is intact (separate failure domain) but no machine is serving it. Recovery: launch a new instance, attach the volume, restart nginx. Downtime: 5-30 minutes if you have automation, hours if you don't.</p>
+<p><strong>Failure mode 2: durability.</strong> The EBS volume has 99.9999% annual durability — five nines. Compared to S3's eleven nines, that's 100,000x worse. Over a 10-year period running 1000 volumes, expected loss: 1 volume. Lost volume = lost data (unless you have backups, which you must set up yourself).</p>
+<p><strong>Failure mode 3: capacity.</strong> Disk fills up. Adding more EBS requires expanding the volume (no downtime, modern EBS) and growing the filesystem, but eventually you hit the per-volume limit (~16 TB per gp3 volume; ~64 TB per io2). At that point you need multiple volumes, and now you're sharding by hand — assigning users to volumes, knowing which volume holds which file, balancing load.</p>
+<p><strong>Failure mode 4: replication.</strong> EBS is single-AZ. To survive an AZ failure, you need cross-AZ replication. To survive a region failure, cross-region. Building this yourself = <code>rsync</code> cronjob to a different AZ; lag is whatever cron interval you set; consistency is "whatever rsync did." S3 gives you this by default, RPO=0 across AZs.</p>
+<p><strong>Failure mode 5: scaling reads.</strong> Serving 1000 reads/sec from one nginx box on EBS works. 100,000 reads/sec needs many boxes, all reading the same files. Now you need a shared filesystem (NFS, EFS) or copy files everywhere. Either way, latency goes up, complexity goes up, cost goes up.</p>
+<p><strong>Failure mode 6: scaling writes.</strong> Writes go to one node (the owner of the EBS volume). To scale, you shard — assign files to volumes. Now your application logic includes "look up which volume owns this file," and rebalancing volumes is an operational nightmare.</p>
+<p><strong>Failure mode 7: cost.</strong> EBS gp3 is $0.08/GB/mo. S3 Standard is $0.023/GB/mo. For 100 TB, EBS costs $8,000/mo vs S3 $2,300/mo — 3.5x. And EBS doesn't auto-tier; cold data costs the same as hot.</p>
+<p><strong>Failure mode 8: serving the world.</strong> Once your customers are global, you need a CDN. The CDN expects to read from a public-internet endpoint with proper headers. Wiring an internal EBS-backed nginx to a CDN involves an SSL cert, a public IP, scaling, and rate-limiting — work S3 + CloudFront does for free.</p>
+<p>The cumulative case: a filesystem on a server works for ~10 GB and one host. It does not scale to a serious workload. Every team that tried (Dropbox is the famous example) eventually built their own object storage anyway. Magic Pocket, Dropbox's internal object storage, replaced their use of S3 (~600 PB at the time of public talks) with a custom 11-nines distributed object store — they didn't "go back to filesystems," they built S3 themselves.</p>
+<hr>
+<h2 id="10-scaling-axes">§10. Scaling Axes</h2>
+<p>How object storage scales.</p>
+<h3 id="type-1-more-objects-more-clients-auto-scales">Type 1: more objects, more clients — auto-scales</h3>
+<p><strong>The growth pattern.</strong> A startup at 100 GB, growing to 100 TB over five years; user base from 10k to 10M; request rate from 100 QPS to 100k QPS.</p>
+<p><strong>How object storage handles it.</strong> Without action. S3 / GCS / Azure Blob auto-scale: more objects → more internal shards (S3 auto-splits prefixes); more requests → load balanced across more frontend nodes; more storage → more underlying storage capacity allocated. The user doesn't see the seams.</p>
+<p><strong>What might bite anyway.</strong></p>
+<ul>
+<li><strong>Bucket-level throughput limits.</strong> Documented limits (3500 GET, 5500 PUT per prefix per second) apply per prefix. Sustained, well-distributed workloads can hit 100k+ QPS bucket-wide.</li>
+<li><strong>List operations.</strong> As object count grows, listing time grows linearly. Switch to inventory or table-format manifests.</li>
+<li><strong>Cost-of-LIST and cost-of-PUT.</strong> At billions of operations, the per-call costs add up. Batch operations where possible.</li>
+</ul>
+<p><strong>Inflection points.</strong> None for storage capacity (effectively unbounded). For QPS, the inflection is "we sustained 5000 QPS on one prefix and got throttled" — hash-prefix the keys. For listings, "the LIST is taking longer than the actual processing" — switch to a sideboard index.</p>
+<h3 id="type-2-one-prefix-hot-hash-prefix">Type 2: one prefix hot — hash prefix</h3>
+<p><strong>The growth pattern.</strong> A logging pipeline writes app logs to <code>logs/2026/05/22/14/</code>. The hour-of-day boundary is the hot prefix; every hour, 100% of writes hit one prefix; the rest of the bucket is cold.</p>
+<p><strong>How object storage tries to handle it.</strong> S3's auto-split kicks in for sustained hot prefixes, but lag is measured in minutes-to-hours. For bursty workloads (every hour-boundary creates a new prefix), auto-split never has time to catch up.</p>
+<p><strong>Real fix.</strong> Hash-prefix. Discussed in §4.3 and §7.1.</p>
+<p><strong>Inflection point.</strong> When sustained write rate per prefix exceeds ~3000/sec, hash-prefixing becomes mandatory. Burst rates above ~5500/sec get throttled.</p>
+<h3 id="type-3-from-a-single-bucket-to-many">Type 3: from a single bucket to many</h3>
+<p><strong>The growth pattern.</strong> Your application has one bucket; lifecycle and access patterns are mixed (hot user uploads, cold backups, multi-tenant data). Bucket policies and lifecycle rules become unwieldy.</p>
+<p><strong>Fix.</strong> Split into many buckets by access pattern: <code>user-uploads-prod</code>, <code>backups-prod</code>, <code>analytics-data-lake-prod</code>, <code>model-artifacts-prod</code>. Each bucket gets its own lifecycle, encryption settings, access controls, tags. Cleaner cost attribution (tags per bucket); cleaner audit; easier permissions.</p>
+<p><strong>Limit.</strong> AWS default account limit is 100 buckets per account (raisable to 1000); names are globally unique.</p>
+<h3 id="type-4-from-one-region-to-many">Type 4: from one region to many</h3>
+<p><strong>The growth pattern.</strong> Latency-sensitive global users; compliance (data residency); disaster recovery.</p>
+<p><strong>Fix options.</strong></p>
+<ul>
+<li><strong>CRR (Cross-Region Replication).</strong> Async copy of objects from source to one or more destination buckets. Standard for DR. Latency from source to destination: minutes (RTC tier promises 15-minute SLA).</li>
+<li><strong>Multi-Region Access Point (MRAP).</strong> Single endpoint over multiple regional buckets. Used for read-heavy globally-distributed access patterns.</li>
+<li><strong>GCS dual-region / multi-region buckets.</strong> Natively replicated; bucket lives in two regions or a multi-region geography. Reads/writes either region with strong consistency at the cost of cross-region latency on writes.</li>
+</ul>
+<p><strong>Inflection point.</strong> When cross-region GET latency from CDN cache miss &gt; acceptable user latency (50-100ms typical for media-rich apps); or when compliance requires data residency.</p>
+<hr>
+<h2 id="11-decision-matrix-object-storage-vs-adjacent-categories">§11. Decision Matrix: Object Storage vs Adjacent Categories</h2>
+<p>Side-by-side comparison along named dimensions.</p>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Object storage</th>
+<th>Block storage (EBS)</th>
+<th>File storage (EFS / NFS)</th>
+<th>CDN edge cache</th>
+<th>Database BLOB column</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Access unit</td>
+<td>Whole object</td>
+<td>4 KB block</td>
+<td>Bytes within file</td>
+<td>URL (with HTTP semantics)</td>
+<td>Row/column</td>
+</tr>
+<tr>
+<td>Random read inside item</td>
+<td>Range GET (slow)</td>
+<td>Native (~100µs)</td>
+<td>Native</td>
+<td>Range GET</td>
+<td>Native (slow at scale)</td>
+</tr>
+<tr>
+<td>Random write inside item</td>
+<td>No (re-upload)</td>
+<td>Native</td>
+<td>Native</td>
+<td>N/A (read-only)</td>
+<td>Native</td>
+</tr>
+<tr>
+<td>Concurrency</td>
+<td>Strong consistency</td>
+<td>Single attacher</td>
+<td>Multi-host with locks</td>
+<td>Read-only</td>
+<td>ACID transactions</td>
+</tr>
+<tr>
+<td>Latency p50 (intra-region)</td>
+<td>30-80ms</td>
+<td>100-500µs</td>
+<td>1-5ms</td>
+<td>5-20ms (edge POP)</td>
+<td>1-10ms</td>
+</tr>
+<tr>
+<td>Throughput per item</td>
+<td>Multi-Gbps</td>
+<td>1-10 Gbps</td>
+<td>10s of Gbps</td>
+<td>High (per-edge)</td>
+<td>Limited by row I/O</td>
+</tr>
+<tr>
+<td>Durability</td>
+<td>11 9s</td>
+<td>5-6 9s</td>
+<td>11 9s</td>
+<td>none (ephemeral)</td>
+<td>depends on DB</td>
+</tr>
+<tr>
+<td>Capacity per item</td>
+<td>5 TB</td>
+<td>64 TB (volume)</td>
+<td>unbounded (per file: huge)</td>
+<td>N/A</td>
+<td>typically &lt;1 GB/cell</td>
+</tr>
+<tr>
+<td>Total capacity</td>
+<td>Unbounded</td>
+<td>Per-volume cap</td>
+<td>PB</td>
+<td>TB-PB per POP</td>
+<td>TB-PB per shard</td>
+</tr>
+<tr>
+<td>Cost (USD/GB/mo)</td>
+<td>$0.023</td>
+<td>$0.08</td>
+<td>$0.30</td>
+<td>varies</td>
+<td>DB-storage rate (&gt;$0.10)</td>
+</tr>
+<tr>
+<td>Egress</td>
+<td>Expensive</td>
+<td>Inter-AZ free</td>
+<td>Inter-AZ free</td>
+<td>CDN egress</td>
+<td>inside-DB free</td>
+</tr>
+<tr>
+<td>Typical use</td>
+<td>Media, lake, model</td>
+<td>DB data files, OS disk</td>
+<td>Shared config, HPC scratch</td>
+<td>Public asset serving</td>
+<td>Tiny embedded blobs</td>
+</tr>
+</tbody>
+</table>
+<p><strong>When to pick which:</strong></p>
+<ul>
+<li><strong>Object storage:</strong> the artifact is big (&gt;10 KB), accessed as a whole (not by partial mutation), durability matters, and you can tolerate 50-150ms latency. Default choice for: user uploads, video / media, ML models, training data, data lake files, backups, log archives.</li>
+<li><strong>Block storage:</strong> the artifact is small (4 KB blocks), accessed with random reads and writes, attached to one host. Default for: database data files, OS root volumes, application caches that need fsync.</li>
+<li><strong>File storage:</strong> you need POSIX semantics (open / read / write / lock) shared across many hosts. Default for: HPC clusters, legacy applications, shared configuration that updates frequently.</li>
+<li><strong>CDN edge cache:</strong> you serve the same large item to many readers worldwide. Pair with object storage as origin.</li>
+<li><strong>Database BLOB column:</strong> the blob is tiny (&lt;10 KB) and lives logically inside a row that you query frequently. Even then, prefer storing a URL in the row and the blob in object storage; database buffer pool is too valuable for blobs.</li>
+</ul>
+<p><strong>Concrete thresholds.</strong></p>
+<ul>
+<li>5 KB blob attached to 1M user rows: BLOB column might be ok.</li>
+<li>50 KB image, served 1B times/yr: object storage + CDN.</li>
+<li>5 MB document, attached to a user: object storage.</li>
+<li>5 GB ML model file: object storage, definitely.</li>
+<li>10 GB / hour log stream from one server: object storage with batching (don't write one log line per PUT).</li>
+<li>50 KB random reads at 100k QPS: a cache (Redis / Memcached / DragonflyDB), not object storage.</li>
+</ul>
+<hr>
+<h2 id="12-storage-tiers-and-economics">§12. Storage Tiers and Economics</h2>
+<p>Object storage charges by storage class. Picking the right one across an object's lifecycle is one of the biggest cost levers.</p>
+<h3 id="s3-storage-classes-us-east-1-reference-prices-2024">S3 storage classes (US-East-1 reference prices, 2024)</h3>
+<table>
+<thead>
+<tr>
+<th>Class</th>
+<th>$/GB/mo</th>
+<th>Retrieval cost</th>
+<th>Min storage</th>
+<th>First-byte latency</th>
+<th>Use case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>S3 Standard</td>
+<td>$0.023</td>
+<td>none (pay per GET)</td>
+<td>none</td>
+<td>ms</td>
+<td>Hot, frequently accessed</td>
+</tr>
+<tr>
+<td>S3 Intelligent-Tiering</td>
+<td>varies</td>
+<td>none (auto-moves)</td>
+<td>none</td>
+<td>ms</td>
+<td>Unknown / changing access patterns</td>
+</tr>
+<tr>
+<td>S3 Standard-IA (Infreq Access)</td>
+<td>$0.0125</td>
+<td>$0.01/GB</td>
+<td>30 days</td>
+<td>ms</td>
+<td>Backup, less-frequent access</td>
+</tr>
+<tr>
+<td>S3 One Zone-IA</td>
+<td>$0.01</td>
+<td>$0.01/GB</td>
+<td>30 days</td>
+<td>ms</td>
+<td>Recreatable, single-AZ ok</td>
+</tr>
+<tr>
+<td>S3 Glacier Instant Retrieval</td>
+<td>$0.004</td>
+<td>$0.03/GB</td>
+<td>90 days</td>
+<td>ms</td>
+<td>Quarterly accessed</td>
+</tr>
+<tr>
+<td>S3 Glacier Flexible Retrieval</td>
+<td>$0.0036</td>
+<td>$0.01-$0.10/GB</td>
+<td>90 days</td>
+<td>min-hours</td>
+<td>Annual backups, deep archive</td>
+</tr>
+<tr>
+<td>S3 Glacier Deep Archive</td>
+<td>$0.00099</td>
+<td>$0.02-$0.025/GB</td>
+<td>180 days</td>
+<td>12 hours</td>
+<td>True cold archive, compliance</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The economics.</strong></p>
+<ul>
+<li><strong>S3 Standard at $0.023/GB/mo</strong> is the default hot tier. Used for anything actively served.</li>
+<li><strong>Standard-IA at $0.0125</strong> halves storage cost but charges $0.01 per GB retrieved. Worth it if you read &lt;0.5x per month per GB. Higher and the retrieval fees eat the savings.</li>
+<li><strong>One Zone-IA at $0.01</strong> is 20% cheaper than IA, single-AZ. Loses an AZ → data gone. Only use for recreatable data (transcoded variants from a master, derived analytics) where loss is recoverable.</li>
+<li><strong>Glacier Instant at $0.004</strong> is ~5x cheaper than Standard, milliseconds latency. Designed for "I need fast access but only rarely." Quarterly compliance reports, archived user data with rare access.</li>
+<li><strong>Glacier Flexible at $0.0036</strong> has minutes-to-hours retrieval. ~6x cheaper than Standard. For monthly-or-rarer access patterns. Often used for backups.</li>
+<li><strong>Glacier Deep Archive at $0.00099</strong> is 23x cheaper than Standard but 12-hour retrieval. For pure archive, compliance retention (7-year financial records, decades-long medical), data you must keep but really hope not to read.</li>
+</ul>
+<h3 id="lifecycle-policies">Lifecycle policies</h3>
+<p>A lifecycle policy is a declarative description of when to move objects between tiers and when to delete them. Example:</p>
+<pre><code>{
+  &quot;Rules&quot;: [{
+    &quot;ID&quot;: &quot;user-uploads-aging&quot;,
+    &quot;Filter&quot;: { &quot;Prefix&quot;: &quot;user-uploads/&quot; },
+    &quot;Status&quot;: &quot;Enabled&quot;,
+    &quot;Transitions&quot;: [
+      { &quot;Days&quot;: 30,  &quot;StorageClass&quot;: &quot;STANDARD_IA&quot; },
+      { &quot;Days&quot;: 90,  &quot;StorageClass&quot;: &quot;GLACIER_IR&quot; },
+      { &quot;Days&quot;: 365, &quot;StorageClass&quot;: &quot;DEEP_ARCHIVE&quot; }
+    ],
+    &quot;Expiration&quot;: { &quot;Days&quot;: 2555 }   // 7 years
+  }]
+}
+</code></pre>
+<p>This rule: objects in the <code>user-uploads/</code> prefix move to IA after 30 days, Glacier Instant after 90, Deep Archive after 365, deleted after 7 years.</p>
+<p><strong>Caveats.</strong></p>
+<ul>
+<li><strong>Transitions cost money.</strong> Each transition is a per-object operation; for 1B objects, transition cost is non-trivial.</li>
+<li><strong>Min storage duration.</strong> Moving an object that's only 10 days old to IA charges the 30-day minimum anyway.</li>
+<li><strong>Lifecycle is per bucket, on prefixes or tags.</strong> Granular control requires bucket-or-tag layout.</li>
+</ul>
+<h3 id="the-we-keep-everything-hot-cost-disaster">The "we keep everything hot" cost disaster</h3>
+<p>A common pattern: a startup grows from 100 GB to 1 PB over five years. Everything sits in S3 Standard because "we might need it." Storage cost: 1,000,000 GB × $0.023 = $23,000/mo = $276k/yr.</p>
+<p>If 90% of it is accessed less than once a year:</p>
+<pre><code>100 TB hot in Standard: 100,000 × $0.023 = $2,300/mo
+900 TB in Glacier Flexible: 900,000 × $0.0036 = $3,240/mo
+Total: $5,540/mo (down from $23,000/mo)
+Savings: $17,460/mo = $209k/yr
+</code></pre>
+<p>A few hours of lifecycle policy authoring, $200k/year saved. This is the single biggest object-storage cost lever.</p>
+<h3 id="intelligent-tiering-when-access-patterns-are-unknown">Intelligent-Tiering when access patterns are unknown</h3>
+<p>S3 Intelligent-Tiering automates the tier decision: S3 monitors access per object and auto-moves between Frequent → Infrequent → Archive Instant → Archive → Deep Archive Access tiers. Monitoring fee: $0.0025 per 1000 objects per month (waived for objects &gt; 128 KB).</p>
+<p>When to use: you have many objects with unpredictable access (user uploads where some go viral and others sit forever; a data lake where most files are read once on ingest and never again, but a few become "reference" files). Not worth it: you know your access pattern (manual policy is cheaper).</p>
+<hr>
+<h2 id="13-security">§13. Security</h2>
+<p>Object storage has been the highest-profile data leak vector in the cloud era. Getting security right requires understanding multiple overlapping mechanisms.</p>
+<h3 id="131-iam-bucket-policies-acls-pre-signed-urls">13.1 IAM, bucket policies, ACLs, pre-signed URLs</h3>
+<p>The four layers, recapped from §7.5:</p>
+<ul>
+<li><strong>IAM (Identity and Access Management).</strong> Identity-based. "This user/role can do these actions on these resources." Lives in the IAM service, attached to users/roles/groups.</li>
+<li><strong>Bucket policy.</strong> Resource-based. "These principals (identified by IAM ARN or AWS account ID) can do these actions on this bucket." Lives on the bucket.</li>
+<li><strong>ACLs (Access Control Lists).</strong> Legacy per-object or per-bucket grants. Deprecated by default in new buckets (Bucket Owner Enforced).</li>
+<li><strong>Pre-signed URLs.</strong> Time-limited, signed grants embedded in a URL.</li>
+</ul>
+<p><strong>Evaluation logic.</strong> A request is allowed if any of (IAM policy, bucket policy, ACL) explicitly allows AND no policy explicitly denies, with deny taking precedence. Public access is also gated by the Block Public Access settings (account + bucket level).</p>
+<p><strong>Best practice posture.</strong></p>
+<ul>
+<li><strong>Default-deny stance.</strong> Nothing is allowed unless explicitly granted.</li>
+<li><strong>Use IAM for service-to-service auth.</strong> Application roles attached to EC2 / ECS (Elastic Container Service) / Lambda; IAM policies grant exactly the actions needed.</li>
+<li><strong>Use bucket policies for cross-account access.</strong> Sharing data between AWS accounts; specify accounts in the bucket policy.</li>
+<li><strong>Don't use ACLs.</strong> Disable them via Bucket Owner Enforced.</li>
+<li><strong>Account-level Block Public Access.</strong> Default on; prevents any policy from making a bucket public.</li>
+</ul>
+<h3 id="132-pre-signed-urls-and-offloading-auth">13.2 Pre-signed URLs and offloading auth</h3>
+<p>Pre-signed URLs (§4.5) are the workhorse for client-direct upload/download. The application server authenticates the user, decides "yes, this user can upload to <code>users/&lt;id&gt;/avatar.jpg</code>," generates the signed URL, returns it. The client <code>PUT</code>s directly to S3. Auth happens once at URL generation; S3 verifies the signature on receipt.</p>
+<p><strong>Properties.</strong></p>
+<ul>
+<li><strong>The URL is the credential.</strong> Anyone with the URL can perform the action until expiry.</li>
+<li><strong>Time-limited.</strong> Typical: 15 minutes for upload, 1 hour for download. Don't make it longer than necessary.</li>
+<li><strong>Specific to operation and resource.</strong> A GET-signed URL can't be used for PUT; a URL for <code>key1</code> can't access <code>key2</code>.</li>
+<li><strong>Headers can be pinned.</strong> Pin Content-Type, Content-MD5 to prevent the client from uploading something else.</li>
+</ul>
+<h3 id="133-server-side-encryption">13.3 Server-side encryption</h3>
+<p>Three variants of S3 server-side encryption:</p>
+<ul>
+<li><strong>SSE-S3 (default).</strong> S3 manages keys. Each object is encrypted at-rest with a unique data key, which is encrypted by an S3-managed master key. Transparent: client just <code>PUT</code>s, S3 encrypts on receipt, decrypts on <code>GET</code>. No code change needed. Sufficient for "we want at-rest encryption for compliance" without managing keys.</li>
+<li><strong>SSE-KMS (KMS-managed).</strong> S3 uses customer-controlled CMKs (Customer Master Keys) in AWS KMS (Key Management Service). Each object encrypted with a unique data key, the data key encrypted by the KMS CMK. Properties: audit trail in CloudTrail (every encryption/decryption logged), KMS access policies (revoke key access to lock out reads), key rotation. Trade-off: KMS API calls cost (~$0.03/10000 calls), so heavy-read workloads pay a noticeable surcharge.</li>
+<li><strong>SSE-C (Customer-provided).</strong> Client provides the encryption key with each request. S3 uses it to encrypt at receipt and discards. To read, client provides the same key. Properties: keys never stored by AWS (they're discarded after use), but client must manage them — losing the key loses the data permanently. Niche; rarely used.</li>
+</ul>
+<h3 id="134-client-side-encryption">13.4 Client-side encryption</h3>
+<p>The strictest posture: encrypt before uploading. The provider sees only ciphertext.</p>
+<pre><code>Client:  data → AES-256(data, client_key) → ciphertext
+         PUT ciphertext to S3
+S3:      stores ciphertext (which is also SSE-encrypted at rest)
+Client:  GET ciphertext from S3
+         decrypt with client_key
+</code></pre>
+<p><strong>When to use.</strong> When the provider must not be able to read the data — extreme regulatory environments (some healthcare, some finance), or paranoia. Backup vendors (Borg, Restic, Tarsnap) do this for customer backups going to S3. The provider sees encrypted blobs only.</p>
+<p><strong>Trade-off.</strong> No server-side processing (S3 Select, Athena, etc.) on encrypted data. Key management is on you; losing the key loses everything.</p>
+<h3 id="135-vpc-endpoints-private-link">13.5 VPC endpoints / Private Link</h3>
+<p>By default, S3 traffic from EC2 traverses the public internet (over TLS, but still public-routed). With a VPC Endpoint for S3, traffic stays inside AWS's backbone:</p>
+<pre><code>EC2 in VPC → VPC Gateway Endpoint for S3 → S3 in same region
+(no internet gateway, no public IP, no NAT)
+</code></pre>
+<p><strong>Properties.</strong></p>
+<ul>
+<li><strong>Network isolation.</strong> Even if an attacker had your IAM creds, they couldn't reach S3 from outside your VPC (assuming the bucket policy restricts to your VPC endpoint).</li>
+<li><strong>No egress data transfer fees.</strong> S3 access via VPC Endpoint is free (within same region).</li>
+<li><strong>Lower latency</strong> (~5-15ms saved by not going through internet routing).</li>
+<li><strong>Compliance</strong> for environments that mandate "no public internet traffic."</li>
+</ul>
+<p>VPC endpoints are essentially mandatory in production for security-conscious deployments.</p>
+<h3 id="136-object-lock-and-worm-write-once-read-many-compliance">13.6 Object Lock and WORM (Write-Once-Read-Many) compliance</h3>
+<p>Some regulations require data immutability: financial records (SEC Rule 17a-4), legal-hold documents, healthcare audit logs.</p>
+<p><strong>Object Lock.</strong> Once an object is locked, no one — not even the bucket owner, not even the root account — can delete or modify it until the lock expires.</p>
+<p><strong>Modes.</strong></p>
+<ul>
+<li><strong>Governance mode.</strong> Locked, but special IAM principals can override.</li>
+<li><strong>Compliance mode.</strong> Locked, no override, period. The retention period must elapse.</li>
+</ul>
+<p><strong>Use.</strong> Bank ledgers, audit logs subject to retention rules, healthcare records, anything where "we promise we will not modify this for N years" is a legal obligation.</p>
+<h3 id="137-threat-model-recap">13.7 Threat model recap</h3>
+<ul>
+<li><strong>Accidental public exposure.</strong> Mitigated by Block Public Access.</li>
+<li><strong>Credential leak.</strong> Mitigated by short-lived IAM credentials (STS — Security Token Service), MFA, and CloudTrail monitoring.</li>
+<li><strong>Pre-signed URL leak.</strong> Mitigated by short expirations.</li>
+<li><strong>Insider deletion.</strong> Mitigated by versioning + MFA Delete + Object Lock for compliance data.</li>
+<li><strong>Provider compromise.</strong> Mitigated by client-side encryption.</li>
+<li><strong>Ransomware on bucket.</strong> Mitigated by versioning (the attacker can't actually delete versions if MFA Delete is on) + cross-account backup (separate "vault" account where the prod account has no access).</li>
+</ul>
+<hr>
+<h2 id="14-use-case-gallery">§14. Use Case Gallery</h2>
+<p>Five archetypal applications of object storage across very different domains.</p>
+<h3 id="141-static-asset-hosting-websites-images-js-bundles">14.1 Static asset hosting (websites, images, JS bundles)</h3>
+<p><strong>Pattern.</strong> Consumer web app — Shopify storefronts, Substack publications, SaaS marketing sites — serves static assets (images, CSS, JS bundles, fonts) globally.</p>
+<p><strong>Architecture.</strong> Object storage as origin; CDN in front; assets versioned by hash in filename (<code>main-a8f29c.js</code>) so they cache forever. Build uploads new versions; old URLs never invalidate because old hashes never reappear.</p>
+<p><strong>Why it fits.</strong> Bytes uploaded once, served billions of times. Origin latency doesn't matter because cache hit rate is &gt;99%. Cost is CDN egress, not S3 storage. URL-hash versioning makes cache invalidation a non-problem.</p>
+<p><strong>Numbers.</strong> Medium site: 500 GB assets, 50M req/mo to CDN, 1M req/mo to origin (2% miss). S3: $11.50 storage + minimal egress. CloudFront: ~$4,250 egress. Without S3+CDN, nginx on EC2 needs multiple servers and breaks under viral traffic.</p>
+<h3 id="142-video-and-media-storage-netflix-class-youtube-class">14.2 Video and media storage (Netflix-class, YouTube-class)</h3>
+<p><strong>Pattern.</strong> Streaming service stores master video files plus transcoded variants (resolutions × codecs × bitrates). Netflix: ~17,000 titles × dozens of encodings each; YouTube: billions of videos.</p>
+<p><strong>Architecture.</strong> Masters cold-tier; variants hotter, proportional to popularity; HLS (HTTP Live Streaming) or DASH (Dynamic Adaptive Streaming over HTTP) chunks at 2-10 sec / few MB each. Client requests chunks sequentially; CDN edge caches hot chunks.</p>
+<p><strong>Why it fits.</strong> Big bytes, "fetch whole chunk in one read" access, durability matters (masters expensive to regenerate), tiering essential (a 2010 film sits in Glacier; a new release in Standard).</p>
+<p><strong>Numbers.</strong> Netflix Open Connect serves ~30% of internet traffic at peak. Backing catalog 10-100 PB. Pareto-distributed popularity means a small fraction of titles dominates; rest sits cold.</p>
+<h3 id="143-data-lake-iceberg-delta-hudi-tables-on-object-storage">14.3 Data lake (Iceberg / Delta / Hudi tables on object storage)</h3>
+<p><strong>Pattern.</strong> Analytics / ML org stores PB of structured data (events, transactions, logs) as Parquet in object storage. Apache Iceberg, Delta Lake, Apache Hudi provide ACID-like semantics over immutable Parquet using manifest files.</p>
+<p><strong>Architecture.</strong> <code>s3://lake/&lt;db&gt;/&lt;table&gt;/data/&lt;hash&gt;/file-&lt;id&gt;.parquet</code>. Catalog metadata <code>s3://lake/&lt;db&gt;/&lt;table&gt;/metadata/v123.metadata.json</code> points atomically at the active file set. Writes append + rewrite catalog atomically. Compaction merges small files.</p>
+<p><strong>Why it fits.</strong> Multi-PB volumes; read-mostly with appends; Trino / Spark / Flink / DuckDB / BigQuery / Snowflake all read Parquet-on-S3 natively; cost orders of magnitude lower than warehouse storage. Iceberg catalog + Parquet data = the canonical metadata-in-DB + bytes-in-object-storage pattern.</p>
+<p><strong>Numbers.</strong> Uber's lake: ~250 PB on HDFS + S3, hundreds of thousands of tables. Netflix: PB-scale Iceberg on S3, all analytics built on it. Apple, Airbnb, Stripe sit on this pattern.</p>
+<h3 id="144-ml-model-storage-and-training-data">14.4 ML model storage and training data</h3>
+<p><strong>Pattern.</strong> ML teams store training datasets (TB-PB of images, text, audio, video) and model artifacts (checkpoints, final models, fine-tuned variants) in object storage. Training jobs read from S3/GCS, write checkpoints back. Serving loads from S3/GCS.</p>
+<p><strong>Architecture.</strong> Datasets in prefixes (<code>s3://datasets/laion-5b/v2/shards/</code>). Versioned model registry (<code>s3://models/recommender/v23/model.pt</code>). Training reads in parallel via PyTorch's <code>S3DataLoader</code> or TensorFlow's <code>tf.data</code> with S3 URLs. LAION-5B, Common Crawl: multi-PB entirely in object storage.</p>
+<p><strong>Why it fits.</strong> Big infrequently-mutated bytes; reads parallelize (1000 files from many GPUs); PB-scale cost discipline; versioning matches experiment cycle.</p>
+<p><strong>Numbers.</strong> OpenAI GPT training data: multi-PB. Meta LLaMA: multi-PB datasets, multi-TB checkpoints. Hugging Face hub: tens of thousands of multi-GB checkpoints on S3, served to anyone running <code>from transformers import AutoModel</code>.</p>
+<h3 id="145-backup-and-archival">14.5 Backup and archival</h3>
+<p><strong>Pattern.</strong> Database backups, application logs, system snapshots stream to object storage continuously. Mostly never read; rare DR event reads a tiny slice.</p>
+<p><strong>Architecture.</strong> Encrypted dumps to <code>s3://backups-prod/postgres/db-name/2026-05-22/</code>. Lifecycle sends old to Glacier after 30 days. Paranoid: cross-account or cross-cloud backup destinations (separate AWS account, or even Backblaze B2 outside AWS, so prod compromise can't reach backups).</p>
+<p><strong>Why it fits.</strong> Cheap, durable, retain for years, easy to encrypt, lifecycle to ultra-cheap tiers. Restore latency tolerable for DR.</p>
+<p><strong>Numbers.</strong> 1 TB DB with daily fulls + hourly incrementals, 7-year retention: ~$60-100/mo with lifecycle vs $1500-3000/mo without.</p>
+<h3 id="146-application-file-uploads-dropbox-notion-slack">14.6 Application file uploads (Dropbox, Notion, Slack)</h3>
+<p><strong>Pattern.</strong> Users upload files (docs, attachments, photos, videos). App stores bytes in object storage, metadata (owner, sharing, filename, mime) in a database, serves via pre-signed URL.</p>
+<p><strong>Architecture.</strong> The canonical diagram in §6.</p>
+<p><strong>Why it fits.</strong> User-controlled, unpredictable sizes; multi-tenant; CDN for shared/public files, pre-signed URLs for private; lifecycle for trash.</p>
+<p><strong>Numbers.</strong> Notion: hundreds of TB. Slack: PB-scale. Dropbox: EB-scale (Magic Pocket replaced S3 for cost). All on the same metadata-in-DB + bytes-in-object-storage pattern.</p>
+<hr>
+<h2 id="15-real-world-implementations-with-numbers">§15. Real-World Implementations with Numbers</h2>
+<p>Named systems shipping object storage at scale.</p>
+<p><strong>AWS S3.</strong> The reference implementation. Public numbers: 280+ trillion objects stored; 100+ million requests per second in aggregate; exabytes of data. Spans dozens of regions and multiple AZs per region. The benchmark for "what object storage can do."</p>
+<p><strong>Netflix Open Connect + S3 origin.</strong> Netflix uses S3 as origin for video files; Open Connect (their custom CDN, deploying servers inside ISPs worldwide) serves most of the bytes. Catalog estimated at 10-100 PB across master + encoded variants. Peak network throughput ~30% of internet bandwidth during evening hours globally.</p>
+<p><strong>Dropbox Magic Pocket.</strong> Dropbox started on AWS S3, hit ~500-600 PB by 2016, then built their own object storage system ("Magic Pocket") specifically to reduce cost. Currently EB-scale, all on commodity hardware (SMR drives, erasure coding, custom controllers). They didn't migrate "back to filesystems"; they built their own S3 from scratch. The public talks on Magic Pocket are an excellent read for systems architecture at this scale.</p>
+<p><strong>Pinterest images.</strong> ~300 billion pins as of recent reports, each pin has multiple image resolutions stored in S3. PB-scale; high read rate (billions of GETs per day) served largely from CloudFront and an internal cache tier.</p>
+<p><strong>GitHub Large File Storage (LFS).</strong> Large files in Git repositories (binaries, datasets, models) stored in S3 with the Git history holding only pointers. Tens of PB across hundreds of millions of repositories.</p>
+<p><strong>Cloudflare R2.</strong> Launched 2022 explicitly to disrupt S3's egress pricing. Reported tens of PB stored within a year; thousands of customers. The technology is similar (erasure coding, S3-compatible API); the business innovation is "we don't charge for egress because our broader CDN business already pays for the bandwidth."</p>
+<p><strong>Facebook Haystack and f4.</strong> Meta's photo storage. Haystack is the original (~2010-era), a custom blob store for billions of photos optimized for one large file holding many photos. f4 is the cold-storage tier, using extreme erasure coding (e.g. (10, 4) within a rack + (3, 1) across racks for double-fault tolerance) to store warm-but-rarely-read photos at lower cost. ~100 PB scale.</p>
+<p><strong>Microsoft Azure Storage.</strong> Azure Blob Storage backs everything from Azure VMs (Page blobs as VHDs) to Office 365 (huge document storage) to consumer OneDrive. Many exabytes.</p>
+<p><strong>OpenAI / Anthropic / Hugging Face model hosting.</strong> Foundation model weights (multi-GB to TB per model) sit in S3 / GCS / Azure Blob for serving and distribution. Hugging Face's CDN-fronted model hub serves billions of model downloads.</p>
+<p><strong>Snowflake / Databricks data lakes.</strong> Snowflake's storage layer is built on cloud object storage (S3, GCS, Azure Blob). Databricks Lakehouse architecture: Delta Lake on S3. PB-scale data per customer.</p>
+<p>The range is staggering. From a side-project blog storing 10 GB in S3 to Meta's f4 holding 100 PB, the same conceptual primitive — key, bytes, durability — scales.</p>
+<hr>
+<h2 id="16-summary">§16. Summary</h2>
+<blockquote>
+<p><em>Object storage is the planet-scale dumping ground of opaque bytes: a flat key-to-blob map with eleven-nines durability, strong read-after-write, effectively infinite capacity, but 50-150ms latency and no semantics richer than <code>GET</code> and <code>PUT</code>. The variants (S3, GCS, Azure Blob, R2, MinIO, Ceph) agree on the API and disagree on pricing — egress, not storage, is the structural cost. Internally, erasure coding spreads each object across availability zones; prefix sharding caps single-prefix throughput at ~3500 GETs / 5500 PUTs per second; multipart upload exists because single PUT caps at 5 GB and parallelism wins. The canonical architectural pattern is small-metadata-in-a-database pointing at big-bytes-in-object-storage, fronted by a CDN for public reads, gated by IAM and bucket policies and pre-signed URLs for private access, and aged through lifecycle policies into cheaper tiers. Get the boundaries right (what goes here vs in a database vs in block storage) and the rest is plumbing.</em></p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

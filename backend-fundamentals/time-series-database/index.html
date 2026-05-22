@@ -1,0 +1,975 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Time-Series Database — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a target="_blank" rel="noopener" href="https://github.com/Folobe26">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/backend-fundamentals/">← Back to Backend Fundamental Components</a>
+        <h1 class="article-title">Time-Series Database</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/22 &nbsp;·&nbsp; Backend Fundamental Components
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>A technology reference on <strong>TSDBs (Time-Series Databases)</strong> — what they are, why a generic relational engine collapses on their workload, the byte-level mechanics (Gorilla XOR floats, delta-of-delta timestamps, 2h blocks, posting-list label indexes), the design space (Prometheus, VictoriaMetrics, InfluxDB, TimescaleDB, M3DB, Thanos/Mimir/Cortex, Pinot/Druid, QuestDB, ClickHouse), and the workloads they serve — monitoring metrics, IoT (Internet of Things) sensor telemetry, financial market data, application performance, business KPIs (Key Performance Indicators). Use cases appear as illustrations throughout — Kubernetes monitoring in §4, Tesla fleet telemetry in §5, trading systems in §6, smart-meter data in §15 — never as the framing device. The technology is the subject.</p>
+</blockquote>
+<hr>
+<h2 id="1-what-time-series-databases-are">§1. What Time-Series Databases Are</h2>
+<p>A <strong>TSDB (Time-Series Database)</strong> is a specialized storage engine for <strong>append-only, timestamped, numeric data</strong> whose access patterns are dominated by (a) range scans over a time window, (b) aggregations across windows (sum, avg, percentile, rate), (c) downsampling from fine-grained to coarse-grained resolutions, and (d) automatic retention pruning of old data. The defining property is "ingest enormous volumes of timestamped points cheaply, query time windows fast, throw old data away on a schedule."</p>
+<p>A time-series sample looks like <code>(metric_name, label_set, timestamp, value)</code> — e.g. <code>http_requests_total{service="api", region="us-east-1", status="200"} 4823 1716391200000</code>. The pair <code>(metric_name, label_set)</code> defines a <strong>time-series</strong> — a logical stream of <code>(timestamp, value)</code> points. The pair <code>(timestamp, value)</code> is one <strong>sample</strong>. A production cluster might have <strong>10 million active series</strong> each receiving a sample every 10 seconds — 1 million samples per second steady state. That is the design point.</p>
+<h3 id="where-tsdbs-sit-and-what-they-arent">Where TSDBs sit and what they aren't</h3>
+<p>TSDBs are a corner of the storage landscape distinct from three adjacent categories newcomers conflate:</p>
+<ul>
+<li>
+<p><strong>vs. OLTP (OnLine Transaction Processing) databases (PostgreSQL, MySQL).</strong> OLTP serves ACID (Atomicity, Consistency, Isolation, Durability) transactional mutations of structured data — bank balances, user profiles, inventory counts. Putting a metrics workload into PostgreSQL is wasteful: no transactions to commit (each sample is independent), no joins (a metric is a self-contained series), no point lookups except <code>(series, time_range)</code>, and row-oriented storage when float values compress 10× better in a columnar codec. A 1M-samples/sec workload melts a PostgreSQL primary; the same workload on Prometheus runs on a 4-core VM. The mismatch is structural, not tuning.</p>
+</li>
+<li>
+<p><strong>vs. OLAP (OnLine Analytical Processing) warehouses (BigQuery, Snowflake, Redshift).</strong> OLAP serves general analytical queries — group-by, joins, window functions across petabytes. It can store time-series but pays a generality tax: no specialized timestamp codec, no inverted label index, no automatic retention, no 1.37-bytes-per-sample compression. A TSDB is <strong>time-specialized</strong>; OLAP is <strong>time-capable</strong>. Crossover around 1 billion samples per day — below that, ClickHouse or Pinot is fine; above, the specialized TSDB pulls ahead 5-20× on storage and query cost.</p>
+</li>
+<li>
+<p><strong>vs. event stores / event sourcing (EventStoreDB, Kafka as a log).</strong> Event stores record discrete domain events (<code>OrderPlaced</code>, <code>PaymentCaptured</code>) and support <strong>replaying</strong> the log to rebuild state. A TSDB records <strong>measurements</strong> (a CPU sample, a request count) where the goal is "value at time T" or "rate over the last hour," not "rebuild aggregate state at version N." Event sourcing is about <strong>causality and state reconstruction</strong>; TSDB is about <strong>measurement and aggregation</strong>.</p>
+</li>
+</ul>
+<p><strong>What a TSDB is NOT good for:</strong> complex joins (no relational join operator; PromQL — Prometheus Query Language — supports label-matched joins but not arbitrary cross-metric joins), transactional updates to past samples (rewrites are hostile to the storage layer), low-latency point lookup by non-time keys (use Redis or a key-value store), unstructured text payloads (logs and traces belong in their own engines — see <a href="10_observability.md">observability doc</a>).</p>
+<p>Mental model: a TSDB is the <strong>right answer for "millions of floats per second, indexed by labels, queried by time window, thrown away on a schedule."</strong> Anywhere that profile doesn't fit, the TSDB is the wrong tool.</p>
+<hr>
+<h2 id="2-inherent-guarantees">§2. Inherent Guarantees</h2>
+<p>What a TSDB provides by design, and what the system designer still has to layer on top.</p>
+<h3 id="provided-by-design">Provided by design</h3>
+<ul>
+<li>
+<p><strong>High write throughput.</strong> A single Prometheus TSDB node sustains <strong>1 million samples per second</strong> on commodity hardware (16 vCPU, 64 GB RAM, NVMe SSD); VictoriaMetrics claims <strong>10 million per node</strong> with the same hardware budget. Datadog's internal TSDB ingests <strong>trillions of samples per day</strong> across its fleet. Write throughput scales linearly with cores until the WAL fsync becomes the bottleneck.</p>
+</li>
+<li>
+<p><strong>Aggressive compression.</strong> Gorilla encoding (§4) hits <strong>1.37 bytes per sample</strong> on real production data — timestamp + 64-bit float compressed into less than 11 bits of disk on average. Compared to a naive 16-byte row store, the storage efficiency gap is <strong>~12×</strong>.</p>
+</li>
+<li>
+<p><strong>Fast time-range aggregations.</strong> A query like <code>sum(rate(http_requests_total[5m])) by (service)</code> over 1000 series returns in milliseconds because (a) samples are stored sequentially per series and (b) the query engine pushes the aggregation down to the chunk decoder.</p>
+</li>
+<li>
+<p><strong>Automatic retention.</strong> Drop blocks older than N days. No manual <code>DELETE</code> is ever necessary; the TSDB owns the lifecycle of old data. Prometheus's <code>--storage.tsdb.retention.time=30d</code> flag does the entire job.</p>
+</li>
+<li>
+<p><strong>Label-based query indexing.</strong> An inverted index from <code>(label_name, label_value) → series_ids</code> lets queries filter by arbitrary label combinations without scanning every series.</p>
+</li>
+</ul>
+<h3 id="must-be-layered-above">Must be layered above</h3>
+<ul>
+<li>
+<p><strong>Cross-series aggregation correctness.</strong> A counter that resets on process restart looks like a negative rate if naively differenced. The application must use a monotonic counter type AND the query language must understand counter resets (PromQL's <code>rate()</code> handles it; raw SQL on samples does not).</p>
+</li>
+<li>
+<p><strong>Cardinality budget enforcement.</strong> A high-cardinality label (<code>user_id</code>, <code>request_id</code>, <code>trace_id</code>) generates one series per unique value. 10 million series is the cliff edge for a single node. The SDK must drop or hash such labels before they hit the TSDB.</p>
+</li>
+<li>
+<p><strong>Long-term retention.</strong> Native Prometheus retention is days-to-weeks of full-resolution data. Year-long retention requires layering Thanos, Mimir, Cortex, or VictoriaMetrics's long-term tier — an object-storage-backed federation layer.</p>
+</li>
+<li>
+<p><strong>High availability.</strong> A single Prometheus instance is a single point of failure. HA (High Availability) requires running two Prometheus instances scraping the same targets with a deduplicating query layer above them.</p>
+</li>
+<li>
+<p><strong>Backfill.</strong> Loading historical data — say, CSVs of last year's stock prices — is not what stock Prometheus is for. TimescaleDB, InfluxDB, ClickHouse, and QuestDB all support backfill; Prometheus only recently added it.</p>
+</li>
+<li>
+<p><strong>Multi-tenancy.</strong> A bare TSDB serves one tenant. Cortex/Mimir add per-tenant ingester sharding, per-tenant query limits, and per-tenant retention. SaaS observability platforms layer billing on top.</p>
+</li>
+<li>
+<p><strong>Linearizability across replicas.</strong> TSDBs are typically eventually consistent — replicas may diverge briefly during scrape jitter. For monitoring this is fine (a 1-second sample drift is invisible); for financial settlement-of-record time-series it is not.</p>
+</li>
+</ul>
+<p>The contract: a TSDB <strong>stores timestamped floats, queries time ranges, drops old data</strong>. Everything else — multi-tenancy, high availability, long-term retention, cardinality control — is layered on by the operator.</p>
+<hr>
+<h2 id="3-the-design-space">§3. The Design Space</h2>
+<p>The TSDB category split into five sub-categories over the past decade. They differ along axes of collection model (pull vs push), query language (PromQL vs SQL vs Flux), retention design (short vs tiered), and access pattern (operator metrics vs user-facing analytics).</p>
+<h3 id="a-monitoring-tsdb-prometheus-victoriametrics">A. Monitoring TSDB — Prometheus, VictoriaMetrics</h3>
+<p>Pull-based. The TSDB scrapes HTTP <code>/metrics</code> endpoints from monitored targets on a schedule (default 15-30s). Service discovery (Kubernetes API, Consul, file-based) tells the scraper which targets to poll. Data model: float per (metric, label_set, timestamp); labels are key-value pairs that define unique series. Query language: PromQL — functional, label-aware, with <code>rate()</code>, <code>histogram_quantile()</code>, <code>topk()</code>, label-matched joins. Retention: short by default (15 days). Long-term needs a federation layer (Thanos/Mimir/Cortex/VictoriaMetrics long-term).</p>
+<p>Strengths: dead simple to deploy, Kubernetes default, vast ecosystem (Grafana, AlertManager, exporters for every database/queue/proxy). Weaknesses: single-node by default, no built-in HA, cardinality cliff at ~10M active series.</p>
+<p><strong>VictoriaMetrics</strong> is the higher-performance Prometheus-compatible alternative — same data model, same PromQL, 5-10× better storage density and throughput. Drop-in replacement when a Prometheus node hits its ceiling.</p>
+<h3 id="b-general-tsdb-influxdb-timescaledb">B. General TSDB — InfluxDB, TimescaleDB</h3>
+<p>Push-based. Applications and agents (Telegraf, fluentd) write samples via HTTP POST or line protocol. InfluxDB has tags (indexed) and fields (not indexed). TimescaleDB uses PostgreSQL rows in a special <strong>hypertable</strong>. Query language: InfluxQL → Flux → SQL (Influx's checkered history — Flux was a functional language, deprecated in v3 in favor of SQL). TimescaleDB extends PostgreSQL SQL with <code>time_bucket()</code> and continuous aggregates.</p>
+<p>Strengths: SQL access, joins with relational data (TimescaleDB), arbitrary backfill, richer-than-numeric data types. Weaknesses: lower ingest ceiling per node than Prometheus-style; SQL more verbose than PromQL for "rate per label" queries.</p>
+<h3 id="c-real-time-analytics-apache-pinot-apache-druid">C. Real-time analytics — Apache Pinot, Apache Druid</h3>
+<p>Push via Kafka. Designed for <strong>user-facing sub-second analytical queries</strong>, not operator monitoring. Data model: rows in a columnar segment, time-partitioned. Query language: SQL. Retention: weeks-to-years with tiered hot/cold storage.</p>
+<p>Strengths: sub-second queries over <strong>billions of events</strong>. LinkedIn's "Who Viewed Your Profile" runs on Pinot, p99 &lt;100ms for queries over years of pageview events. Weaknesses: ops complexity (controller, broker, server, deep store); slower ingest than a pure TSDB; over-engineered for "what's my error rate" monitoring.</p>
+<p>Pinot and Druid are sometimes called TSDBs and sometimes called OLAP. They're shaped like a TSDB (time-partitioned, append-only, columnar) but query user-facing dashboards, not machine alerts.</p>
+<h3 id="d-long-term-prometheus-storage-thanos-mimir-cortex-victoriametrics">D. Long-term Prometheus storage — Thanos, Mimir, Cortex, VictoriaMetrics</h3>
+<p>Receive Prometheus's remote-write stream OR sidecar-tap into local 2h blocks. Storage: S3-class object storage (S3, GCS — Google Cloud Storage, ABS — Azure Blob Storage) for blocks older than ~6 hours. Architecture: ingester tier (in-memory recent samples) + store gateway (S3 query path) + query frontend (caching, splitting, parallelism).</p>
+<p>Strengths: unlimited retention (S3 prices, $0.023 per GB-month), horizontal scalability via tenant sharding. Weaknesses: large ops surface area (5-7 microservices); cold queries from S3 are 10-100× slower than recent-data queries from ingesters.</p>
+<p><strong>Mimir</strong> is Grafana Labs's Cortex fork — actively maintained. <strong>Cortex</strong> is the original CNCF (Cloud Native Computing Foundation) project. <strong>Thanos</strong> is the sidecar-style alternative — slightly different architecture, similar outcome. <strong>VictoriaMetrics cluster</strong> does the same job with fewer components.</p>
+<h3 id="e-specialized-tsdbs-m3db-opentsdb-questdb-clickhouse-for-time-series">E. Specialized TSDBs — M3DB, OpenTSDB, QuestDB, ClickHouse-for-time-series</h3>
+<ul>
+<li><strong>M3DB:</strong> Uber-built, optimized for <strong>high-cardinality</strong> (Prometheus's limit was a non-starter at Uber's scale). M3 = ingester + coordinator + query layer with M3DB as the underlying TSDB.</li>
+<li><strong>OpenTSDB:</strong> the original (2010) Hadoop/HBase-backed TSDB. Largely superseded but still runs at some shops.</li>
+<li><strong>QuestDB:</strong> SQL-native, single-binary, optimized for <strong>financial market data</strong>. Tens of millions of ticks per second on a single machine.</li>
+<li><strong>ClickHouse for time-series:</strong> general columnar OLAP database with <code>MergeTree</code> engine + time-ordered partitioning. Deployed as a TSDB at Uber, Cloudflare, eBay for SQL + aggregate analytics together.</li>
+</ul>
+<h3 id="comparison-table">Comparison table</h3>
+<table>
+<thead>
+<tr>
+<th>TSDB</th>
+<th>Collection</th>
+<th>Query language</th>
+<th>Compression</th>
+<th>Per-node ingest ceiling</th>
+<th>Retention model</th>
+<th>Best for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prometheus</td>
+<td>pull</td>
+<td>PromQL</td>
+<td>Gorilla (~1.4 B/sample)</td>
+<td>~1M samples/sec</td>
+<td>local 2h blocks, days-weeks</td>
+<td>Kubernetes monitoring, the default</td>
+</tr>
+<tr>
+<td>VictoriaMetrics</td>
+<td>pull or push</td>
+<td>PromQL + MetricsQL</td>
+<td>Gorilla + extra zstd</td>
+<td>~10M samples/sec</td>
+<td>local + S3 long-term</td>
+<td>Prometheus-compatible at higher scale</td>
+</tr>
+<tr>
+<td>InfluxDB (v3 IOx)</td>
+<td>push</td>
+<td>SQL</td>
+<td>Parquet + zstd</td>
+<td>~1-2M samples/sec</td>
+<td>retention policies</td>
+<td>SQL access, IoT, mixed workloads</td>
+</tr>
+<tr>
+<td>TimescaleDB</td>
+<td>push</td>
+<td>PostgreSQL SQL</td>
+<td>columnar compression</td>
+<td>~500K-1M samples/sec</td>
+<td>hypertable chunks</td>
+<td>wants PostgreSQL + time-series in one DB</td>
+</tr>
+<tr>
+<td>M3DB</td>
+<td>push</td>
+<td>M3QL / PromQL</td>
+<td>Gorilla variant</td>
+<td>~5M samples/sec</td>
+<td>local + S3</td>
+<td>huge cardinality (Uber-class)</td>
+</tr>
+<tr>
+<td>Pinot</td>
+<td>Kafka push</td>
+<td>SQL</td>
+<td>columnar + dictionary</td>
+<td>~1M events/sec</td>
+<td>tiered hot/cold</td>
+<td>user-facing analytics dashboards</td>
+</tr>
+<tr>
+<td>Druid</td>
+<td>Kafka push</td>
+<td>SQL</td>
+<td>columnar</td>
+<td>similar to Pinot</td>
+<td>tiered hot/cold</td>
+<td>similar to Pinot, slight ops differences</td>
+</tr>
+<tr>
+<td>ClickHouse</td>
+<td>push</td>
+<td>SQL</td>
+<td>columnar + LZ4/zstd</td>
+<td>~10M+ rows/sec</td>
+<td>TTL on tables</td>
+<td>SQL analytics + time-series in one engine</td>
+</tr>
+<tr>
+<td>QuestDB</td>
+<td>push</td>
+<td>SQL</td>
+<td>columnar</td>
+<td>tens of millions ticks/sec</td>
+<td>retention policies</td>
+<td>financial tick data, low-latency ingest</td>
+</tr>
+<tr>
+<td>Thanos / Mimir</td>
+<td>downstream of Prometheus</td>
+<td>PromQL</td>
+<td>inherited from Prom blocks</td>
+<td>scales horizontally</td>
+<td>S3 unbounded</td>
+<td>long-term Prometheus retention</td>
+</tr>
+</tbody>
+</table>
+<p>The picks split cleanly: <strong>Prometheus for monitoring</strong>, <strong>VictoriaMetrics if Prometheus is too slow</strong>, <strong>TimescaleDB if SQL and joins matter</strong>, <strong>InfluxDB for IoT push-mode</strong>, <strong>Pinot/Druid for user-facing analytics</strong>, <strong>ClickHouse for SQL analytics with time-series shape</strong>, <strong>M3DB for Uber-class cardinality</strong>, <strong>Thanos/Mimir for long-term Prometheus</strong>.</p>
+<hr>
+<h2 id="4-byte-level-storage-internals">§4. Byte-Level Storage Internals</h2>
+<p>This is the section that separates "I deployed Prometheus" from "I know why Prometheus uses 1/12th the disk a naive design would." Three pieces matter: the <strong>data model</strong>, the <strong>block layout</strong>, and the <strong>two compression algorithms</strong> (Gorilla XOR for floats and delta-of-delta for timestamps).</p>
+<h3 id="41-the-data-model-series-labels-samples">4.1 The data model: series, labels, samples</h3>
+<p>Every sample lives in a logical <strong>time-series</strong>. A series is uniquely identified by:</p>
+<pre><code>metric_name + sorted(label_kv_pairs)
+        ↓ hash
+   series_id (typically uint64)
+</code></pre>
+<p>For example, the metric <code>http_requests_total</code> with labels <code>{service="api", region="us-east-1", status="200", method="POST"}</code> becomes one series with a stable <code>series_id</code>. A different status (<code>status="500"</code>) is a <em>different</em> series with a <em>different</em> series_id. This is critical: <strong>cardinality is driven by unique label-value combinations</strong>, not by sample volume.</p>
+<p>A sample is the <code>(timestamp_ms, float64_value)</code> pair appended to a series. Steady state: 100M samples/sec across 10M series = 10 samples/sec/series average = sample every 100ms.</p>
+<h3 id="42-block-based-storage-prometheus-tsdb">4.2 Block-based storage (Prometheus TSDB)</h3>
+<p>The Prometheus on-disk format is the de facto reference design. M3DB, VictoriaMetrics, Cortex, and Mimir all use variants of the same shape.</p>
+<p><strong>The head block.</strong> The most recent ~2 hours of data lives in memory in the head block. New scrapes append to in-memory chunks per series. Every sample is also written to a <strong>WAL (Write-Ahead Log)</strong> on disk for crash recovery. Head block memory size is roughly:</p>
+<pre><code>head_RAM ≈ active_series × (open_chunk_bytes + index_overhead)
+         ≈ 10M series × (1KB open chunk + 200 bytes index)
+         ≈ ~12 GB RAM for a 10M-series instance
+</code></pre>
+<p><strong>Persistent 2-hour blocks.</strong> Every 2 hours, the head block "cuts" — closed chunks flush to a persistent block on disk and the head block resets. Each block is a <strong>self-contained immutable directory</strong> holding all samples for its 2-hour window:</p>
+<pre><code>data/
+  01HF3MRD8Y6J3QTBPGZS5RFK0E/      # ULID — universally unique time-sorted ID
+    meta.json                       # min_time, max_time, stats, ulid
+    chunks/
+      000001                        # binary chunks (Gorilla-encoded)
+      000002
+    index                           # inverted label index + series table
+    tombstones                      # rare — deleted ranges
+</code></pre>
+<p>Block immutability is the design's superpower: a block can be compressed once, indexed once, then never rewritten. Compaction merges multiple 2h blocks into larger blocks (8h → 24h → multi-day) without touching the original samples, only re-encoding into a denser layout.</p>
+<p><strong>WAL for crash safety.</strong> Before a sample lands in the head block's in-memory chunk, it is appended to a WAL segment on disk. The WAL is a sequential stream of records:</p>
+<pre><code>record_type | series_id | timestamp | value
+</code></pre>
+<p>WAL fsync is batched every ~100ms (configurable). On crash, the head block is rebuilt by replaying the WAL from the last checkpoint. <strong>Durability point: up to 100ms of pre-fsync samples can be lost.</strong> Acceptable for monitoring (one missing 10s sample is invisible); not acceptable for financial settlement (where TimescaleDB's <code>synchronous_commit=on</code> or QuestDB's sync mode buys per-commit durability at lower throughput).</p>
+<p><strong>Compaction.</strong> Every 2h block is compacted with neighbors at fixed intervals — typically 6h → 24h → multi-day blocks. Compaction:
+- Re-encodes chunks for better compression (more samples per chunk → better delta-of-delta and XOR locality).
+- Drops tombstoned ranges.
+- Rebuilds the inverted index.
+- Reduces the number of blocks the query engine must touch for a long-range query.</p>
+<h3 id="43-the-inverted-label-index">4.3 The inverted label index</h3>
+<p>A PromQL query <code>sum(rate(http_requests_total{service="api", region="us-east-1"}[5m]))</code> must first find all series matching <code>service="api" AND region="us-east-1"</code>. This is <strong>exactly</strong> the problem Lucene solves for full-text search: posting-list intersection.</p>
+<p>The TSDB maintains a posting-list index:</p>
+<pre><code>(label_name=&quot;service&quot;, label_value=&quot;api&quot;)        → [series_3, series_7, series_11, ...]
+(label_name=&quot;region&quot;,  label_value=&quot;us-east-1&quot;)  → [series_3, series_11, series_19, ...]
+
+AND merge: [series_3, series_11]  ← these series match both labels
+</code></pre>
+<p>Posting lists are stored sorted by series_id. Intersection is a merge scan — O(min(|A|, |B|)) time, fast even for large lists. The query engine then loads chunks for <code>[series_3, series_11]</code> over the requested time window and decodes.</p>
+<p><strong>Cardinality explosion is what kills this index.</strong> Each unique label_value adds a posting list entry. If <code>user_id</code> is a label with 10 million unique values, the index has 10 million posting lists for that label. Memory for the index alone exceeds 10 GB and queries that filter by user_id become O(N) instead of O(log N). Mitigation: drop high-cardinality labels at the SDK before the scrape (§7).</p>
+<h3 id="44-compression-delta-of-delta-on-timestamps">4.4 Compression: delta-of-delta on timestamps</h3>
+<p>Timestamps in a monitoring TSDB are almost always at regular intervals. Scrape every 10 seconds → timestamps are <code>T, T+10s, T+20s, T+30s, ...</code>. Deltas between consecutive timestamps are constant (10s, 10s, 10s). The <strong>delta-of-delta</strong> is zero (10-10=0, 10-10=0, 10-10=0).</p>
+<p>The Gorilla codec encodes the delta-of-delta:</p>
+<pre><code>For each sample after the first:
+  delta_i = timestamp_i - timestamp_{i-1}
+  delta_of_delta_i = delta_i - delta_{i-1}
+
+If delta_of_delta == 0:          encode in 1 bit (the value '0')
+If delta_of_delta in [-63, 64]:  encode in 7 bits + 2-bit tag (9 bits total)
+If delta_of_delta in [-255, 256]: encode in 9 bits + 3-bit tag (12 bits total)
+If delta_of_delta in [-2047, 2048]: encode in 12 bits + 4-bit tag (16 bits total)
+Otherwise:                       fallback 32-bit delta + 4-bit tag (36 bits total)
+</code></pre>
+<p>Steady-state monitoring: 99% of samples have delta_of_delta = 0, so timestamps compress to <strong>~1 bit per sample</strong>.</p>
+<h3 id="45-compression-gorilla-xor-on-floats">4.5 Compression: Gorilla XOR on floats</h3>
+<p>Values from the same metric tend to be highly correlated. CPU utilization sample-to-sample changes by tenths of a percent. A memory gauge moves smoothly. Even a request-rate counter, after <code>rate()</code>, varies slowly.</p>
+<p>The Gorilla paper (Pelkonen et al., VLDB 2015 — Facebook) observed that XOR of two consecutive IEEE 754 doubles produces a small integer with many leading and trailing zeros:</p>
+<pre><code>double_1 = 47.3       → IEEE 754: 0x4047A66666666666
+double_2 = 47.5       → IEEE 754: 0x4047C00000000000
+xor      = 47.3 ⊕ 47.5 = 0x0000666666666666
+                          ↑ many leading zeros
+                                                 ↑ many trailing zeros
+                              ↑─ meaningful bits ─↑
+</code></pre>
+<p>Gorilla encodes the XOR result as <code>(leading_zero_count, meaningful_bit_count, meaningful_bits)</code>:</p>
+<pre><code>If XOR == 0 (identical to previous): encode in 1 bit (value '0')
+If meaningful_bits fit in previous range: encode in (meaningful_bits) + 1 bit (skip header)
+Otherwise:                          5 bits leading + 6 bits length + meaningful_bits + 2-bit tag
+</code></pre>
+<p>Real-world floats average <strong>~7-11 bits per sample</strong> in production.</p>
+<h3 id="46-the-137-bytes-per-sample-number">4.6 The 1.37-bytes-per-sample number</h3>
+<p>Putting it together for one sample:
+- <strong>Timestamp:</strong> ~1 bit (delta-of-delta=0 case) up to ~16 bits worst case → average ~1-4 bits.
+- <strong>Value:</strong> ~7-11 bits average via XOR.
+- <strong>Per-sample overhead</strong> (delimiters, padding): negligible amortized.</p>
+<p>Total: ~11 bits per sample on average = <strong>1.37 bytes per sample</strong>. Compared to a naive <code>(uint64 timestamp, double value)</code> = 16 bytes per sample, Gorilla is <strong>~12× denser</strong>.</p>
+<p>At a 1-million-samples-per-second workload, this is the difference between <strong>1.4 MB/sec on disk vs 16 MB/sec on disk</strong> — i.e., a 4 TB disk holds ~33 days at Gorilla density vs ~3 days naive. Compounded by compaction-level recompression and you get the multi-month retention Prometheus advertises on commodity hardware.</p>
+<h3 id="47-one-scrape-end-to-end">4.7 One scrape end-to-end</h3>
+<p>Walk a single metric scrape, from HTTP request to a byte on disk:</p>
+<pre><code>1. App exposes /metrics in text exposition format:
+   http_requests_total{service=&quot;api&quot;,status=&quot;200&quot;} 4823 1716391200000
+
+2. Prometheus scraper HTTP GETs /metrics every 10s.
+   Parses each line: (metric_name, label_set, value, timestamp).
+
+3. Hash (metric_name + sorted_labels) → series_id.
+   If new series_id, allocate it in the in-memory series table and
+   add posting-list entries to the inverted label index.
+
+4. Append (timestamp, value) to the open chunk for series_id in the head
+   block. Chunk grows by ~1.4 bytes due to Gorilla encoding.
+
+5. Append WAL record (series_id, timestamp, value). WAL fsync batched
+   every ~100ms. Pre-fsync crash loses ≤100ms of samples.
+
+6. After ~120 samples (~20 min at 10s scrape), the open chunk closes,
+   gets Gorilla-encoded fully; a new open chunk replaces it. Closed
+   chunks stay in head-block RAM until block cut.
+
+7. Every 2h, the head block &quot;cuts&quot;: closed chunks flush to disk in the
+   block's chunks/ directory; inverted label index is built; WAL is
+   truncated; meta.json written last (atomic block visibility); head
+   block resets.
+
+8. After 24h, compaction merges 2h blocks into 24h blocks; multi-day
+   blocks into week-long blocks.
+
+9. After retention (e.g. 15d), oldest blocks are deleted by rmdir.
+   Atomic, no rewrite.
+
+10. (Optional) Thanos sidecar uploads blocks to S3 for long-term
+    retention; local retention can shorten once blocks are in S3.
+</code></pre>
+<p>The whole pipeline is "append to memory, write to WAL, batch fsync, flush block, compact, expire" — no random page rewrites, no btree splits, no transactional rollbacks. The simplicity is what makes 1M samples/sec on a single node possible.</p>
+<h3 id="48-why-this-beats-a-generic-database-10-100">4.8 Why this beats a generic database 10-100×</h3>
+<p>A naive PostgreSQL table <code>(metric_id, ts, value)</code> with a <code>(metric_id, ts)</code> btree index:</p>
+<ul>
+<li>16 bytes per row (key) + 16 bytes per value + 30-40 bytes of btree/MVCC overhead = ~60 bytes per sample.</li>
+<li>Random page writes (btree page rewrites on each insert) → ~20-30k inserts/sec/SSD ceiling.</li>
+<li>No timestamp-aware compression.</li>
+</ul>
+<p>A specialized TSDB:</p>
+<ul>
+<li>1.4 bytes per sample (Gorilla).</li>
+<li>Sequential WAL writes + memtable + immutable blocks → 1M+ samples/sec.</li>
+<li>30-50× less storage, 30-100× more throughput.</li>
+</ul>
+<p><strong>The factor of ~12× on storage and ~30× on throughput is structural — it comes from the access pattern (monotonic timestamps, repeated values, no updates), not from clever tuning.</strong> A generic database cannot close this gap by adding indexes; it would have to become a TSDB.</p>
+<hr>
+<h2 id="5-capacity-envelope">§5. Capacity Envelope</h2>
+<p>What this technology can do across very different scales, illustrated by real deployments.</p>
+<h3 id="small-single-prometheus-vm">Small — single Prometheus VM</h3>
+<p><strong>Setup:</strong> Prometheus on a 4-core, 16 GB RAM VM with a 100 GB local SSD. Scraping 50 targets, each exposing ~100 metrics. ~10k samples/sec steady state. 7-day retention.</p>
+<ul>
+<li><strong>Storage:</strong> 10k samples/sec × 86400 s × 7 days × 1.4 B/sample ≈ <strong>8 GB</strong> for the whole 7-day window.</li>
+<li><strong>CPU:</strong> scrape + Gorilla encode + WAL write uses &lt;10% of 4 cores.</li>
+<li><strong>Query latency:</strong> common dashboards (CPU/memory by service over 1h) return in &lt;100ms.</li>
+</ul>
+<p>Plenty for a startup running 50 containers in Kubernetes. The bottleneck shows up around 10k targets / 1M series — RAM for the head block.</p>
+<h3 id="mid-typical-saas-observability">Mid — typical SaaS observability</h3>
+<p><strong>Setup:</strong> 5 Prometheus instances scraping a 2000-node Kubernetes cluster + Thanos sidecars uploading to S3. ~1M samples/sec steady state. 30-day retention local + 1-year retention in S3.</p>
+<ul>
+<li><strong>Active series:</strong> ~5M across all instances.</li>
+<li><strong>Daily samples:</strong> 1M × 86400 = ~86 billion samples/day.</li>
+<li><strong>Daily storage:</strong> 86B × 1.4 B = ~120 GB/day local before compaction; ~50 GB/day in S3 after compaction-level recompression.</li>
+<li><strong>30-day local:</strong> ~3.5 TB after compaction.</li>
+<li><strong>1-year S3:</strong> ~18 TB at $0.023/GB-month = ~$415/month.</li>
+</ul>
+<p>Most production observability platforms live here. Bottlenecks: cardinality from poorly bounded labels, query cost on long ranges (year-long p99 latency query touches 365 day-blocks).</p>
+<h3 id="large-datadog-scale">Large — Datadog scale</h3>
+<p><strong>Setup:</strong> Datadog's internal TSDB (proprietary, derived from same Gorilla family). Per public material: <strong>15+ trillion samples ingested per day</strong> at peak.</p>
+<ul>
+<li><strong>15 trillion samples/day</strong> = 175 million samples/sec average; multi-hundred-million peaks.</li>
+<li><strong>Storage at 1.4 B/sample:</strong> ~21 TB/day after compression.</li>
+<li><strong>Cluster footprint:</strong> thousands of ingester nodes, S3 long-term storage in the multi-petabyte range.</li>
+</ul>
+<p>Per-tenant sharding (multi-tenant SaaS) plus regional sharding (data residency) plus per-customer rate limits to keep one tenant from drowning others.</p>
+<h3 id="giant-google-monarch">Giant — Google Monarch</h3>
+<p><strong>Setup:</strong> Google's internal monitoring system. Per public material (USENIX 2020): <strong>~1 trillion samples per second globally</strong> at the time of publication.</p>
+<ul>
+<li><strong>Per-second samples:</strong> ~1 trillion/sec → 10^12 ÷ 10^6 = 1M samples/sec/server, hosted by a fleet on the order of 1M ingest servers globally.</li>
+<li><strong>Architecture:</strong> in-memory regional zones, leaf nodes hold recent data, root nodes aggregate cross-region queries.</li>
+<li><strong>No SSD persistence in the hot tier</strong> — Monarch holds the recent window in RAM only, replicated across zones. Reliability via replication, not persistence. Long-term archived to colossal blob storage.</li>
+</ul>
+<p>The fact that Monarch is RAM-only in the hot tier is the design's bold choice: at this scale, SSD writeback becomes the bottleneck and RAM + replication is the way out.</p>
+<h3 id="domain-specific-scales">Domain-specific scales</h3>
+<ul>
+<li><strong>IoT — Tesla fleet telemetry.</strong> ~5M vehicles × hundreds of signals at 1-100 Hz → <strong>multi-millions of samples/sec</strong>. InfluxDB and ClickHouse variants common in automotive.</li>
+<li><strong>Financial market data.</strong> Equities tick streams (NYSE, NASDAQ consolidated) hit <strong>tens of millions of ticks/sec at peak</strong>. QuestDB and kdb+ dominate — optimized for sub-ms query latency on a single host. ~50 GB/day per market at richer payload (bid/ask/volume).</li>
+<li><strong>Application performance — LinkedIn-class.</strong> ~5000 services × 100 metrics × 0.1 Hz = ~50M samples/sec aggregate. Backed by internal Prometheus-compatible TSDB with multi-region federation.</li>
+</ul>
+<p>The range spans <strong>six orders of magnitude in samples/sec — from 10k on a 4-core VM to 1 trillion across Monarch's global fleet</strong>. The storage engine fundamentals (Gorilla, delta-of-delta, immutable blocks, inverted label index) are identical across the range. What scales is the <strong>topology above the engine</strong> — sharding, federation, replication, retention tiering.</p>
+<hr>
+<h2 id="6-architecture-in-context">§6. Architecture in Context</h2>
+<p>The canonical pattern for a TSDB in a production monitoring or analytics system.</p>
+<pre><code>                                ┌──────────────────────────────┐
+                                │  Application + sidecars      │
+                                │  /metrics endpoint exposed   │
+                                │  via Prom client lib or      │
+                                │  OTel SDK                    │
+                                └──────────┬───────────────────┘
+                                           │
+                                           │ HTTP GET /metrics (pull)
+                                           │  -or- OTLP push
+                                           ▼
+                                ┌──────────────────────────────┐
+                                │   Scraper / ingester tier    │
+                                │   - Prometheus (pull)        │
+                                │   - OTel Collector (push)    │
+                                │   - VictoriaMetrics agent    │
+                                └──────────┬───────────────────┘
+                                           │
+                                           │ WAL + head block in RAM
+                                           │ 2h blocks on local NVMe
+                                           ▼
+                ┌──────────────────────────────────────────────────────┐
+                │              Hot TSDB tier (recent ~6h-30d)          │
+                │  - Prometheus / VictoriaMetrics / Mimir ingesters    │
+                │  - Sharded by tenant or by metric_name hash          │
+                │  - Replicated for HA                                 │
+                └──────────────────────────────────────────┬───────────┘
+                                                           │
+                                                           │ 2h block upload
+                                                           ▼
+                                          ┌──────────────────────────────┐
+                                          │   Cold tier — S3 / GCS / ABS │
+                                          │   Multi-month / multi-year   │
+                                          │   blocks                     │
+                                          └──────────┬───────────────────┘
+                                                     │
+              ┌──────────────────────────────────────┴──────────────┐
+              │                                                     │
+              ▼                                                     ▼
+   ┌──────────────────────┐                            ┌──────────────────────┐
+   │ Query frontend       │                            │ Store gateway        │
+   │ - PromQL parser      │ ─────────────────────────► │ Reads blocks from S3 │
+   │ - query splitting    │                            │ Bloom filter cache   │
+   │ - result caching     │                            │ Decode chunks        │
+   └──────────┬───────────┘                            └──────────────────────┘
+              │
+              ▼
+   ┌──────────────────────────────────────────────────┐
+   │  Consumers                                       │
+   │  - Grafana (dashboards)                          │
+   │  - AlertManager (rule evaluation → PagerDuty)    │
+   │  - Recording rules (downsampled rollup outputs)  │
+   │  - Internal analytics dashboards                 │
+   └──────────────────────────────────────────────────┘
+</code></pre>
+<p><strong>Annotations on the diagram:</strong></p>
+<ul>
+<li><strong>Sharding</strong> happens in the ingester tier. Mimir/Cortex shard by <code>(tenant_id, series_hash)</code> so all samples of a given series land on the same ingester (for replay correctness). Prometheus single-instance has no sharding; HA pairs scrape redundantly and the query layer deduplicates.</li>
+<li><strong>Replication</strong> is typically 2-3× at the ingester tier. Each sample written to 2 or 3 ingesters; on query, results are deduplicated.</li>
+<li><strong>WAL fsync</strong> is the durability point — pre-fsync samples are lost on crash; post-fsync samples are recoverable from the WAL replay.</li>
+<li><strong>Block upload</strong> is the long-term durability point — once the block is in S3, the local copy can be safely deleted after retention expires.</li>
+</ul>
+<p>This is the shape of every Prometheus-class observability platform from a startup running one VM to Datadog's multi-region SaaS. The boxes scale, multiply, and shard, but the data flow — scrape/push → WAL → head block → flush → block → S3 — does not change.</p>
+<hr>
+<h2 id="7-hard-problems-inherent-to-tsdbs">§7. Hard Problems Inherent to TSDBs</h2>
+<p>Six structural challenges every TSDB operator faces, drawn from the technology's design constraints — not from any particular vendor or workload.</p>
+<h3 id="71-cardinality-explosion">7.1 Cardinality explosion</h3>
+<p><strong>The problem.</strong> A label with high cardinality — <code>user_id</code>, <code>request_id</code>, <code>session_id</code>, <code>trace_id</code>, anything with millions of unique values — creates millions of unique series. Memory, index size, and query latency all scale linearly with cardinality.</p>
+<p><strong>The naive solution.</strong> "Just add the label, more dimensions are more visibility." Run with it.</p>
+<p><strong>How it breaks.</strong> A web service emits <code>http_request_duration_seconds{user_id="..."}</code> and ships to Prometheus. The fleet has 50 million users. The TSDB allocates 50M series, each consuming ~1 KB for the open chunk + index entries. Head block RAM blows past 50 GB. The TSDB OOMs (Out Of Memory). Restart it; it OOMs again on WAL replay. Production observability is now down because someone added one well-intentioned label.</p>
+<p><strong>The actual fix.</strong>
+- Drop high-cardinality labels at the SDK. The Prom client library <code>Counter.labels(user_id=...)</code> should be <code>Counter.labels()</code> instead — the per-user detail goes into traces (where each trace is one event, not one series), not metrics.
+- For "I need to see one user's metrics," use <strong>exemplars</strong> — a histogram-bucket pointer to a sample trace_id. Exemplars cost one trace pointer per histogram bucket, not one series per user.
+- For pre-emptive defense, configure <code>metric_relabel_configs</code> in Prometheus to drop or hash labels matching a pattern at scrape time.
+- Set <code>query.max-series-fetched</code> to fail expensive queries before they take down the TSDB.</p>
+<p>(Treated in more depth in the <a href="10_observability.md">observability doc</a>, §4.1.)</p>
+<h3 id="72-downsampling-and-retention-tiering">7.2 Downsampling and retention tiering</h3>
+<p><strong>The problem.</strong> Raw 10-second samples are great for the last hour. They are wasteful for last year — nobody looks at second-level granularity over a 365-day window. But "year-long" dashboards are common (capacity planning, business KPIs over time, compliance reporting).</p>
+<p><strong>The naive solution.</strong> Keep raw samples forever. Disk is cheap.</p>
+<p><strong>How it breaks.</strong> 1M samples/sec × 1 year × 1.4 B/sample = <strong>44 TB/year of raw data</strong>. A "show me p99 latency for the last year" query reads 365 day-blocks × ~120 GB each = enormous I/O. Query takes minutes; dashboard becomes unusable; users complain; you start to think monitoring isn't worth it.</p>
+<p><strong>The actual fix.</strong> Tiered downsampling — keep multiple resolutions, each with its own retention:</p>
+<table>
+<thead>
+<tr>
+<th>Resolution</th>
+<th>Retention</th>
+<th>Storage cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Raw (10s)</td>
+<td>30 days</td>
+<td>120 GB/day × 30 = 3.6 TB</td>
+</tr>
+<tr>
+<td>1m aggregated</td>
+<td>90 days</td>
+<td>12 GB/day × 90 = 1.1 TB</td>
+</tr>
+<tr>
+<td>5m aggregated</td>
+<td>1 year</td>
+<td>2.4 GB/day × 365 = 880 GB</td>
+</tr>
+<tr>
+<td>1h aggregated</td>
+<td>5 years</td>
+<td>200 MB/day × 1825 = 365 GB</td>
+</tr>
+</tbody>
+</table>
+<p>Total: ~6 TB for 5 years of multi-resolution data vs ~220 TB raw. <strong>35× cost reduction.</strong></p>
+<p>Mechanisms:
+- <strong>Prometheus recording rules</strong> pre-compute aggregates and write them as new series. <code>rate(http_requests_total[1m])</code> becomes a separate series <code>http_request_rate_1m</code> that the dashboard queries directly.
+- <strong>Thanos / Mimir downsampling</strong> is automatic — every 2h block is downsampled to 5m and 1h resolution.
+- <strong>TimescaleDB continuous aggregates</strong> are SQL-defined rollups maintained incrementally.
+- <strong>InfluxDB continuous queries</strong> (legacy) and <strong>tasks</strong> (v3) do the same.</p>
+<p>Query layer must know about multiple resolutions and pick the right one based on the requested range: "give me 1 year p99" should hit the 1h-resolution series, not the raw.</p>
+<h3 id="73-high-write-ingest">7.3 High-write ingest</h3>
+<p><strong>The problem.</strong> A single TSDB node is designed for ~1M samples/sec; beyond that, sharding is required. Cardinality explosion (7.1) can also drive ingest cost up sharply even at modest sample rates.</p>
+<p><strong>The naive solution.</strong> "Just buy a bigger machine." 32-core, 256 GB RAM, NVMe RAID.</p>
+<p><strong>How it breaks.</strong> Beyond ~3-5M samples/sec on a single node, WAL fsync becomes the bottleneck (each fsync is ~50-200µs, and a 100ms batch limits throughput). The head block index grows past available RAM. Compaction CPU starts to compete with ingest CPU. Scaling vertically hits a wall at ~5M samples/sec/node regardless of hardware.</p>
+<p><strong>The actual fix.</strong> Shard by series. Mimir/Cortex use consistent hashing on <code>series_id</code> to distribute samples across an ingester ring. Each ingester owns ~1/N of the series. Query layer fans out a PromQL query to all ingesters and merges results. M3DB does the same with its own ring topology. VictoriaMetrics cluster shards by metric name + label fingerprint.</p>
+<p>The inflection: 1 instance ≈ 1M samples/sec; 10 instances ≈ 10M; 100 instances ≈ ~80M (sublinear due to query fanout overhead).</p>
+<h3 id="74-long-range-query-cost">7.4 Long-range query cost</h3>
+<p><strong>The problem.</strong> A query like <code>histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) over the last 1 year</code> must touch every block in the year — even with downsampling, that's hundreds of blocks. Each block must be opened, its index consulted, chunks decoded, percentile computed.</p>
+<p><strong>The naive solution.</strong> Just execute it. Modern hardware is fast.</p>
+<p><strong>How it breaks.</strong> A naive 1-year query on a Mimir tenant with 5M series scans ~365 day-blocks, decodes ~10 GB of data, performs the percentile computation. Latency: 30-300 seconds. One user clicking such a query can saturate the query path; concurrent users grind dashboards to a halt.</p>
+<p><strong>The actual fix.</strong>
+- <strong>Query splitting and parallelism.</strong> Mimir/Thanos query frontend splits a 1-year query into 12 monthly sub-queries that run in parallel, then merges results.
+- <strong>Result caching.</strong> PromQL queries on stable past windows cache forever (Mimir's <code>results-cache</code>). A repeated 1-year dashboard hits cache on second load.
+- <strong>Pre-aggregated recording rules.</strong> The percentile is computed at ingest time once per 5m window and written as a series. The 1-year dashboard queries the pre-computed series, not the raw histogram buckets — 100× cheaper.
+- <strong>Adaptive resolution.</strong> Query frontend rewrites the query to use coarser resolution (1h instead of 10s) when the range is long.</p>
+<h3 id="75-multi-tenancy">7.5 Multi-tenancy</h3>
+<p><strong>The problem.</strong> One TSDB serving many teams. Team A's runaway cardinality and slow query should not break Team B's dashboards.</p>
+<p><strong>The naive solution.</strong> One TSDB per team. Operational nightmare; cost duplication; cross-team queries impossible.</p>
+<p><strong>How it breaks.</strong> One TSDB cluster shared by 50 teams. Team A's developer adds a high-cardinality label by mistake. Cardinality across the cluster explodes from 5M to 50M series in 30 minutes. Head block OOMs. <strong>All 50 teams lose monitoring</strong> at once. Postmortem: "noisy neighbor."</p>
+<p><strong>The actual fix.</strong> Per-tenant resource limits and sharded ingest:
+- Each request to the TSDB carries a <code>tenant_id</code> header (Mimir/Cortex pattern).
+- Ingesters route by <code>(tenant_id, series_hash)</code> so each tenant's series live on a tenant-specific ring slice.
+- <strong>Per-tenant limits:</strong> max active series, max samples/sec ingest, max query series fetched, max query duration, max query memory. Exceeding any limit returns 429 to that tenant only; other tenants unaffected.
+- <strong>Per-tenant retention.</strong> Free tier 14 days, paid tier 90 days, enterprise 1 year. Implemented as a TTL per tenant on block deletion.
+- <strong>Per-tenant query queues.</strong> Slow queries from tenant A don't block tenant B's queue.</p>
+<p>This is the architecture of Grafana Cloud, Chronosphere, Datadog, New Relic — every SaaS observability platform. The same pattern applies internally at a large company where each engineering team is a "tenant."</p>
+<h3 id="76-backfill">7.6 Backfill</h3>
+<p><strong>The problem.</strong> Loading historical data — last year's stock prices, archived telemetry from a vehicle that was offline, exported metrics from a deprecated TSDB being migrated.</p>
+<p><strong>The naive solution.</strong> Just write old timestamps to the TSDB.</p>
+<p><strong>How it breaks.</strong> Prometheus (until very recently) explicitly rejected samples with timestamps older than ~1h. The reason: the head block is in-memory and time-ordered; out-of-order samples would force chunk rewrites that break the immutability invariant. Backfill via push was simply not supported. Operators worked around it by stopping Prometheus and loading raw blocks via the <code>promtool tsdb create-blocks-from rules</code> workflow.</p>
+<p><strong>The actual fix.</strong>
+- <strong>TimescaleDB, InfluxDB, ClickHouse, QuestDB</strong> support out-of-order writes natively because they're not constrained by the 2h immutable block design.
+- <strong>Prometheus</strong> now supports out-of-order writes (since v2.39, 2022) with a configurable out-of-order window — but at a complexity and memory cost; not the default.
+- <strong>For Prometheus migrations</strong>, the recommended path is generate blocks offline with <code>promtool</code> and drop them into the data directory. Block compaction will merge them with existing data.
+- <strong>For long-term backfill</strong>, push directly to the long-term tier (Thanos's <code>thanos receive</code>, Mimir's distributor) which can accept out-of-order data because its blocks are not yet finalized.</p>
+<h3 id="77-slow-query-isolation">7.7 Slow query isolation</h3>
+<p><strong>The problem.</strong> One user's expensive query — <code>topk(100, sum(rate(http_requests_total[1d])) by (user_id))</code> over a 1M-series, 100M-cardinality tenant — reads gigabytes of chunks into memory, runs for minutes, and can OOM the entire TSDB.</p>
+<p><strong>The naive solution.</strong> Trust users to write good queries.</p>
+<p><strong>How it breaks.</strong> A junior engineer is debugging at 3am, types the wrong PromQL, hits enter. The query reads 2 GB into the query engine's working memory. The TSDB OOMs. All dashboards and alerts go dark for the 60 seconds it takes to restart. The junior engineer is now responsible for a real incident.</p>
+<p><strong>The actual fix.</strong>
+- <strong>Query timeouts</strong> (default 2 minutes, configurable per tenant).
+- <strong>Per-query memory limits</strong> (<code>query.max-samples</code>, <code>query.max-fetched-series</code>, <code>query.max-fetched-chunks</code>).
+- <strong>Query queues</strong> to limit concurrency.
+- <strong>Query analyzer</strong> (Mimir's read-path analyzer, Grafana's "Query Inspector") to estimate cost before execution.
+- <strong>Resource quotas</strong> at the query frontend that reject queries projected to exceed thresholds.</p>
+<hr>
+<h2 id="8-failure-modes">§8. Failure Modes</h2>
+<p>Specific crash and degradation scenarios with recovery procedure and durability point.</p>
+<h3 id="disk-full">Disk full</h3>
+<p>The TSDB instance fills its local disk. WAL writes fail. Head block can no longer flush. Prometheus stops scraping new samples (configurable: drop or stop). Already-acked samples in WAL are recoverable if WAL fsync completed; queries continue on existing data. <strong>Recovery:</strong> add disk, restart, WAL replays on startup. <strong>Prevention:</strong> alert on <code>node_filesystem_avail_bytes / node_filesystem_size_bytes &lt; 0.15</code>, set retention aggressively low until upgrade.</p>
+<h3 id="wal-corruption">WAL corruption</h3>
+<p>Power loss mid-WAL-write or filesystem corruption. On startup, Prometheus detects checksum mismatch on a WAL segment and skips it, continuing replay from the next valid record. <strong>Recovery:</strong> lose up to the corrupt segment's worth of samples (~30 minutes worst case); head block rebuilds from valid WAL records. <strong>Durability point:</strong> WAL fsync — samples before the last fsync are recoverable; samples within the ~100ms batching window are lost.</p>
+<h3 id="cardinality-explosion-taking-out-the-tsdb">Cardinality explosion taking out the TSDB</h3>
+<p>A bad deploy adds a high-cardinality label. Series count goes from 5M to 50M in 5 minutes. Head block RAM grows past available memory; Linux OOM killer terminates the process; restart with WAL replay re-allocates the 50M series and OOMs again. <strong>Recovery (graceful degradation):</strong> (1) identify the offending metric via <code>prometheus_tsdb_head_series</code> and "Top metrics by series count" dashboards; (2) add a <code>metric_relabel_configs</code> rule to drop the label at scrape time; (3) restart with reduced chunk-write queue and aggressive <code>--query.max-samples</code>; (4) if WAL fatally bloated, delete old segments and accept sample loss; (5) wait for retention to expire bloated blocks. <strong>Prevention:</strong> cardinality alerts, per-job cardinality limits in scrape config, organizational label-naming discipline.</p>
+<h3 id="query-oom">Query OOM</h3>
+<p>A user runs <code>topk(1000, ...)</code> with no time filter; query reads 50 GB into memory. The query engine hits its per-query limit and returns an error; if unlimited, OOMs the process and other queries fail until restart. <strong>Recovery:</strong> restart query engine (separate process in cluster mode; same process in single-node Prometheus). Queries are read-only — recovery is just process restart.</p>
+<h3 id="scrape-target-timeout-cascading">Scrape target timeout cascading</h3>
+<p>A scrape target's <code>/metrics</code> endpoint hangs for 30+ seconds. Scraper's worker pool depletes; other targets miss scrape windows. Each scrape has a <code>scrape_timeout</code> (default 10s); targets exceeding it are aborted and marked unhealthy via <code>up{...} == 0</code>. <strong>Prevention:</strong> scrape timeout &lt; scrape interval (always); limit per-target metric count (some exporters expose tens of thousands of metrics); <code>metric_relabel_configs</code> to drop noisy metrics at parse time.</p>
+<h3 id="ingester-replica-divergence">Ingester replica divergence</h3>
+<p>In a Mimir cluster, two ingester replicas for the same series have ~10s clock skew or one missed samples during a network blip. Query frontend merges results from all replicas and dedupes by <code>(series_id, timestamp)</code>. <strong>Durability point:</strong> ingester replication factor — with RF=3, two ingesters can fail simultaneously without sample loss.</p>
+<hr>
+<h2 id="9-why-not-a-generic-database">§9. Why Not a Generic Database</h2>
+<p>The seductive argument: "PostgreSQL is rock-solid, well-understood, runs my application — why not just put metrics in there too?"</p>
+<p>Build a table:</p>
+<pre><code class="language-sql">CREATE TABLE metrics (
+  metric_name TEXT NOT NULL,
+  labels JSONB NOT NULL,
+  ts TIMESTAMPTZ NOT NULL,
+  value DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX ON metrics (metric_name, ts);
+</code></pre>
+<p>Walk through ingest at 100K samples/sec:</p>
+<ol>
+<li>
+<p><strong>Each <code>INSERT</code> is a btree page mutation.</strong> Random page write. NVMe SSD random write: ~10-30K IOPS sustainably. With group commit and prepared statements, maybe 50K rows/sec. <strong>Past 50K/sec, the WAL fsync saturates.</strong></p>
+</li>
+<li>
+<p><strong>Storage per row.</strong> 8 bytes timestamp + 8 bytes float + ~50 bytes for <code>metric_name</code> (TEXT) + ~80 bytes for JSONB labels + ~30 bytes btree overhead = ~180 bytes per sample. <strong>130× worse than Gorilla's 1.4 bytes.</strong></p>
+</li>
+<li>
+<p><strong>Query <code>SELECT avg(value) FROM metrics WHERE metric_name='cpu' AND ts &gt; now() - '5m' GROUP BY (labels-&gt;&gt;'service')</code>.</strong> PostgreSQL scans the btree, fetches matching rows. Each row is in a different page (no co-location by series). 5 minutes at 10K samples/sec = 3M rows. Random page reads → multi-second latency.</p>
+</li>
+<li>
+<p><strong>MVCC bloat from the constant <code>INSERT</code> stream.</strong> Autovacuum cannot keep up; table bloats; query plans degrade further.</p>
+</li>
+<li>
+<p><strong>Retention.</strong> <code>DELETE FROM metrics WHERE ts &lt; now() - '30 days'</code> is a delete on millions of rows. Locks pages, blocks vacuum, generates massive WAL. The whole cluster slows. In a TSDB, retention is <code>rmdir block_directory</code> — atomic, near-instant.</p>
+</li>
+</ol>
+<p>The breakage is <strong>structural</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>Cost dimension</th>
+<th>PostgreSQL</th>
+<th>Prometheus</th>
+<th>Factor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Storage per sample</td>
+<td>~180 B</td>
+<td>~1.4 B</td>
+<td><strong>130× worse</strong></td>
+</tr>
+<tr>
+<td>Sustained writes/sec/SSD</td>
+<td>~50K</td>
+<td>~1M</td>
+<td><strong>20× worse</strong></td>
+</tr>
+<tr>
+<td>5min range query</td>
+<td>seconds</td>
+<td>milliseconds</td>
+<td><strong>100× worse</strong></td>
+</tr>
+<tr>
+<td>Retention deletion</td>
+<td>hours of locks</td>
+<td>seconds (rmdir)</td>
+<td><strong>massive</strong></td>
+</tr>
+<tr>
+<td>Compression on floats</td>
+<td>none / generic</td>
+<td>Gorilla XOR</td>
+<td><strong>12×</strong></td>
+</tr>
+<tr>
+<td>Compression on timestamps</td>
+<td>none</td>
+<td>delta-of-delta</td>
+<td><strong>30×</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The factor of 10-100× across every dimension is what justifies a specialized engine. PostgreSQL is the right tool when you need transactions, joins, and arbitrary structured queries on small-to-medium data. It is the wrong tool when you need millions of timestamped floats per second.</p>
+<p>TimescaleDB closes some of this gap by adding a hypertable layer with chunk pruning and compression on top of PostgreSQL — but in doing so, it has effectively become a TSDB that happens to expose PostgreSQL SQL. Same engine internally; the abstraction at the SQL surface is the only thing that's "still PostgreSQL."</p>
+<hr>
+<h2 id="10-scaling-axes">§10. Scaling Axes</h2>
+<p>Time-series workloads scale on two qualitatively different axes. They require different fixes.</p>
+<h3 id="type-1-more-series-more-scrape-targets-uniform-growth">Type 1: more series, more scrape targets — uniform growth</h3>
+<p>A fleet doubles from 5K to 10K Kubernetes pods. Each pod exposes ~100 metrics. Active series doubles from 5M to 10M. Sample rate doubles from 500K/sec to 1M/sec.</p>
+<p><strong>Fix:</strong> horizontal sharding. Mimir/Cortex consistent hashing across the ingester ring spreads new series across more ingester nodes. Each node still holds ~1/N of series; doubling targets means doubling N. Query frontend fan-out spreads query cost.</p>
+<p>Inflection points:
+- <strong>1 instance → HA pair (~1M series/instance):</strong> add a second Prometheus instance scraping the same targets, query layer deduplicates.
+- <strong>HA pair → sharded cluster (~10M series/instance):</strong> transition to Mimir or VictoriaMetrics cluster. Cardinality across the fleet outgrows one instance.
+- <strong>Sharded cluster → multi-region (~100M series cluster-wide):</strong> federation across regions. Each region has its own ingester ring; cross-region queries fan out to all regions and merge.</p>
+<h3 id="type-2-same-entities-more-rate-per-entity-hotspot-intensification">Type 2: same entities, more rate per entity — hotspot intensification</h3>
+<p>Same 5K pods, but a high-cardinality label appears. Per-pod series count goes from 100 to 50,000. Total series count goes from 500K to 250M. Sample rate stays the same.</p>
+<p><strong>This is the harder one.</strong> Sharding by series helps for ingest (each ingester takes 1/N of the new series), but it does not help the <strong>query path</strong> — a query like <code>topk(10, sum(rate(...)) by (label))</code> must read across all 250M series to compute the topk.</p>
+<p><strong>Fixes:</strong>
+- <strong>Drop the high-cardinality label at SDK.</strong> First and best fix. If you don't need per-user metrics, don't emit per-user labels.
+- <strong>Pre-aggregated views.</strong> Define a recording rule that materializes the topk at ingest time as a low-cardinality derived series. Queries hit the derived series.
+- <strong>Tail-sampled traces instead.</strong> Per-request detail belongs in traces, where each request is one event, not one series.
+- <strong>Switch to a higher-cardinality TSDB.</strong> M3DB at Uber was built because Prometheus's cardinality ceiling was a non-starter for their use case. VictoriaMetrics and Mimir tolerate higher cardinality than vanilla Prometheus.</p>
+<p>Inflection points:
+- <strong>1M-10M series active:</strong> vanilla Prometheus on a big node.
+- <strong>10M-100M series active:</strong> Mimir/Cortex or VictoriaMetrics cluster.
+- <strong>100M+ series active:</strong> M3DB-class system, or aggressive cardinality control to bring it back down.</p>
+<h3 id="read-amplification">Read amplification</h3>
+<p>A separate scaling axis often missed: a <strong>single PromQL query</strong> can read many series. <code>sum(rate(http_requests_total[5m]))</code> over all services with all status codes touches every series matching the metric — could be 10K+ series for a moderately-labeled metric. Multiply by N concurrent queries (Grafana with 30 panels open, 100 users) and the query path is the bottleneck before the ingest path.</p>
+<p>Fix: query splitting, result caching, recording rules — same techniques as §7.4.</p>
+<hr>
+<h2 id="11-decision-matrix">§11. Decision Matrix</h2>
+<p>When to pick which TSDB.</p>
+<table>
+<thead>
+<tr>
+<th>You want</th>
+<th>Pick</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Kubernetes monitoring, default reach</td>
+<td><strong>Prometheus</strong></td>
+<td>Ecosystem default; every exporter and dashboard assumes it; deploy in &lt;1 hour</td>
+</tr>
+<tr>
+<td>Prometheus-compatible, higher per-node throughput</td>
+<td><strong>VictoriaMetrics</strong></td>
+<td>Drop-in for PromQL/remote-write; 5-10× throughput; simpler ops than Mimir</td>
+</tr>
+<tr>
+<td>Long-term retention behind Prometheus</td>
+<td><strong>Mimir</strong> or <strong>Thanos</strong></td>
+<td>Both add S3-backed unbounded retention; Mimir for big SaaS; Thanos is lighter</td>
+</tr>
+<tr>
+<td>IoT push-mode, SQL access</td>
+<td><strong>InfluxDB</strong></td>
+<td>Push-native via line protocol; v3 has SQL; rich tags/fields</td>
+</tr>
+<tr>
+<td>SQL + relational data + time-series in one place</td>
+<td><strong>TimescaleDB</strong></td>
+<td>PostgreSQL hypertable; joins with relational tables; familiar SQL; backfill native</td>
+</tr>
+<tr>
+<td>Financial market data, microsecond ingest</td>
+<td><strong>QuestDB</strong> or <strong>kdb+</strong></td>
+<td>Optimized for tick data; SQL; out-of-order ingest; nanosecond timestamps</td>
+</tr>
+<tr>
+<td>User-facing analytics dashboards (sub-second p99)</td>
+<td><strong>Apache Pinot</strong></td>
+<td>Indexed columnar; star-tree indexes; LinkedIn-class scale</td>
+</tr>
+<tr>
+<td>Cross between time-series and general analytics</td>
+<td><strong>ClickHouse</strong></td>
+<td>SQL; great compression; flexible schema; ingest 10M+ rows/sec</td>
+</tr>
+<tr>
+<td>Uber-class cardinality (10⁸+ series)</td>
+<td><strong>M3DB</strong></td>
+<td>Built for this; M3 coordinator + DB + query layer</td>
+</tr>
+<tr>
+<td>Single trillion-samples/sec global scale</td>
+<td><strong>Build your own</strong> like Monarch</td>
+<td>Beyond the public OSS ceiling</td>
+</tr>
+</tbody>
+</table>
+<p>The boring default: <strong>Prometheus + Grafana + AlertManager</strong> for monitoring, plus <strong>VictoriaMetrics or Mimir</strong> when you outgrow it, plus <strong>Pinot or ClickHouse</strong> for user-facing analytics dashboards. Most organizations don't need anything more exotic until they're at 100M+ active series.</p>
+<hr>
+<h2 id="12-promql-and-query-languages">§12. PromQL and Query Languages</h2>
+<p>The query language is the second-half of a TSDB's value. A great storage engine with a bad query language wins fewer users than a mediocre engine with a great query language. PromQL is the dominant choice for monitoring; SQL is the dominant choice for analytics.</p>
+<h3 id="promql">PromQL</h3>
+<p>Prometheus's functional query language. Tightly fitted to the time-series data model.</p>
+<ul>
+<li>
+<p><strong>Instant vector vs range vector.</strong> <code>http_requests_total</code> returns one sample per series at a single point in time (instant). <code>http_requests_total[5m]</code> returns the time-window of samples per series over the last 5 minutes (range) — not directly displayable, must be reduced via a function.</p>
+</li>
+<li>
+<p><strong>Aggregations.</strong> <code>sum</code>, <code>avg</code>, <code>min</code>, <code>max</code>, <code>count</code>, <code>quantile</code>, <code>topk</code>, <code>bottomk</code>. Applied across series with <code>by</code>/<code>without</code> clauses: <code>sum(rate(http_requests_total[5m])) by (service)</code> computes the per-second rate over a 5m window, then sums by service.</p>
+</li>
+<li>
+<p><strong><code>rate()</code> vs <code>increase()</code>.</strong> Single most common confusion for newcomers. <code>rate(metric[5m])</code> = per-second rate over the window, accounting for counter resets. <code>increase(metric[5m])</code> = total increase over the window = <code>rate × window_seconds</code>. Both handle counter resets correctly. <code>rate()</code> is correct for "requests per second"; <code>increase()</code> for "total requests in window."</p>
+</li>
+<li>
+<p><strong><code>histogram_quantile()</code>.</strong> Computes a percentile from histogram buckets. The metric <code>http_request_duration_seconds_bucket{le="..."}</code> has one series per bucket; <code>histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))</code> aggregates buckets across instances and interpolates the 99th percentile.</p>
+</li>
+<li>
+<p><strong>Label-matched joins.</strong> <code>metric_a * on(service) group_left() metric_b</code>. Limited — not full SQL joins, but enough for "multiply error rate by traffic to get error volume."</p>
+</li>
+</ul>
+<h3 id="influxql-flux-sql">InfluxQL → Flux → SQL</h3>
+<p>InfluxDB's query language evolved three times in a decade:
+- <strong>InfluxQL</strong> (original, SQL-like): "easy if you know SQL." Limited expressiveness.
+- <strong>Flux</strong> (v2): functional pipeline language with <code>|&gt;</code> syntax. Powerful, but a new DSL nobody else knew.
+- <strong>SQL</strong> (v3 IOx): back to SQL on top of a columnar engine.</p>
+<p>The lesson: query language design is hard, and users hate learning new DSLs when SQL is "good enough" for time-series queries.</p>
+<h3 id="sql-extensions-timescaledb-clickhouse-questdb">SQL extensions (TimescaleDB, ClickHouse, QuestDB)</h3>
+<p>SQL with time-series functions:
+- <code>time_bucket('1 minute', ts)</code> — bucket samples into 1-minute windows.
+- <code>first_value()</code>, <code>last_value()</code> — sample at start/end of window.
+- <code>time_bucket_gapfill()</code> — fill missing windows with NULLs or interpolation.
+- <code>LATERAL JOIN</code> for windowed lookups.</p>
+<p>TimescaleDB example:</p>
+<pre><code class="language-sql">SELECT time_bucket('5 minutes', ts) AS bucket,
+       service,
+       avg(value) AS p50,
+       percentile_cont(0.99) WITHIN GROUP (ORDER BY value) AS p99
+FROM metrics
+WHERE metric_name = 'http_request_duration_seconds'
+  AND ts &gt; now() - INTERVAL '1 hour'
+GROUP BY bucket, service
+ORDER BY bucket;
+</code></pre>
+<p>ClickHouse and QuestDB have similar dialects. The advantage of SQL is that everyone already knows it and analytical tools (Tableau, Looker, Superset) speak it natively. The disadvantage is that for the most common monitoring queries, PromQL is dramatically more concise.</p>
+<h3 id="the-metric-query-is-hard-lesson">The "metric query is hard" lesson</h3>
+<p>Most newcomers to TSDBs struggle with:
+- <strong>Counter reset handling.</strong> A counter resets to 0 when the process restarts. Naive <code>value_now - value_then</code> produces a negative number. PromQL's <code>rate()</code> handles this; SQL on raw samples does not unless you explicitly model it.
+- <strong>Sample alignment across series.</strong> Two series scraped at slightly different times have offset timestamps. Aligning them for a join requires interpolation or window-snapping.
+- <strong>Histogram aggregation.</strong> Quantiles do not aggregate linearly. <code>avg(p99(serviceA), p99(serviceB))</code> is <strong>not</strong> the p99 of the combined population. You must aggregate the underlying histogram buckets first, then compute the quantile.</p>
+<p>These traps catch experienced SQL practitioners as often as junior engineers. They're not bugs in PromQL — they're consequences of the time-series data model meeting a query language.</p>
+<hr>
+<h2 id="13-downsampling-and-retention">§13. Downsampling and Retention</h2>
+<p>The economic math of TSDB operation.</p>
+<p><strong>Pre-aggregation patterns.</strong>
+- <strong>Recording rules (Prometheus).</strong> PromQL expressions evaluated on a schedule and written back as new series. <code>record: service:http_request_rate:5m / expr: sum(rate(http_requests_total[5m])) by (service)</code> lets the dashboard query the pre-aggregated series — 1000× cheaper than computing live.
+- <strong>Continuous aggregates (TimescaleDB).</strong> SQL-defined rollups maintained incrementally — new hypertable chunks trigger the rollup to extend.
+- <strong>Continuous queries / tasks (InfluxDB).</strong> Declarative aggregations re-evaluated on a schedule.
+- <strong>Materialized views (ClickHouse).</strong> Views that physically store aggregated rows, updated on insert via row-level triggers.
+- <strong>Thanos / Mimir downsampling.</strong> Automatic — every 2h block downsampled to 5m; every 24h block downsampled to 1h. Three resolutions of the same data coexist on disk.</p>
+<p><strong>Retention policies.</strong>
+- <strong>Prometheus</strong> <code>--storage.tsdb.retention.time=15d</code>: blocks older than 15 days are deleted by <code>rmdir</code> — atomic and near-instant.
+- <strong>InfluxDB</strong> retention policies: per-bucket TTL applied to shards.
+- <strong>TimescaleDB</strong> <code>SELECT drop_chunks('hypertable', INTERVAL '90 days')</code> removes whole chunks at once.
+- <strong>ClickHouse</strong> TTL clauses per-table or per-column; data deleted in background merges.</p>
+<p><strong>The cost math.</strong> For a SaaS observability workload:
+- Raw 10s × 100 metrics × 1000 hosts × 86400 s/day = <strong>86.4 billion samples/day</strong>.
+- At 1.4 B/sample (Gorilla): <strong>120 GB/day</strong>.
+- 30-day raw retention: <strong>3.6 TB</strong> local NVMe.
+- 1-year raw retention: <strong>44 TB</strong> — uncomfortable for local SSD, fine for S3 at $1000/month.
+- 1-year with 5m downsampling: <strong>88 GB</strong> for the 5m tier — trivial.
+- 5-year with 1h downsampling: <strong>~90 GB</strong> total — trivial.</p>
+<p>The pattern: <strong>keep raw for short windows where investigation needs precision; downsample aggressively beyond that.</strong> The choice of resolutions and retention boundaries is the single biggest cost lever for an observability platform.</p>
+<hr>
+<h2 id="14-specialized-time-series-workloads">§14. Specialized Time-Series Workloads</h2>
+<p>Different domains stress different parts of the TSDB design.</p>
+<ul>
+<li>
+<p><strong>Application monitoring — RED and USE.</strong> RED (Rate, Errors, Duration) for request-driven services — three metrics per endpoint, the basis of most service-level alerts. USE (Utilization, Saturation, Errors) for resources — CPU, queue depth, error counts; the basis of most infrastructure alerts. A typical cluster: ~50-200 metrics per service × thousands of services × 10s scrape = ~5-50K samples/sec.</p>
+</li>
+<li>
+<p><strong>Infrastructure monitoring — node_exporter.</strong> Linux host metrics: CPU, memory, disk, network, /proc inspection. <code>node_exporter</code> exposes ~1000 metrics per host with well-bounded labels — 1000 hosts × 1000 metrics × 6 scrapes/min ≈ 100K samples/sec.</p>
+</li>
+<li>
+<p><strong>Business KPIs.</strong> Signups per minute, revenue per minute, active users, conversion rate. Emitted as counters/gauges from application code (<code>signup_total</code>, <code>revenue_dollars_total</code>), queried via PromQL or pushed to Pinot. Cardinality bounded by business categories (campaign, region, tier) — typically &lt;1000 unique series.</p>
+</li>
+<li>
+<p><strong>IoT sensor telemetry.</strong> Millions of devices × ~10-100 sensors × ~1Hz = ~10M-1B samples/sec aggregate. <em>High</em> cardinality: every device is a series. A 5M-vehicle fleet × 50 sensors = 250M series — exactly the case Prometheus is not designed for. Backfill essential (devices reconnect after offline periods). Workload fit: InfluxDB, TimescaleDB, ClickHouse; M3DB if cardinality is extreme.</p>
+</li>
+<li>
+<p><strong>Financial market data.</strong> Tens of millions of ticks/sec at peak. Ingest-to-query in single-digit milliseconds; nanosecond timestamps; values are bid/ask/volume tuples, not just one float. Workload fit: QuestDB, kdb+, InfluxDB; ClickHouse for analytics on archived ticks.</p>
+</li>
+<li>
+<p><strong>APM (Application Performance Monitoring) trace summaries.</strong> Trace data lives in a trace store (Tempo, Jaeger); trace-derived metrics — per-service p99 latency, per-endpoint error rate — get ingested as time-series. Pattern: tail-sampling collector emits metrics-from-spans (RED metrics computed across sampled spans) as Prometheus exporters.</p>
+</li>
+<li>
+<p><strong>Container / pod metrics.</strong> Kubernetes-native time-series: <code>kube-state-metrics</code> (desired/actual pods, deployment health), <code>cAdvisor</code>/<code>kubelet</code> (per-container CPU/memory/network), <code>metrics-server</code> (HPA — Horizontal Pod Autoscaler input). Cardinality bounded by <code>(namespace, pod, container)</code> — typically 100s of K to a few M series in a large cluster.</p>
+</li>
+</ul>
+<hr>
+<h2 id="15-use-case-gallery">§15. Use Case Gallery</h2>
+<p>Different products, different workloads, all on TSDBs.</p>
+<ul>
+<li>
+<p><strong>Service monitoring — every Kubernetes-era backend.</strong> The dominant TSDB use case. Prometheus (or a Prometheus-compatible TSDB) scrapes <code>/metrics</code> endpoints of every service. Pattern: ~1000 services × ~100 metrics × 10s scrape ≈ 100K samples/sec/cluster. Storage 100K × 86400 × 1.4 B ≈ 12 GB/day. Trivial for a single Prometheus instance. The default of the cloud-native ecosystem.</p>
+</li>
+<li>
+<p><strong>IoT telemetry — Tesla, factory floors, smart homes.</strong> Tesla's fleet of 5M+ vehicles each reporting hundreds of telemetry channels. Industrial: factory PLCs (Programmable Logic Controllers) over OPC-UA. Smart home: Nest, Ring, Hue. Workload shape: high-cardinality per-device series, multi-million samples/sec aggregate, high backfill demand. Typical stack: device → MQTT broker → Kafka → TSDB (InfluxDB or ClickHouse) → Grafana.</p>
+</li>
+<li>
+<p><strong>Trading systems — real-time stock prices.</strong> NYSE consolidated tape ~10-50M trades/sec at peak. Trading algorithms must see the latest tick within microseconds. Typical stack: market feed (TCP/multicast) → ingest service → QuestDB or kdb+ on a beefy single machine. Query "last 1 minute of trades for AAPL bucketed by 100ms" returns in &lt;1ms.</p>
+</li>
+<li>
+<p><strong>Cloud cost monitoring.</strong> Resource utilization × pricing = cost time-series. Cloud providers (AWS Cost Explorer, GCP Billing) emit data; third-party tools (Vantage, Kubecost) aggregate. Pattern: hourly fetch of cost-per-service breakdown stored as <code>cloud_cost_dollars{service=..., region=...}</code>. Low volume (&lt;10K samples/sec), long retention (years).</p>
+</li>
+<li>
+<p><strong>Network monitoring — SNMP polling.</strong> SNMP (Simple Network Management Protocol) is the 30-year-old standard for polling routers, switches, firewalls. NOCs (Network Operations Centers) poll ~10000 devices every 30s with ~100 OIDs (Object Identifiers) per device = ~33K samples/sec. Stack: snmp_exporter / LibreNMS → Prometheus → Grafana. Older shops still run RRDtool (Round-Robin Database, 1999) → Cacti / MRTG (Multi Router Traffic Grapher).</p>
+</li>
+<li>
+<p><strong>DevOps process metrics — DORA.</strong> Deployment frequency, change failure rate, mean time to recovery. Emit from CI/CD as counters/gauges; chart "deploys per week per team" for leadership. GitHub Actions / Jenkins → Prometheus pushgateway → Grafana. Low volume, long retention.</p>
+</li>
+<li>
+<p><strong>User analytics — DAU and retention.</strong> Daily/weekly active users, cohort retention curves. Computed batch from event data, result is a small time-series per cohort. Events in Kafka → Spark/Flink → Pinot or Prometheus. Dashboard queries the pre-computed time-series.</p>
+</li>
+<li>
+<p><strong>Energy / grid monitoring — smart meters.</strong> ~150M smart electricity meters in the US, each reporting consumption every 15 minutes (or 1Hz for high-resolution meters). ~167K samples/sec for a national utility. Compliance retention: 7-year billing dispute window. Stack: meter → AMI (Advanced Metering Infrastructure) → InfluxDB or TimescaleDB → analytics + billing.</p>
+</li>
+</ul>
+<hr>
+<h2 id="16-real-world-implementations">§16. Real-World Implementations</h2>
+<p>Named systems shipping TSDBs at scale.</p>
+<ul>
+<li>
+<p><strong>Prometheus.</strong> Born at SoundCloud (2012), inspired by Google Borgmon. Kubernetes default since ~2017. Single-node, pull-based. Federation via Thanos/Mimir/Cortex for long-term.</p>
+</li>
+<li>
+<p><strong>Datadog.</strong> SaaS observability. Proprietary internal TSDB derived from Gorilla-family techniques. <strong>Trillions of samples per day</strong> ingested across customer base. Push-based agent + collectors per host.</p>
+</li>
+<li>
+<p><strong>Grafana Mimir / Cortex.</strong> Mimir is Grafana Labs's actively-maintained fork of Cortex (the original CNCF project for horizontally-scalable Prometheus). Open source. Powers Grafana Cloud Metrics. Reference deployments handle billions of active series.</p>
+</li>
+<li>
+<p><strong>Thanos.</strong> Sidecar-based long-term retention for Prometheus. Backs S3-class storage with a query layer for unified access. The "minimum upgrade from vanilla Prometheus."</p>
+</li>
+<li>
+<p><strong>VictoriaMetrics.</strong> Single-binary or cluster Prometheus-compatible TSDB with higher per-node throughput. Open source + enterprise tier. Drop-in replacement at higher scale.</p>
+</li>
+<li>
+<p><strong>InfluxDB.</strong> v1/v2 were the OG general-purpose TSDB. v3 IOx is a new engine on Parquet + DataFusion (Rust). InfluxDB Cloud is the managed offering; Aiven and others also offer managed InfluxDB.</p>
+</li>
+<li>
+<p><strong>TimescaleDB.</strong> PostgreSQL extension with hypertables. Used widely for time-series + relational workloads. <strong>Timescale Cloud</strong> is the managed offering.</p>
+</li>
+<li>
+<p><strong>M3DB / M3.</strong> Uber-built, Uber-open-sourced. Built for Uber's cardinality (~1 billion active series). Gorilla-derived chunk format with custom Bloom filter index. M3 platform = ingester + coordinator + query layer around M3DB.</p>
+</li>
+<li>
+<p><strong>Facebook Beringei.</strong> The original Gorilla paper's implementation. In-memory engine, durable via replication, not disk. The <strong>paper itself</strong> (Pelkonen et al., VLDB 2015) is the foundational reference everyone in the TSDB space has read.</p>
+</li>
+<li>
+<p><strong>Netflix Atlas.</strong> Netflix-internal TSDB optimized for in-memory operational dashboards. Open source. Multi-tier with in-memory hot layer and on-disk cold layer.</p>
+</li>
+<li>
+<p><strong>Google Monarch.</strong> Google's internal monitoring system. Per USENIX 2020 paper, <strong>~1 trillion samples/sec globally</strong>. The largest TSDB deployment publicly described. Hot tier is RAM-only across zones; no SSD in the recent-data path. Federated query layer across regions.</p>
+</li>
+<li>
+<p><strong>Apache Pinot.</strong> LinkedIn-born, open source. Powers <strong>user-facing analytical queries</strong> over time-series-shaped data — "Who Viewed Your Profile," ad analytics. Sub-second p99 on billions of events.</p>
+</li>
+<li>
+<p><strong>Apache Druid.</strong> Similar shape to Pinot; born at Metamarkets/Imply. Heavy use in advertising tech.</p>
+</li>
+<li>
+<p><strong>ClickHouse.</strong> Yandex-born, now ClickHouse Inc. General columnar analytical database; widely deployed for time-series because of its compression and ingest speed. Cloudflare, Uber, eBay, GitLab all run large ClickHouse deployments.</p>
+</li>
+<li>
+<p><strong>QuestDB.</strong> SQL-native TSDB optimized for financial market data and IoT. Tens of millions of inserts/sec on a single machine.</p>
+</li>
+<li>
+<p><strong>kdb+ / KX.</strong> Proprietary, dominant in finance. Q programming language. Decades of incumbency at investment banks for tick data.</p>
+</li>
+<li>
+<p><strong>OpenTSDB.</strong> The 2010-era TSDB on HBase. Largely superseded; still running at older shops.</p>
+</li>
+<li>
+<p><strong>RRDtool.</strong> The 1999 original — Round-Robin Database. Built for network monitoring (MRTG → Cacti). Fixed-size circular file; automatic downsampling baked in. Still widely deployed in NOCs and embedded systems for its simplicity.</p>
+</li>
+</ul>
+<hr>
+<h2 id="17-summary">§17. Summary</h2>
+<blockquote>
+<p>A TSDB is a specialized engine for "append-only timestamped floats indexed by labels and queried by time range" — a workload where a generic relational database loses 10-100× to a specialized one. The wins come from a small set of structural choices: monotonic timestamps compress to delta-of-delta (~1 bit/sample), correlated floats compress to Gorilla XOR (~7-11 bits/sample), immutable 2-hour blocks let retention be <code>rmdir</code> instead of <code>DELETE</code>, and an inverted label index lets queries filter by arbitrary label combinations. The dominant pattern — Prometheus + Grafana + AlertManager for monitoring, with Mimir/Thanos/VictoriaMetrics layered on for long-term — is the cloud-native default; specialized variants (Pinot/Druid for user-facing analytics, InfluxDB/TimescaleDB for SQL + IoT, M3DB for trillion-series cardinality, QuestDB/kdb+ for financial ticks) exist where the default's design point breaks. The recurring failure mode is <strong>cardinality explosion</strong> — a high-cardinality label (<code>user_id</code>, <code>request_id</code>) generating millions of series and OOM'ing the head block. The recurring cost optimization is <strong>tiered downsampling</strong> — raw samples for days, downsampled aggregates for years. Pick a TSDB when the workload is millions of timestamped floats per second; pick anything else when it isn't.</p>
+</blockquote>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>
