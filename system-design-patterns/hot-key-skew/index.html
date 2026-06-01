@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hot Key / Skew — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design-patterns/">← Back to System Design Patterns</a>
+        <h1 class="article-title">Hot Key / Skew</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/31 &nbsp;·&nbsp; System Design Patterns
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>A handful of keys absorb a disproportionate fraction of traffic, so a partitioning scheme that is mathematically balanced on average melts a single shard while the rest of the fleet idles. See <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">glossary</a> for Consistent Hashing, Preference List, Virtual Node (vnode), and Quorum. Core question docs:
+<a href="../questions/design-ticketmaster.md">Ticketmaster</a>,
+<a href="../questions/design-a-flash-sale-for-an-e-commerce-site.md">Flash sale</a>,
+<a href="../questions/design-twitter.md">Twitter (celebrity fan-out)</a>,
+<a href="../questions/design-a-youtube-likes-counter.md">YouTube likes counter</a>,
+<a href="../questions/design-an-ad-click-aggregator.md">Ad click aggregator</a>,
+<a href="../questions/design-typeahead-autocomplete.md">Typeahead autocomplete</a>,
+<a href="../questions/design-a-distributed-cache-like-redis.md">Distributed cache like Redis</a>.</p>
+</blockquote>
+<hr />
+<h2 id="1-the-fundamental-hardness">1. The fundamental hardness</h2>
+<p>Most partitioning schemes — consistent hashing, range partitioning, hash-mod-N — assume the key distribution is approximately uniform. Under that assumption the load on each shard converges to <code>total_QPS / num_shards</code>, and capacity planning is a multiplication problem. The Law of Large Numbers (LLN) makes everything look smooth in a load test with synthetic data.</p>
+<p>Real workloads are Zipfian. Web traffic, search queries, social-graph fan-out, e-commerce SKU pages, ticket inventory rows, ad impressions, viral content — all follow a power-law where the head of the distribution is many orders of magnitude hotter than the median. A workable rule of thumb at the kind of scale these prompts ask about: the top 0.01% of keys absorb on the order of half the requests, and the hottest key is typically 1,000× to 100,000× the median (the very tail of viral spikes — Beyoncé, Super Bowl moment — pushes higher, but treat 10⁶× as an exceptional incident, not a planning constant). Under that distribution one shard sees <code>0.5 × total_QPS</code> while the other N-1 shards split the remaining half. Doubling cluster size does not help: the hot key still lives on exactly one shard.</p>
+<p>The invariant that breaks: <strong>per-shard load must stay below per-shard capacity.</strong> Consistent hashing preserves <em>key-to-shard stability</em> but is silent about <em>load balance under skew</em>. Virtual nodes (vnodes) smooth out medium-frequency keys but do nothing for a single ultra-hot key — every vnode that owns that key gets the full traffic for it. The result is a hot shard with CPU pegged, queues building, p99 latency climbing, and the dependent caller's connection pool draining. Because failover moves the key to its replica, the replica then melts too — cascading hot-shard failure.</p>
+<p>Hot keys are also <strong>emergent and time-varying.</strong> Beyoncé announces a tour at 10:00 AM and the inventory row that was cold yesterday is the entire system's bottleneck at 10:00:01 AM. The mitigation cannot be a static config; it has to be detection-driven and reactive within seconds.</p>
+<hr />
+<h2 id="2-how-to-recognize-it-in-the-interview">2. How to recognize it in the interview</h2>
+<h3 id="prompt-phrases-that-signal-the-pattern">Prompt phrases that signal the pattern</h3>
+<ul>
+<li>"Celebrity," "viral," "trending," "Black Friday," "flash sale," "Super Bowl," "Beyoncé seat."</li>
+<li>"Most-popular X," "leaderboard," "top-K," "global hot list."</li>
+<li>"Some users have millions of followers," "some posts get a billion views."</li>
+<li>"One product page gets 90% of traffic during the drop."</li>
+<li>"Inventory of one ticket / one SKU."</li>
+<li>"Live event chat" where one stream has 10M concurrent viewers.</li>
+<li>Any mention of Zipf, power law, long tail, or 80/20.</li>
+</ul>
+<h3 id="architectural-smells-in-stated-requirements">Architectural smells in stated requirements</h3>
+<ul>
+<li>A single row, key, or counter is the contended resource (e.g., <code>inventory[sku=PS5]</code>, <code>likes[video_id=v1]</code>).</li>
+<li>Read QPS or write QPS quoted in millions but the working-set of "what people actually look at" is small.</li>
+<li>A per-key strong-consistency requirement layered on top of high QPS (Ticketmaster, payments-against-one-account).</li>
+<li>Strict ordering or counter semantics on a key that everyone hits.</li>
+<li>Sharding strategy is "hash by user_id" but the read pattern is "by content_id."</li>
+</ul>
+<h3 id="example-design-x-prompts-where-this-is-the-core-hardness">Example "design X" prompts where this is the core hardness</h3>
+<ol>
+<li><strong><a href="../questions/design-ticketmaster.md">Design Ticketmaster</a></strong> — one seat row, ten million people refreshing; classic write-hot + strong-consistency stack.</li>
+<li><strong><a href="../questions/design-a-flash-sale-for-an-e-commerce-site.md">Design a flash sale</a></strong> — one SKU, oversell forbidden, 10M shoppers in a 30-second window.</li>
+<li><strong><a href="../questions/design-twitter.md">Design Twitter</a></strong> — celebrity with 100M followers; naive fan-out-on-write blows up.</li>
+<li><strong><a href="../questions/design-a-youtube-likes-counter.md">Design YouTube likes counter</a></strong> — one viral video accumulates 1M likes/sec; single-row increment storm.</li>
+<li><strong><a href="../questions/design-an-ad-click-aggregator.md">Design ad click aggregator</a></strong> — one campaign captures most clicks; per-campaign counter is hot.</li>
+<li><strong><a href="../questions/design-typeahead-autocomplete.md">Design typeahead</a></strong> — "n", "a", "the" prefixes are read millions of times more often than rare prefixes.</li>
+<li><strong><a href="../questions/design-a-live-comment-streaming-service-like-twitch-chat.md">Design Twitch chat / live comments</a></strong> — one live stream is the entire system's load.</li>
+</ol>
+<hr />
+<h2 id="3-60-second-spoken-framing">3. 60-second spoken framing</h2>
+<blockquote>
+<p>The first thing I want to call out is that this workload is Zipfian. A small number of keys will take most of the traffic, and consistent hashing alone will not save us — one shard will melt while others idle. So my design has two halves. First, the cold path: standard consistent hashing with virtual nodes, plus per-key Time-To-Live (TTL) caching at the app layer for the long tail. Second, the hot path: I detect hot keys at the edge with a sliding-window counter or a Count-Min Sketch, then apply one or more of: a local first-level (L1) cache with jittered TTL to collapse reads, request coalescing so concurrent misses share one origin fetch, write-side sub-keying so a hot counter becomes N sub-counters summed at read time, and read-side replication of the hot value to every shard. The choice depends on whether the hot key is read-heavy or write-heavy, and whether stale reads are tolerable. I will keep a dedicated hot-key tier as the operational escape hatch, separate from the main store, so a single bad key cannot take down general traffic.</p>
+</blockquote>
+<hr />
+<h2 id="4-canonical-toolkit">4. Canonical toolkit</h2>
+<p>Seven techniques. Pick a subset based on read-vs-write skew, consistency budget, and detection latency.</p>
+<h3 id="41-local-l1-cache-with-ttl-jitter-read-heavy-hot-key">4.1 Local L1 cache with TTL jitter (read-heavy hot key)</h3>
+<p><strong>What it is.</strong> Each application server keeps an in-process Least-Recently-Used (LRU) cache (e.g., Caffeine, Guava, or <code>functools.lru_cache</code>) sitting in front of the distributed cache or store. The TTL has random jitter applied so that expirations don't synchronize across servers.</p>
+<p><strong>When to use.</strong> Read-heavy hot keys whose value can be stale by seconds (e.g., product page render, profile metadata, top-K list).</p>
+<p><strong>Cost.</strong> Memory on every app server. Staleness equal to the TTL plus the time to refresh. Cache-coherency lost — invalidation across N servers is best-effort.</p>
+<p><strong>When it breaks.</strong> When the application requires read-your-write within milliseconds. When the value changes faster than the TTL. When the working set of hot keys is too large to fit in L1.</p>
+<pre><code>                ┌───────────────┐
+client req ─►   │ App server    │   L1 hit ──► return (sub-ms, zero RPC)
+                │  ├─ L1 LRU    │
+                │  ├─ Coalescer │   miss ──► single fetch to L2
+                │  └─ ────────► │
+                └───────────────┘
+</code></pre>
+<pre><code class="language-python"># Per-server L1 cache with jittered TTL and coalescing.
+import asyncio
+import random
+import time
+
+class HotKeyL1Cache:
+    def __init__(self, base_ttl_s=5.0, jitter_s=2.0):
+        self.cache = {}                      # key -&gt; (value, expires_at)
+        self.inflight = {}                   # key -&gt; asyncio.Future
+        self.base_ttl_s = base_ttl_s
+        self.jitter_s = jitter_s
+
+    async def get(self, key, loader):
+        now = time.monotonic()
+        entry = self.cache.get(key)
+        if entry and entry[1] &gt; now:
+            return entry[0]                  # L1 hit
+
+        # Coalesce: only one in-flight load per key per process.
+        fut = self.inflight.get(key)
+        if fut is None:
+            fut = asyncio.get_event_loop().create_future()
+            self.inflight[key] = fut
+            try:
+                value = await loader(key)    # one RPC to origin
+                ttl = self.base_ttl_s + random.uniform(0, self.jitter_s)
+                self.cache[key] = (value, now + ttl)
+                fut.set_result(value)
+            except Exception as e:
+                fut.set_exception(e)
+            finally:
+                self.inflight.pop(key, None)
+        return await fut
+</code></pre>
+<h3 id="42-hot-key-replication-read-heavy-large-fan-out">4.2 Hot-key replication (read-heavy, large fan-out)</h3>
+<p><strong>What it is.</strong> Instead of one shard owning the hot key, replicate it to M shards (M can equal N, the cluster size, in the limit). Reads round-robin across the replica set. Writes fan out to all M replicas synchronously or asynchronously.</p>
+<p><strong>When to use.</strong> Read-heavy hot keys where the value changes infrequently (top trending list, configuration row, feature flag). Use when L1 caching is insufficient <em>because the working set of hot keys is too large to fit in per-app-server memory</em> or because you need a single tier where every shard owns the key. Note: replication does <em>not</em> by itself give you sub-second freshness — replicas lag by the fan-out time, so this is not a fix for "cannot tolerate seconds of staleness"; combine with synchronous fan-out or quorum reads if that's the constraint.</p>
+<p><strong>Cost.</strong> Write amplification: one logical write becomes M physical writes in <em>QPS</em> terms, not just storage. If a hot key takes 10K writes/sec and M=64, the cluster does 640K writes/sec for that one key. Storage M× per hot key is usually negligible. The real operational cost is dual code paths in routing and keeping the replica set consistent.</p>
+<p><strong>When it breaks.</strong> Write-heavy hot keys — write amplification destroys you. Strong-consistency requirements — keeping M replicas in lockstep on every write is essentially a write-quorum problem with M=N.</p>
+<pre><code>naive:                            replicated:
+                                                    one key replicated to 4 shards
+  ┌──┐  ┌──┐  ┌──┐  ┌──┐            ┌──┐  ┌──┐  ┌──┐  ┌──┐
+  │S1│  │S2│  │S3│  │S4│            │S1│  │S2│  │S3│  │S4│
+  │██│  │  │  │  │  │  │            │█ │  │█ │  │█ │  │█ │
+  │██│  │  │  │  │  │  │            │  │  │  │  │  │  │  │
+  └──┘  └──┘  └──┘  └──┘            └──┘  └──┘  └──┘  └──┘
+   hot                              reads round-robin across {S1..S4}
+</code></pre>
+<pre><code class="language-python"># Routing layer with hot-key replica fan-out.
+class HotKeyRouter:
+    def __init__(self, shards, hot_keys_to_replicas):
+        self.shards = shards                          # list of shard ids
+        self.hot = hot_keys_to_replicas               # key -&gt; list[shard_id]
+
+    def shards_for_read(self, key):
+        replicas = self.hot.get(key)
+        if replicas:
+            # Random pick spreads load evenly.
+            return [random.choice(replicas)]
+        return [self._hash_to_shard(key)]
+
+    def shards_for_write(self, key):
+        return self.hot.get(key) or [self._hash_to_shard(key)]
+</code></pre>
+<h3 id="43-request-coalescing-singleflight-read-heavy-expensive-origin">4.3 Request coalescing / singleflight (read-heavy, expensive origin)</h3>
+<p><strong>What it is.</strong> When N concurrent requests all miss cache for the same key, only one goes to the origin; the others wait on the same future. Implemented as a per-process lock keyed by the hot key. Conceptually the same idea as Go's <code>singleflight</code> package or Java's <code>CompletableFuture</code> deduplication.</p>
+<p><strong>When to use.</strong> When the upstream fetch is expensive (database query, model inference, downstream service call) and many concurrent misses can collapse to one. Especially during cache-miss-storm scenarios after a key expires.</p>
+<p><strong>Cost.</strong> Adds latency to the (N-1) waiting requests — they pay the fetch time, not the cache-hit time. Single point of failure: if the leader fetch hangs, all coalesced requests time out together.</p>
+<p><strong>When it breaks.</strong> When the upstream is intermittently slow — one slow leader fetch blocks everyone. Mitigate with per-request timeout shorter than the leader fetch timeout, so callers can fail fast and retry independently.</p>
+<pre><code>t=0 ms     500 concurrent GET(/api/product/PS5) arrive
+            ┌──── only req #1 acquires the singleflight lock ────┐
+            ▼                                                    │
+       fetch from origin (100 ms)                                │
+            │                                                    │
+            ▼                                                    │
+       broadcast result to all 500 waiters ─────────────────────┘
+            ▼
+       cache it locally for the next requests
+</code></pre>
+<h3 id="44-sub-keying-counter-sharding-write-heavy-hot-key">4.4 Sub-keying / counter sharding (write-heavy hot key)</h3>
+<p><strong>What it is.</strong> Replace one logical hot key with K sub-keys hashed by the writer (e.g., <code>counter[video=v1]</code> becomes <code>counter[video=v1#bucket=0..63]</code>). Each sub-key is independently incremented. Reads sum across the K sub-keys, optionally with a small cache to avoid the fan-in cost on every read.</p>
+<p><strong>When to use.</strong> Write-heavy hot keys where reads are infrequent or tolerant of a small fan-in: like counters, leaderboards, ad impression buckets, like counts, view counts. Pairs perfectly with <a href="../real-time-aggregation/">real-time-aggregation</a>.</p>
+<p><strong>Cost.</strong> Read amplification: one logical read becomes K physical reads (or K reads against a periodic rollup). Operational: K must be chosen carefully — too small and you still have a hot sub-key; too large and reads get expensive.</p>
+<p><strong>When it breaks.</strong> Strong-consistency reads (the K sub-keys can be in-flight at different times, so the sum is approximate by <code>O(K × per-bucket-batch-latency)</code>). Read-modify-write semantics (e.g., "increment if value &lt; cap") — needs a coordinator, see <a href="../strong-consistency-under-contention/">strong-consistency-under-contention</a>.</p>
+<pre><code>naive write-hot counter:                 sub-keyed counter (K=4):
+                                          writer_id mod 4 picks the bucket
+  ┌─────────────────┐                     ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐
+  │ counter[v1] = N │  ◄── 1M w/s          │ b0=… │ │ b1=… │ │ b2=… │ │ b3=… │
+  └─────────────────┘                     └──────┘ └──────┘ └──────┘ └──────┘
+       single hot row                     each ≈ 250 K w/s; spread across shards
+
+                                          read: SUM(b0..b3)
+</code></pre>
+<pre><code class="language-python"># Write-side sub-keying for a counter.
+class ShardedCounter:
+    def __init__(self, kv, num_buckets=64):
+        self.kv = kv
+        self.k = num_buckets
+
+    def incr(self, key, writer_hint):
+        bucket = hash(writer_hint) % self.k
+        self.kv.incr(f&quot;{key}#{bucket}&quot;)
+
+    def value(self, key):
+        # Fan-in read; cache the result with short TTL if reads are hot too.
+        return sum(self.kv.get(f&quot;{key}#{i}&quot;, 0) for i in range(self.k))
+</code></pre>
+<h3 id="45-client-side-hot-key-detection-and-fan-out">4.5 Client-side hot-key detection and fan-out</h3>
+<p><strong>What it is.</strong> Each client (app server, edge proxy) maintains a small sketch — a Count-Min Sketch with a sliding window, or a top-K stream summary — of per-key request rates. When a key crosses a threshold (e.g., &gt; 1% of total QPS or &gt; 1k QPS absolute), the client locally flips that key into "hot mode": route through the L1 cache, coalesce, fan out to replica set, and emit a metric so operators can promote the key to the dedicated hot tier.</p>
+<p><strong>When to use.</strong> As the front-end of any of the above techniques — you cannot apply them to every key (memory cost), so detection narrows the set. Essential when hot keys are emergent (Beyoncé tour announcement).</p>
+<p><strong>Cost.</strong> Sketch memory per client (small, KB range). False positives waste hot-path budget; false negatives let a hot key slip through.</p>
+<p><strong>When it breaks.</strong> Highly bursty traffic where the hot key changes within the sketch window. Coordinated misdetection across clients can cause synchronized cache rebuilds.</p>
+<pre><code class="language-python"># Sliding-window Count-Min Sketch for hot-key detection.
+import collections
+import time
+
+class HotKeyDetector:
+    def __init__(self, window_s=10, hot_threshold_qps=1000):
+        self.window_s = window_s
+        self.threshold = hot_threshold_qps
+        self.buckets = collections.deque()  # (ts, key_counts)
+
+    def observe(self, key):
+        now = time.time()
+        if not self.buckets or self.buckets[-1][0] != int(now):
+            self.buckets.append((int(now), collections.Counter()))
+        self.buckets[-1][1][key] += 1
+        while self.buckets and self.buckets[0][0] &lt; now - self.window_s:
+            self.buckets.popleft()
+
+    def is_hot(self, key):
+        total = sum(b[1].get(key, 0) for b in self.buckets)
+        return (total / self.window_s) &gt;= self.threshold
+</code></pre>
+<h3 id="46-dedicated-hot-key-tier-operational-escape-hatch">4.6 Dedicated hot-key tier (operational escape hatch)</h3>
+<p><strong>What it is.</strong> A separate, in-memory, read-optimized store (Redis cluster, Memcached, custom service) that hot keys are <em>promoted</em> into — either automatically when detection fires, or manually by an operator before a known event. The main store still holds the truth; the hot tier is a read replica with explicit invalidation on writes. Some designs make the hot tier write-through; others keep it read-only and async-refreshed.</p>
+<p><strong>When to use.</strong> Anchor strategy for known hot events (flash sale, ticket onsale, sports finals). Also as the operational landing spot when detection promotes a key.</p>
+<p><strong>Cost.</strong> Two stores to operate, two invalidation paths to keep consistent. Cold reads after promotion incur a one-shot main-store hit.</p>
+<p><strong>When it breaks.</strong> When hot keys are write-heavy and consistency-critical — the dual-write is hard. When promotion is slow relative to the traffic spike (Beyoncé announcement: spike arrives in seconds).</p>
+<h3 id="47-edge-content-delivery-network-cdn-caching-for-hot-read-keys">4.7 Edge / Content Delivery Network (CDN) caching for hot read keys</h3>
+<p><strong>What it is.</strong> Push hot read keys to the CDN edge with short TTL and stale-while-revalidate semantics. The edge fans out to thousands of points of presence (PoP), each serving a slice of the world's traffic. Only the origin sees <code>~1 / num_edges</code> of the traffic, gated by TTL refresh.</p>
+<p><strong>When to use.</strong> Public, cacheable HTTP responses for the hot key: product detail pages, public profile pages, viral content. Especially for read-heavy with seconds-tolerable staleness.</p>
+<p><strong>Cost.</strong> Per-user personalization defeats it. Invalidation is slow (CDN purge can take minutes). Cache-key engineering (which query params and headers vary) is non-trivial.</p>
+<p><strong>When it breaks.</strong> Logged-in personalized responses. Real-time freshness requirements. Cache-bypass attacks where adversaries vary cache-key components to force origin pass-through (see <a href="../cache-stampede-read-amplification/">cache-stampede-read-amplification</a>).</p>
+<h3 id="48-per-key-admission-control-operational-backstop">4.8 Per-key admission control (operational backstop)</h3>
+<p><strong>What it is.</strong> Independent of all the above, install a per-key token-bucket rate limiter at the edge or load balancer. The bucket fills at a rate slightly above the hot tier's measured capacity for that key. Excess is shed (return 429 / queue / show a waiting room).</p>
+<p><strong>When to use.</strong> As the always-on safety net. The other techniques optimize <em>capacity</em>; admission control protects <em>availability</em> when capacity is exceeded faster than mitigation can react.</p>
+<p><strong>Cost.</strong> Visible user impact: shed users see errors or queues. Operational complexity: per-key limits must be tuned and updated as the hot set evolves.</p>
+<p><strong>When it breaks.</strong> When users retry aggressively — shed load returns as retry storms. Mitigate with <code>Retry-After</code> headers and exponential backoff at the client. See <a href="../backpressure-flow-control/">backpressure-flow-control</a>.</p>
+<pre><code class="language-python"># Per-key token bucket; admit only what the hot tier can handle.
+import time
+
+class PerKeyAdmission:
+    def __init__(self, capacity_per_key):
+        self.cap = capacity_per_key          # key -&gt; tokens/sec
+        self.state = {}                      # key -&gt; (tokens, last_refill)
+
+    def admit(self, key):
+        rate = self.cap.get(key, float(&quot;inf&quot;))
+        tokens, last = self.state.get(key, (rate, time.monotonic()))
+        now = time.monotonic()
+        tokens = min(rate, tokens + (now - last) * rate)
+        if tokens &gt;= 1:
+            self.state[key] = (tokens - 1, now)
+            return True
+        self.state[key] = (tokens, now)
+        return False                          # shed
+</code></pre>
+<hr />
+<h2 id="5-worked-example-naive-broken-fixed">5. Worked example: naive → broken → fixed</h2>
+<p><strong>Scenario.</strong> YouTube-style likes counter. 1 million videos in catalog, but on a Tuesday afternoon one music video drops and absorbs the spike.</p>
+<p><strong>Workload.</strong></p>
+<ul>
+<li>Total write QPS across all videos: 200K likes/sec.</li>
+<li>Distribution: top video takes 60% of writes = 120K likes/sec on one key.</li>
+<li>Reads (rendering "like count" on every page view): 2M reads/sec total, top video takes 50% = 1M reads/sec on one key.</li>
+<li>Backing store: 32 shards of a Key-Value (KV) store; each shard can handle 30K ops/sec sustained.</li>
+</ul>
+<h3 id="naive-design">Naive design</h3>
+<ul>
+<li>One row per video: <code>likes[video_id] = count</code>.</li>
+<li>Consistent hashing by <code>video_id</code> over 32 shards.</li>
+<li>Writes: <code>INCR likes[video_id]</code>.</li>
+<li>Reads: <code>GET likes[video_id]</code>.</li>
+</ul>
+<h3 id="failure-mode">Failure mode</h3>
+<ul>
+<li>The hot video lands on one shard. That shard sees 120K writes/sec + 1M reads/sec = 1.12M ops/sec against a 30K capacity.</li>
+<li>Result: shard CPU at 100%, queue depth growing, p99 latency from 5 ms to 30 sec, then timeouts.</li>
+<li>Failover does not help — the replica becomes the new hot shard.</li>
+<li>The other 31 shards are idle at ~3K ops/sec each.</li>
+<li>Per-shard utilization: 1 shard at 37× capacity, 31 shards at 10% capacity.</li>
+</ul>
+<h3 id="fixed-design">Fixed design</h3>
+<p>Three-layer mitigation:</p>
+<ol>
+<li><strong>Sub-keyed write counter.</strong> <code>likes[v#0..63]</code>, one of K=64 sub-keys chosen by <code>hash(user_id) % 64</code>. 120K writes/sec divided by 64 = ~1.9K writes/sec per sub-key. Sub-keys are themselves consistent-hashed across 32 shards, so the 64 sub-keys distribute approximately evenly. No single shard sees more than ~4K writes/sec from the hot video.</li>
+<li><strong>Read-side aggregation with cache.</strong> A background roll-up job sums <code>likes[v#0..63]</code> every 1 second and writes the total to <code>likes_total[v]</code> with TTL=2 seconds. Reads hit the total, which is now in a regular cache.</li>
+<li><strong>L1 cache + edge CDN for reads.</strong> The total is also cacheable at the CDN with TTL=1 second and stale-while-revalidate=5 seconds. Of 1M reads/sec, ~99% are served at edge. Origin sees ~10K reads/sec for this key — fits comfortably.</li>
+</ol>
+<h3 id="numbers-after-fix">Numbers after fix</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Load on hot key</th>
+<th>Capacity headroom</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CDN edge</td>
+<td>1M reads/sec</td>
+<td>Designed for it; horizontally trivial.</td>
+</tr>
+<tr>
+<td>Origin reads</td>
+<td>~10K reads/sec</td>
+<td>30K/shard; 33% utilization.</td>
+</tr>
+<tr>
+<td>Origin writes (per sub-key)</td>
+<td>~1.9K writes/sec</td>
+<td>6% utilization per shard.</td>
+</tr>
+<tr>
+<td>Worst single shard</td>
+<td>~6K total ops/sec</td>
+<td>20% utilization.</td>
+</tr>
+<tr>
+<td>Other 31 shards</td>
+<td>unchanged</td>
+<td>~3K ops/sec, ~10%.</td>
+</tr>
+</tbody>
+</table>
+<p>Tradeoff incurred: like count is stale by up to ~1 second. Acceptable for the product.</p>
+<h3 id="what-changed-conceptually">What changed conceptually</h3>
+<ul>
+<li>Writes were <em>spread</em> (sub-keying), not <em>concentrated</em>. The hot row dissolves into 64 lukewarm rows.</li>
+<li>Reads were <em>aggregated once, served many times</em> (roll-up + CDN). The N×M fan-in of "read 64 sub-keys per request" is paid 1×/second instead of 1×/request.</li>
+<li>The detection layer is not in the hot path — sub-keying is unconditional for likes. The detector only matters for the <em>next</em> unknown hot pattern.</li>
+</ul>
+<h3 id="why-not-just-cache-the-total">Why not just "cache the total"?</h3>
+<p>Reads were the cheap fix; the storm was on the write side. Caching alone leaves 120K writes/sec hammering one shard. The interview signal is to address both axes — read amplification and write amplification — with separate, layered techniques.</p>
+<hr />
+<h2 id="6-variants-and-how-to-choose">6. Variants and how to choose</h2>
+<p>Hot-key problems split along two axes: <strong>read vs write</strong> and <strong>consistency tolerance</strong>. Pick the toolkit based on the quadrant.</p>
+<table>
+<thead>
+<tr>
+<th>Variant</th>
+<th>Hot key shape</th>
+<th>Consistency budget</th>
+<th>Primary technique</th>
+<th>Secondary</th>
+<th>Anti-pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot read, eventually consistent</td>
+<td>Product page, profile, viral video metadata</td>
+<td>Seconds</td>
+<td>CDN/edge + L1 cache + jittered TTL</td>
+<td>Coalescing on miss</td>
+<td>Hitting origin for every read</td>
+</tr>
+<tr>
+<td>Hot read, strongly consistent</td>
+<td>Live inventory display</td>
+<td>Sub-second</td>
+<td>Hot-key replication (M=N) + write fan-out</td>
+<td>Detection-driven promotion</td>
+<td>Naive single-shard ownership</td>
+</tr>
+<tr>
+<td>Hot write, no aggregation</td>
+<td>Per-key audit log append</td>
+<td>Eventual</td>
+<td>Sub-keying / counter sharding</td>
+<td>Async batching</td>
+<td>One row, one writer</td>
+</tr>
+<tr>
+<td>Hot write, with read aggregation</td>
+<td>Likes / views / clicks counter</td>
+<td>1-5 sec</td>
+<td>Sub-keying + periodic roll-up</td>
+<td>L1 on roll-up read</td>
+<td>Distributed lock on single counter</td>
+</tr>
+<tr>
+<td>Hot read-modify-write, strict</td>
+<td>Ticket seat reservation, stock decrement</td>
+<td>Strong + ordered</td>
+<td>Single-writer queue per key + coordinated state machine</td>
+<td>Optimistic Concurrency Control (OCC)</td>
+<td>Spreading the write — breaks the invariant</td>
+</tr>
+</tbody>
+</table>
+<p>The fifth row is the trap. Sub-keying a counter that has the invariant "must not go negative" silently breaks correctness, because no single sub-key knows the total. For that variant, see <a href="../strong-consistency-under-contention/">strong-consistency-under-contention</a> and <a href="../coordination-exactly-one-execution/">coordination-exactly-one-execution</a>.</p>
+<hr />
+<h2 id="7-failure-modes-and-operations">7. Failure modes and operations</h2>
+<h3 id="production-failure-metric-mitigation">Production failure → metric → mitigation</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Signal / metric</th>
+<th>Immediate mitigation</th>
+<th>Permanent fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One shard CPU at 100% during traffic spike</td>
+<td>Per-shard CPU; per-key QPS top-K</td>
+<td>Promote the hot key to the dedicated hot tier; engage circuit breaker on cold path</td>
+<td>Add the key to the static hot-list config; tune detector threshold</td>
+</tr>
+<tr>
+<td>L1 cache miss storm after key expiry</td>
+<td>Origin QPS spike correlated with cache miss rate</td>
+<td>Increase TTL jitter; verify singleflight coalescing engaged</td>
+<td>Add stale-while-revalidate; make refresh asynchronous</td>
+</tr>
+<tr>
+<td>Replica hot tier divergence</td>
+<td>Per-replica value diff; staleness metric</td>
+<td>Force-rebuild the slow replica from main store</td>
+<td>Verify write fan-out is fire-and-forget or quorum; check replication lag SLI</td>
+</tr>
+<tr>
+<td>Counter sub-key fan-in slow</td>
+<td>Read latency on aggregated counter; per-shard p99</td>
+<td>Increase roll-up frequency; cache the total</td>
+<td>Pre-aggregate to a materialized total</td>
+</tr>
+<tr>
+<td>Detector false negative: hot key slips through</td>
+<td>Tail of per-shard latency; hot-shard saturation</td>
+<td>Manually promote the key via operator runbook</td>
+<td>Lower threshold; widen sketch window; add server-side detection as backstop</td>
+</tr>
+<tr>
+<td>Detector false positive: cold key promoted</td>
+<td>Hot-tier hit rate &lt; 50% for promoted key</td>
+<td>Demote the key</td>
+<td>Add hysteresis (require sustained hot rate)</td>
+</tr>
+<tr>
+<td>Demotion asymmetry: key drops below threshold but stale replicas/hot-tier copies still serve reads</td>
+<td>Read-after-write staleness on demoted key; divergent values across replica set</td>
+<td>Invalidate hot-tier entry and stop writes to extra replicas atomically via a config bump</td>
+<td>Demotion requires an explicit drain: stop writes to replicas, then stop reads after one TTL or replication-lag window has passed; hysteresis prevents flapping but does not solve the drain race</td>
+</tr>
+<tr>
+<td>CDN edge serves stale data past TTL</td>
+<td>CDN hit ratio; freshness lag</td>
+<td>Issue targeted purge; reduce TTL</td>
+<td>Build a fast-invalidation path (purge API + soft TTL)</td>
+</tr>
+<tr>
+<td>Cascade: hot key takes shard down, then replica down, then...</td>
+<td>Cluster-wide error rate</td>
+<td>Page on-call; engage load-shedding on the hot key only; rate-limit at edge</td>
+<td>Per-key rate limit; hot-key isolation; auto-promotion</td>
+</tr>
+</tbody>
+</table>
+<h3 id="on-call-incident-playbook-hot-key-cascade">On-call incident playbook (hot-key cascade)</h3>
+<ol>
+<li><strong>Identify.</strong> <code>topk_by_qps</code> on the hot shard's metrics. Confirm one key dominates.</li>
+<li><strong>Isolate.</strong> Apply per-key rate limit at the edge (drop or shed beyond <code>2× capacity / num_replicas</code>). Other traffic continues.</li>
+<li><strong>Promote.</strong> Move the hot key to the hot tier. If write-heavy, enable sub-keying for that key.</li>
+<li><strong>Verify.</strong> Per-shard CPU drops; aggregate error rate falls.</li>
+<li><strong>Postmortem inputs.</strong> Was the key in the detector's top-K but not promoted? Why? Detection lag? Threshold? Was the hot tier overprovisioned for the spike?</li>
+</ol>
+<hr />
+<h2 id="8-combinations-with-other-patterns">8. Combinations with other patterns</h2>
+<p>Hot key / skew rarely appears alone. The most common stacks:</p>
+<ul>
+<li><strong><a href="../cache-stampede-read-amplification/">cache-stampede-read-amplification</a></strong> — A hot key whose Time-To-Live (TTL) expires causes simultaneous origin fetches from every cache node. Singleflight at every layer + jittered TTL + stale-while-revalidate is the combined defense.</li>
+<li><strong><a href="../fan-out-write-amplification/">fan-out-write-amplification</a></strong> — A celebrity's tweet has 100M followers; the fan-out itself is the hot-key problem on the writer side. The mitigation is the dual of write fan-out: pull-on-read for celebrity tweets, plus the toolkit here for the read side.</li>
+<li><strong><a href="../strong-consistency-under-contention/">strong-consistency-under-contention</a></strong> — Ticketmaster seat row: hot key + the invariant "one seat sells once." Sub-keying breaks the invariant; the right tool is single-writer queue or optimistic locking, plus rate-limiting upstream.</li>
+<li><strong><a href="../real-time-aggregation/">real-time-aggregation</a></strong> — Counter sub-keying produces N sub-counters that must be aggregated; the aggregation tier itself becomes a hot path during spikes.</li>
+<li><strong><a href="../backpressure-flow-control/">backpressure-flow-control</a></strong> — When mitigation can't be deployed fast enough, the only way to keep the cluster up is to shed load on the hot key specifically rather than the whole cluster.</li>
+<li><strong><a href="../coordination-exactly-one-execution/">coordination-exactly-one-execution</a></strong> — Hot key + "must execute exactly once" (flash-sale checkout) needs the coordination pattern plus per-key admission control.</li>
+<li><strong><a href="../idempotency-exactly-once/">idempotency-exactly-once</a></strong> — Hot writes amplify retries; idempotency keys must be enforced cheaply (Bloom filter at the front, deduplication DB behind).</li>
+</ul>
+<hr />
+<h2 id="9-likely-interviewer-probes">9. Likely interviewer probes</h2>
+<ol>
+<li>
+<p><strong>"Show me the math: how skewed is your workload?"</strong>
+   Strong answer: name the distribution (Zipf with parameter ~1.0), give the rule of thumb (top 0.01% takes ~50%), pick a concrete hot key (one video, one product, one seat row), compute the shard load assuming uniform partitioning. If the hottest single key takes fraction <code>f</code> of total QPS and per-shard capacity is provisioned at <code>total_QPS / N</code>, the hot shard runs at <code>f × N</code> times its provisioned capacity. For <code>f = 0.5</code> and <code>N = 32</code>, that's 16× over capacity — explaining concretely why "add more shards" doesn't help.</p>
+</li>
+<li>
+<p><strong>"How do you detect hot keys at runtime?"</strong>
+   Strong answer: sliding-window Count-Min Sketch (CMS) at every app server. Sketch dimensions sized for false positive rate &lt; 1%, window 10 seconds, top-K extracted every second. Server-side detector on the shard itself as backstop. Detector emits to a control plane that decides promotion. Threshold has hysteresis: hot when sustained &gt; 1k QPS for 5 seconds, demote when below 100 QPS for 60 seconds.</p>
+</li>
+<li>
+<p><strong>"What if the hot key is write-heavy and requires strong consistency, like a flash sale inventory row?"</strong>
+   Strong answer: you cannot sub-key — breaks the invariant. Two patterns work. (a) Single-writer queue: route all writes for that key to one writer process which holds a lease; writer processes a batch with one transactional commit per batch. (b) Optimistic concurrency: each writer reads version, attempts conditional write; retry on conflict. Both shape: write rate becomes serialized, so capacity is <code>1 / commit_latency</code>. Realistically that's ~10K-30K tx/sec per partition on a good transactional store; batching commits (commit N decrements as one transaction) pushes throughput up by the batch size, at the cost of per-request latency. To go higher than batched single-writer can sustain, the inventory itself must be partitioned (e.g., reserve 100 seats per partition, then a partition becomes the hot row at smaller scale).</p>
+</li>
+<li>
+<p><strong>"How does this interact with consistent hashing and virtual nodes?"</strong>
+   Strong answer: vnodes spread <em>medium-frequency</em> keys evenly. They do not help a single ultra-hot key — the key still hashes to exactly one (vnode, shard) pair. Hot-key replication breaks the vnode invariant by writing to multiple positions on the ring, requiring the router to know which keys are special.</p>
+</li>
+<li>
+<p><strong>"What's the cost of hot-key replication at M=N?"</strong>
+   Strong answer: write amplification N× in <em>QPS</em>, not just storage — a 10K writes/sec hot key on a 64-shard cluster becomes 640K cluster-wide writes for that one key, so this technique only pays off when the key is read-heavy (read:write ratio ≫ N). Storage N× per hot key is negligible if hot keys are few (100 keys × 64 shards = 6,400 extra rows). Fan-out latency for writes equals the slowest replica. Operational cost on top: dual code paths in the router, replication lag monitoring, divergence detection. The technique is the wrong choice for a write-heavy hot counter; reach for sub-keying instead.</p>
+</li>
+<li>
+<p><strong>"How do you handle a hot key that is <em>also</em> large (multi-MB value)?"</strong>
+   Strong answer: don't replicate the full value to every shard. Chunk the value, hot-key the index, distribute the chunks. Or store the value once in object storage with a CDN in front, and hot-key only the metadata pointer. Or shape the API so the value is materialized client-side from cacheable pieces.</p>
+</li>
+<li>
+<p><strong>"Walk me through how Beyoncé announces a tour at 10:00:00 and the system stays up."</strong>
+   Strong answer: at 09:58 detection sketch is cold for the new event. At 10:00:00 announce drops; QPS on the event row goes from 0 to 500k/sec in 5 seconds. CMS detects it at 10:00:02, control plane promotes by 10:00:03, hot tier serves from 10:00:04. The 4-second gap is the design's actual exposure — during that window the origin shard is over capacity, so survival depends on three things, not the promotion itself: (a) per-key admission control at the edge capping origin load at, say, 5-10× normal — <em>most</em> requests get a 429 or a queue page; (b) singleflight at every cache layer to collapse concurrent misses on the same key; (c) graceful degradation — return a queue page or stale snapshot rather than a hard error. Honest framing: with these in place, the cluster stays up and <em>most users</em> see a holding page for 4 seconds, not a successful low-latency read. If the event is known in advance, pre-announcement static promotion eliminates the gap entirely; that's the right design when you can, and admission control is the fallback when you can't.</p>
+</li>
+</ol>
+<hr />
+<h2 id="10-common-traps-stronger-moves">10. Common traps → stronger moves</h2>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"Consistent hashing solves all sharding."</td>
+<td>Consistent hashing balances <em>keys</em> assuming uniform key access. Under Zipf, one key is the load. Vnodes help medium-frequency, not the head.</td>
+</tr>
+<tr>
+<td>Sub-keying a counter that has a hard upper bound (inventory).</td>
+<td>Single-writer queue or optimistic-concurrency control; sub-keying violates the invariant.</td>
+</tr>
+<tr>
+<td>Static hot-key list configured once.</td>
+<td>Runtime detection (CMS or top-K sketch) + control plane that promotes/demotes dynamically.</td>
+</tr>
+<tr>
+<td>Global Time-To-Live (TTL) on cache, no jitter.</td>
+<td>TTL with uniform jitter; stale-while-revalidate; singleflight on miss.</td>
+</tr>
+<tr>
+<td>Replicate all keys to all shards "just in case."</td>
+<td>Only replicate the detected hot set; ratio is asymmetric (head of distribution is tiny).</td>
+</tr>
+<tr>
+<td>Rely on the main store's cache to absorb the hot key.</td>
+<td>Dedicated hot tier — main store cache is a shared resource and gets evicted by other traffic.</td>
+</tr>
+<tr>
+<td>Edge cache without invalidation strategy.</td>
+<td>Soft TTL + purge API; design the cache key so partial invalidation is possible.</td>
+</tr>
+<tr>
+<td>Per-cluster rate limit when one key is hot.</td>
+<td>Per-key rate limit; preserve cold-path traffic.</td>
+</tr>
+<tr>
+<td>"Just add more shards."</td>
+<td>More shards do not help — the hot key still lives on one. Scale the hot-key tier independently.</td>
+</tr>
+<tr>
+<td>Treat hot-key handling as a steady-state config.</td>
+<td>Treat it as a control loop with detection, decision, action, and rollback.</td>
+</tr>
+<tr>
+<td>Singleflight only at the application layer.</td>
+<td>Singleflight at every cache layer (L1, L2, edge); cache stampedes appear at the layer below the one with deduplication.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11-staff-level-answer-checklist">11. Staff-level answer checklist</h2>
+<ul>
+<li>Acknowledged Zipfian skew in the first 60 seconds; named a concrete hot key with a back-of-envelope load estimate.</li>
+<li>Distinguished read-hot from write-hot — picked different toolkits, did not conflate.</li>
+<li>Named consistent hashing + vnodes as <em>necessary but insufficient</em> — and explained why.</li>
+<li>Picked at least two complementary techniques from the toolkit, justified by workload shape.</li>
+<li>Designed a detection mechanism (sketch, top-K, control plane) and reasoned about its lag.</li>
+<li>Showed how the single ultra-hot key (Beyoncé) survives a 0-to-spike transition in seconds.</li>
+<li>Discussed write amplification cost of replication; storage cost of sub-keying; staleness cost of caching.</li>
+<li>Treated the dedicated hot tier as an operational escape hatch, not the primary design.</li>
+<li>Named the failure modes: cascade to replica, false promotion, divergence, stampede on TTL boundary.</li>
+<li>Connected to sibling patterns: stampede, fan-out, contention, exactly-once.</li>
+<li>Discussed strong-consistency case separately and named single-writer queue / optimistic concurrency.</li>
+<li>Mentioned at least one operational metric (per-key QPS, per-shard CPU, hot-tier hit rate, detector promotion lag).</li>
+<li>Closed with the change trigger: what would push the design to a different point on the cost/staleness/consistency curve.</li>
+</ul>
+<hr />
+<h2 id="12-cross-references">12. Cross-references</h2>
+<h3 id="question-docs-where-this-pattern-is-central">Question docs where this pattern is central</h3>
+<ul>
+<li><a href="../questions/design-ticketmaster.md">Design Ticketmaster</a> — write-hot, strong consistency: the canonical hot-key plus contention stack.</li>
+<li><a href="../questions/design-a-flash-sale-for-an-e-commerce-site.md">Design a flash sale</a> — hot SKU, oversell forbidden, second-scale spike.</li>
+<li><a href="../questions/design-twitter.md">Design Twitter</a> and <a href="../questions/design-twitter-timeline.md">Twitter Timeline</a> — celebrity fan-out, hybrid push/pull.</li>
+<li><a href="../questions/design-a-youtube-likes-counter.md">Design YouTube likes counter</a> — write-hot counter, sub-keying canonical.</li>
+<li><a href="../questions/design-an-ad-click-aggregator.md">Design ad click aggregator</a> — hot campaign, real-time aggregation.</li>
+<li><a href="../questions/design-typeahead-autocomplete.md">Design typeahead autocomplete</a> — short-prefix read hotness, edge cacheable.</li>
+<li><a href="../questions/design-a-live-comment-streaming-service-like-twitch-chat.md">Design a live comment streaming service like Twitch chat</a> — one stream is the load.</li>
+<li><a href="../questions/design-a-distributed-cache-like-redis.md">Design a distributed cache like Redis</a> — hot keys in the cache layer itself.</li>
+<li><a href="../questions/design-instagram.md">Design Instagram</a> and <a href="../questions/design-facebooks-newsfeed.md">Design Facebook Newsfeed</a> — celebrity user fan-out.</li>
+<li><a href="../questions/design-reddit.md">Design Reddit</a> — hot post / hot subreddit.</li>
+<li><a href="../questions/amazon-dynamo.md">Amazon Dynamo</a> and <a href="../questions/apache-cassandra.md">Apache Cassandra</a> — vnode-based consistent hashing baselines.</li>
+</ul>
+<h3 id="sibling-pattern-docs">Sibling pattern docs</h3>
+<ul>
+<li><a href="../cache-stampede-read-amplification/">cache-stampede-read-amplification.md</a> — closest sibling; many techniques here are mirror images.</li>
+<li><a href="../fan-out-write-amplification/">fan-out-write-amplification.md</a> — write-side analogue for celebrity producers.</li>
+<li><a href="../strong-consistency-under-contention/">strong-consistency-under-contention.md</a> — for the variant where sub-keying breaks the invariant.</li>
+<li><a href="../real-time-aggregation/">real-time-aggregation.md</a> — for the read-side fan-in after sub-keying.</li>
+<li><a href="../backpressure-flow-control/">backpressure-flow-control.md</a> — load-shedding when mitigation lags.</li>
+<li><a href="../coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a> — single-writer queue for hot strong-consistency keys.</li>
+<li><a href="../idempotency-exactly-once/">idempotency-exactly-once.md</a> — defending hot write paths against retry amplification.</li>
+<li><a href="../ordering-causal-consistency/">ordering-causal-consistency.md</a> — when the hot key has per-key ordering constraints.</li>
+</ul>
+<h3 id="glossary-terms">Glossary terms</h3>
+<ul>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Consistent Hashing</a> — baseline that breaks under skew.</li>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Virtual Node (vnode)</a> — smooths medium-frequency, not the head.</li>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Preference List</a> — what hot-key replication overrides.</li>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Quorum</a> — <code>R + W &gt; N</code> interacts with replicated hot key.</li>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Vector Clock</a> — used when the replicated hot key takes concurrent writes.</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Search and Ranking — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design-patterns/">← Back to System Design Patterns</a>
+        <h1 class="article-title">Search and Ranking</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/31 &nbsp;·&nbsp; System Design Patterns
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>Return the K most relevant documents out of billions in under 100 milliseconds by splitting the work into a cheap, high-recall candidate generation stage and an expensive, high-precision ranking stage, executed across a sharded inverted index plus an Approximate Nearest Neighbor (ANN) vector index, fronted by a query planner that scatters, gathers, ranks, and hydrates. See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for shared vocabulary. Closely related question docs: <a href="../questions/design-google-search.md">Design Google Search</a>, <a href="../questions/design-twitter-search.md">Design Twitter Search</a>, <a href="../questions/design-typeahead-autocomplete.md">Design Typeahead / Autocomplete</a>, <a href="../questions/design-typeahead-suggestion.md">Design Typeahead Suggestion</a>, <a href="../questions/design-a-netflix-style-recommendation-system.md">Design a Netflix-Style Recommendation System</a>, <a href="../questions/design-facebooks-newsfeed.md">Design Facebook's Newsfeed</a>, <a href="../questions/design-google-ads.md">Design Google Ads</a>.</p>
+</blockquote>
+<hr />
+<h2 id="1-the-fundamental-hardness">1. The fundamental hardness</h2>
+<p>Search and ranking is not one problem; it is two problems wearing the same UI. The first problem is <strong>recall</strong>: out of a corpus of <code>N</code> documents (where <code>N</code> is often <code>10^9</code> to <code>10^12</code>), find the candidate set <code>C</code> that <em>could plausibly answer</em> the query. The second problem is <strong>ranking</strong>: out of <code>C</code> (typically <code>10^3</code> to <code>10^5</code> items), order them so the top <code>K</code> (often <code>10</code>) match what the user actually wants. Recall is judged by "did we miss anything we should have shown?". Ranking is judged by "is the best result first?". These two metrics pull on different parts of the system, and conflating them is the most common failure mode at the whiteboard.</p>
+<p>The naive design — store all documents in a database, run a <code>LIKE '%query%'</code> scan on each request — fails at three independent walls. Wall one: linear scan. Even at an aggressive <code>~10 µs</code> per document for a substring match, <code>10^9</code> documents is <code>~10^4</code> seconds (hours) per query, and you cannot parallelize without already having sharded the data. Wall two: relevance. Substring match has no notion of which document is <em>better</em>; you would return the first match, not the best match. Wall three: semantics. The query "best laptop for coding" should match a result titled "developer notebook recommendations" even though they share zero tokens. Keyword indexes alone miss the second; vector embeddings alone miss exact matches and structured filters ("price under $50"). Whether a system needs both is workload-dependent — exact-match-dominated domains (e-commerce stock-keeping unit (SKU) search, log search, code search) can ship keyword-only and be fine. Semantic-intent domains (web search, recommendation, "find similar") need vectors. The honest answer in interview is to identify which side of that line your product is on.</p>
+<p>Latency makes the hardness concrete. A typical budget for a consumer search is <strong>200 ms end-to-end at p99</strong>, of which roughly 100 ms is the search backend and the rest is network + frontend rendering. Inside 100 ms you must: tokenize the query, look up postings lists across many shards, intersect / union them, score with Best Matching 25 (BM25), retrieve top-<code>N</code> candidates, optionally run a second-stage machine-learning (ML) ranker over <code>N=1000</code> features per candidate, hydrate the document bodies, and merge. At <code>10^12</code> documents you cannot do this on one machine; you cannot do it serially across shards either. You must shard, scatter-gather in parallel, prune aggressively, and accept that <strong>the tail latency of the slowest shard becomes the latency of the query — and the p99 of <code>S</code> independent shards is roughly the per-shard p(1 - 0.01/S), i.e. p99.9 of a single shard at <code>S=100</code>, p99.99 at <code>S=1000</code></strong>. That number is what justifies hedged requests, replica selection by latency, and per-shard timeouts; not a vague "tail latency is bad" hand-wave. The whole architecture is a study in <em>latency budget allocation across a parallel fan-out</em>, very similar in shape to <a href="../fan-out-write-amplification/">fan-out write amplification</a> but read-side.</p>
+<p>The final twist: the system has to stay fresh. A tweet posted thirty seconds ago should be searchable; a product whose price just dropped should re-rank. But rebuilding a <code>10^12</code>-document index takes hours. Real systems tier the index — a small, hot "live" tier indexed in near-real-time, plus a large, cheap "main" tier built in batch — and the query merges across tiers. Freshness vs. cost vs. index-build complexity is a permanent tradeoff that the interviewer will probe.</p>
+<hr />
+<h2 id="2-how-to-recognize-it-in-the-interview">2. How to recognize it in the interview</h2>
+<h3 id="prompt-phrases-that-signal-this-pattern">Prompt phrases that signal this pattern</h3>
+<ul>
+<li>"Find documents / tweets / products / videos matching a query."</li>
+<li>"Return top <code>K</code> most relevant ..."</li>
+<li>"Rank by relevance, popularity, freshness, ..."</li>
+<li>"Personalize the feed / results / recommendations."</li>
+<li>"Auto-complete as the user types" (specialized prefix variant).</li>
+<li>"Semantic search" / "find similar items" (vector-heavy variant).</li>
+<li>"Show ads relevant to this query / this user." (ranking-heavy variant).</li>
+<li>"We have billions of items and queries need to come back fast."</li>
+</ul>
+<h3 id="architectural-smells">Architectural smells</h3>
+<ul>
+<li>Read-heavy workload with arbitrary predicates (full-text, filters, geo, time).</li>
+<li>The corpus is too large to fit on one machine; queries must touch many shards.</li>
+<li>"Most relevant" is application-defined and learned from feedback (clicks, dwell time).</li>
+<li>Freshness matters and is not the same as the bulk index build cadence.</li>
+<li>The product has both a head (popular queries, hot items) and a heavy long tail.</li>
+<li>Read quality is judged by an offline metric (recall@K, normalized Discounted Cumulative Gain (nDCG), Mean Reciprocal Rank (MRR)) not just latency.</li>
+</ul>
+<h3 id="example-interview-prompts-where-this-is-core">Example interview prompts where this is core</h3>
+<ol>
+<li>Design Twitter search over the last decade of tweets at 100k Queries Per Second (QPS).</li>
+<li>Design YouTube / Netflix homepage recommendations for 1B users.</li>
+<li>Design Google Search at web scale.</li>
+<li>Design Yelp restaurant search with text, location, and ratings.</li>
+<li>Design e-commerce product search at Amazon scale.</li>
+<li>Design Google Ads ranking for a query auction at 100k QPS with sub-100 ms p99.</li>
+<li>Design LinkedIn People-You-May-Know (recommendation, not text search, but the same two-stage pattern).</li>
+</ol>
+<hr />
+<h2 id="3-60-second-spoken-framing">3. 60-second spoken framing</h2>
+<blockquote>
+<p>Before I jump to architecture I'd size the problem. For a corpus under ~10M documents with low Queries Per Second (QPS), a single-node Elasticsearch with Best Matching 25 (BM25) and no learned ranker is genuinely fine — the staff-level move there is to <em>not</em> over-engineer. The interesting case is when the corpus exceeds one machine's memory, the latency budget can't accommodate a re-rank of the full corpus, or relevance quality is a product differentiator. In that regime I frame it as a two-stage retrieval problem. Stage one is candidate generation: I want high recall, low latency, and I'm willing to be sloppy on order. A sharded inverted index for keyword lookup, plus — if the queries are intent-heavy or semantic — an Approximate Nearest Neighbor index over learned embeddings, scatter-gather across shards, pull back a few hundred to a thousand candidates per query. Stage two is ranking: take those candidates and run a learned ranker — Gradient-Boosted Decision Tree (GBDT) like LambdaMART or a neural ranker — over features pulled from an online feature store, return the top ten. Around that I'd build a tiered index for freshness (live tier seconds-fresh, main tier rebuilt batch), caching of head queries, and an offline pipeline that retrains the ranker on click logs. The hard problems will be scatter-gather tail latency, freshness lag, and training/serving skew in the ranker, which I am happy to go deep on.</p>
+</blockquote>
+<hr />
+<h2 id="4-canonical-toolkit">4. Canonical toolkit</h2>
+<table>
+<thead>
+<tr>
+<th>Technique</th>
+<th>When to reach for it</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inverted index (Lucene-style)</td>
+<td>Keyword retrieval, structured filters, the spine of every text-search system.</td>
+<td>Index build is expensive; query is logarithmic in postings list length.</td>
+</tr>
+<tr>
+<td>Document-sharded scatter-gather</td>
+<td>Corpus too big for one machine; queries fanned out to every shard.</td>
+<td>Tail latency dominated by slowest shard.</td>
+</tr>
+<tr>
+<td>Term-sharded indexing</td>
+<td>Massive corpus, very long postings lists for popular terms.</td>
+<td>Hot-shard risk on common terms; less common.</td>
+</tr>
+<tr>
+<td>Vector embeddings + ANN (Hierarchical Navigable Small World (HNSW), Inverted File (IVF), ScaNN)</td>
+<td>Semantic search, recommendation, "find similar".</td>
+<td>Recall &lt; 100%; embedding refresh cost; memory-heavy.</td>
+</tr>
+<tr>
+<td>Two-stage retrieval (cheap recall + expensive rank)</td>
+<td>Anytime ranking signals are too expensive to compute over the whole corpus.</td>
+<td>Bug surface in the seam between stages.</td>
+</tr>
+<tr>
+<td>Learn-to-rank (LambdaMART, neural rankers)</td>
+<td>Optimizing nDCG / Click-Through Rate (CTR) from labeled data and click logs.</td>
+<td>Training pipeline, feature drift, online/offline parity.</td>
+</tr>
+<tr>
+<td>BM25 (Best Matching 25) baseline</td>
+<td>First-pass scoring inside the inverted index — the floor everyone competes against.</td>
+<td>Sensitive to tokenization, stemming, language analyzer choice; <code>k1</code> / <code>b</code> hyperparameters need per-corpus tuning. Cheap to serve (microseconds per document).</td>
+</tr>
+<tr>
+<td>Online feature store + offline feature pipeline</td>
+<td>Per-query / per-document / per-user features available in microseconds at rank time.</td>
+<td>Online/offline skew is a permanent source of bugs.</td>
+</tr>
+<tr>
+<td>Query rewriting + expansion</td>
+<td>Bridge surface form to intent (synonyms, stemming, spell correction).</td>
+<td>Over-expansion blows up recall but adds latency.</td>
+</tr>
+<tr>
+<td>Tiered index (live + main)</td>
+<td>Need second-level freshness over a corpus too big to rebuild often.</td>
+<td>Two indexing pipelines to operate; merge logic at query time.</td>
+</tr>
+<tr>
+<td>Top-results cache</td>
+<td>Head queries hit hard; cache cuts most load.</td>
+<td>Cache invalidation on index updates, hot-key risk (see <a href="../cache-stampede-read-amplification/">cache-stampede-read-amplification</a>).</td>
+</tr>
+</tbody>
+</table>
+<h3 id="41-inverted-index-build-sketch">4.1 Inverted index build (sketch)</h3>
+<pre><code class="language-python"># Build a simple in-memory inverted index over a document corpus.
+# In production, this is what Lucene / Tantivy does on disk with skip lists,
+# block-compressed postings, term dictionaries, and positional info.
+
+from collections import defaultdict
+from dataclasses import dataclass, field
+import math
+import re
+
+TOKEN_RE = re.compile(r&quot;[A-Za-z0-9]+&quot;)
+
+def tokenize(text: str) -&gt; list[str]:
+    # Real systems: language detect -&gt; tokenizer -&gt; lowercaser -&gt; stemmer -&gt; stopwords.
+    return [t.lower() for t in TOKEN_RE.findall(text)]
+
+@dataclass
+class Posting:
+    doc_id: int
+    term_freq: int  # how many times the term appears in this doc
+
+@dataclass
+class InvertedIndex:
+    # term -&gt; list of postings (sorted by doc_id for fast intersection)
+    postings: dict[str, list[Posting]] = field(default_factory=lambda: defaultdict(list))
+    # doc_id -&gt; document length in tokens (used by BM25)
+    doc_len: dict[int, int] = field(default_factory=dict)
+    avg_doc_len: float = 0.0
+    n_docs: int = 0
+
+    def add(self, doc_id: int, text: str) -&gt; None:
+        tokens = tokenize(text)
+        self.doc_len[doc_id] = len(tokens)
+        counts: dict[str, int] = defaultdict(int)
+        for tok in tokens:
+            counts[tok] += 1
+        for term, tf in counts.items():
+            self.postings[term].append(Posting(doc_id, tf))
+        self.n_docs += 1
+
+    def finalize(self) -&gt; None:
+        for term in self.postings:
+            self.postings[term].sort(key=lambda p: p.doc_id)
+        self.avg_doc_len = sum(self.doc_len.values()) / max(1, self.n_docs)
+</code></pre>
+<p>Two things to note in interview: postings are kept <em>sorted by doc_id</em> so multi-term queries can be answered by a linear merge (intersection / union in <code>O(sum of postings list lengths)</code>), and the index stores enough statistics (term frequency, document length, document count) to score BM25 without re-reading documents.</p>
+<h3 id="42-bm25-scoring-sketch">4.2 BM25 scoring (sketch)</h3>
+<pre><code class="language-python">def bm25_score(idx: InvertedIndex, query_terms: list[str], doc_id: int,
+               k1: float = 1.2, b: float = 0.75) -&gt; float:
+    # BM25 = sum over query terms of: IDF(t) * (tf * (k1+1)) / (tf + k1 * (1 - b + b * dl/avg_dl))
+    score = 0.0
+    dl = idx.doc_len.get(doc_id, 0)
+    if dl == 0:
+        return 0.0
+    for t in query_terms:
+        postings = idx.postings.get(t, [])
+        df = len(postings)
+        if df == 0:
+            continue
+        # Lucene-style IDF; smoothed to stay non-negative.
+        idf = math.log(1 + (idx.n_docs - df + 0.5) / (df + 0.5))
+        # Find this doc's term frequency. In production, postings are skip-listed
+        # for sublinear lookup; here we do a binary search.
+        lo, hi = 0, len(postings) - 1
+        tf = 0
+        while lo &lt;= hi:
+            mid = (lo + hi) // 2
+            if postings[mid].doc_id == doc_id:
+                tf = postings[mid].term_freq
+                break
+            if postings[mid].doc_id &lt; doc_id:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if tf == 0:
+            continue
+        denom = tf + k1 * (1 - b + b * dl / max(1.0, idx.avg_doc_len))
+        score += idf * (tf * (k1 + 1)) / denom
+    return score
+</code></pre>
+<p>BM25 is a probabilistic refinement of Term Frequency / Inverse Document Frequency (TF-IDF). The interesting parameters: <code>k1</code> controls term-frequency saturation (so the 100th occurrence of "the" does not score 100x the first), <code>b</code> controls length normalization (so a 10-word tweet does not lose to a 10,000-word page just on raw frequency). It is the floor that every learned ranker must beat.</p>
+<h3 id="43-scatter-gather-across-document-shards-sketch">4.3 Scatter-gather across document shards (sketch)</h3>
+<pre><code class="language-python">import asyncio
+from dataclasses import dataclass
+
+@dataclass(order=True)
+class ScoredDoc:
+    score: float
+    doc_id: int
+    shard_id: int
+
+async def shard_search(shard_client, query: str, k: int) -&gt; list[ScoredDoc]:
+    # Each shard runs the inverted-index lookup + BM25 locally and returns its top-k.
+    # In Lucene-speak: a per-shard `IndexSearcher.search(query, k)`.
+    return await shard_client.search(query, k)
+
+async def scatter_gather(shards: list, query: str, k: int,
+                         per_shard_timeout_ms: int = 80) -&gt; list[ScoredDoc]:
+    # Fan out to all shards in parallel. Time-bound every shard call so one slow
+    # shard cannot blow the global p99. Late shards are simply dropped; the
+    # tradeoff is a small, bounded recall hit on the long tail.
+    tasks = [
+        asyncio.wait_for(shard_search(s, query, k), per_shard_timeout_ms / 1000.0)
+        for s in shards
+    ]
+    results: list[ScoredDoc] = []
+    for fut in asyncio.as_completed(tasks):
+        try:
+            results.extend(await fut)
+        except asyncio.TimeoutError:
+            # Record a shard-timeout metric; this is the most important search SLO signal.
+            continue
+    # Global merge: heap-merge top-k across all shards. We can use heapq.nlargest
+    # because each shard already returned its sorted top-k.
+    results.sort(reverse=True)
+    return results[:k]
+</code></pre>
+<p>Three knobs for the interviewer: <strong>per-shard timeout</strong> (lower = tighter tail, higher = better recall), <strong>per-shard <code>k</code></strong> (you typically ask each shard for <code>k * over_fetch_factor</code> because the global top-<code>k</code> is not evenly distributed across shards), and <strong>partial-result policy</strong> (return what you have, or fail closed). Partial results are usually the right choice for search; never for payments.</p>
+<h3 id="44-two-stage-ranking-pipeline-sketch">4.4 Two-stage ranking pipeline (sketch)</h3>
+<pre><code class="language-python">@dataclass
+class Candidate:
+    doc_id: int
+    first_stage_score: float
+
+def first_stage_retrieve(query: str, top_n: int = 1000) -&gt; list[Candidate]:
+    # Cheap: BM25 + ANN union, scatter-gather across shards, return ~1000 candidates.
+    bm25_cands = bm25_search(query, k=top_n)
+    ann_cands = ann_search(embed(query), k=top_n)
+    # De-duplicate; keep max first-stage score as a feature for stage two.
+    merged: dict[int, Candidate] = {}
+    for c in bm25_cands + ann_cands:
+        cur = merged.get(c.doc_id)
+        if cur is None or c.first_stage_score &gt; cur.first_stage_score:
+            merged[c.doc_id] = c
+    return list(merged.values())
+
+def hydrate_features(candidates: list[Candidate], query: str, user_id: int) -&gt; list[dict]:
+    # Pull from an online feature store. Per-doc features (CTR, recency, quality),
+    # per-(query, doc) features (BM25, semantic similarity), per-user features,
+    # cross features (user x doc affinity).
+    feature_store = OnlineFeatureStore()
+    return feature_store.multi_get(
+        doc_ids=[c.doc_id for c in candidates],
+        query=query,
+        user_id=user_id,
+    )
+
+def second_stage_rank(candidates: list[Candidate], features: list[dict],
+                      ranker, k: int) -&gt; list[Candidate]:
+    # Expensive: GBDT or neural ranker scores each (query, doc, user) tuple.
+    scores = ranker.predict(features)
+    ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+    return [c for c, _ in ranked[:k]]
+
+def serve_query(query: str, user_id: int, k: int = 10) -&gt; list[int]:
+    cands = first_stage_retrieve(query, top_n=1000)
+    feats = hydrate_features(cands, query, user_id)
+    top = second_stage_rank(cands, feats, RANKER, k=k)
+    return [c.doc_id for c in top]
+</code></pre>
+<p>The reason this two-stage pattern earns its complexity is concrete latency arithmetic, not a generic best-practice claim. Stage one (inverted-index lookup + BM25 across a sharded posting list) is on the order of 5-20 ms per query because BM25 scoring is microseconds per candidate document. A learned ranker with ~100 features per <code>(query, doc, user)</code> tuple typically costs 50-500 µs of inference per candidate (GBDT) or 1-10 ms (neural). If you tried to run the learned ranker over every matching document, a query that matches 10^6 documents would cost minutes; over a fixed 1000-candidate slate it costs 50 ms to a few hundred ms, fitting the budget. The break-even is: <strong>two-stage is worth the seam-bug surface when (candidates from stage one) × (per-candidate stage-two cost) would otherwise blow the latency budget.</strong> For small corpora (&lt; 10M docs) or cheap rankers (linear model on a handful of features), single-stage BM25 with an <code>ORDER BY</code> is genuinely sufficient and shipping two stages is gold-plating. Every web-scale system — Google, Amazon, YouTube, Netflix, Twitter, TikTok, Yelp, LinkedIn Feed — uses some shape of two-stage <em>because</em> their candidate counts and ranker costs put them on the wrong side of that arithmetic.</p>
+<hr />
+<h2 id="5-worked-example-naive-broken-fixed">5. Worked example: naive → broken → fixed</h2>
+<p><strong>Workload.</strong> Twitter-style search: <code>100k QPS</code> against <code>100 billion tweets</code> (10 years of history at ~30M/day). Latency Service-Level Objective (SLO): <code>p99 &lt; 300 ms</code> end-to-end, <code>p50 &lt; 80 ms</code>. Freshness target: a tweet posted now should be searchable within <code>5 seconds</code>. Each tweet has full text, author, timestamp, hashtags, language, engagement counts, and an embedding.</p>
+<h3 id="51-naive-design-interview-anti-pattern">5.1 Naive design (interview anti-pattern)</h3>
+<pre><code class="language-text">Client --&gt; Search Service --&gt; Postgres
+                                    SELECT id FROM tweets
+                                    WHERE text LIKE '%query%'
+                                    ORDER BY created_at DESC LIMIT 10;
+</code></pre>
+<p>Why every part breaks:</p>
+<table>
+<thead>
+<tr>
+<th>Problem</th>
+<th>Consequence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>LIKE '%...%'</code> cannot use a B-tree index.</td>
+<td>Full-table scan over <code>10^11</code> rows. Single query: hours.</td>
+</tr>
+<tr>
+<td>One Postgres host.</td>
+<td>At <code>100k QPS</code>, the host is overwhelmed at ~3 orders of magnitude under load.</td>
+</tr>
+<tr>
+<td><code>ORDER BY created_at</code> is recency-only ranking.</td>
+<td>No relevance; spam wins; user trust collapses.</td>
+</tr>
+<tr>
+<td>No freshness pipeline.</td>
+<td>If we replicated to a read replica, the lag would be unbounded under write spikes.</td>
+</tr>
+<tr>
+<td>No filters: language, blocked authors, deleted tweets.</td>
+<td>Visibility leaks.</td>
+</tr>
+</tbody>
+</table>
+<p>This design fails on all of recall, ranking, latency, and correctness.</p>
+<h3 id="52-first-fix-attempt-still-broken">5.2 First-fix attempt (still broken)</h3>
+<p>A bright candidate jumps to: "OK, use Elasticsearch."</p>
+<pre><code class="language-text">Client --&gt; Search Service --&gt; Elasticsearch (one cluster)
+                                    GET /tweets/_search { query: ... }
+</code></pre>
+<p>This is better but still wrong at this scale, for reasons the interviewer will probe:</p>
+<ul>
+<li><strong>One cluster cannot hold <code>10^11</code> documents</strong> at reasonable cost. Elastic's practical per-shard sweet spot is <code>20-50 GB</code>, so you need thousands of shards.</li>
+<li><strong>Scatter-gather across thousands of shards</strong> turns tail latency into a disaster: the slowest of 1000 shards at p99 is much worse than the cluster p99.</li>
+<li><strong>Ranking is still just BM25.</strong> You will lose to any competitor with a learned ranker.</li>
+<li><strong>No freshness tier.</strong> Indexing 30M tweets/day inline with the main index slows indexing and contends with query load.</li>
+<li><strong>No caching.</strong> Repeated head queries ("World Cup", "election") hit the cluster <code>100k * head_share</code> times per second.</li>
+<li><strong>No degraded mode.</strong> When one shard dies, the query fails instead of returning partial results.</li>
+</ul>
+<h3 id="53-fixed-design-staff-level">5.3 Fixed design (staff-level)</h3>
+<pre><code class="language-text">                    ┌────────────────────────────────────────────────┐
+                    │  Edge / API gateway                            │
+                    │  - request shaping, auth, query parsing        │
+                    │  - response cache for head queries (~30s TTL)  │
+                    └──────────────────────┬─────────────────────────┘
+                                           │
+                                           ▼
+                    ┌────────────────────────────────────────────────┐
+                    │  Search Frontend (query planner)               │
+                    │  - tokenize, language detect, query rewrite    │
+                    │  - rewrite -&gt; {keyword sub-query, vector q}    │
+                    │  - decide which tiers / shards to hit          │
+                    └─────────┬────────────────────────┬─────────────┘
+                              │                        │
+              scatter-gather  │                        │ scatter-gather
+                              ▼                        ▼
+              ┌───────────────────────┐   ┌────────────────────────┐
+              │  Live tier            │   │  Main tier             │
+              │  - last 7 days        │   │  - all history         │
+              │  - in-memory inverted │   │  - on-disk inverted    │
+              │  - sharded by doc_id  │   │  - sharded by doc_id   │
+              │  - 16-32 shards       │   │  - 1000+ shards        │
+              │  - 5 sec ingest lag   │   │  - rebuilt nightly     │
+              └───────────┬───────────┘   └────────────┬───────────┘
+                          │                            │
+                          └─────────┬──────────────────┘
+                                    │
+                                    ▼  union; dedupe; keep top ~1000
+                    ┌────────────────────────────────────────────────┐
+                    │  Stage-2 Ranker                                │
+                    │  - LambdaMART or DNN                           │
+                    │  - features from Online Feature Store          │
+                    │  - 1000 candidates -&gt; top 10                   │
+                    └──────────────────────┬─────────────────────────┘
+                                           │
+                                           ▼
+                    ┌────────────────────────────────────────────────┐
+                    │  Hydration / visibility filter                 │
+                    │  - look up tweet bodies from Tweet Store       │
+                    │  - apply blocks, deletes, privacy, geo block   │
+                    │  - return top-K + highlights                   │
+                    └────────────────────────────────────────────────┘
+
+Offline:
+   Tweet Stream (Kafka)
+      ├─&gt; Live Indexer (5s lag, writes to Live tier)
+      ├─&gt; Main Indexer (batch nightly, writes to Main tier)
+      ├─&gt; Embedding Service -&gt; ANN Index (HNSW)
+      └─&gt; Feature Pipeline -&gt; Offline Feature Store -&gt; bulk-load Online Feature Store
+
+Training:
+   Click logs + impression logs -&gt; labeled training set -&gt;
+       LambdaMART training nightly -&gt; shadow eval -&gt; ramp to 1% / 10% / 100%
+</code></pre>
+<p>Why this works:</p>
+<table>
+<thead>
+<tr>
+<th>Decision</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Document-sharded (not term-sharded)</td>
+<td>Even load across shards regardless of query; query fans out to all shards, but each shard's work is bounded. Term-sharded suffers hot-shard on "the".</td>
+</tr>
+<tr>
+<td>Two-tier live + main</td>
+<td>Decouples freshness from index build cost. Live tier is small (~1B docs) and can be in memory. Main tier holds the long tail cheaply on disk.</td>
+</tr>
+<tr>
+<td>Per-shard timeout = 80 ms</td>
+<td>Bounds tail. If a shard misses, we accept partial recall on the long tail rather than failing the query.</td>
+</tr>
+<tr>
+<td>BM25 + ANN union for stage 1</td>
+<td>Recall on both surface form and intent. BM25 alone misses paraphrases; ANN alone misses exact-string queries (handles, $cashtags, quoted phrases). Twitter search has both classes in the query mix, which is why the union is worth it here — for a domain that is exact-match-only (e.g., username lookup) ANN is overkill.</td>
+</tr>
+<tr>
+<td>LambdaMART for stage 2</td>
+<td>GBDT on ~100 features is a strong, cheap-to-serve baseline. Modern web-scale systems often migrate to a neural ranker (deep &amp; cross, two-tower with cross-attention, transformer rerankers) once feature-engineering ROI plateaus; the right choice depends on team capacity for training infra and serving latency budget, not a universal "GBDT wins".</td>
+</tr>
+<tr>
+<td>Online feature store</td>
+<td>Sub-millisecond feature reads at rank time; trained offline so online/offline parity is maintained.</td>
+</tr>
+<tr>
+<td>Query-result cache, ~30 s TTL on head</td>
+<td>A small fraction of queries are most of the traffic; this cuts backend load roughly an order of magnitude.</td>
+</tr>
+<tr>
+<td>Hydration after rank</td>
+<td>Don't pay full document I/O for 1000 candidates — only the top 10.</td>
+</tr>
+<tr>
+<td>Visibility filter at query time, not at index time</td>
+<td>Deletes / blocks change too often to bake into the index.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="54-capacity-math-interview-style-napkin">5.4 Capacity math (interview-style napkin)</h3>
+<ul>
+<li><code>10^11 tweets * 200 bytes posting overhead per term * 50 terms/tweet ~= 1 PB</code> for the main inverted index. That is the budget that justifies tiering.</li>
+<li><code>100k QPS * 1000 shards = 10^8 sub-queries/sec</code> of fan-out load against the cluster. Each shard sees <code>10^8 / 1000 = 10^5</code> sub-queries/sec, which is well above sustainable single-machine search QPS (a Lucene shard typically tops out at hundreds to low thousands of qps for non-trivial queries). The cache + cheap query rejection + over-provisioning shards is what makes the math close. If you do not name caching and the per-shard QPS target, the interviewer should push.</li>
+<li>Scatter-gather tail: with 1000 shards fanned in parallel and a per-shard p99 of 20 ms, the <em>aggregate</em> p99 (slowest of 1000 independent draws) is roughly the per-shard p99.9 — typically 2-5x the per-shard p99. Hedged requests to a replica after 20 ms cut this materially, at the cost of ~10% extra cluster load.</li>
+<li>Feature fetch budget: 1000 candidates × ~100 features = 10^5 feature reads per query. Batched as one multi-get into an in-memory feature store, this is ~1-5 ms wall-clock (not "&lt; 1 µs / candidate" of compute — that arithmetic conflates wall time with per-item amortized cost). The honest claim is: the feature store must support batched multi-get with single-digit ms p99, which is what colocated in-memory key-value stores (Redis, RocksDB-in-memory, custom mmap) deliver.</li>
+</ul>
+<hr />
+<h2 id="6-variants-and-how-to-choose">6. Variants and how to choose</h2>
+<h3 id="61-keyword-vs-vector-vs-hybrid">6.1 Keyword vs. vector vs. hybrid</h3>
+<table>
+<thead>
+<tr>
+<th>Axis</th>
+<th>BM25 / keyword inverted index</th>
+<th>ANN over learned embeddings</th>
+<th>Hybrid</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Strength</td>
+<td>Exact match, structured filters, explainable.</td>
+<td>Semantic match, "find similar", multilingual via shared embedding space.</td>
+<td>Both, when both classes of query exist in the mix.</td>
+</tr>
+<tr>
+<td>Weakness</td>
+<td>Misses paraphrases, synonyms, intent.</td>
+<td>Misses exact phrases, struct filters, recall &lt; 100%.</td>
+<td>Two indexing pipelines, two refresh stories, fusion-scoring complexity.</td>
+</tr>
+<tr>
+<td>Recall@1000 on web queries</td>
+<td>High on head, low on intent-heavy long tail.</td>
+<td>Lower than BM25 on head, much better on long tail.</td>
+<td>Highest, but the gain over the better single mode is often modest (5-15% recall@1000) and not free.</td>
+</tr>
+<tr>
+<td>Build cost</td>
+<td>Linear in tokens.</td>
+<td>Linear in docs + embedding model cost (often 10-100x the cost per doc of tokenization).</td>
+<td>Both.</td>
+</tr>
+<tr>
+<td>Refresh cost</td>
+<td>Cheap (segment merges).</td>
+<td>Expensive (embedding refresh on model change rebuilds the whole index).</td>
+<td>Both.</td>
+</tr>
+<tr>
+<td>Use when</td>
+<td>Exact-match dominates (SKU, code, log, username, legal); explainability/audit is required.</td>
+<td>Intent-dominant (recommendation, "more like this", multimodal); query mix is short/ambiguous.</td>
+<td>The query mix is genuinely mixed and you have the team capacity to operate two pipelines.</td>
+</tr>
+</tbody>
+</table>
+<p>Hybrid is the <em>web-search</em> default because web queries are genuinely mixed. It is <strong>not</strong> a universal default: an e-commerce SKU lookup, a logs search, a code search, or a structured filter-first product (Yelp filters by cuisine + open-now + rating) can ship keyword-only and beat a hybrid system on latency, refresh cost, and predictability. Pick hybrid when you can name a class of queries that BM25 measurably misses.</p>
+<h3 id="62-document-sharded-vs-term-sharded">6.2 Document-sharded vs. term-sharded</h3>
+<table>
+<thead>
+<tr>
+<th>Axis</th>
+<th>Document-sharded (default)</th>
+<th>Term-sharded</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>How keys map to shards</td>
+<td><code>shard = hash(doc_id) % N</code>; every shard has all terms, a slice of docs.</td>
+<td><code>shard = hash(term)</code>; one shard owns all postings for a given term.</td>
+</tr>
+<tr>
+<td>Query fan-out</td>
+<td>All shards (high fan-out).</td>
+<td>Only the shards owning query terms (low fan-out).</td>
+</tr>
+<tr>
+<td>Per-shard work</td>
+<td>Bounded, predictable.</td>
+<td>Unbounded for popular terms — hot shard on "the".</td>
+</tr>
+<tr>
+<td>Tail latency</td>
+<td>Dominated by slowest shard; aggressive timeouts needed.</td>
+<td>Dominated by hottest term.</td>
+</tr>
+<tr>
+<td>Indexing</td>
+<td>Each doc indexed on its single shard — simple, parallel.</td>
+<td>Each doc touches as many shards as it has distinct terms.</td>
+</tr>
+<tr>
+<td>Industry use</td>
+<td>Lucene, Elasticsearch, Solr, Vespa — the standard.</td>
+<td>Mostly historical; some early web search systems.</td>
+</tr>
+</tbody>
+</table>
+<p>For staff interviews: <strong>default to document-sharded</strong> and only mention term-sharded as the alternative you considered and rejected.</p>
+<h3 id="63-offline-rank-and-store-vs-online-rank">6.3 Offline-rank-and-store vs. online-rank</h3>
+<table>
+<thead>
+<tr>
+<th>Axis</th>
+<th>Offline (precompute per user/query)</th>
+<th>Online (rank at request time)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Latency</td>
+<td>Single key lookup; sub-millisecond.</td>
+<td>Stage-1 + stage-2 + hydrate; 50-200 ms.</td>
+</tr>
+<tr>
+<td>Freshness</td>
+<td>As stale as the last batch (hours to a day).</td>
+<td>Up-to-the-second.</td>
+</tr>
+<tr>
+<td>Personalization</td>
+<td>Limited to keys you precomputed for.</td>
+<td>Arbitrary per-request signals (location, time, A/B bucket).</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>Big batch job; cheap reads.</td>
+<td>Big online fleet; smaller batch.</td>
+</tr>
+<tr>
+<td>Use when</td>
+<td>Stable corpus, predictable users (Netflix homepage, Facebook PYMK).</td>
+<td>Volatile corpus (Twitter search, news, ads).</td>
+</tr>
+<tr>
+<td>Hybrid trick</td>
+<td>Precompute candidate pool; rank online.</td>
+<td>Same.</td>
+</tr>
+</tbody>
+</table>
+<p>The hybrid (precompute candidates offline, rank online with fresh features) is the industry default for recommender feeds. Twitter / news search lean online because freshness wins.</p>
+<hr />
+<h2 id="7-failure-modes-and-operations">7. Failure modes and operations</h2>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Metric to alert on</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Shard timeout / drop</td>
+<td><code>shard_timeout_rate</code> per shard, p99 query latency.</td>
+<td>Per-shard timeout; partial results; replica failover; auto-shed indexing load when query load spikes.</td>
+</tr>
+<tr>
+<td>One shard hot (skewed doc_id hashing)</td>
+<td>per-shard QPS variance.</td>
+<td>Resharding; randomize doc_id (Twitter's snowflake IDs are good for this); upstream load balancer.</td>
+</tr>
+<tr>
+<td>Index corruption (bad merge, disk bit-rot)</td>
+<td>Checksum mismatch, recall@K regression vs. canary index.</td>
+<td>Always keep N-1 prior segment generations; can roll back. Checksums on every segment.</td>
+</tr>
+<tr>
+<td>Stale shards (replica missed updates)</td>
+<td>Replication lag, shard version drift.</td>
+<td>Pull from authoritative log (Kafka offset), not from sibling shards. Same shape as <a href="../durability-at-scale/">durability-at-scale</a>.</td>
+</tr>
+<tr>
+<td>Freshness lag (live tier behind)</td>
+<td><code>now - max(indexed_timestamp)</code> per shard.</td>
+<td>Backpressure the indexer; scale up consumers; alert when lag &gt; N seconds.</td>
+</tr>
+<tr>
+<td>Ranker model drift (training/serving skew, distribution shift)</td>
+<td>Online vs. offline nDCG delta; CTR by bucket; calibration.</td>
+<td>Daily retrain; A/B + shadow eval before ramp; auto-rollback if online metric drops X%. Closely related to <a href="../idempotency-exactly-once/">idempotency-exactly-once</a> for click logging.</td>
+</tr>
+<tr>
+<td>Feature store online/offline skew</td>
+<td>Per-feature distribution diff.</td>
+<td>Single source of truth in offline; replicate to online; emit feature snapshots at training time; checksum at serve time.</td>
+</tr>
+<tr>
+<td>Hot query stampede ("when an event breaks")</td>
+<td>Cache miss rate spike, backend QPS spike.</td>
+<td>Top-results cache with negative TTL; request coalescing; admission control. Cross-link <a href="../cache-stampede-read-amplification/">cache-stampede-read-amplification</a>.</td>
+</tr>
+<tr>
+<td>Visibility leak (deleted tweet still searchable)</td>
+<td>Time-to-purge SLA, sample audits.</td>
+<td>Deletion topic with strict ordering (<a href="../ordering-causal-consistency/">ordering-causal-consistency</a>); visibility filter at query time as a defense-in-depth.</td>
+</tr>
+<tr>
+<td>Adversarial / spam queries</td>
+<td>Anomaly detection on per-query cost.</td>
+<td>Per-IP rate limits; query cost limits (<a href="../backpressure-flow-control/">backpressure-flow-control</a>); query syntax allowlist.</td>
+</tr>
+<tr>
+<td>Embedding model rollover</td>
+<td>Recall delta vs. old index; dual-write period length.</td>
+<td>Always dual-index for a window; switch reader after recall@K parity is verified.</td>
+</tr>
+<tr>
+<td>Index build failure</td>
+<td>Pipeline SLO, freshness alarm.</td>
+<td>Keep prior generation; alert on age of "current" index.</td>
+</tr>
+<tr>
+<td>ANN recall regression</td>
+<td>Offline recall@K on canary set; per-segment HNSW M / efConstruction drift.</td>
+<td>Lock ANN build params per version; re-evaluate on each model rev.</td>
+</tr>
+<tr>
+<td>Slow / runaway query</td>
+<td>Per-query latency, posting-list length cap.</td>
+<td>Time budget per query; abandon on exceed; return partial.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="71-operational-golden-signals">7.1 Operational golden signals</h3>
+<ul>
+<li><code>p50</code> and <code>p99</code> end-to-end latency (per region, per query class).</li>
+<li>Per-shard <code>p99</code>; shard-timeout rate.</li>
+<li>Recall@K and nDCG on a held-out judged set (offline, daily).</li>
+<li>CTR / dwell-time / abandonment by bucket (online, hourly).</li>
+<li>Indexing lag (live tier).</li>
+<li>Index age / staleness (main tier).</li>
+<li>Cache hit rate and hit-rate by query class.</li>
+<li>Feature freshness (max age of any feature in the request).</li>
+<li>Ranker prediction distribution (skew / drift detection).</li>
+</ul>
+<hr />
+<h2 id="8-combinations-with-other-patterns">8. Combinations with other patterns</h2>
+<ul>
+<li><strong><a href="../fan-out-write-amplification/">Fan-out write amplification</a></strong> — search is the <em>read-side</em> mirror of newsfeed fan-out. The fan-out pattern pushes updates to many timelines; the search pattern pulls candidates from many shards. The latency budget allocation across many parallel calls is the same problem.</li>
+<li><strong><a href="../hot-key-skew/">Hot key skew</a></strong> — head queries, breaking news, the term "the": all manifestations of skew at the query layer. Mitigations (caching, shard randomization, request coalescing) overlap heavily.</li>
+<li><strong><a href="../cache-stampede-read-amplification/">Cache stampede / read amplification</a></strong> — top-results cache, feature-store cache; both must defend against thundering-herd on miss.</li>
+<li><strong><a href="../backpressure-flow-control/">Backpressure / flow control</a></strong> — when query volume spikes, you must shed expensive queries before the index falls behind. Per-query cost accounting is essential.</li>
+<li><strong><a href="../geo-spatial-queries/">Geo-spatial queries</a></strong> — Yelp / Uber search adds a geo predicate on top of the relevance ranking. The two-stage pattern stays the same; the candidate generator changes from inverted index to geohash / S2 / quadtree.</li>
+<li><strong><a href="../real-time-aggregation/">Real-time aggregation</a></strong> — engagement features (likes, views, CTR) that feed ranking are themselves a real-time aggregation problem. The freshness of these features is often the binding constraint on the ranker's quality.</li>
+<li><strong><a href="../idempotency-exactly-once/">Idempotency / exactly-once</a></strong> — click-log ingestion must dedupe so ranker training is not poisoned. Two impressions of the same <code>(query, doc, user)</code> must merge cleanly.</li>
+<li><strong><a href="../ordering-causal-consistency/">Ordering / causal consistency</a></strong> — deletion events must be processed in order with the original publish; otherwise a deleted document re-appears.</li>
+<li><strong><a href="../durability-at-scale/">Durability at scale</a></strong> — the index is derived state; the authoritative log is the input stream. You can always rebuild the index from the log; you cannot rebuild the log from the index.</li>
+<li><strong><a href="../coordination-exactly-one-execution/">Coordination / exactly-one execution</a></strong> — index build jobs (segment merges, ANN rebuilds) need leader election so we don't double-spend the compute budget.</li>
+</ul>
+<hr />
+<h2 id="9-likely-interviewer-probes">9. Likely interviewer probes</h2>
+<ol>
+<li><em>"Your fan-out is to 1000 shards and your p99 budget is 100 ms. Walk me through the math on tail latency. What is your shard-level p99 target and how do you stay there?"</em> — push for per-shard timeout, hedged requests, replica selection by latency, and over-fetching.</li>
+<li><em>"What happens when one shard goes offline?"</em> — replica failover, partial results, graceful degradation, query retry policy, why returning best-effort is the right call for search but wrong for transactions.</li>
+<li><em>"Your ranker just shipped a new model and online CTR dropped 3% overnight. How do you debug?"</em> — A/B vs. shadow, feature drift, training/serving skew, calibration, auto-rollback, the role of holdouts.</li>
+<li><em>"How do you handle a tweet being deleted? At index time or query time?"</em> — both. Index-time eventual purge for cost; query-time filter for correctness. The deletion topic and the audit story.</li>
+<li><em>"How do you decide between document-sharded and term-sharded?"</em> — load distribution under realistic query mix; one slow term vs. one slow shard; how Lucene resolved this question 20 years ago.</li>
+<li><em>"Tell me about your embedding refresh. The model is retrained — what happens to the existing ANN index?"</em> — dual-index period, recall parity gate, rolling switch; why you cannot just hot-swap.</li>
+<li><em>"Walk me through the offline → online feature pipeline. Where do bugs hide?"</em> — training/serving skew, definition drift, log-and-wait validation, checksums, replay.</li>
+<li><em>"How would you A/B test a new ranker?"</em> — interleaved evaluation vs. side-by-side; minimum detectable effect; guardrail metrics (latency, error rate, fairness); ramp policy.</li>
+<li><em>"What is your indexing pipeline's recovery story if the Kafka topic is corrupted?"</em> — log is the source of truth; can we rebuild from the upstream system (the tweet store)? Backfill replays.</li>
+<li><em>"How do you handle multilingual queries?"</em> — language-specific analyzers, multilingual embeddings, fallback strategies, query-language detection.</li>
+</ol>
+<hr />
+<h2 id="10-common-traps-stronger-moves">10. Common traps → stronger moves</h2>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"I'll just put everything in Elasticsearch."</td>
+<td>Name the tiering, the shard count, the per-shard p99 target, the freshness pipeline, and the second-stage ranker. ES is one component, not a design.</td>
+</tr>
+<tr>
+<td>Using one giant index for everything.</td>
+<td>Tier: live (in-memory, seconds-fresh) + main (on-disk, batch-built). Possibly per-doc-type sub-indexes.</td>
+</tr>
+<tr>
+<td>Term-sharded as a default.</td>
+<td>Document-sharded; mention term-sharded only as the alternative you rejected.</td>
+</tr>
+<tr>
+<td>Reflexively reaching for hybrid retrieval.</td>
+<td>Name the query classes you expect (exact-match, intent, structured filter, "more like this"). If only one class matters, ship one retrieval mode. If multiple classes exist and BM25 measurably misses one of them, add ANN and union; let the second-stage ranker arbitrate.</td>
+</tr>
+<tr>
+<td>Ranking with <code>ORDER BY created_at DESC</code>.</td>
+<td>Learn-to-rank (LambdaMART, DNN); name the features and the training signal (clicks + dwell, not just clicks).</td>
+</tr>
+<tr>
+<td>Computing features at query time from raw data.</td>
+<td>Online feature store; precompute aggregates; cache; emit feature snapshots at training time to preserve offline/online parity.</td>
+</tr>
+<tr>
+<td>Failing the whole query on one shard failure.</td>
+<td>Per-shard timeout + partial results + degraded-mode banner. Document the recall hit.</td>
+</tr>
+<tr>
+<td>Caching with infinite TTL on head queries.</td>
+<td>Short TTL (10-60 s); cache key includes user segment if personalized; negative TTL to soak up cache misses on tail; coalescing on stampede.</td>
+</tr>
+<tr>
+<td>Indexing deletes by overwriting in place.</td>
+<td>Soft delete in index + visibility filter at query time + background purge. Hard delete is too slow at scale.</td>
+</tr>
+<tr>
+<td>"We'll personalize later."</td>
+<td>Reserve the per-user feature space and the candidate-injection slot in stage 2 from day one; personalization retrofits are painful.</td>
+</tr>
+<tr>
+<td>Treating the ranker as a static asset.</td>
+<td>The ranker is a service with its own lifecycle: train, shadow, A/B, ramp, monitor, rollback. Name an owner.</td>
+</tr>
+<tr>
+<td>Ignoring offline metrics.</td>
+<td>nDCG / recall@K / MRR on a judged set; daily; with regression alarms. Online CTR alone leads to feedback loops.</td>
+</tr>
+<tr>
+<td>Forgetting visibility / safety filters.</td>
+<td>Apply at query time after rank; treat as a hard requirement, not a flag. The cost is small; the leak is reputation-ending.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11-staff-level-answer-checklist">11. Staff-level answer checklist</h2>
+<ul>
+<li>[ ] <strong>Sized the problem first</strong>: corpus size, QPS, relevance-quality bar. Called out that single-node Elasticsearch with BM25 is the right answer below ~10M documents / low QPS / no semantic queries — and only escalated to two-stage when the latency or quality math actually requires it.</li>
+<li>[ ] Named the <strong>recall vs. ranking</strong> split out loud within the first two minutes.</li>
+<li>[ ] Picked <strong>two-stage retrieval</strong> (cheap candidate generation, expensive ranking) and justified it with latency math — specifically, that (candidate count × per-candidate ranker cost) over the full corpus would blow the budget.</li>
+<li>[ ] Named the <strong>inverted index</strong> (Lucene/Elasticsearch) for keyword recall, and — if the query mix has intent / semantic / "find similar" classes — <strong>ANN</strong> (HNSW/IVF/ScaNN) for semantic recall, with the union justified by a named query class that keyword misses. If the corpus is exact-match-only, said so and skipped ANN.</li>
+<li>[ ] Chose <strong>document-sharded</strong> scatter-gather; named the per-shard timeout and the partial-result policy.</li>
+<li>[ ] Specified a <strong>live tier + main tier</strong> with the freshness target (seconds vs. nightly) and the merge story at query time.</li>
+<li>[ ] Specified a <strong>learned ranker</strong> (LambdaMART or DNN), the feature sources, and where features live (online feature store).</li>
+<li>[ ] Discussed <strong>BM25 as the baseline</strong> the learned ranker must beat, plus query rewriting / expansion.</li>
+<li>[ ] Named <strong>caching</strong> for head queries with TTL and stampede protection.</li>
+<li>[ ] Talked about <strong>failure modes</strong>: shard timeouts, model drift, freshness lag, deletion ordering, training/serving skew.</li>
+<li>[ ] Talked about <strong>operations</strong>: nDCG/CTR/latency dashboards, A/B + shadow, ramp + rollback for ranker changes.</li>
+<li>[ ] Drew a <strong>capacity napkin</strong>: corpus size, shard count, per-shard p99 budget, QPS per shard after caching.</li>
+<li>[ ] Linked to <strong>adjacent patterns</strong>: fan-out, hot key, cache stampede, real-time aggregation, geo, ordering.</li>
+<li>[ ] Said what is <strong>out of scope</strong> (crawl pipeline, ad auction internals) and named the trigger that would bring them back.</li>
+<li>[ ] Closed with the <strong>biggest open risk</strong>: usually ranker drift or training/serving skew, not raw latency.</li>
+</ul>
+<hr />
+<h2 id="12-cross-references">12. Cross-references</h2>
+<ul>
+<li>Glossary: <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a></li>
+<li>Playbook: <a href="../STAFF_SYSTEM_DESIGN_INTERVIEW_PLAYBOOK.md">Staff System Design Interview Playbook</a></li>
+<li>Question docs (this pattern is core):</li>
+<li><a href="../questions/design-google-search.md">Design Google Search</a></li>
+<li><a href="../questions/design-twitter-search.md">Design Twitter Search</a></li>
+<li><a href="../questions/design-typeahead-autocomplete.md">Design Typeahead / Autocomplete</a></li>
+<li><a href="../questions/design-typeahead-suggestion.md">Design Typeahead Suggestion</a></li>
+<li><a href="../questions/design-a-netflix-style-recommendation-system.md">Design a Netflix-Style Recommendation System</a></li>
+<li><a href="../questions/design-facebooks-newsfeed.md">Design Facebook's Newsfeed</a></li>
+<li><a href="../questions/design-twitter-timeline.md">Design Twitter Timeline</a></li>
+<li><a href="../questions/design-google-ads.md">Design Google Ads</a></li>
+<li><a href="../questions/design-facebook-people-you-may-know.md">Design Facebook People You May Know</a></li>
+<li><a href="../questions/design-yelp-or-nearby-friends.md">Design Yelp or Nearby Friends</a></li>
+<li><a href="../questions/design-google-news-as-a-global-aggregator.md">Design Google News as a Global Aggregator</a></li>
+<li><a href="../questions/design-youtube-or-netflix.md">Design YouTube or Netflix</a></li>
+<li><a href="../questions/design-reddit.md">Design Reddit</a></li>
+<li><a href="../questions/design-instagram.md">Design Instagram</a></li>
+<li>Sibling pattern docs:</li>
+<li><a href="../fan-out-write-amplification/">fan-out-write-amplification</a></li>
+<li><a href="../hot-key-skew/">hot-key-skew</a></li>
+<li><a href="../strong-consistency-under-contention/">strong-consistency-under-contention</a></li>
+<li><a href="../idempotency-exactly-once/">idempotency-exactly-once</a></li>
+<li><a href="../geo-spatial-queries/">geo-spatial-queries</a></li>
+<li><a href="../real-time-aggregation/">real-time-aggregation</a></li>
+<li><a href="../coordination-exactly-one-execution/">coordination-exactly-one-execution</a></li>
+<li><a href="../ordering-causal-consistency/">ordering-causal-consistency</a></li>
+<li><a href="../durability-at-scale/">durability-at-scale</a></li>
+<li><a href="../backpressure-flow-control/">backpressure-flow-control</a></li>
+<li><a href="../cache-stampede-read-amplification/">cache-stampede-read-amplification</a></li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

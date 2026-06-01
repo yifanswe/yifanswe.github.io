@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fan-out / Write Amplification — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design-patterns/">← Back to System Design Patterns</a>
+        <h1 class="article-title">Fan-out / Write Amplification</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/31 &nbsp;·&nbsp; System Design Patterns
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>One producer write must become visible to N consumers. The pattern is the toolkit for choosing where to pay the cost — at write time (push), at read time (pull), or in a hybrid split — and for taming the celebrity case where N is unbounded. See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for foundational terms.</p>
+<p>Core question docs where this pattern is the center of gravity:
+- <a href="../questions/design-twitter.md">Design Twitter</a>
+- <a href="../questions/design-twitter-timeline.md">Design Twitter Timeline</a>
+- <a href="../questions/design-facebooks-newsfeed.md">Design Facebook Newsfeed</a>
+- <a href="../questions/design-instagram.md">Design Instagram</a>
+- <a href="../questions/design-a-notification-system.md">Design a Notification System</a>
+- <a href="../questions/design-discord.md">Design Discord</a>
+- <a href="../questions/design-a-live-comment-streaming-service-like-twitch-chat.md">Design a Live Comment Streaming Service like Twitch Chat</a></p>
+</blockquote>
+<hr />
+<h2 id="1-the-fundamental-hardness">1. The fundamental hardness</h2>
+<p>The naive shape of any social, messaging, or notification system is a single user action that must be reflected in many places. A Tweet is one row written by one user; the product promise is that up to hundreds of millions of followers see it in their timeline. A new chat message is one insert; the promise is that every member of the channel — possibly tens of thousands in a Discord server, possibly two devices for a 1:1 conversation — gets the message delivered, ordered, and counted in unread state. An ad-click event is one record; the dashboards, billing aggregates, fraud detectors, and reporting indexes all need their own derived view of it.</p>
+<p>The invariant that breaks under naive design is <strong>bounded per-write work</strong>. If the cost of one producer write is O(N) where N is the size of an unbounded social graph, then any single popular producer is a denial-of-service vector against your own database. A Beyoncé tweet at 100M followers and a 1KB timeline row is a 100GB write burst per tweet. A Discord announcement to a 500K-member server is a 500K-row fan-out. The CPU and I/O budget of the system is no longer dominated by users; it's dominated by the <em>graph</em> of who-follows-whom.</p>
+<p>The opposite extreme — compute the read view from scratch by scanning everything a consumer follows — moves the cost to read time. That solves the celebrity problem but creates a symmetric read-amplification problem (see the sibling pattern <a href="./cache-stampede-read-amplification.md">cache-stampede-read-amplification.md</a>). A user who follows 5,000 accounts now triggers 5,000 partition reads on every timeline refresh, and the average user refreshes more often than the average user posts. Both extremes are bad; the staff-level move is to know exactly when to use which, and how to combine them.</p>
+<p>The pattern is also about <strong>decoupling latency from work</strong>. The user who wrote the Tweet must get a fast acknowledgment (the write to their own outbox must commit in tens of milliseconds). The 100M follower deliveries must complete eventually, with bounded freshness lag, but they do not have to complete in the request path. That's the role of Kafka, fan-out workers, and a clear split between the synchronous authoritative write and the asynchronous derived projection.</p>
+<hr />
+<h2 id="2-how-to-recognize-it-in-the-interview">2. How to recognize it in the interview</h2>
+<h3 id="prompt-phrases-that-signal-this-pattern">Prompt phrases that signal this pattern</h3>
+<ul>
+<li>"Every follower sees the post."</li>
+<li>"Timeline / feed / inbox."</li>
+<li>"Notifications to all subscribers."</li>
+<li>"Members of the channel."</li>
+<li>"Broadcast to all clients connected to the room."</li>
+<li>"Push the update to N devices."</li>
+<li>"Activity stream / what's new."</li>
+<li>"When a user posts, all their friends..."</li>
+</ul>
+<h3 id="architectural-smells-in-stated-requirements">Architectural smells in stated requirements</h3>
+<ul>
+<li>The producer and consumer counts are wildly asymmetric (one writer, many readers).</li>
+<li>The follower / subscriber graph has heavy tail — a small number of nodes have orders of magnitude more edges than the median.</li>
+<li>Read freshness target is on the order of seconds (not milliseconds, not minutes).</li>
+<li>The product is read-heavy in aggregate (timeline refreshes &gt;&gt; tweets posted).</li>
+<li>There is an "unread" or "delivery receipt" requirement, meaning per-recipient state has to exist somewhere.</li>
+<li>The interviewer mentions "personalized" — each recipient's view differs, so a shared cache key doesn't work.</li>
+</ul>
+<h3 id="example-design-x-prompts-where-this-is-the-core-hardness">Example "design X" prompts where this is the core hardness</h3>
+<table>
+<thead>
+<tr>
+<th>Prompt</th>
+<th>Why fan-out is the center</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Design Twitter</td>
+<td>The home timeline is the canonical "one write, N followers" problem; celebrities break the naive push design.</td>
+</tr>
+<tr>
+<td>Design Facebook Newsfeed</td>
+<td>Same fan-out hardness but with ranking on top — every friend's post must be a candidate for your feed.</td>
+</tr>
+<tr>
+<td>Design Instagram</td>
+<td>Photo posts fan out to followers; Stories add a 24-hour freshness window that changes the calculus.</td>
+</tr>
+<tr>
+<td>Design a notification system</td>
+<td>One event (price drop, friend joined, mention) routes to thousands or millions of recipient inboxes plus push channels.</td>
+</tr>
+<tr>
+<td>Design Discord</td>
+<td>One message lands in one channel; every connected member sees it in real time, plus offline members need backfill.</td>
+</tr>
+<tr>
+<td>Design Twitch Chat</td>
+<td>One chat message broadcast to 100K+ concurrent viewers of a popular stream; this is read-side fan-out via pub/sub, not write storage.</td>
+</tr>
+<tr>
+<td>Design Google News as a global aggregator</td>
+<td>One article ingested fans out to topical sections, regional sections, and personalized streams.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="3-60-second-spoken-framing">3. 60-second spoken framing</h2>
+<blockquote>
+<p>The hardness here is write amplification: one producer write has to reach N consumers, and N is unbounded for celebrities. I'd start with a hybrid push-pull model. For the median user — a few hundred followers — I push at write time by inserting into each follower's timeline cache, so the read is a single key lookup. For users above a celebrity threshold, say 10K followers, I do not push. Their posts live in a per-author store; the timeline read merges precomputed pushes plus a pull from the small set of celebrities the reader follows. Fan-out itself is async behind Kafka, so the producer's write latency is decoupled from delivery work, and fan-out workers are sharded by recipient to avoid hot writers. The thing I'd watch in production is the celebrity threshold drifting — recompute it from the follower distribution monthly.</p>
+</blockquote>
+<hr />
+<h2 id="4-canonical-toolkit">4. Canonical toolkit</h2>
+<h3 id="41-push-model-precompute-on-write-fan-out-on-write">4.1 Push model (precompute on write, "fan-out on write")</h3>
+<p><strong>What it is.</strong> When a producer writes, synchronously enqueue a job that inserts the produced item into every consumer's materialized inbox / timeline. Read time becomes O(1) — fetch the top K from your own inbox.</p>
+<pre><code>producer writes Tweet T
+        │
+        ▼
+   tweets table  (authoritative store)
+        │
+        ▼
+   Kafka topic  (fan-out events)
+        │
+        ▼
+  fan-out workers
+        │
+        ├── insert (follower_1, T) into timeline:follower_1
+        ├── insert (follower_2, T) into timeline:follower_2
+        └── ... N times
+</code></pre>
+<p><strong>When to use.</strong> Read-heavy systems where the cost of one read is more expensive than one write <em>summed over the read frequency ratio</em>. If users refresh their timeline 50x for every Tweet they post, you've already lost the math if reads are O(followees) and writes are O(1).</p>
+<p><strong>Cost.</strong> Storage proliferates — each Tweet is duplicated into every follower's timeline. Write fan-out is O(N) per produce. For N=100M, this is multi-minute work for one event.</p>
+<p><strong>When it breaks.</strong> Celebrity accounts. Inactive followers (you fan out to accounts that haven't logged in in two years). Burst posts (one popular event causes everyone with a million followers to post at once; queues back up).</p>
+<pre><code class="language-python">def on_tweet(tweet):
+    db.tweets.insert(tweet)               # authoritative
+    kafka.publish(&quot;fanout&quot;, {
+        &quot;tweet_id&quot;: tweet.id,
+        &quot;author_id&quot;: tweet.author_id,
+    })
+
+def fanout_worker(event):
+    author = event[&quot;author_id&quot;]
+    for follower_id in followers_of(author):    # may be 100M
+        timeline_cache.lpush(
+            f&quot;timeline:{follower_id}&quot;,
+            event[&quot;tweet_id&quot;],
+        )
+        timeline_cache.ltrim(f&quot;timeline:{follower_id}&quot;, 0, 999)
+</code></pre>
+<h3 id="42-pull-model-compute-on-read-fan-out-on-read">4.2 Pull model (compute on read, "fan-out on read")</h3>
+<p><strong>What it is.</strong> Store only the producer's own outbox (their own tweets / posts). On read, the consumer queries every followee's outbox, merges by timestamp, returns top K.</p>
+<pre><code>read timeline for U:
+   followees(U) = [a, b, c, ..., m]      # may be 5000
+   for each f in followees(U):
+       scan top K from tweets where author = f
+   merge-sort by ts, take K
+</code></pre>
+<p><strong>When to use.</strong> Write-heavy systems with few reads. Celebrity-only paths (when the producer has too many followers to push). Cold accounts that read so rarely it's cheaper to compute on demand than maintain a materialized view.</p>
+<p><strong>Cost.</strong> Read is O(followees) partition reads plus merge cost. Tail latency is bounded by the slowest shard. Cache hit rate is per-author-outbox, not per-reader, so cache benefits the popular producers but doesn't help readers who follow obscure accounts.</p>
+<p><strong>When it breaks.</strong> Power users who follow thousands of accounts. Read QPS spikes (everyone refreshing at 9am). Any per-reader personalization (ranking model) that has to score all candidates.</p>
+<h3 id="43-hybrid-push-pull-the-twitter-celebrity-threshold">4.3 Hybrid push / pull (the Twitter "celebrity threshold")</h3>
+<p><strong>What it is.</strong> Pick a follower-count threshold C (e.g., 10,000). Accounts below C are pushed normally. Accounts above C are <em>not</em> pushed; their tweets sit in a per-author celebrity store. On timeline read, the consumer merges (a) their pre-pushed timeline cache with (b) a pull-fan-out across the small set of celebrities they follow.</p>
+<pre><code>on tweet by author A:
+   if followers(A) &lt; C:
+       push to every follower's timeline cache
+   else:
+       store in celebrities:{A} only (do not push)
+
+on timeline read for U:
+   cached    = read timeline:{U}                   # pre-pushed posts
+   celebs    = followees(U) ∩ celebrity_set        # usually &lt; 50
+   recent    = [read celebrities:{c} top K for c in celebs]
+   return merge_by_ts(cached, *recent)[:K]
+</code></pre>
+<p><strong>When to use.</strong> The follower distribution is heavy-tailed (it always is). You want the cheap path for the 99% and a different path for the 1% that would otherwise drive write storms.</p>
+<p><strong>Cost.</strong> Two code paths. The celebrity set is itself state that must be maintained (graduating a user above the threshold means stopping pushes for them; demoting means restarting). Read path has to do a small fan-out per request.</p>
+<p><strong>When it breaks.</strong> A user just below the threshold suddenly goes viral. A timeline reader who follows 200 celebrities (the read-side fan-out is now non-trivial). The threshold is set wrong for the actual graph — too low and you waste reads, too high and write storms persist.</p>
+<h3 id="44-kafka-or-any-durable-log-for-async-decoupling">4.4 Kafka (or any durable log) for async decoupling</h3>
+<p><strong>What it is.</strong> The producer's authoritative write commits synchronously to the source-of-truth store. A second event publishes to Kafka. Fan-out happens in workers that consume from Kafka. The producer never blocks on fan-out work.</p>
+<pre><code>producer ──► tweets DB  (sync, ack here)
+         └─► Kafka      (async, decoupled)
+                  │
+                  ▼
+            fan-out workers (scalable, sharded, retryable)
+</code></pre>
+<p><strong>When to use.</strong> Always, in any serious design. Even if your fan-out is trivial today, decoupling lets you scale workers independently, retry independently, and add new consumers (search index, analytics, notifications) without modifying the write path.</p>
+<p><strong>Cost.</strong> End-to-end latency adds a few hundred ms of queue delay. Exactly-once semantics require idempotent workers (see <a href="./idempotency-exactly-once.md">idempotency-exactly-once.md</a>).</p>
+<p><strong>When it breaks.</strong> Queue backs up under burst load and the freshness SLO is violated. Workers crash mid-fan-out and you re-deliver duplicates. Partition assignment causes one fan-out worker to own a celebrity and choke its partition.</p>
+<h3 id="45-fan-out-workers-sharded-by-recipient">4.5 Fan-out workers sharded by recipient</h3>
+<p><strong>What it is.</strong> Instead of one Kafka partition per author (which puts all of Beyoncé's fan-out on one worker), shard fan-out work by <em>recipient</em>. The fan-out coordinator reads the author's follower list, hashes each follower to a partition, and emits one event per recipient (or per recipient-shard batch).</p>
+<pre><code>              &quot;tweet T by author A&quot;
+                       │
+                       ▼
+          coordinator: load followers(A)
+                       │
+       ┌───────────────┼───────────────┐
+       ▼               ▼               ▼
+   partition 0     partition 1     partition N
+   followers       followers       followers
+   hash%N=0        hash%N=1        hash%N=N
+       │               │               │
+   worker 0        worker 1        worker N
+   inserts into    inserts into    inserts into
+   timelines for   timelines for   timelines for
+   their recipients
+</code></pre>
+<p><strong>When to use.</strong> Any push model where the producer's follower count can be large. Recipient-sharding spreads the load evenly across the cluster instead of concentrating it on whichever worker owns the author key.</p>
+<p><strong>Cost.</strong> Coordinator must read the entire follower list to dispatch. For 100M followers this is itself a streaming operation (you don't load the list into memory; you scan the follower index and emit batched events).</p>
+<p><strong>When it breaks.</strong> If your follower table itself isn't sharded for streaming reads, the coordinator becomes the bottleneck. If you batch too aggressively, individual recipient delivery latency degrades.</p>
+<h3 id="46-priority-queues-for-vip-recipients">4.6 Priority queues for VIP recipients</h3>
+<p><strong>What it is.</strong> Not all recipients are equal. The author's own device should see the post before strangers do. Verified accounts may have an SLO. Active users (currently in-app) get priority delivery; offline users wait.</p>
+<pre><code>fan-out queue tiers:
+  P0: self + currently-active sessions     (&lt; 1s SLO)
+  P1: recently-active followers             (&lt; 30s SLO)
+  P2: long-tail dormant followers          (best effort, minutes)
+</code></pre>
+<p><strong>When to use.</strong> When freshness perception varies sharply by recipient. Twitter's "you see your own tweet immediately" is a P0 path; the cousin who hasn't logged in for two months is P2.</p>
+<p><strong>Cost.</strong> Three queues, three sets of workers. Operational complexity. Need to classify recipients on the fly (cache of "active in last 24h").</p>
+<p><strong>When it breaks.</strong> Classification is stale and you under-prioritize someone who just opened the app. P0 starves itself (everyone is "active" during a major event).</p>
+<h3 id="47-dedicated-celebrity-store-merged-at-read-time">4.7 Dedicated celebrity store, merged at read time</h3>
+<p><strong>What it is.</strong> Beyond the push/pull split, store celebrity posts in a dedicated, heavily-cached, geo-replicated store optimized for fan-in reads. Every timeline read does a merge between the consumer's materialized timeline and a small fan-in across the celebrities they follow. The celebrity store is sized for the ~10,000 most-followed accounts and can be fully cached in memory globally.</p>
+<p><strong>When to use.</strong> When the celebrity tail is small enough to fit hot. When read-time merge cost is acceptable (a few extra partition reads).</p>
+<p><strong>Cost.</strong> Cache for the celebrity set must be kept warm and consistent globally. The set membership (who is a celebrity) changes over time.</p>
+<p><strong>When it breaks.</strong> A non-celebrity goes viral overnight and isn't in the celebrity store. The merge sort at read time is non-trivial when a user follows many celebrities and wants per-tweet ranking.</p>
+<hr />
+<h2 id="5-worked-example-naive-broken-fixed">5. Worked example: naive → broken → fixed</h2>
+<p><strong>Scenario.</strong> A Twitter-like system. 500M daily active users. Median user has 200 followers. p99 follower count is 50K. Top 1,000 accounts have between 1M and 200M followers. Posts per day: 500M. Timeline reads per day: 50B (each user refreshes ~100 times). Freshness SLO: a non-celebrity post should appear in followers' timelines within 5 seconds (p95).</p>
+<h3 id="naive-design">Naive design</h3>
+<blockquote>
+<p>"On every Tweet, fan out to every follower synchronously. On read, fetch from a per-user timeline table."</p>
+</blockquote>
+<p>Math:
+- Writes per day = 500M.
+- Average fan-out = 200, but the distribution is heavy-tailed. Total fan-out writes per day ≈ 500M × E[followers]. With heavy tail, E[followers] is dominated by celebrity posts. If 0.001% of posts come from 100M-follower accounts, that's ~5,000 posts × 100M = 500B follower-writes from celebrities alone. Plus 500B for the median.
+- Per-write payload: 100 bytes timeline entry.
+- Storage per day for the materialized timeline: 1T entries × 100B = 100TB. Per year: 36PB.
+- Sync fan-out blocks the producer for minutes when Beyoncé tweets — write latency p99 explodes.</p>
+<h3 id="exact-failure-mode">Exact failure mode</h3>
+<ul>
+<li><strong>Hot worker.</strong> The Kafka partition owning Beyoncé's userId gets every Beyoncé tweet; its single fan-out consumer is sequential. Lag grows monotonically until the consumer crashes.</li>
+<li><strong>Storage blow-up.</strong> Timelines for inactive users (those who haven't logged in for 6 months) are still being written to. Half the storage is for users who will never read it.</li>
+<li><strong>Write storms during major events.</strong> A breaking news tweet by a major news account at 9am Eastern triggers fan-out to 100M followers, all of whom are also refreshing — read QPS and write QPS spike together.</li>
+<li><strong>Tail latency.</strong> p99 write latency for the <em>producer</em> tracks fan-out completion. A Beyoncé tweet takes minutes; the user sees a spinner.</li>
+</ul>
+<h3 id="proper-design">Proper design</h3>
+<ol>
+<li><strong>Decouple sync producer write from fan-out.</strong> Producer commits to <code>tweets</code> table; emits <code>tweet_published</code> to Kafka. Producer ACKs in &lt; 50ms regardless of follower count.</li>
+<li><strong>Hybrid push / pull.</strong> Compute a celebrity threshold C from the follower-count distribution monthly. Set C = 10,000. Authors below C are pushed; authors at or above C are <em>not</em> pushed — their tweets live in <code>celebrity_tweets:{author_id}</code> only.</li>
+<li><strong>Recipient-sharded fan-out workers.</strong> The fan-out coordinator scans the follower index in chunks and emits one Kafka event per recipient-shard (where partitioning is by <code>follower_id % N</code>). Workers pull from their partition and write to the timeline cache for their recipients only.</li>
+<li><strong>Priority tiers.</strong> P0 = the author's own device (push instantly). P1 = followers active in the last 24h (push within 5s). P2 = dormant followers (push best-effort, with a cap of 30 minutes of lag tolerated).</li>
+<li><strong>Active-follower filter.</strong> Don't fan out to users who haven't logged in for 30+ days. Their timeline is computed on-demand from per-author outboxes if they ever return.</li>
+<li><strong>Celebrity store at read time.</strong> Timeline read = (a) pull pre-pushed timeline from cache for the reader, plus (b) for each celebrity the reader follows (typically &lt; 50), pull recent posts from <code>celebrity_tweets:{author}</code>. Merge by timestamp / rank, return top K.</li>
+</ol>
+<h3 id="numbers-after-fix">Numbers after fix</h3>
+<ul>
+<li>Median-author fan-out: 200 timeline inserts per Tweet, mostly to active followers (~80 actually delivered). Bounded per-event work.</li>
+<li>Celebrity-author posts: ~5,000 per day, zero fan-out writes. Each is a single insert into the celebrity store, replicated to all regions.</li>
+<li>Sync write latency for producer: &lt; 50ms p99, independent of follower count.</li>
+<li>Fan-out worker lag: P0 &lt; 1s, P1 &lt; 5s, P2 &lt; 5 minutes — measured per-tier, alertable.</li>
+<li>Storage: only active timelines materialized; storage savings ~50% from dormant-follower exclusion.</li>
+<li>Read path: timeline cache hit ≈ 95%; merge with celebrity store adds 5-20ms of read latency depending on how many celebrities the reader follows.</li>
+</ul>
+<hr />
+<h2 id="6-variants-and-how-to-choose">6. Variants and how to choose</h2>
+<table>
+<thead>
+<tr>
+<th>Variant</th>
+<th>Write cost</th>
+<th>Read cost</th>
+<th>Storage</th>
+<th>Best for</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pure push</td>
+<td>O(N followers)</td>
+<td>O(1)</td>
+<td>High (N × posts)</td>
+<td>Read-heavy, bounded fan-out</td>
+<td>Discord channels with member cap</td>
+</tr>
+<tr>
+<td>Pure pull</td>
+<td>O(1)</td>
+<td>O(F followees)</td>
+<td>Low (1 × posts)</td>
+<td>Write-heavy, low-read or fully personalized ranking</td>
+<td>Personalized news ranking with full re-rank per read</td>
+</tr>
+<tr>
+<td>Hybrid (celebrity threshold)</td>
+<td>O(N) for normal, O(1) for celebs</td>
+<td>O(1) + O(few celebs)</td>
+<td>Medium</td>
+<td>Heavy-tailed follower graph</td>
+<td>Twitter, Instagram</td>
+</tr>
+<tr>
+<td>Push to active only</td>
+<td>O(active followers)</td>
+<td>O(1) + on-demand backfill for dormant</td>
+<td>Lower</td>
+<td>Apps with large dormant tail</td>
+<td>LinkedIn feed</td>
+</tr>
+<tr>
+<td>Pull with aggressive cache</td>
+<td>O(1)</td>
+<td>O(F) but cached per-author</td>
+<td>Medium</td>
+<td>Small fan-out, hot producers</td>
+<td>Reddit subreddit listings</td>
+</tr>
+</tbody>
+</table>
+<p>Decision drivers:
+- <strong>Skew of follower distribution.</strong> Long-tail → hybrid. Uniform → push or pull.
+- <strong>Read:write ratio.</strong> &gt; 10:1 → push. &lt; 1:1 → pull. Otherwise hybrid.
+- <strong>Personalization at read.</strong> Per-user ranking on the candidate set → pull, because you can't precompute every reader's view anyway.
+- <strong>Freshness SLO.</strong> Seconds → push or hybrid. Minutes-acceptable → pull is fine.
+- <strong>Active user ratio.</strong> If only 30% of followers are active, don't push to the other 70%.</p>
+<hr />
+<h2 id="7-failure-modes-and-operations">7. Failure modes and operations</h2>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Symptom / metric</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Celebrity write storm</td>
+<td>Fan-out lag spikes; one Kafka partition's consumer lag grows</td>
+<td>Hybrid push/pull threshold; recipient-sharded workers; rate-limit fan-out per producer</td>
+</tr>
+<tr>
+<td>Queue backlog under burst</td>
+<td>Kafka consumer lag &gt; SLO</td>
+<td>Auto-scale workers on lag; spill P2 work to slower batch path</td>
+</tr>
+<tr>
+<td>Dormant follower waste</td>
+<td>Storage growth faster than DAU growth</td>
+<td>Active-follower filter; on-demand backfill for returning users</td>
+</tr>
+<tr>
+<td>Duplicate delivery</td>
+<td>Same tweet appears twice in some timelines</td>
+<td>Idempotent insert keyed by (recipient, tweet_id); see <a href="./idempotency-exactly-once.md">idempotency-exactly-once.md</a></td>
+</tr>
+<tr>
+<td>Out-of-order delivery</td>
+<td>Older tweet appears above newer</td>
+<td>Sort by tweet timestamp (not insert time) in the timeline cache; ranking uses authoritative ts</td>
+</tr>
+<tr>
+<td>Threshold misconfiguration</td>
+<td>Latency regression after a follower-distribution shift</td>
+<td>Recompute celebrity threshold monthly; alert on threshold drift</td>
+</tr>
+<tr>
+<td>Cold cache after deploy</td>
+<td>Read-path latency spike</td>
+<td>Warm timeline cache from the materialized store on rollout; gradual cutover</td>
+</tr>
+<tr>
+<td>Hot reader (power user follows everyone)</td>
+<td>Slow timeline reads for one user</td>
+<td>Cap per-user "followees" in read fan-out; offer "lists" UI to segment</td>
+</tr>
+<tr>
+<td>Compaction / GC of old timeline entries</td>
+<td>Disk full</td>
+<td>Timeline ring buffer with fixed length (e.g., 1000 newest); evict cold</td>
+</tr>
+<tr>
+<td>Cross-region fan-out</td>
+<td>Inter-region write storm</td>
+<td>Regionalize fan-out: each follower's home region runs the insert; cross-region pub/sub of post events only</td>
+</tr>
+</tbody>
+</table>
+<h3 id="on-call-incident-playbook">On-call incident playbook</h3>
+<p>Symptom: "Fan-out lag alert, P1 tier, lag = 4 minutes."</p>
+<ol>
+<li><strong>Identify the producer cohort.</strong> Query the lag-by-partition dashboard. If lag is concentrated on a few partitions, look at the authors whose follower-shard hashes to those partitions.</li>
+<li><strong>Check for a celebrity bypass miss.</strong> Is there an author near the threshold who just crossed it? If yes, mark them as celebrity manually and replay the affected events through the celebrity path.</li>
+<li><strong>Check worker health.</strong> CPU? GC pauses? Downstream timeline-cache shard hot? Often the timeline cache shard is the actual bottleneck, not the worker.</li>
+<li><strong>Apply backpressure.</strong> Temporarily downgrade P2 fan-out (delay dormant deliveries) to free worker capacity for P0/P1.</li>
+<li><strong>Hot-shard remediation.</strong> If one timeline-cache shard is the bottleneck, do a one-off re-shard or add a read-through cache layer in front of it.</li>
+<li><strong>Post-incident.</strong> Update the celebrity-threshold computation. If a new product (e.g., breaking-news mentions) is driving spikes, route those through a separate fan-out class.</li>
+</ol>
+<hr />
+<h2 id="8-combinations-with-other-patterns">8. Combinations with other patterns</h2>
+<p>Fan-out / write amplification rarely lives alone. The typical stack:</p>
+<ul>
+<li><strong><a href="./hot-key-skew.md">hot-key-skew.md</a></strong> — Celebrities are the canonical hot key on the <em>write</em> side; their posts are the canonical hot key on the <em>read</em> side. The celebrity store is a hot-key mitigation. Fan-out worker sharding is hot-key mitigation in the queue layer.</li>
+<li><strong><a href="./idempotency-exactly-once.md">idempotency-exactly-once.md</a></strong> — Fan-out workers retry on failure. Inserts into recipient timelines must be idempotent (deduplication keyed by <code>(recipient_id, tweet_id)</code>).</li>
+<li><strong><a href="./cache-stampede-read-amplification.md">cache-stampede-read-amplification.md</a></strong> — Timeline reads hit a cache. Cache stampedes occur when many users refresh after a major event. Use request coalescing and stale-while-revalidate.</li>
+<li><strong><a href="./backpressure-flow-control.md">backpressure-flow-control.md</a></strong> — Fan-out queues need backpressure: when the consumer lag exceeds SLO, the system must throttle producers or degrade tiers, not blindly accept work.</li>
+<li><strong><a href="./ordering-causal-consistency.md">ordering-causal-consistency.md</a></strong> — Chat messages must arrive in order per channel. Fan-out by channel partition; do not parallelize across partitions for a single channel.</li>
+<li><strong><a href="./durability-at-scale.md">durability-at-scale.md</a></strong> — The authoritative tweet store must be durable. The materialized timelines do <em>not</em> have to be — they are a derived projection and can be rebuilt from the authoritative store.</li>
+<li><strong><a href="./real-time-aggregation.md">real-time-aggregation.md</a></strong> — Counters ("retweet count", "like count") are themselves fan-out problems where the writes go to a counter store; combine with fan-in aggregation.</li>
+<li><strong><a href="./coordination-exactly-one-execution.md">coordination-exactly-one-execution.md</a></strong> — When the coordinator dispatches recipient-sharded fan-out, exactly-one dispatch per (author, tweet) must be guaranteed even if the coordinator restarts.</li>
+<li><strong><a href="./search-and-ranking.md">search-and-ranking.md</a></strong> — If timelines are <em>ranked</em> (not just chronological), the candidate set is built by fan-out, then ranked at read time per user. Ranking lives on top of fan-out, not instead of it.</li>
+</ul>
+<hr />
+<h2 id="9-likely-interviewer-probes">9. Likely interviewer probes</h2>
+<p><strong>Q1: Walk me through the celebrity threshold. How do you pick it, and what happens when someone crosses it?</strong></p>
+<p>Strong answer shape: The threshold is a function of the follower-count distribution and the per-write cost of fan-out. Empirically you pick it where the marginal cost of one more push exceeds the marginal cost of one more pull at read time. In practice, ~10K-50K for Twitter-scale. The transition is asymmetric:</p>
+<ul>
+<li><strong>Promotion (regular → celebrity).</strong> Stop pushing new tweets; followers start seeing this user's posts via the celebrity pull-merge at read time. No backfill needed — older tweets were already pushed and remain in follower timeline caches.</li>
+<li><strong>Demotion (celebrity → regular).</strong> Subtle: tweets posted <em>during</em> the celebrity period were never pushed; they were visible only through the celebrity pull-merge. If you turn off the pull-path the moment the user drops below threshold, those tweets vanish from follower timelines. Real systems mitigate this three ways: (1) keep the user in the celebrity-pull set for a grace period (e.g., 30 days) after demotion so followers continue merging until the tweets age out of the bounded timeline window naturally; (2) trigger a one-time backfill fan-out of the last N celebrity-era tweets at demotion (correct but expensive — itself a write storm); (3) add hysteresis on the threshold (promote at 10K followers, demote only at 5K) so flapping is rare and the demotion path is exercised infrequently.</li>
+</ul>
+<p>The threshold itself is recomputed periodically (monthly) based on the current graph and current cost ratios. Most production systems combine grace period + hysteresis and rely on bounded timeline length to close the consistency window.</p>
+<p><strong>Q2: Your fan-out worker has crashed mid-job. There were 50M followers; 20M had been delivered. How do you recover?</strong></p>
+<p>Strong answer shape: Inserts must be idempotent (deduplicated by <code>(recipient_id, tweet_id)</code> at the timeline-cache layer). The fan-out job is checkpointed by follower-shard — you know which shards completed. On restart, re-emit only the uncompleted shards. Within a shard, the re-emission re-inserts the same tweet_id, which is dropped by the idempotency check. Cross-reference <a href="./idempotency-exactly-once.md">idempotency-exactly-once.md</a>.</p>
+<p><strong>Q3: How do you bound the work for one author's tweet without bounding the size of their follower list?</strong></p>
+<p>Strong answer shape: Decouple write commit from fan-out completion. The author's write commits in O(1) — single insert to <code>tweets</code>. Fan-out runs async in worker pool, sharded by recipient, possibly across multiple priority tiers. The author never blocks on their own followers. Bounded work is a per-worker property, not a per-author property. If the author has 100M followers, the <em>system</em> does 100M units of work, but no single component does more than its slice.</p>
+<p><strong>Q4: How do you handle the case where a user posts a tweet, then immediately refreshes their own timeline and doesn't see it?</strong></p>
+<p>Strong answer shape: Self-visibility is a P0 path. On post, write to (a) the authoritative tweets table, (b) immediately insert into the author's own timeline cache before fan-out kicks off, (c) emit the fan-out event. The author sees their own tweet via path (b) within milliseconds of writing it. Read-your-own-write is a separate concern from general freshness.</p>
+<p><strong>Q5: Why not just do everything at read time and avoid the write storm entirely?</strong></p>
+<p>Strong answer shape: Read traffic dominates write traffic by 50-100x in social feed products. For a chronological feed with a 50-post display, naive pull is actually fine at p50 — 50 reads from in-memory cache complete in single-digit ms. Push earns its complexity in three specific cases: (1) ranked feeds where candidate generation across 5000 followees would re-score every refresh, (2) tight p99.9 SLO where scatter-gather tail latency hurts, (3) extreme refresh QPS where the per-refresh read budget exceeds cache capacity. The honest staff-level answer is: pull suffices for basic chronological feeds; push is a ranking / tail-latency / QPS optimization, not a generic "many followers" fix.</p>
+<p><strong>Q6: How does your design change if posts can be deleted?</strong></p>
+<p>Strong answer shape: Deletes are a second fan-out problem — they must also reach every recipient. Two common approaches: (a) lazy delete — keep the tweet_id in timelines but mark it deleted in the authoritative store; the read path filters out tombstoned tweet_ids; (b) eager delete — emit a delete event to the same fan-out workers, which remove from each recipient's timeline. Lazy is cheaper and simpler; eager gives faster removal but doubles the fan-out cost. For privacy-sensitive deletes (e.g., revoked posts), eager is required and SLO-bound.</p>
+<hr />
+<h2 id="10-common-traps-stronger-moves">10. Common traps → stronger moves</h2>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pure push, no celebrity carve-out.</td>
+<td>Hybrid push / pull above a threshold computed from the follower distribution.</td>
+</tr>
+<tr>
+<td>Sync fan-out in the producer's write path.</td>
+<td>Authoritative write commits sync; fan-out runs async behind Kafka.</td>
+</tr>
+<tr>
+<td>Partition fan-out work by author.</td>
+<td>Partition by recipient — celebrity authors no longer pin one worker.</td>
+</tr>
+<tr>
+<td>Treat all followers equally.</td>
+<td>Priority tiers (P0 self, P1 active, P2 dormant) with separate SLOs.</td>
+</tr>
+<tr>
+<td>Fan out to every follower including dormant.</td>
+<td>Active-follower filter; on-demand backfill for returning users.</td>
+</tr>
+<tr>
+<td>Pull from every followee on every read.</td>
+<td>Cache the timeline; pull only the celebrity tail at read time.</td>
+</tr>
+<tr>
+<td>Single Kafka topic for all fan-out.</td>
+<td>Topic per priority tier; topic per fan-out class (timeline vs notifications vs search index).</td>
+</tr>
+<tr>
+<td>Retry on failure without dedup.</td>
+<td>Idempotent recipient inserts keyed by (recipient_id, post_id).</td>
+</tr>
+<tr>
+<td>Materialize timeline forever.</td>
+<td>Ring buffer of newest N entries; older posts pulled from authoritative store on demand.</td>
+</tr>
+<tr>
+<td>Same threshold globally for all features.</td>
+<td>Per-feature threshold — timelines vs notifications vs search may all want different splits.</td>
+</tr>
+<tr>
+<td>Ignore cross-region.</td>
+<td>Regionalize fan-out — only post events cross regions; the per-recipient inserts stay local.</td>
+</tr>
+<tr>
+<td>"We'll just use Redis."</td>
+<td>Pick the storage tier per access pattern: in-memory cache for hot timelines, durable KV for celebrity store, log for the authoritative tweets.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11-staff-level-answer-checklist">11. Staff-level answer checklist</h2>
+<ul>
+<li>[ ] Named the invariant: bounded per-write work, with N decoupled from producer latency.</li>
+<li>[ ] Identified the heavy-tailed follower distribution as the source of write amplification.</li>
+<li>[ ] Picked a model (push / pull / hybrid) and justified it from the read:write ratio.</li>
+<li>[ ] Decoupled authoritative write from fan-out via Kafka.</li>
+<li>[ ] Sharded fan-out workers by recipient, not by author.</li>
+<li>[ ] Specified a celebrity threshold and how it's chosen / recomputed.</li>
+<li>[ ] Designed a read path that merges pre-pushed timeline with a small celebrity pull.</li>
+<li>[ ] Made inserts idempotent and explained delete handling.</li>
+<li>[ ] Filtered dormant followers from push; planned the cold-user backfill path.</li>
+<li>[ ] Set per-tier freshness SLOs and named the metrics (per-tier lag, fan-out backlog, threshold drift).</li>
+<li>[ ] Discussed cache stampede on read after major events.</li>
+<li>[ ] Named what is authoritative vs what is a rebuildable projection.</li>
+<li>[ ] Covered the on-call incident path for fan-out lag.</li>
+<li>[ ] Articulated regional fan-out and where cross-region traffic happens.</li>
+</ul>
+<hr />
+<h2 id="12-cross-references">12. Cross-references</h2>
+<h3 id="question-docs">Question docs</h3>
+<ul>
+<li><a href="../questions/design-twitter.md">Design Twitter</a> — full system design with hybrid fan-out as the centerpiece.</li>
+<li><a href="../questions/design-twitter-timeline.md">Design Twitter Timeline</a> — narrower scope, deepest treatment of the timeline read/write path.</li>
+<li><a href="../questions/design-facebooks-newsfeed.md">Design Facebook Newsfeed</a> — fan-out plus ranking; the candidate set is built by fan-out, then re-ranked per user.</li>
+<li><a href="../questions/design-instagram.md">Design Instagram</a> — photo fan-out plus the Stories 24h window.</li>
+<li><a href="../questions/design-a-notification-system.md">Design a Notification System</a> — multi-channel fan-out (push, email, SMS) with per-recipient delivery state.</li>
+<li><a href="../questions/design-discord.md">Design Discord</a> — channel fan-out with real-time push to connected clients plus offline backfill.</li>
+<li><a href="../questions/design-a-live-comment-streaming-service-like-twitch-chat.md">Design a Live Comment Streaming Service like Twitch Chat</a> — read-side fan-out via pub/sub at very high recipient count.</li>
+<li><a href="../questions/design-google-news-as-a-global-aggregator.md">Design Google News as a Global Aggregator</a> — fan-out into topical, regional, and personalized streams.</li>
+<li><a href="../questions/design-linkedin-connections.md">Design LinkedIn Connections</a> — graph traversal that interacts with feed fan-out.</li>
+</ul>
+<h3 id="sibling-pattern-docs">Sibling pattern docs</h3>
+<ul>
+<li><a href="./hot-key-skew.md">hot-key-skew.md</a></li>
+<li><a href="./cache-stampede-read-amplification.md">cache-stampede-read-amplification.md</a></li>
+<li><a href="./idempotency-exactly-once.md">idempotency-exactly-once.md</a></li>
+<li><a href="./backpressure-flow-control.md">backpressure-flow-control.md</a></li>
+<li><a href="./ordering-causal-consistency.md">ordering-causal-consistency.md</a></li>
+<li><a href="./durability-at-scale.md">durability-at-scale.md</a></li>
+<li><a href="./real-time-aggregation.md">real-time-aggregation.md</a></li>
+<li><a href="./coordination-exactly-one-execution.md">coordination-exactly-one-execution.md</a></li>
+<li><a href="./search-and-ranking.md">search-and-ranking.md</a></li>
+</ul>
+<h3 id="glossary-terms">Glossary terms</h3>
+<ul>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md#1-replica-副本">Replica</a></li>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md#2-quorum-法定人数--多数派">Quorum</a></li>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md#3-consistent-hashing-一致性哈希">Consistent hashing</a></li>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md#4-preference-list-优先副本列表">Preference list</a></li>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md#5-coordinator-node-协调节点">Coordinator node</a></li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

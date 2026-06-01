@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ordering / Causal Consistency — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design-patterns/">← Back to System Design Patterns</a>
+        <h1 class="article-title">Ordering / Causal Consistency</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/31 &nbsp;·&nbsp; System Design Patterns
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>Designing systems so that events respect "happens-before" without paying the cost of a single global sequencer for every write. See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for vocabulary (vector clock, Lamport clock, CRDT, quorum, hinted handoff). Closely tied to these question docs: <a href="../questions/design-facebook-messenger.md">Facebook Messenger</a>, <a href="../questions/design-whatsapp.md">WhatsApp</a>, <a href="../questions/design-google-docs.md">Google Docs</a>, <a href="../questions/design-twitter.md">Twitter</a>, <a href="../questions/design-the-stripe-payment-gateway.md">Stripe payment gateway</a>, <a href="../questions/design-a-collaborative-whiteboard-like-miro.md">collaborative whiteboard</a>, <a href="../questions/amazon-dynamo.md">Amazon Dynamo</a>.</p>
+</blockquote>
+<hr />
+<h2 id="1-the-fundamental-hardness">1. The fundamental hardness</h2>
+<p>Distributed systems do not have a single shared clock. Two events that happen "at the same time" on two different machines have no objective ordering — physical wall clocks drift (typically tens of milliseconds across a data center, hundreds across regions even with Network Time Protocol (NTP)), packets travel different routes with different latencies, and message queues reorder. Yet users and product semantics demand order: a chat message must show up after the one it replies to, a Google Docs edit must apply to the right base version, a bank account debit must be visible before the dependent credit.</p>
+<p>The simplest answer is "give everything a total order from a single sequencer." This works at small scale (a single Kafka partition with one producer, a single Spanner Paxos group). It breaks at scale because:</p>
+<ol>
+<li>A single sequencer is a per-key throughput cap — one machine's stamping rate (tens to low hundreds of thousands of stamps per second) bounds the whole keyspace it owns.</li>
+<li>A single sequencer requires geographically centralized coordination — cross-region round-trips for every write are unacceptable for messaging or collaborative editing. (Availability is <em>not</em> the problem most of the time — a logical sequencer can be made highly available via Raft. Throughput and geography are.)</li>
+</ol>
+<p>The escape hatch is the distinction between <strong>total order</strong> (every event has a globally agreed-upon position, including events that never interacted) and <strong>causal order</strong> (events that depend on each other respect happens-before; independent events can be ordered arbitrarily). Causal order is strictly weaker and dramatically cheaper. Leslie Lamport's 1978 "Time, Clocks, and the Ordering of Events" defines happens-before (denoted <code>→</code>): event <code>a → b</code> if <code>a</code> happens before <code>b</code> on the same node, or <code>a</code> is a send and <code>b</code> is the matching receive, or there is a chain. Events with no chain between them are <strong>concurrent</strong>, and causal order does not require us to pick one over the other.</p>
+<p>The staff-level move is to ask: <strong>what is the minimum ordering scope my product actually needs?</strong> Per-conversation? Per-document? Per-user-account? Then design a partition key that contains that scope inside a single sequencer, and let independent scopes scale horizontally. Where two scopes must merge (multi-region writes to the same key, or two users editing the same document), reach for the toolkit below.</p>
+<hr />
+<h2 id="2-how-to-recognize-it-in-the-interview">2. How to recognize it in the interview</h2>
+<h3 id="prompt-phrases">Prompt phrases</h3>
+<ul>
+<li>"Messages must appear in order on every device."</li>
+<li>"Two clients edit the same document at the same time."</li>
+<li>"Multi-region replication, but the user expects a consistent view."</li>
+<li>"Out-of-order delivery should not corrupt the state."</li>
+<li>"The conversation/feed/timeline must be deterministic."</li>
+<li>"Read your own writes" across devices.</li>
+<li>"Bank ledger" or "double-entry transactions."</li>
+</ul>
+<h3 id="architectural-smells">Architectural smells</h3>
+<ul>
+<li>Two writers can touch the same logical entity (the same chat, the same doc, the same counter).</li>
+<li>Wall-clock timestamps are being used as a sort key. (Suspicious — clock skew breaks this.)</li>
+<li>The system spans regions and the prompt mentions "active-active."</li>
+<li>A queue or fan-out is between the writer and the storage, so messages can arrive out of order.</li>
+<li>The state is naturally a sequence (messages, events, edits, ledger entries) rather than a set.</li>
+</ul>
+<h3 id="example-interview-prompts-where-this-is-core">Example interview prompts where this is core</h3>
+<ol>
+<li>Design Facebook Messenger / WhatsApp — per-conversation ordering across devices and regions.</li>
+<li>Design Google Docs — concurrent edits to the same document.</li>
+<li>Design a collaborative whiteboard like Miro — same problem in 2D.</li>
+<li>Design a payment / ledger system — debits and credits must be causally consistent; double-entry invariants must hold.</li>
+<li>Design Twitter timeline — when multiple producers post and a fan-out reorders them, the timeline must still feel sane.</li>
+<li>Design an ad-click aggregator — out-of-order click events arriving across regions must aggregate correctly without double-counting.</li>
+</ol>
+<p>If you hear any of these, the first 90 seconds of your answer should name the ordering scope and the technique you will use to enforce it.</p>
+<hr />
+<h2 id="3-60-second-spoken-framing">3. 60-second spoken framing</h2>
+<blockquote>
+<p>The invariant I am designing around is causal consistency — if event <code>B</code> could have observed event <code>A</code>, the system must show them in that order. I am explicitly not promising total order across unrelated keys, because that requires a single sequencer and does not scale. My first move is to pick an ordering scope — per conversation, per document, per account — and route all writes for one scope to a single partition with a single writer, so within the scope I get free total order. Where two scopes must merge, like multi-region replication or concurrent edits, I reach for vector clocks, Conflict-Free Replicated Data Types (CRDTs), or Operational Transform (OT) depending on whether I need to detect conflicts, auto-merge them, or transform operations. I will tell you which one I picked and why.</p>
+</blockquote>
+<hr />
+<h2 id="4-canonical-toolkit">4. Canonical toolkit</h2>
+<table>
+<thead>
+<tr>
+<th>Technique</th>
+<th>What it gives you</th>
+<th>Cost</th>
+<th>Typical use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Per-key single writer / single partition</td>
+<td>Free total order within the partition.</td>
+<td>Per-key throughput cap; partition is a hotspot if the key is hot.</td>
+<td>Kafka partition key, Spanner directory, per-conversation log.</td>
+</tr>
+<tr>
+<td>Lamport timestamp</td>
+<td>Total order consistent with causality (but not unique to causality).</td>
+<td>One scalar per event; ties broken by node ID.</td>
+<td>Lightweight event ordering; logs; simple replicated state machines.</td>
+</tr>
+<tr>
+<td>Vector clock</td>
+<td>Detects happens-before vs concurrent precisely.</td>
+<td>One counter slot per ever-active writer in the object's history; at 1000 nodes that's 1000 <code>(node_id, counter)</code> entries on every replicated object until pruned.</td>
+<td>Dynamo siblings, Riak, multi-region replication where you actually need to <em>detect</em> concurrent writes (not just order them).</td>
+</tr>
+<tr>
+<td>Conflict-Free Replicated Data Type (CRDT)</td>
+<td>Auto-merging data structures (G-Counter, OR-Set, Last-Writer-Wins Register, RGA for text).</td>
+<td>State per replica grows with the operation history — OR-Set carries one tombstone per ever-deleted element per replica until garbage collected; not every data type has a useful CRDT formulation (e.g., "set with cardinality constraint", arbitrary integer with multiplication).</td>
+<td>Multi-region counters, offline-first apps, collaborative editing without a central server.</td>
+</tr>
+<tr>
+<td>Operational Transform (OT)</td>
+<td>Transform concurrent operations against each other so they converge.</td>
+<td>Requires a central server (typically); transform functions are subtle and bug-prone — TP1 must hold for every op-pair.</td>
+<td>Google Docs, Etherpad, Office Online.</td>
+</tr>
+<tr>
+<td>Session sequence number from client</td>
+<td>Causal order within one client's session at near-zero cost.</td>
+<td>Only orders one client's own actions.</td>
+<td>Multi-device sync, idempotency keys, retry deduplication.</td>
+</tr>
+<tr>
+<td>Monotonic ID from a sequencer</td>
+<td>Per-machine monotonic IDs that are <em>roughly</em> time-sortable across machines.</td>
+<td>Not a true global total order — two events at the same millisecond on different machines are ordered only by an arbitrary machine-ID tiebreaker. Depends on monotonic wall clock.</td>
+<td>Twitter Snowflake, Sonyflake, KSUID. Good for unique sortable IDs; not a substitute for consensus when you need real linearizability.</td>
+</tr>
+<tr>
+<td>Hybrid Logical Clock (HLC)</td>
+<td>Lamport semantics plus wall-clock approximation, bounded skew.</td>
+<td>Slightly more code; depends on NTP for the wall-clock part.</td>
+<td>CockroachDB, YugabyteDB, modern multi-region stores.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="41-lamport-timestamp-update">4.1 Lamport timestamp update</h3>
+<pre><code class="language-python">class LamportClock:
+    &quot;&quot;&quot;One Lamport scalar per node. Monotonically increases with any event.&quot;&quot;&quot;
+
+    def __init__(self, node_id: int) -&gt; None:
+        self.node_id = node_id
+        self.counter = 0
+
+    def on_local_event(self) -&gt; int:
+        self.counter += 1
+        return self.counter
+
+    def on_send(self) -&gt; int:
+        # Stamp the outgoing message with our incremented counter.
+        self.counter += 1
+        return self.counter
+
+    def on_receive(self, incoming_ts: int) -&gt; int:
+        # Lamport rule: counter = max(local, incoming) + 1.
+        self.counter = max(self.counter, incoming_ts) + 1
+        return self.counter
+
+    def order_key(self, ts: int) -&gt; tuple[int, int]:
+        # Break ties with node_id so the total order is deterministic.
+        return (ts, self.node_id)
+</code></pre>
+<p>Lamport gives <code>a → b</code> implies <code>LC(a) &lt; LC(b)</code>, but the converse is false: <code>LC(a) &lt; LC(b)</code> does not mean <code>a → b</code>. Two concurrent events can still be totally ordered by Lamport; you just cannot detect the concurrency from the timestamp alone. That is fine when you only need a deterministic order and do not care about conflict detection.</p>
+<h3 id="42-vector-clock-compare">4.2 Vector clock compare</h3>
+<pre><code class="language-python">from enum import Enum
+
+class Causality(Enum):
+    BEFORE = &quot;before&quot;        # A happened before B
+    AFTER = &quot;after&quot;          # A happened after B
+    EQUAL = &quot;equal&quot;          # Same event
+    CONCURRENT = &quot;concurrent&quot;  # Conflict; neither observed the other
+
+VectorClock = dict[str, int]  # node_id -&gt; counter
+
+def compare(a: VectorClock, b: VectorClock) -&gt; Causality:
+    a_less_eq_b = True
+    b_less_eq_a = True
+    for node in a.keys() | b.keys():
+        ca, cb = a.get(node, 0), b.get(node, 0)
+        if ca &gt; cb:
+            a_less_eq_b = False
+        if cb &gt; ca:
+            b_less_eq_a = False
+    if a_less_eq_b and b_less_eq_a:
+        return Causality.EQUAL
+    if a_less_eq_b:
+        return Causality.BEFORE
+    if b_less_eq_a:
+        return Causality.AFTER
+    return Causality.CONCURRENT
+
+def merge(a: VectorClock, b: VectorClock) -&gt; VectorClock:
+    # Element-wise max; used when a node observes a remote version.
+    out: VectorClock = {}
+    for node in a.keys() | b.keys():
+        out[node] = max(a.get(node, 0), b.get(node, 0))
+    return out
+
+def on_local_write(vc: VectorClock, node: str) -&gt; VectorClock:
+    out = dict(vc)
+    out[node] = out.get(node, 0) + 1
+    return out
+</code></pre>
+<p>The expensive part is not the comparison — it is the storage. Every replicated object carries a vector clock with one slot per writer that has ever touched it. In a Dynamo-style cluster with a few hundred nodes where any coordinator can stamp any key, the clock on a long-lived object can accumulate hundreds of <code>(node_id, counter)</code> pairs even though only a couple of them have written recently. Production systems prune entries that have not been touched in a long time, accepting a small probability of false-concurrent reports. Most interview prompts do not actually need vector clocks — they need Lamport stamps or a per-scope sequence number. Reach for vector clocks only when the design has multiple coordinators writing the same key <em>and</em> the application has to distinguish "concurrent, must resolve" from "one strictly followed the other." If you just need a deterministic order, Lamport is cheaper.</p>
+<h3 id="43-g-counter-crdt-merge">4.3 G-Counter CRDT merge</h3>
+<pre><code class="language-python">class GCounter:
+    &quot;&quot;&quot;Grow-only counter. Each node increments only its own slot.
+    Merge is element-wise max; value is the sum.
+    Used for things like &quot;global like count&quot; across regions without coordination.
+    &quot;&quot;&quot;
+
+    def __init__(self, node_id: str) -&gt; None:
+        self.node_id = node_id
+        self.slots: dict[str, int] = {}
+
+    def increment(self, by: int = 1) -&gt; None:
+        if by &lt; 0:
+            raise ValueError(&quot;G-Counter cannot decrement. Use PN-Counter for that.&quot;)
+        self.slots[self.node_id] = self.slots.get(self.node_id, 0) + by
+
+    def value(self) -&gt; int:
+        return sum(self.slots.values())
+
+    def merge(self, other: &quot;GCounter&quot;) -&gt; &quot;GCounter&quot;:
+        out = GCounter(self.node_id)
+        for k in self.slots.keys() | other.slots.keys():
+            out.slots[k] = max(self.slots.get(k, 0), other.slots.get(k, 0))
+        return out
+</code></pre>
+<p>The CRDT property: merge is commutative, associative, and idempotent. So replicas can gossip in any order, multiple times, and still converge. The data structure pays for this with extra state — a G-Counter stores one integer per ever-active node, not just a single integer.</p>
+<p>The honest trade-offs to call out:</p>
+<ul>
+<li><strong>G-Counter cannot decrement.</strong> If you need both increment and decrement (likes minus unlikes), you need a PN-Counter, which is two G-Counters — twice the state, and the displayed value is a <em>difference</em>, which can transiently go negative under partition recovery if a remove arrived without its matching add yet.</li>
+<li><strong>OR-Set carries tombstones.</strong> Every <code>remove(x)</code> must persist as a tombstone until every replica has observed it (causal stability), otherwise a concurrent <code>add(x)</code> on a lagging replica would resurrect the element. Without garbage collection, state grows with the cumulative number of removes, not the current set size.</li>
+<li><strong>Not every data type has a CRDT.</strong> Operations that aren't commutative (assign integer to a function of its current value, enforce "at most K elements") don't have a useful merge. CRDTs make commutative operations cheap, not non-commutative ones possible.</li>
+</ul>
+<h3 id="44-operational-transform-insert-vs-insert">4.4 Operational Transform — insert vs insert</h3>
+<pre><code class="language-python">from dataclasses import dataclass
+
+@dataclass
+class InsertOp:
+    position: int
+    text: str
+    author: str  # tiebreaker for same-position conflicts
+
+def transform_insert_insert(local: InsertOp, remote: InsertOp) -&gt; InsertOp:
+    &quot;&quot;&quot;Transform `local` so it can be applied after `remote` was applied.
+    Both ops were generated against the same base document.
+    &quot;&quot;&quot;
+    if remote.position &lt; local.position:
+        # Remote inserted to the left; shift our position right.
+        return InsertOp(local.position + len(remote.text), local.text, local.author)
+    if remote.position &gt; local.position:
+        # Remote inserted to the right; we are unaffected.
+        return local
+    # Same position. Break ties deterministically so both sides agree.
+    if remote.author &lt; local.author:
+        return InsertOp(local.position + len(remote.text), local.text, local.author)
+    return local
+</code></pre>
+<p>OT is what Google Docs uses. The transform function must satisfy the TP1 property: for any two concurrent operations <code>a</code> and <code>b</code>, <code>transform(a, b)</code> then apply <code>b</code> must produce the same document as <code>transform(b, a)</code> then apply <code>a</code>. Building correct OT for rich text (insert, delete, format, with cursors and selections) is famously hard. Many modern systems prefer CRDTs (specifically RGA — Replicated Growable Array, or Yjs/Automerge) to avoid the TP1 minefield.</p>
+<h3 id="45-hybrid-logical-clock-update">4.5 Hybrid Logical Clock update</h3>
+<pre><code class="language-python">import time
+
+class HLC:
+    &quot;&quot;&quot;Hybrid Logical Clock — Lamport behavior, but tracks wall-clock too.
+    Two-tuple: (wall_ms, logical). Comparison is lexicographic.
+    Used in CockroachDB, YugabyteDB.
+    &quot;&quot;&quot;
+
+    def __init__(self) -&gt; None:
+        self.wall_ms = 0
+        self.logical = 0
+
+    def _now(self) -&gt; int:
+        return int(time.time() * 1000)
+
+    def on_local_event(self) -&gt; tuple[int, int]:
+        now = self._now()
+        if now &gt; self.wall_ms:
+            self.wall_ms = now
+            self.logical = 0
+        else:
+            self.logical += 1
+        return (self.wall_ms, self.logical)
+
+    def on_receive(self, incoming_wall: int, incoming_logical: int) -&gt; tuple[int, int]:
+        now = self._now()
+        new_wall = max(self.wall_ms, incoming_wall, now)
+        if new_wall == self.wall_ms == incoming_wall:
+            self.logical = max(self.logical, incoming_logical) + 1
+        elif new_wall == self.wall_ms:
+            self.logical += 1
+        elif new_wall == incoming_wall:
+            self.logical = incoming_logical + 1
+        else:
+            self.logical = 0
+        self.wall_ms = new_wall
+        return (self.wall_ms, self.logical)
+</code></pre>
+<p>HLC is the modern default when you want Lamport's safety plus the operational benefit of timestamps that approximate wall time (so humans reading logs and tooling building time-series indexes both work).</p>
+<hr />
+<h2 id="5-worked-example-naive-broken-fixed-messenger">5. Worked example: naive → broken → fixed (Messenger)</h2>
+<h3 id="the-scenario">The scenario</h3>
+<p>Two-person chat between Alice and Bob. Alice's phone is on a flaky cellular connection. Alice sends two messages back-to-back:</p>
+<pre><code>T = 100ms : Alice taps &quot;Did you see the email?&quot;      (msg1)
+T = 101ms : Alice taps &quot;Reply when you can&quot;          (msg2)
+</code></pre>
+<p>In a single healthy TCP connection these would arrive in order — TCP itself is FIFO. The realistic ways msg2 reaches the server before msg1 are:</p>
+<ul>
+<li><strong>msg1's send failed and got queued for retry</strong> while msg2 went on a freshly re-opened socket. The two now race through different load-balanced application servers.</li>
+<li><strong>The client reconnected</strong> between msg1 and msg2 (cell-to-WiFi handoff, app backgrounded then resumed). The new connection lands on a different server.</li>
+<li><strong>Alice has two devices</strong> (phone and laptop) and they are independent — covered as a separate edge case below.</li>
+</ul>
+<p>This is the common failure shape. "Single TCP connection delivered packets out of order" is not — assume FIFO inside one connection.</p>
+<h3 id="the-naive-design">The naive design</h3>
+<p>The send service stamps each message with the application server's wall-clock time on receipt and writes to a globally sharded message store. Because msg1 was retried on a slower path, msg2 actually reaches the system first:</p>
+<pre><code>App server B receives msg2 at B's clock = 250ms  -&gt; store as ts=250
+App server A receives msg1 at A's clock = 280ms  -&gt; store as ts=280
+                                              ^ msg1's retry took longer than msg2's first send
+</code></pre>
+<p>Bob's client queries <code>messages where conv_id = X order by ts asc</code> and sees:</p>
+<pre><code>[250ms] &quot;Reply when you can&quot;
+[280ms] &quot;Did you see the email?&quot;
+</code></pre>
+<p>Bob is confused. The reply appears before the question. Clock skew is <em>not</em> the root cause here — even with perfectly synchronized clocks, the receipt timestamp reflects arrival order, not Alice's send order. Wall clocks would make it strictly worse: a 50ms NTP drift between servers can flip ordering even when arrival order is correct.</p>
+<h3 id="why-naive-timestamps-fail">Why naive timestamps fail</h3>
+<ol>
+<li><strong>Arrival time is not send time.</strong> Retries, reconnects, and routing variance mean a later-sent message can arrive earlier.</li>
+<li><strong>Wall clocks drift</strong> independently on top of that. Even with NTP, ±5ms between hosts is normal; ±50ms during NTP outages. Across regions, hundreds of milliseconds.</li>
+<li><strong>The events are causally ordered</strong> (Alice sent msg1 strictly before msg2 from her single device) but the storage layer threw that information away.</li>
+<li><strong>There is no single sequencer</strong>, so no machine has authority to say "msg1 is first."</li>
+</ol>
+<h3 id="fix-1-per-conversation-single-partition-with-monotonic-sequence">Fix 1: per-conversation single partition with monotonic sequence</h3>
+<p>The natural ordering scope here is the conversation. Partition the conversation log by <code>conversation_id</code>. All writes for one conversation go to one Kafka partition / one Spanner directory / one log shard. The shard owner stamps each message with a monotonic per-conversation sequence number.</p>
+<pre><code>                  +----------------------+
+   Alice phone --&gt;| Conversation Router  | -- hash(conv_id) --&gt; shard 17
+   Bob   phone --&gt;|                      |
+                  +----------------------+
+                                                |
+                                                v
+                                +-------------------------------+
+                                | Conversation shard 17 (leader)|
+                                |                               |
+                                |   seq=42 msg1 &quot;Did you see...&quot;|
+                                |   seq=43 msg2 &quot;Reply when...&quot; |
+                                |   ...                         |
+                                +-------------------------------+
+</code></pre>
+<p>Within the shard, sequence numbers are assigned in arrival order at the leader. Bob reads <code>where conv_id=X order by seq asc</code> and sees the right order regardless of wall-clock drift across servers.</p>
+<p>The remaining problem: what if msg1 and msg2 arrived at the leader out of order (msg2 first, because msg1's retry was slower)? Then seq=42 is "Reply when you can" and seq=43 is "Did you see the email?". The shard's own order is still consistent (Bob will see the same order on every device), but it does not match Alice's intent.</p>
+<h3 id="fix-2-client-session-sequence-number">Fix 2: client session sequence number</h3>
+<p>Have the client stamp each message with <code>(client_session_id, client_seq)</code>. The client increments <code>client_seq</code> for every message it sends in this session. The shard uses this to <strong>sort within a single sender's burst</strong>: if two messages from the same client session arrive at the shard, order by <code>client_seq</code> even if arrival order disagrees.</p>
+<pre><code class="language-python"># Client side
+class ChatClient:
+    def __init__(self, session_id: str) -&gt; None:
+        self.session_id = session_id
+        self.client_seq = 0
+
+    def send(self, conv_id: str, body: str) -&gt; dict:
+        self.client_seq += 1
+        return {
+            &quot;conv_id&quot;: conv_id,
+            &quot;body&quot;: body,
+            &quot;session_id&quot;: self.session_id,
+            &quot;client_seq&quot;: self.client_seq,
+        }
+
+# Shard side, when assigning the durable per-conversation sequence:
+def assign_seq(shard_state, msg):
+    # Buffer briefly to absorb out-of-order arrivals from the same session.
+    # Then assign the next shard sequence in (session_id, client_seq) order.
+    shard_state.pending.append(msg)
+    ready = shard_state.flush_in_order()  # sorts by (session, client_seq)
+    for m in ready:
+        m[&quot;seq&quot;] = shard_state.next_seq()
+        shard_state.log.append(m)
+</code></pre>
+<p>Now Alice's two messages — even if delivered out of order to the shard — are reordered by <code>client_seq</code> before sequencing. Bob sees them in Alice's intended order.</p>
+<h3 id="edge-case-alice-has-two-devices">Edge case: Alice has two devices</h3>
+<p>Now Alice has both her phone and her laptop sending into the same conversation. The two devices have independent <code>client_seq</code> counters. They are genuinely concurrent — there is no "right" answer for which Alice-message comes first. The shard breaks ties by arrival order at the leader (effectively a Lamport stamp), and the conversation is consistent across viewers even if a re-watch from a fresh device gets the same order. That is the best you can do without slowing every send down with cross-device coordination.</p>
+<h3 id="why-not-spanner-a-single-global-sequencer">Why not Spanner / a single global sequencer?</h3>
+<p>You could use Spanner-style TrueTime to give every message a globally ordered timestamp. It works for the bank ledger case (where you need cross-account total order). For chat, it is overkill — the product only needs per-conversation order, and TrueTime adds ~10-14ms of commit-wait to every write. The per-conversation shard approach gives you what you need at one-tenth the latency.</p>
+<h3 id="summary-table">Summary table</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Mechanism</th>
+<th>What it enforces</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Client</td>
+<td>Session sequence number.</td>
+<td>Order within one device's burst.</td>
+</tr>
+<tr>
+<td>Shard</td>
+<td>Per-conversation monotonic seq.</td>
+<td>Order across all writers into the conversation.</td>
+</tr>
+<tr>
+<td>Cross-shard</td>
+<td>None needed.</td>
+<td>We accepted no cross-conversation order.</td>
+</tr>
+<tr>
+<td>Cross-region</td>
+<td>Single leader region per conversation.</td>
+<td>One source of truth; followers replicate the seq.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="6-variants-and-how-to-choose">6. Variants and how to choose</h2>
+<table>
+<thead>
+<tr>
+<th>Technique</th>
+<th>Detects conflict?</th>
+<th>Auto-merges?</th>
+<th>Total order?</th>
+<th>Storage cost</th>
+<th>When to use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single partition / single writer</td>
+<td>N/A — no conflict possible.</td>
+<td>N/A.</td>
+<td>Yes, within partition.</td>
+<td>Low.</td>
+<td>Per-conversation chat, per-account ledger, per-document edits with a server.</td>
+</tr>
+<tr>
+<td>Lamport timestamp</td>
+<td>No (cannot distinguish concurrent from sequential).</td>
+<td>No.</td>
+<td>Yes, but arbitrary tie-breaks.</td>
+<td>One integer per event.</td>
+<td>Lightweight log ordering; replicated state machine input ordering.</td>
+</tr>
+<tr>
+<td>Vector clock</td>
+<td>Yes (precise happens-before).</td>
+<td>No (you must merge in app code).</td>
+<td>No (only partial).</td>
+<td><code>O(writers)</code> per object; needs pruning.</td>
+<td>Dynamo-style stores, multi-master KV with sibling resolution.</td>
+</tr>
+<tr>
+<td>CRDT (G-Counter, OR-Set, LWW-Reg, RGA)</td>
+<td>Implicitly resolved.</td>
+<td>Yes (mathematically).</td>
+<td>No.</td>
+<td>Larger state; tombstones for delete-aware CRDTs.</td>
+<td>Offline-first apps, multi-region counters, peer-to-peer collaborative editors.</td>
+</tr>
+<tr>
+<td>Operational Transform</td>
+<td>Yes (server resolves).</td>
+<td>Yes via transform.</td>
+<td>Yes (after server linearizes).</td>
+<td>Operation log + transform functions.</td>
+<td>Server-mediated rich-text editors (Google Docs, Etherpad).</td>
+</tr>
+<tr>
+<td>Single sequencer (Snowflake)</td>
+<td>No.</td>
+<td>No.</td>
+<td>Approximate — sortable by time, but events at the same millisecond on different machines are ordered by an arbitrary machine-ID tiebreaker, not by causality.</td>
+<td>Tiny per-event ID.</td>
+<td>Globally unique sortable IDs (tweet IDs, ad-click IDs). Not a substitute for consensus when you need real total order under contention.</td>
+</tr>
+<tr>
+<td>HLC</td>
+<td>Effectively yes (via Lamport part).</td>
+<td>No.</td>
+<td>Yes (lex order).</td>
+<td>Two integers per event.</td>
+<td>CockroachDB, YugabyteDB; modern multi-region SQL.</td>
+</tr>
+<tr>
+<td>Consensus (Paxos, Raft)</td>
+<td>N/A.</td>
+<td>N/A.</td>
+<td>Yes, strong.</td>
+<td>Quorum write latency.</td>
+<td>Bank ledger, exactly-once invariants, leader election.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="decision-flowchart">Decision flowchart</h3>
+<pre><code>Does your product need a global total order across unrelated keys?
+   YES -&gt; Consensus per shard (Spanner / CockroachDB) or single sequencer.
+   NO  -&gt; Continue.
+
+Can you partition by an ordering scope (conversation, document, account)?
+   YES -&gt; Per-scope single writer. A monotonic sequence number assigned by
+          the leader is usually sufficient — STOP here. This covers most
+          chat apps, per-document editing with a central server, per-account
+          ledgers within one region.
+   NO  -&gt; Continue (true multi-master).
+
+Do concurrent writes have a deterministic merge rule?
+   YES, mathematical merge   -&gt; CRDT.
+   YES, transform-based      -&gt; OT (need server) or RGA CRDT.
+   NO, app must resolve      -&gt; Vector clocks + sibling presentation.
+</code></pre>
+<p>The staff-level read of this flowchart is that most interview prompts terminate at the second box. Reaching vector clocks, CRDTs, or OT is a signal that the design has true multi-master writes, which is itself a choice (often forced by offline-first or cross-region active-active). If the prompt does not require those, don't pay for them.</p>
+<hr />
+<h2 id="7-failure-modes-and-operations">7. Failure modes and operations</h2>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>What it looks like</th>
+<th>Metric to watch</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Vector clock unbounded growth</td>
+<td>Single object has VC with hundreds of writer IDs.</td>
+<td><code>p99_vector_clock_size</code>.</td>
+<td>Prune entries older than retention window; cap at <code>K</code> writers; tombstone unused.</td>
+</tr>
+<tr>
+<td>CRDT state explosion</td>
+<td>OR-Set carries millions of tombstones for deleted items.</td>
+<td><code>crdt_state_bytes_per_object</code>.</td>
+<td>Periodic garbage collection with causal stability (Riak's "reap"); switch to delta-CRDTs.</td>
+</tr>
+<tr>
+<td>Sequencer outage</td>
+<td>Kafka partition leader (or per-scope leader) down; writes to that scope blocked. (Snowflake is per-machine, so one instance dying does not block writes — clients route to another generator.)</td>
+<td><code>sequencer_unavailability_seconds</code>.</td>
+<td>Fast leader election (Raft); multiple sequencers per key range with non-overlapping ID space; client-side retry with backoff.</td>
+</tr>
+<tr>
+<td>Wall clock skew breaks HLC</td>
+<td>Clock jumps backward; HLC <code>max(now, prev)</code> masks the issue but operations look misordered in logs.</td>
+<td><code>clock_skew_ms_p99</code>.</td>
+<td>NTP with chrony + multiple time sources; alert on skew &gt; 50ms; reject events with future-dated wall clocks beyond a threshold.</td>
+</tr>
+<tr>
+<td>Out-of-order delivery to single-partition log</td>
+<td>Client retry causes msg2 to arrive before msg1.</td>
+<td><code>out_of_order_arrival_rate</code>.</td>
+<td>Client session seq + bounded reorder buffer at the leader.</td>
+</tr>
+<tr>
+<td>Lamport tie collisions</td>
+<td>Two events with identical Lamport stamp; ties broken by node ID can starve a node.</td>
+<td><code>lamport_tie_rate</code>.</td>
+<td>Periodic clock-jump to spread node IDs; randomize node ID at startup.</td>
+</tr>
+<tr>
+<td>Concurrent CRDT semantics surprise users</td>
+<td>Add-then-delete in one region + delete-then-add in another converges to "exists" or "deleted" depending on CRDT choice.</td>
+<td>User-reported "my changes disappeared" tickets.</td>
+<td>Pick the CRDT that matches product expectations (Add-wins OR-Set vs Remove-wins) and document it; expose "this was concurrently edited" UI hint.</td>
+</tr>
+<tr>
+<td>OT transform bug</td>
+<td>TP1 violated; two clients diverge.</td>
+<td>Diff between server log replay and client state.</td>
+<td>Property-based tests for every (op, op) pair; canary new transforms; fall back to server snapshot on drift.</td>
+</tr>
+<tr>
+<td>Snowflake ID collision under clock rewind</td>
+<td>Two events with the same ID.</td>
+<td><code>id_collision_count</code>.</td>
+<td>Refuse to issue IDs when wall clock goes backward; use machine-ID bits for safety; HLC inside the generator.</td>
+</tr>
+<tr>
+<td>Cross-region replication lag breaks read-your-write</td>
+<td>User writes in <code>us-east</code>, reads from <code>eu-west</code>, doesn't see their write.</td>
+<td><code>replication_lag_p99_ms</code>.</td>
+<td>Sticky session to the write region for a TTL; client-side write-through cache; explicit causal token in client to filter stale replicas.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-discipline">Operational discipline</h3>
+<ul>
+<li><strong>Always emit the ordering metadata</strong> (Lamport stamp, vector clock, HLC) into application logs, even when you do not act on it. Correctness drift is invisible without it.</li>
+<li><strong>Have a replay tool</strong> that can re-derive the current state from the event log. CRDTs and OT systems must support this for incident recovery.</li>
+<li><strong>Pre-decide your merge policy in product specs.</strong> "Last writer wins" is a product decision masquerading as an engineering one; the product manager owns the call.</li>
+<li><strong>Test out-of-order delivery</strong> in integration tests by deliberately reordering message arrivals at the boundary. Most ordering bugs are reproducible only under specific reorderings.</li>
+</ul>
+<hr />
+<h2 id="8-combinations-with-other-patterns">8. Combinations with other patterns</h2>
+<p>This pattern is rarely solved in isolation. The strongest staff answers chain it with:</p>
+<ul>
+<li><strong><a href="../strong-consistency-under-contention/">strong-consistency-under-contention.md</a></strong> — When the ordering scope is one account or one document and you need not just order but linearizability, you graduate from per-partition single-writer to consensus (Paxos/Raft). Use this for bank ledgers, ticket inventory, and any "no double-spend" invariant.</li>
+<li><strong><a href="../idempotency-exactly-once/">idempotency-exactly-once.md</a></strong> — Causal order plus retries equals duplicate-prone systems. Every ordered write needs an idempotency key (client session + client seq is a natural fit). Without idempotency, retried writes show up as duplicate events at different positions in the order.</li>
+<li><strong><a href="../fan-out-write-amplification/">fan-out-write-amplification.md</a></strong> — When you fan out a message to many recipients (group chat, Twitter timeline), each fan-out destination has its own delivery ordering. Combine per-source order (this pattern) with per-destination merge order (fan-out pattern).</li>
+<li><strong><a href="../coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a></strong> — A single sequencer / partition leader is itself an exactly-one-execution problem solved via lease or consensus. The two patterns share the lease primitive.</li>
+<li><strong><a href="../hot-key-skew/">hot-key-skew.md</a></strong> — Per-key single writer is a hot-key bottleneck if one key receives most traffic (the "Justin Bieber" chat, the most-edited Google Doc). You may need to sub-shard within a logical key.</li>
+<li><strong><a href="../real-time-aggregation/">real-time-aggregation.md</a></strong> — Out-of-order arrival at aggregators (ad-click counts arriving late from a slow region) is solved with watermarks and event-time windows. The aggregation pipeline relies on the upstream ordering guarantee you established here.</li>
+<li><strong><a href="../backpressure-flow-control/">backpressure-flow-control.md</a></strong> — A single-writer partition under load needs explicit backpressure; otherwise the reorder buffer at the leader grows without bound and ordering guarantees degrade.</li>
+<li><strong><a href="../durability-at-scale/">durability-at-scale.md</a></strong> — The ordered log is the source of truth; durability is non-negotiable. Replicated log (Kafka, Bookkeeper) is the standard substrate.</li>
+</ul>
+<hr />
+<h2 id="9-likely-interviewer-probes">9. Likely interviewer probes</h2>
+<ol>
+<li><strong>"You said per-conversation Kafka partition. What happens when one conversation gets so hot that one partition can't keep up?"</strong> — First check whether you actually have this problem: a single Kafka partition handles tens of thousands of messages per second, which covers all but a handful of real-world group chats. If you genuinely do (a 500K-member Discord channel during a livestream), sub-shard by <code>(conv_id, sub_partition_id)</code> and merge with a Lamport stamp at read time so per-sender order is preserved while cross-sender order is best-effort. Vector clocks are overkill here — the product only needs "messages from one sender are in order," not pairwise concurrency detection.</li>
+<li><strong>"Two users edit the same Google Doc cell from different continents. Walk me through what happens with OT vs CRDT."</strong> — OT routes both ops to a central server which linearizes and transforms them against each other; the transform function <code>T(a, b)</code> is hand-written per op-pair and must satisfy TP1. CRDT lets each client apply locally then gossip, with merge baked into the data structure (RGA for text uses position identifiers chosen so insertions don't collide). The honest trade-off: OT has smaller per-document state but the transform code is bug-prone and a transform error silently diverges clients; CRDT has bigger per-document state (every character carries an identifier and characters deleted by anyone live on as tombstones until garbage-collected) but the convergence proof is structural, not code. Google Docs uses OT for historical reasons; newer collaborative editors (Figma, Linear, Notion blocks) lean CRDT because the libraries (Yjs, Automerge) have absorbed the state-management complexity and you avoid TP1 bug surface.</li>
+<li><strong>"Your vector clock grows forever. How do you bound it?"</strong> — Prune entries with no activity in <code>T</code> (typically days). Accept rare false-concurrent reports for very-stale writers. Many production systems also cap at <code>K</code> entries and evict LRU.</li>
+<li><strong>"What does Spanner's TrueTime buy you that HLC does not?"</strong> — TrueTime gives an externally consistent ordering across the entire database via commit-wait of the clock-uncertainty interval. HLC only orders events that interact (Lamport semantics); it does not give external consistency. Spanner pays ~10ms per commit; CockroachDB / HLC pay 0 commit-wait but cannot promise external consistency.</li>
+<li><strong>"How do you implement read-your-own-write across regions when writes go to the primary region?"</strong> — Issue the client a causal token on write (Lamport stamp, HLC, or write commit position). Reads carry the token; replicas refuse to serve if their replication position is behind the token, redirecting to a fresher replica or stalling briefly.</li>
+<li><strong>"Tell me about CRDT garbage collection. Why is it hard?"</strong> — A deletion in an OR-Set must persist as a tombstone until all replicas have seen and acknowledged it (causal stability). Tracking causal stability requires either central coordination or full vector-clock propagation. Without GC, tombstones grow forever and state explodes.</li>
+<li><strong>"You're using Snowflake IDs sorted by time. What goes wrong on clock rewind?"</strong> — IDs become non-monotonic; sorting by ID produces a reordering that violates causal order. Mitigations: refuse to issue IDs when clock goes backward (block for the rewind duration); use HLC inside the generator; or pair the time-based ID with a Lamport stamp.</li>
+</ol>
+<hr />
+<h2 id="10-common-traps-stronger-moves">10. Common traps → stronger moves</h2>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"I'll just timestamp everything with <code>time.now()</code> and sort."</td>
+<td>Name a partition key that maps to your ordering scope; assign monotonic sequence at a single writer per partition.</td>
+</tr>
+<tr>
+<td>"I'll use Spanner everywhere for global order."</td>
+<td>Only pay for global order where the invariant requires it (ledger, inventory). Use cheaper per-scope ordering for chat / feed / docs.</td>
+</tr>
+<tr>
+<td>"Vector clocks solve everything."</td>
+<td>Vector clocks detect conflict but don't resolve it. State the application's merge rule explicitly (LWW, set union, app callback).</td>
+</tr>
+<tr>
+<td>"We'll use OT for collaborative editing."</td>
+<td>OT is correct but the transform functions are notoriously bug-prone; if the team is small, prefer a battle-tested CRDT library (Yjs, Automerge).</td>
+</tr>
+<tr>
+<td>"Client retries are fine, idempotency keys not needed."</td>
+<td>Combine ordering with idempotency: <code>(session_id, client_seq)</code> as the dedup key; retried writes get the same slot, not a new one.</td>
+</tr>
+<tr>
+<td>"I'll let wall-clock skew sort itself out with NTP."</td>
+<td>Treat clock skew as adversarial. Use HLC for any timestamp that influences ordering; alert on skew &gt; 50ms.</td>
+</tr>
+<tr>
+<td>"Single Kafka partition gives total order — done."</td>
+<td>Single partition is also a single bottleneck and a single point of failure for that key. Discuss sub-sharding and leader-failover plan.</td>
+</tr>
+<tr>
+<td>"CRDTs auto-merge so the product is correct by construction."</td>
+<td>CRDTs converge mechanically but the convergence target may not match user intent (Add-wins vs Remove-wins). Validate semantics with product.</td>
+</tr>
+<tr>
+<td>"We'll order by the database's auto-incrementing ID."</td>
+<td>DB auto-increment is per-database, not per-key, and breaks under multi-master. Use per-scope sequence or HLC instead.</td>
+</tr>
+<tr>
+<td>"Sequencer is a single point of failure — let's not have one."</td>
+<td>A single logical sequencer can be highly available via Raft. The right question is throughput, not availability.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11-staff-level-answer-checklist">11. Staff-level answer checklist</h2>
+<ul>
+<li>[ ] You named the <strong>ordering scope</strong> the product requires (per-conversation, per-document, per-account), not "global order."</li>
+<li>[ ] You distinguished <strong>total order</strong> from <strong>causal order</strong> and chose the cheaper option that meets the invariant.</li>
+<li>[ ] You picked one of {single-partition, Lamport, vector clock, CRDT, OT, sequencer, HLC, consensus} with a justification grounded in the product, not the buzzword.</li>
+<li>[ ] You discussed <strong>wall-clock skew</strong> as a real adversary and named your defense (HLC, monotonic seq, no wall clocks in sort keys).</li>
+<li>[ ] You showed how <strong>client session sequence numbers</strong> combine with server sequencing to handle in-flight reordering.</li>
+<li>[ ] You named the <strong>conflict-resolution policy</strong> (LWW, set union, application callback, CRDT semantics) and noted that this is a product decision.</li>
+<li>[ ] You discussed <strong>read-your-own-write across regions</strong> via causal tokens or sticky writes.</li>
+<li>[ ] You named at least one <strong>operational metric</strong> (vector clock size, replication lag, out-of-order arrival rate, sequencer availability).</li>
+<li>[ ] You acknowledged the <strong>multi-device problem</strong> (two devices from the same user are genuinely concurrent) and gave a tie-break rule.</li>
+<li>[ ] You combined this with <strong>idempotency</strong> for retries and <strong>exactly-one-execution</strong> for the sequencer / leader.</li>
+<li>[ ] You called out a <strong>fallback path</strong> for when the primary mechanism degrades (sequencer down, vector clock grows too large, CRDT state explodes).</li>
+</ul>
+<hr />
+<h2 id="12-cross-references">12. Cross-references</h2>
+<h3 id="pattern-siblings">Pattern siblings</h3>
+<ul>
+<li><a href="../strong-consistency-under-contention/">strong-consistency-under-contention.md</a> — When ordering becomes linearizability.</li>
+<li><a href="../idempotency-exactly-once/">idempotency-exactly-once.md</a> — Retries + ordering = need for dedup keys.</li>
+<li><a href="../fan-out-write-amplification/">fan-out-write-amplification.md</a> — Order per source × order per destination.</li>
+<li><a href="../coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a> — Single-leader partition is a coordination problem.</li>
+<li><a href="../hot-key-skew/">hot-key-skew.md</a> — Single-partition order meets hot keys.</li>
+<li><a href="../real-time-aggregation/">real-time-aggregation.md</a> — Watermarks for out-of-order event-time data.</li>
+<li><a href="../durability-at-scale/">durability-at-scale.md</a> — The ordered log as source of truth.</li>
+<li><a href="../backpressure-flow-control/">backpressure-flow-control.md</a> — Bounded reorder buffers.</li>
+<li><a href="../cache-stampede-read-amplification/">cache-stampede-read-amplification.md</a> — Causal tokens to avoid stale-cache reads.</li>
+<li><a href="../search-and-ranking/">search-and-ranking.md</a> — Index update ordering across shards.</li>
+<li><a href="../geo-spatial-queries/">geo-spatial-queries.md</a> — Multi-region writes to nearby-friend feeds.</li>
+</ul>
+<h3 id="question-docs-where-this-pattern-is-load-bearing">Question docs where this pattern is load-bearing</h3>
+<ul>
+<li><a href="../questions/design-facebook-messenger.md">Facebook Messenger</a> — Per-conversation log with monotonic seq; multi-device sync via per-device cursors.</li>
+<li><a href="../questions/design-whatsapp.md">WhatsApp</a> — Same substrate, end-to-end encryption layers ordering above the wire format.</li>
+<li><a href="../questions/design-google-docs.md">Google Docs</a> — Operational Transform via central server, or CRDTs (RGA) for peer-to-peer.</li>
+<li><a href="../questions/design-a-collaborative-whiteboard-like-miro.md">Collaborative whiteboard (Miro)</a> — OT or CRDT for 2D shape operations.</li>
+<li><a href="../questions/design-twitter.md">Twitter</a> — Snowflake IDs for globally sortable tweet IDs; per-user timeline ordering.</li>
+<li><a href="../questions/design-twitter-timeline.md">Twitter timeline</a> — Merge fan-out per producer with per-recipient ordering.</li>
+<li><a href="../questions/design-the-stripe-payment-gateway.md">Stripe payment gateway</a> — Causal ordering of payment state transitions; idempotency keys.</li>
+<li><a href="../questions/design-a-payment-system.md">Payment system</a> — Bank-ledger semantics: strict ordering of debits and credits.</li>
+<li><a href="../questions/design-an-ad-click-aggregator.md">Ad-click aggregator</a> — Out-of-order event-time arrival; watermarks; HLC.</li>
+<li><a href="../questions/amazon-dynamo.md">Amazon Dynamo</a> — Canonical vector-clock sibling resolution.</li>
+<li><a href="../questions/apache-kafka.md">Apache Kafka</a> — Per-partition total order as the foundational primitive.</li>
+<li><a href="../questions/design-discord.md">Discord</a> — Per-channel ordering with high throughput.</li>
+<li><a href="../questions/design-a-live-comment-streaming-service-like-twitch-chat.md">Live comment streaming</a> — Per-room sequence with fan-out delivery.</li>
+</ul>
+<h3 id="external-references-worth-naming-in-an-interview">External references worth naming in an interview</h3>
+<ul>
+<li>Lamport, "Time, Clocks, and the Ordering of Events in a Distributed System" (1978) — the foundational paper.</li>
+<li>DeCandia et al., "Dynamo: Amazon's Highly Available Key-value Store" (2007) — vector clocks in production.</li>
+<li>Shapiro et al., "A Comprehensive Study of Convergent and Commutative Replicated Data Types" (2011) — the CRDT taxonomy.</li>
+<li>Kulkarni et al., "Logical Physical Clocks" (2014) — the HLC paper, foundation of CockroachDB / YugabyteDB.</li>
+<li>Corbett et al., "Spanner: Google's Globally Distributed Database" (2012) — TrueTime and external consistency.</li>
+<li>Sun &amp; Ellis, "Operational Transformation in Real-Time Group Editors" (1998) — OT correctness criteria.</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

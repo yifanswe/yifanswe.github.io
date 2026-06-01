@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Strong Consistency Under Contention — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design-patterns/">← Back to System Design Patterns</a>
+        <h1 class="article-title">Strong Consistency Under Contention</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/31 &nbsp;·&nbsp; System Design Patterns
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>When N actors race for one scarce resource, the system must produce exactly one winner and tell every loser "no" — never silently overcommit. See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for terms. Question docs where this is the load-bearing pattern:
+- <a href="../questions/design-ticketmaster.md">design-ticketmaster.md</a>
+- <a href="../questions/design-a-flash-sale-for-an-e-commerce-site.md">design-a-flash-sale-for-an-e-commerce-site.md</a>
+- <a href="../questions/design-a-stock-exchange.md">design-a-stock-exchange.md</a>
+- <a href="../questions/design-a-payment-system.md">design-a-payment-system.md</a>
+- <a href="../questions/design-the-stripe-payment-gateway.md">design-the-stripe-payment-gateway.md</a>
+- <a href="../questions/design-a-distributed-lock-manager-like-chubby.md">design-a-distributed-lock-manager-like-chubby.md</a>
+- <a href="../questions/design-amazon-shopping-cart.md">design-amazon-shopping-cart.md</a></p>
+</blockquote>
+<hr />
+<h2 id="1-the-fundamental-hardness">1. The fundamental hardness</h2>
+<p>Distributed systems default to availability. You replicate state across many machines so that any of them can serve a read or accept a write. That works beautifully for "post a tweet," "view a profile," or "increment a like counter," because the truth is additive and a few seconds of skew costs nothing.</p>
+<p>This pattern is the opposite. The truth is <strong>subtractive and bounded</strong>. There is one seat at row 4, column 12, for the Tesla Cybertruck unveil. There is <code>$143.27</code> in Yifan's checking account. There is one last unit of the limited-edition graphics card. Two requests at the same millisecond cannot both win. The Atomicity, Consistency, Isolation, Durability (ACID) "Isolation" property — that two transactions should appear to run one after the other — is precisely what every distributed-database trick tries to relax, because serializing concurrent writes is expensive. Under contention, you cannot relax it. You have to pay.</p>
+<p>A staff-level caveat before going further: the bar for "strong consistency" is set by the product, not by reflex. A bank balance, a stock-exchange fill, and a username reservation cannot tolerate any overcommit. A concert seat or a flash-sale unit usually can — most ticketing and e-commerce platforms quietly absorb a small overselling rate (a fraction of a percent) by issuing refunds or upgrades, because the business cost of compensation is lower than the engineering cost of perfect serialization at peak. The pattern below assumes the strict case; when the interviewer's product actually allows compensation, the right answer is to call that out and pick a cheaper design.</p>
+<p>The invariant is brutal in its simplicity:</p>
+<blockquote>
+<p>For a contested resource of capacity <code>C</code>, the count of successful commits must equal <code>min(C, demand)</code>. Never <code>C + 1</code>. Never a silent loss of a successful commit. And every loser must observe a deterministic "no" so they can stop, retry against a different key, or give up cleanly.</p>
+</blockquote>
+<p>What makes this hard at staff level is not the lock itself. The hard part is doing this under three simultaneous pressures: (1) throughput — 10,000 requests per second (RPS) hitting a single key; (2) tail latency — your locking layer cannot turn a 50 millisecond (ms) p99 user click into a 5 second timeout; (3) failure — the process holding the lock can die mid-checkout, the lock-manager can lose quorum, the database can fail over mid-transaction. Any one of these turns a "just use a database transaction" design into either oversells, deadlocks, ghost reservations, or full outages.</p>
+<p>A naive design under contention breaks in one of five ways. <strong>Lost update</strong>: two requests both read inventory=1, both decrement, both write inventory=0, both succeed; you sold two. <strong>Phantom reservation</strong>: a user holds a seat in a session, the session dies silently, the seat is held forever. <strong>Double-spend on retry</strong>: a payment client times out, retries; the original request actually committed; the user is charged twice. <strong>Lock holder dies</strong>: a node holds a lock, garbage collection (GC) pauses it for 12 seconds, by then another node grabbed the lock thinking it was abandoned, and now two nodes both "own" the resource. <strong>Cascading lock contention</strong>: 10,000 buyers all wait on the same row lock, your database connection pool exhausts, the rest of the site goes down.</p>
+<hr />
+<h2 id="2-how-to-recognize-it-in-the-interview">2. How to recognize it in the interview</h2>
+<h3 id="prompt-phrases-that-signal-this-pattern">Prompt phrases that signal this pattern</h3>
+<ul>
+<li>"Limited inventory" / "last item" / "sold out" / "in stock count."</li>
+<li>"Two users cannot book the same X."</li>
+<li>"Exactly one winner" / "no oversell" / "no double-charge."</li>
+<li>"Concert tickets" / "flash sale" / "drop" / "lottery."</li>
+<li>"Match buyer with seller" / "order book" / "trade."</li>
+<li>"Balance" / "transfer" / "debit" / "authorization."</li>
+<li>"Reserve and confirm" / "hold for N minutes" / "checkout flow."</li>
+<li>"First come first served" with high concurrency.</li>
+</ul>
+<h3 id="architectural-smells-in-stated-requirements">Architectural smells in stated requirements</h3>
+<ul>
+<li>A scalar field (<code>stock_count</code>, <code>balance</code>, <code>seat_status</code>) that is <strong>decremented</strong> rather than appended.</li>
+<li>A unique constraint that is semantically a business rule, not just a database hint (<code>UNIQUE(seat_id)</code> in <code>bookings</code>).</li>
+<li>A workflow with two phases (reserve → confirm, authorize → capture) where the gap can be seconds to minutes of user think-time.</li>
+<li>Reads of stock count appearing on a high-traffic landing page while writes need to be exact. (This is the read-write split — see <a href="../cache-stampede-read-amplification/">cache-stampede-read-amplification.md</a>.)</li>
+<li>A single hot key — one concert, one stock symbol, one celebrity-restock — concentrating contention. Overlaps with <a href="../hot-key-skew/">hot-key-skew.md</a>.</li>
+<li>An idempotency-key requirement. Overlaps with <a href="../idempotency-exactly-once/">idempotency-exactly-once.md</a>.</li>
+</ul>
+<h3 id="example-design-x-prompts-where-this-is-the-core-hardness">Example "design X" prompts where this is the core hardness</h3>
+<ol>
+<li><strong>Ticketmaster / Eventbrite seat selection</strong> — 50,000-seat stadium, 200,000 fans hitting "select" in the first 30 seconds.</li>
+<li><strong>Flash sale on a limited-edition product</strong> — 1,000 units of a graphics card go on sale at noon, 100,000 people on the page.</li>
+<li><strong>Stock exchange / matching engine</strong> — every order against the book must commit in deterministic price-time priority.</li>
+<li><strong>Payment system / debit on a wallet balance</strong> — bank balance must never go negative even if two ATMs and a card terminal hit the same account at once.</li>
+<li><strong>Uber driver dispatch</strong> — one driver can only accept one rider at a time; two riders can be assigned to two different drivers but never both to the same one.</li>
+<li><strong>Hotel / Airbnb booking on a specific date range</strong> — overlapping date ranges for the same listing must not both succeed.</li>
+<li><strong>Username / handle reservation</strong> — first person to claim <code>@elonmusk2</code> wins, everyone else gets "taken."</li>
+</ol>
+<hr />
+<h2 id="3-60-second-spoken-framing">3. 60-second spoken framing</h2>
+<blockquote>
+<p>The invariant here is exact. For a contested resource of capacity <code>C</code>, the system must produce exactly <code>min(C, demand)</code> successful commits, every loser must get a clear "no," and we cannot block the rest of the site while the contended key burns. My default approach is to push all writes for one key through a single serialization point — either a single-writer partition or a database row lock — and protect the user experience with a short-TTL reservation token so the seat is held during checkout but released automatically on abandon. On top of that I layer optimistic concurrency control for low-contention items, a database-level unique constraint as a final safety net so even a bug in the application layer cannot oversell, and an idempotency key on every write so retries are safe. The two failure modes I plan for are lock-holder death (use fencing tokens, never raw locks) and hot-key meltdown (cap concurrency per key, shed load early).</p>
+</blockquote>
+<hr />
+<h2 id="4-canonical-toolkit">4. Canonical toolkit</h2>
+<h3 id="41-single-writer-partition-the-default-at-scale">4.1 Single-writer partition (the default at scale)</h3>
+<p><strong>What</strong>: For every contested key <code>K</code>, route all writes to the same node. That node serializes writes through an in-memory queue. There is no lock, no compare-and-swap (CAS) retry storm — just a queue. This is how Kafka achieves per-partition ordering, how an order-matching engine handles a single stock symbol, and how LinkedIn Espresso handles per-key linearizability.</p>
+<pre><code>        ┌───────────────────────────────────────────┐
+        │ Router (hash by seat_id or symbol)        │
+        └────┬────────────┬────────────┬────────────┘
+             │            │            │
+       seat_id=A     seat_id=B    seat_id=C
+             │            │            │
+        ┌────▼───┐   ┌────▼───┐   ┌────▼───┐
+        │ Node 1 │   │ Node 2 │   │ Node 3 │
+        │ queue  │   │ queue  │   │ queue  │
+        │  for A │   │  for B │   │  for C │
+        └────────┘   └────────┘   └────────┘
+        Single-threaded apply per key → no lock needed
+</code></pre>
+<p><strong>When to use</strong>: High contention on a finite set of keys, where the per-key throughput fits a single core. Realistic per-core ceilings: ~5-20k ops/sec in Python (GIL-bound), ~50-200k ops/sec in Java or Go with a tight in-memory state machine, 500k+ in C++ or Rust. The number that matters is "what does the per-key apply cost in CPU?" — if a decrement-plus-log-append is ~5 microseconds, one core saturates around 200k ops/sec, and most of the budget is the replicated log append. Use this for matching engines, ticket seat-allocation, ad auction floors.</p>
+<p><strong>Cost</strong>: You lose the ability to load-balance hot keys across machines. If one key is 100x hotter than the cluster average, that one node will melt. You also need a routing layer that consistently maps <code>K</code> to the same node — usually consistent hashing with a versioned partition map. Failover means draining the in-flight queue and replaying on a backup; you need replication (typically Raft, Paxos, or a Kafka-style log) for the per-partition state.</p>
+<p><strong>When it breaks</strong>: One key gets so hot that one node cannot keep up. Then you must shard the key itself, which usually means changing the product (allocate seats into sub-blocks, split a stock symbol across price ranges). Or the node dies and you have to fail over without losing the queue — you need synchronous replication of the in-memory queue's input.</p>
+<pre><code class="language-python"># Sketch: single-writer partition, applied per key.
+# In production this is the same idea as a Raft state machine.
+
+import asyncio
+from collections import defaultdict
+
+class SeatPartition:
+    def __init__(self, seat_ids):
+        # source of truth, in memory, replicated via log
+        self.seats = {s: &quot;FREE&quot; for s in seat_ids}
+        self.queues = defaultdict(asyncio.Queue)
+
+    async def reserve(self, seat_id, user_id, request_id):
+        # Caller awaits this; per-seat queue serializes the apply step.
+        future = asyncio.get_event_loop().create_future()
+        await self.queues[seat_id].put((user_id, request_id, future))
+        return await future
+
+    async def run_partition(self, seat_id):
+        # One coroutine per seat. No lock — there is exactly one writer.
+        q = self.queues[seat_id]
+        while True:
+            user_id, request_id, future = await q.get()
+            if self.seats[seat_id] == &quot;FREE&quot;:
+                self.seats[seat_id] = (&quot;HELD&quot;, user_id, request_id)
+                # Append to replicated log BEFORE acking the future.
+                await replicate((&quot;RESERVE&quot;, seat_id, user_id, request_id))
+                future.set_result(&quot;ok&quot;)
+            else:
+                future.set_result(&quot;taken&quot;)
+</code></pre>
+<h3 id="42-optimistic-concurrency-control-cas-with-a-version">4.2 Optimistic concurrency control (CAS with a version)</h3>
+<p><strong>What</strong>: Read the row with its current version number. Compute the new value. Write back with <code>WHERE version = old_version</code>. If another writer already incremented the version, your update affects zero rows; retry from the read.</p>
+<pre><code class="language-sql">-- read
+SELECT stock_count, version FROM inventory WHERE sku = 'X';
+-- write
+UPDATE inventory
+   SET stock_count = stock_count - 1, version = version + 1
+ WHERE sku = 'X' AND version = :old_version AND stock_count &gt; 0;
+-- if 0 rows affected, retry
+</code></pre>
+<pre><code class="language-python">def try_decrement(sku):
+    for attempt in range(MAX_RETRIES):
+        row = db.fetch_one(&quot;SELECT stock_count, version FROM inventory WHERE sku=%s&quot;, sku)
+        if row.stock_count &lt;= 0:
+            return &quot;sold_out&quot;
+        affected = db.execute(
+            &quot;UPDATE inventory SET stock_count = stock_count - 1, &quot;
+            &quot;version = version + 1 WHERE sku=%s AND version=%s AND stock_count &gt; 0&quot;,
+            sku, row.version,
+        )
+        if affected == 1:
+            return &quot;ok&quot;
+        # else: someone else won this round, retry
+    return &quot;give_up&quot;
+</code></pre>
+<p><strong>When to use</strong>: Low to moderate contention. Updates on user-owned data (profile, preferences). Inventory of items with many SKUs where any one SKU is rarely the hot one. The Dynamo paper's vector clock siblings are a generalized form of CAS — see <a href="../questions/amazon-dynamo.md">amazon-dynamo.md</a>.</p>
+<p><strong>Cost</strong>: Retry rate scales roughly with the number of concurrent writers on the same key during one round-trip. With round-trip latency <code>t</code> and <code>N</code> concurrent writers on one key, the expected number of CAS attempts before any individual writer succeeds is ~<code>N/2</code>, so total work scales as <code>O(N^2)</code>. Concretely: at 10 concurrent writers on one row and a 2 ms round-trip, each request averages ~5 attempts (10 ms tail). At 100 concurrent writers, average ~50 attempts (100 ms tail) and the database is doing 50x the read+update work that a single-writer design would do. Past a few tens of concurrent writers on one key, optimistic CAS stops being cheaper than just locking the row.</p>
+<p><strong>When it breaks</strong>: Hot key, high contention. The crossover where pessimistic locking or single-writer is cheaper than CAS is usually in the range of ~10-50 concurrent writers per key, depending on round-trip latency and update cost. Above that, switch.</p>
+<h3 id="43-pessimistic-locking-select-for-update">4.3 Pessimistic locking (<code>SELECT ... FOR UPDATE</code>)</h3>
+<p><strong>What</strong>: Open a database transaction. Lock the row. Read it. Modify it. Commit. The database serializes everyone touching that row.</p>
+<pre><code class="language-sql">BEGIN;
+SELECT stock_count FROM inventory WHERE sku = 'X' FOR UPDATE;  -- blocks others
+-- application checks and decides
+UPDATE inventory SET stock_count = stock_count - 1 WHERE sku = 'X';
+COMMIT;
+</code></pre>
+<p><strong>When to use</strong>: Single-region, single relational database, simple flows. The staff-level move is to recognize how far this goes: if the transaction body is just <code>SELECT ... FOR UPDATE; UPDATE; COMMIT</code> with no application-side think-time, the lock is held for ~1-3 ms (a couple of round-trips), so one row can sustain 300-1000 RPS before the lock-wait queue noticeably backs up. Even better, the entire workflow collapses to a single <code>UPDATE inventory SET stock = stock - 1 WHERE sku = X AND stock &gt; 0</code> — atomic in Postgres or MySQL, lock held for microseconds, scales to thousands of RPS per row. Most interview prompts at the "tens to low hundreds RPS per key" level genuinely do not need anything beyond this. Common for B2B order entry, hotel booking, internal admin tools.</p>
+<p><strong>Cost</strong>: The danger is holding the transaction across application-side work. A 100 ms application-side delay between <code>FOR UPDATE</code> and <code>COMMIT</code>, multiplied by a few hundred concurrent contenders, will saturate a typical 50-200 connection pool and freeze the rest of the site. Two rules of thumb: never await a user action inside the transaction; never await a network call to another service inside the transaction (use a reservation token outside the transaction instead). Deadlock probability also increases when transactions touch multiple rows in inconsistent order — always lock by a fixed key order.</p>
+<p><strong>When it breaks</strong>: Cross-shard or cross-region locking — Postgres or MySQL row locks do not extend across shards or regions. Massive sustained contention on one row — at ~5-10k RPS on one row with a 1 ms transaction, the lock-wait queue depth (<code>queries × hold_time / request_interval</code>) starts to exceed the connection pool and the queue itself becomes the bottleneck. At that point you have a true hot-key problem, not a locking problem, and the fix is single-writer partitioning, not a different lock primitive.</p>
+<h3 id="44-distributed-lock-with-fencing-tokens-chubby-zookeeper-etcd">4.4 Distributed lock with fencing tokens (Chubby / ZooKeeper / etcd)</h3>
+<p><strong>What</strong>: A separate coordination service grants a lock. The lock holder gets a monotonically increasing <strong>fencing token</strong>. Every downstream service that the lock protects must reject any operation whose token is older than the latest seen token. This protects against the lock-holder-pause failure mode that destroys naive distributed locks.</p>
+<pre><code>client A acquires lock → token = 33
+   ↓
+client A is GC-paused for 12 seconds
+   ↓
+lock expires → client B acquires lock → token = 34
+   ↓
+client B writes to storage with token=34 → storage records &quot;last=34&quot;
+   ↓
+client A wakes up, tries to write with token=33 → storage rejects (33 &lt; 34)
+</code></pre>
+<pre><code class="language-python"># Pseudocode, deliberately verbose to show the fencing step.
+token = lock_service.acquire(&quot;seat:A12&quot;, ttl_sec=30)  # token = e.g. 33
+if token is None:
+    return &quot;could_not_acquire&quot;
+try:
+    # Storage must verify the token is the latest. The token is part of every write.
+    response = storage.cas_update(
+        key=&quot;seat:A12&quot;,
+        expected_state=&quot;FREE&quot;,
+        new_state=(&quot;HELD&quot;, user_id),
+        fencing_token=token,   # storage compares to its own monotonic counter
+    )
+finally:
+    lock_service.release(&quot;seat:A12&quot;, token=token)
+</code></pre>
+<p><strong>When to use</strong>: When the resource lives outside the lock service (a database row, a file, a remote API call) and you need an external lock manager because the resource itself does not support strong leadership. Common for distributed job leadership, leader election, exclusive access to a shared file. See <a href="../questions/design-a-distributed-lock-manager-like-chubby.md">design-a-distributed-lock-manager-like-chubby.md</a> for the deep dive.</p>
+<p><strong>Cost</strong>: Adds a dependency on a quorum-based system (ZooKeeper, etcd, Chubby) with its own availability, latency, and operational story. Cross-service token enforcement is invasive — every downstream API needs to accept and check tokens.</p>
+<p><strong>When it breaks</strong>: If you forget the fencing token, a paused-then-resumed client silently overwrites a newer holder's work. This is the <strong>single most common subtle bug</strong> in distributed-lock design. Martin Kleppmann's "How to do distributed locking" essay is the canonical reference — interviewers love to probe this.</p>
+<h3 id="45-reservation-tokens-with-ttl">4.5 Reservation tokens with TTL</h3>
+<p><strong>What</strong>: Two-step booking. Step 1: "reserve" decrements available inventory by 1 and writes a row <code>(resource_id, user_id, token, expires_at)</code> with a short TTL (typically 60-600 seconds). Step 2: "confirm" turns the reservation into a permanent booking. A background job (or a lazy check on read) reclaims expired reservations.</p>
+<pre><code>t=0  user clicks &quot;select seat A12&quot;
+     ──► reservation_create(seat=A12, user=Yifan, expires_at=t+300)
+     ──► seat state = HELD-by-Yifan-until-t+300
+
+t=10 Yifan enters payment info, confirms
+     ──► reservation_confirm(token=...) → booking row, seat=BOOKED
+
+OR
+
+t=400 (Yifan abandoned tab)
+     ──► sweeper or next caller's lazy check → seat = FREE again
+</code></pre>
+<pre><code class="language-python">def reserve(seat_id, user_id, ttl_sec=300):
+    now = time.time()
+    # Atomic: either we acquire the seat or someone else owns it.
+    affected = db.execute(
+        &quot;&quot;&quot;
+        UPDATE seats
+           SET held_by = %s, held_until = %s, version = version + 1
+         WHERE seat_id = %s
+           AND (held_by IS NULL OR held_until &lt; %s)
+        &quot;&quot;&quot;,
+        user_id, now + ttl_sec, seat_id, now,
+    )
+    if affected == 1:
+        return make_token(seat_id, user_id, now + ttl_sec)
+    return None  # someone else holds it and the hold hasn't expired
+
+def confirm(token):
+    seat_id, user_id, expires_at = parse_token(token)
+    if time.time() &gt; expires_at:
+        return &quot;expired&quot;
+    affected = db.execute(
+        &quot;&quot;&quot;
+        UPDATE seats
+           SET booked_by = %s, status = 'BOOKED', held_by = NULL, held_until = NULL
+         WHERE seat_id = %s AND held_by = %s AND held_until &gt;= %s
+        &quot;&quot;&quot;,
+        user_id, seat_id, user_id, time.time(),
+    )
+    return &quot;ok&quot; if affected == 1 else &quot;lost_hold&quot;
+</code></pre>
+<p><strong>When to use</strong>: Any flow with user think-time between "I want this" and "I committed to this." Ticket purchasing, hotel booking, ride dispatch ("driver, you have 15 seconds to accept"). This is the de facto standard for Ticketmaster, StubHub, Airbnb.</p>
+<p><strong>Cost</strong>: TTL is a tuning problem disguised as a number, not a "pick a reasonable value" choice. Too short and you reclaim seats from users who are still entering their card; too long and during a flash sale you cap effective inventory at <code>capacity × (TTL / median_checkout_time)</code>, suppressing real demand. You also need a sweeper <em>and</em> lazy reclaim on read, because either one alone has a failure mode (sweeper falls behind under load; lazy reclaim never fires for keys nobody re-reads). The state space — <code>FREE</code>, <code>HELD</code>, <code>BOOKED</code>, <code>EXPIRED</code> — has an asymmetry that is easy to miss: <strong>reserve and release are not symmetric</strong>. A reserve happens in one atomic write, but a release can happen via three different paths (explicit user release, sweeper expiry, lazy reclaim on the next reader's request). Each of those paths must agree on "is this hold actually expired right now?" using a single source of time (the storage's clock, not any client's clock) and a single source of truth for the token (the holder's identity <em>plus</em> expiry, not just the identity — otherwise a slow <code>confirm</code> can race a successful steal).</p>
+<p><strong>When it breaks</strong>: The classic zombie-reservation race: user A's hold expires at t=300; sweeper or lazy reclaim resets the seat to FREE at t=301; user B grabs the seat at t=302; user A's delayed <code>confirm</code> request arrives at t=303 with their old (now-expired) token. The confirm must reject — which is why the <code>confirm</code> query in the code above re-checks <code>held_by = user_id AND held_until &gt;= now()</code> instead of trusting the token alone. The second failure: same user races their own retries (network flakes during reserve) and ends up holding two seats. Idempotency on <code>reserve</code> keyed by <code>(user_id, event_id, request_id)</code> fixes the retry case, but does not fix a legitimately-greedy user who reserves under multiple sessions — for that you need a per-user concurrent-hold cap inside the reservation service.</p>
+<h3 id="46-two-phase-reservation-intent-commit-across-services">4.6 Two-phase reservation (intent → commit) across services</h3>
+<p><strong>What</strong>: When the commit requires multiple systems to all agree (e.g., debit my wallet AND mark seat as booked AND notify the venue), you cannot atomically update them all. The reservation step is the <strong>intent</strong>: write a Saga state row, debit nothing, mark seat HELD. The commit step is the <strong>apply</strong>: debit wallet, finalize booking, idempotent confirm on the venue. If any step fails, run the compensation: refund wallet, release seat. See <a href="../idempotency-exactly-once/">idempotency-exactly-once.md</a> and <a href="../coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a>.</p>
+<p><strong>When to use</strong>: Multi-service commits. Payment + inventory + notification. Avoid distributed two-phase commit (2PC) — it blocks under coordinator failure. Use Saga with explicit compensation instead.</p>
+<p><strong>Cost</strong>: Visible intermediate states. Need careful idempotency on each step. Operationally complex.</p>
+<p><strong>When it breaks</strong>: Compensation can fail too. You need a permanent reconciliation job to detect and alarm on stuck Sagas.</p>
+<h3 id="47-database-level-constraint-as-last-line-of-defense">4.7 Database-level constraint as last line of defense</h3>
+<p><strong>What</strong>: Add a <code>UNIQUE(seat_id, event_id)</code> constraint on the <code>bookings</code> table. Even if every application-layer check is buggy, the database itself will refuse to insert a duplicate booking.</p>
+<pre><code class="language-sql">CREATE TABLE bookings (
+  booking_id  BIGINT PRIMARY KEY,
+  event_id    BIGINT NOT NULL,
+  seat_id     BIGINT NOT NULL,
+  user_id     BIGINT NOT NULL,
+  created_at  TIMESTAMP NOT NULL,
+  UNIQUE (event_id, seat_id)   -- the load-bearing constraint
+);
+</code></pre>
+<p><strong>When to use</strong>: Always, when the semantic invariant can be expressed as a uniqueness or check constraint. Cheap, simple, foolproof. The cost is essentially zero.</p>
+<p><strong>Cost</strong>: Negligible. Insertion is <code>O(log n)</code> on the index. The only downside is that constraint violations show up as exceptions, so the application must distinguish between "duplicate" (return "taken") and "real error" (retry or alarm).</p>
+<p><strong>When it breaks</strong>: Cannot express more complex invariants (e.g., "no overlapping date range"). For those, use exclusion constraints (Postgres <code>EXCLUDE USING GIST</code>) or a custom serialization layer.</p>
+<hr />
+<h2 id="5-worked-example-naive-broken-fixed">5. Worked example: naive → broken → fixed</h2>
+<p><strong>Scenario</strong>: A Tesla Cybertruck pre-order event. The Foundation Series has 10,000 units. The order page opens at 9:00 AM Pacific Time. We expect 500,000 unique users on the page in the first 60 seconds. Each user clicks "Reserve mine" essentially simultaneously. The product invariant: <strong>exactly 10,000 successful reservations, no oversells, every loser sees "sold out" within 5 seconds.</strong></p>
+<h3 id="naive-version-broken">Naive version (broken)</h3>
+<pre><code class="language-python"># Every web request runs this. No locking.
+def reserve():
+    row = db.fetch_one(&quot;SELECT available FROM inventory WHERE sku='cybertruck-fs'&quot;)
+    if row.available &gt; 0:
+        # ... user enters payment info, picks color, takes 30 seconds ...
+        db.execute(&quot;UPDATE inventory SET available = available - 1 WHERE sku='cybertruck-fs'&quot;)
+        db.execute(&quot;INSERT INTO orders (user_id, sku) VALUES (...)&quot;)
+        return &quot;confirmed&quot;
+    return &quot;sold_out&quot;
+</code></pre>
+<p>What goes wrong, in order of severity:</p>
+<ol>
+<li><strong>Massive oversell</strong>. The <code>UPDATE</code> has no <code>WHERE available &gt; 0</code> guard, and the SELECT-then-UPDATE window straddles 30 seconds of user input. Every request that passed the SELECT proceeds to decrement, regardless of what the row has become. Even if only ~10,000 requests pass the SELECT concurrently (read at the same instant), each one decrements unconditionally; the counter goes deeply negative. The fix on this line alone is <code>UPDATE ... WHERE available &gt; 0</code> and rely on <code>affected_rows == 1</code>, which a single atomic statement guarantees. The real bug being illustrated is "application-side read, then unconditional write" — and that is what every technique in section 4 is designed to prevent.</li>
+<li><strong>Database meltdown</strong>. The web tier can hold maybe 50-200 DB connections; the database accepts that many concurrent transactions, the rest queue at the connection pool layer. With 30-second user think-time held inside the transaction, throughput collapses to <code>pool_size / hold_time</code> ≈ a handful of commits per second, while the queue grows without bound. The rest of the Tesla site sharing the same database also queues. Within a minute the entire pool is held by stuck checkout sessions.</li>
+<li><strong>Reads from caches</strong>. The "available" count on the marketing page is cached. After "sold out" the cache says "92 available" for 15 minutes, generating angry users.</li>
+<li><strong>Stuck checkouts</strong>. Some users got past the SELECT, lost network, never finished. Their slot is consumed in business terms but their order row never landed. Inventory is now mismatched from order intent.</li>
+</ol>
+<h3 id="fixed-version-production-grade">Fixed version (production grade)</h3>
+<p>Layered defense:</p>
+<pre><code>┌────────────────────────────────────────────────────────────────────────┐
+│  Edge: CAPTCHA + queue token issued at landing page                    │
+│        (admit ~30k users into checkout flow; 470k see waiting room)    │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  Reservation service: single-writer partition for sku=cybertruck-fs    │
+│  - One leader node holds the in-memory inventory counter (10,000)      │
+│  - Per-request: decrement counter; emit HELD record with TTL=600s      │
+│  - Append every decision to a replicated log (Kafka or Raft)           │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼  HELD record (token, user_id, expires_at)
+┌────────────────────────────────────────────────────────────────────────┐
+│  Checkout service: user enters payment, picks color (10 minutes max)   │
+│  - On submit: idempotency-key check (user_id + order_request_id)       │
+│  - Calls payment authorization                                         │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  Order finalize:                                                       │
+│  - INSERT INTO orders ... with UNIQUE(user_id, hold_token) constraint  │
+│  - Mark inventory HOLD → SOLD                                          │
+│  - If payment fails, release hold and decrement-inverse the counter    │
+└────────────────────────────────────────────────────────────────────────┘
+
+Sweeper: every 30s, find HELD rows where expires_at &lt; now, release seat,
+         increment counter back, log for audit.
+</code></pre>
+<pre><code class="language-python"># Inventory service - single writer for sku.
+
+class InventoryPartition:
+    def __init__(self, sku, capacity):
+        self.sku = sku
+        self.available = capacity
+        self.held = {}  # token -&gt; (user_id, expires_at)
+
+    def reserve(self, user_id, idempotency_key):
+        # Single-threaded apply. No lock needed because there's one writer.
+
+        # Idempotency: if same user retries, return their existing hold.
+        for token, (uid, exp) in self.held.items():
+            if uid == user_id and self._matches_idem(token, idempotency_key):
+                return (&quot;ok&quot;, token)
+
+        if self.available &lt;= 0:
+            return (&quot;sold_out&quot;, None)
+
+        token = generate_token(self.sku, user_id, idempotency_key)
+        self.available -= 1
+        self.held[token] = (user_id, time.time() + 600)
+        replicate_log_append({
+            &quot;op&quot;: &quot;HELD&quot;,
+            &quot;sku&quot;: self.sku,
+            &quot;token&quot;: token,
+            &quot;user_id&quot;: user_id,
+            &quot;available_after&quot;: self.available,
+        })
+        return (&quot;ok&quot;, token)
+
+    def confirm(self, token, user_id):
+        held = self.held.get(token)
+        if not held or held[0] != user_id:
+            return &quot;invalid&quot;
+        if time.time() &gt; held[1]:
+            return &quot;expired&quot;  # will be reclaimed by sweeper
+        del self.held[token]
+        replicate_log_append({&quot;op&quot;: &quot;SOLD&quot;, &quot;sku&quot;: self.sku, &quot;token&quot;: token})
+        return &quot;ok&quot;
+
+    def release(self, token):
+        held = self.held.pop(token, None)
+        if held:
+            self.available += 1
+            replicate_log_append({&quot;op&quot;: &quot;RELEASE&quot;, &quot;sku&quot;: self.sku, &quot;token&quot;: token})
+
+    def sweep(self):
+        now = time.time()
+        for token, (uid, exp) in list(self.held.items()):
+            if exp &lt; now:
+                self.release(token)
+</code></pre>
+<p>Order finalization keeps the database constraint as the floor:</p>
+<pre><code class="language-sql">INSERT INTO orders (user_id, sku, hold_token, status)
+VALUES (:user_id, :sku, :hold_token, 'PAID');
+-- UNIQUE(hold_token) ensures even if the application layer retries, only one row lands.
+</code></pre>
+<p>Why this works:</p>
+<table>
+<thead>
+<tr>
+<th>Pressure</th>
+<th>How the design responds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Oversell</td>
+<td>Single writer for the SKU is the only entity that decrements. The atomic counter cannot go below zero.</td>
+</tr>
+<tr>
+<td>Throughput</td>
+<td>One core can sustain ~50-200k decrement-and-log per second in a compiled language (Java/Go/Rust); the log-append round-trip dominates. We only need ~10k decrement events total over 60 seconds, so a single core is two orders of magnitude over-provisioned.</td>
+</tr>
+<tr>
+<td>Database meltdown</td>
+<td>The database is no longer in the hot path of decrement. It only receives confirmed orders, at human-rate.</td>
+</tr>
+<tr>
+<td>Marketing-page cache lie</td>
+<td>The reservation service emits a "sold_out" event; the marketing service consumes and updates the cache. Stale by seconds, not minutes.</td>
+</tr>
+<tr>
+<td>Stuck checkouts</td>
+<td>TTL on the hold; sweeper releases; database UNIQUE constraint prevents double-commit if a stuck flow ever resumes.</td>
+</tr>
+<tr>
+<td>Lock-holder dies</td>
+<td>Single-writer node's state is replicated synchronously to a follower. Failover restores the counter.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="6-variants-and-how-to-choose">6. Variants and how to choose</h2>
+<h3 id="decision-table">Decision table</h3>
+<table>
+<thead>
+<tr>
+<th>Technique</th>
+<th>Best fit</th>
+<th>Throughput per key</th>
+<th>Operational cost</th>
+<th>Failure mode when stressed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Single-writer partition</strong></td>
+<td>Massive contention on a known key set (matching engine, flash sale, ticket master event)</td>
+<td>Highest (~50-200k/sec per core in compiled languages; log-append-bound)</td>
+<td>High setup (routing, replication)</td>
+<td>One key hotter than one core can serve</td>
+</tr>
+<tr>
+<td><strong>Optimistic CCC (CAS + version)</strong></td>
+<td>Low to moderate contention; many keys, few collisions</td>
+<td>Good when collisions are rare; total work is O(N^2) in concurrent writers per key</td>
+<td>Low</td>
+<td>Retry storm past ~10-50 concurrent writers per key</td>
+</tr>
+<tr>
+<td><strong>Pessimistic lock (<code>SELECT FOR UPDATE</code>)</strong></td>
+<td>Single relational DB, simple flows, no app-side think-time inside the transaction</td>
+<td>A single atomic UPDATE sustains thousands of RPS per row; transactions with round-trips hold ~ms locks → low hundreds RPS per row before queueing dominates</td>
+<td>Low (built in)</td>
+<td>Connection-pool starvation when transactions hold across app-side work; deadlocks from inconsistent lock order</td>
+</tr>
+<tr>
+<td><strong>Distributed lock + fencing token</strong></td>
+<td>Resource lives outside any one DB; need exclusive access across services</td>
+<td>Moderate (limited by lock service)</td>
+<td>Medium-high (lock service + fencing protocol)</td>
+<td>Forgetting the fence; lock service outage</td>
+</tr>
+<tr>
+<td><strong>Reservation token with TTL</strong></td>
+<td>Multi-step user flow with think-time</td>
+<td>Same as the underlying atomic step</td>
+<td>Medium (TTL tuning, sweeper)</td>
+<td>TTL too short or too long, sweeper falls behind</td>
+</tr>
+<tr>
+<td><strong>Two-phase reservation (Saga)</strong></td>
+<td>Cross-service commit (payment + inventory + notify)</td>
+<td>Limited by slowest step</td>
+<td>High (compensation, reconciliation)</td>
+<td>Compensation failure, stuck Sagas</td>
+</tr>
+<tr>
+<td><strong>Database UNIQUE constraint</strong></td>
+<td>Anywhere uniqueness is the invariant</td>
+<td>Free (always-on)</td>
+<td>Zero</td>
+<td>Cannot express non-uniqueness invariants</td>
+</tr>
+</tbody>
+</table>
+<h3 id="choosing-rule-of-thumb">Choosing rule of thumb</h3>
+<pre><code>                       Per-key RPS &gt; a few thousand
+                          AND single-DB row would saturate?
+                                     │
+                            ┌────────┴────────┐
+                            │                 │
+                           yes               no
+                            │                 │
+                            ▼                 ▼
+             Single-writer partition    Cross-service commit?
+             + reservation TTL                │
+             + DB UNIQUE                ┌─────┴─────┐
+                                        │           │
+                                       yes          no
+                                        │           │
+                                        ▼           ▼
+                          Saga + idempotency   Single atomic UPDATE
+                          + DB UNIQUE          (WHERE stock &gt; 0)
+                                               + DB UNIQUE
+                                               (add reservation TTL
+                                                only if there is
+                                                user think-time)
+</code></pre>
+<p>If the interviewer says "single relational database, tens of orders per minute, must never oversell": pessimistic lock + UNIQUE constraint. Done.</p>
+<p>If the interviewer says "10k requests per second on one SKU during a flash sale": single-writer partition + reservation TTL + UNIQUE.</p>
+<p>If the interviewer says "payment must debit a wallet and create an order, across two services": Saga with compensation + idempotency keys + UNIQUE.</p>
+<hr />
+<h2 id="7-failure-modes-and-operations">7. Failure modes and operations</h2>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Symptom / metric</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Lost update on naive read-modify-write</td>
+<td><code>oversell_count &gt; 0</code> audit metric; angry support tickets</td>
+<td>CAS with version; single-writer; or <code>SELECT FOR UPDATE</code></td>
+</tr>
+<tr>
+<td>Lock-holder pause (GC, network freeze)</td>
+<td>Two clients write to storage at "same time" with same lock</td>
+<td>Fencing tokens enforced at storage layer</td>
+</tr>
+<tr>
+<td>Lock service quorum loss</td>
+<td><code>lock_acquire_p99</code> spike; <code>lock_acquire_error_rate</code> rises</td>
+<td>Multi-region etcd or ZooKeeper; circuit-break to fail-closed mode</td>
+</tr>
+<tr>
+<td>Phantom reservation (hold never released)</td>
+<td>Held seats remain after user abandons; <code>held_count</code> does not decrease</td>
+<td>TTL on hold; sweeper job; lazy reclaim on next read of same key</td>
+</tr>
+<tr>
+<td>Retry storm under contention</td>
+<td><code>cas_retry_count</code> per request explodes; CPU saturates</td>
+<td>Cap retries; add jitter; switch to single-writer for known hot keys</td>
+</tr>
+<tr>
+<td>Connection-pool starvation from long-held locks</td>
+<td><code>db_connections_in_use</code> near max; rest of site slow</td>
+<td>Move lock outside the DB transaction; cap transaction duration</td>
+</tr>
+<tr>
+<td>Double-charge from client retry</td>
+<td><code>payment_idempotency_collisions</code> show non-idempotent retries</td>
+<td>Idempotency key on every payment; UNIQUE constraint on <code>(user_id, idem_key)</code></td>
+</tr>
+<tr>
+<td>Single-writer node death</td>
+<td>Reservation throughput drops to zero</td>
+<td>Synchronous replication of partition log; automatic failover; bounded RTO</td>
+</tr>
+<tr>
+<td>Hot-key meltdown (one key dominates)</td>
+<td>Per-key QPS chart shows one key 100x others</td>
+<td>Pre-partition the key product-side (sub-blocks); shed load at edge with queue/CAPTCHA</td>
+</tr>
+<tr>
+<td>Compensation failure in Saga</td>
+<td><code>saga_stuck_count</code> rises</td>
+<td>Permanent reconciliation worker; alert on stuck &gt; N minutes</td>
+</tr>
+<tr>
+<td>Cross-region lock contention</td>
+<td>Lock acquire latency = inter-region RTT</td>
+<td>Pin a key to one region; route writes accordingly</td>
+</tr>
+<tr>
+<td>Time skew between hold expiry and sweeper</td>
+<td>Two writers think the hold is theirs</td>
+<td>Use the storage's own clock as the source of truth; fence by expiry+token</td>
+</tr>
+</tbody>
+</table>
+<h3 id="metrics-every-staff-answer-should-mention">Metrics every staff answer should mention</h3>
+<ul>
+<li><code>oversell_count</code> (must be exactly 0; alert on &gt; 0)</li>
+<li><code>successful_reservations_per_sku</code></li>
+<li><code>hold_to_confirm_ratio</code> (low ratio = abandoned holds; tune TTL or UX)</li>
+<li><code>cas_retry_distribution</code> (long tail = contention; consider single writer)</li>
+<li><code>lock_holder_pause_detected</code> (any non-zero requires fence-token audit)</li>
+<li><code>partition_leader_election_count</code> (frequent = unhealthy node)</li>
+<li><code>saga_stuck_count</code> and <code>saga_compensation_failures</code></li>
+</ul>
+<hr />
+<h2 id="8-combinations-with-other-patterns">8. Combinations with other patterns</h2>
+<p>This pattern almost never stands alone. Common pairings:</p>
+<ul>
+<li><strong><a href="../hot-key-skew/">hot-key-skew.md</a></strong> — the contended key is by definition hot. Pre-partition by sub-key (seat-block, price-bucket), shed load with a waiting room, or apply per-key rate limits. The flash-sale example combines both patterns.</li>
+<li><strong><a href="../idempotency-exactly-once/">idempotency-exactly-once.md</a></strong> — every write under contention must be safe to retry. The client cannot know if their first attempt committed when the network drops. Idempotency keys are mandatory.</li>
+<li><strong><a href="../cache-stampede-read-amplification/">cache-stampede-read-amplification.md</a></strong> — the read side often shows "12 left!" which must be approximately correct. Cache the count, but use the strong-consistency layer for the actual decrement.</li>
+<li><strong><a href="../coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a></strong> — when the result of the contention must trigger exactly one downstream action (one confirmation email, one ledger entry). Outbox pattern + idempotent consumer.</li>
+<li><strong><a href="../durability-at-scale/">durability-at-scale.md</a></strong> — the winner's commit must survive node loss. Synchronous replication of the partition log (Raft) or quorum write to a durable store.</li>
+<li><strong><a href="../backpressure-flow-control/">backpressure-flow-control.md</a></strong> — when 500k users hit one URL, you must drop or queue early. The waiting-room pattern.</li>
+<li><strong><a href="../ordering-causal-consistency/">ordering-causal-consistency.md</a></strong> — a stock-exchange order book needs strict per-symbol ordering (price-time priority). The single-writer partition pattern is the same machinery, with an extra ordering constraint.</li>
+</ul>
+<hr />
+<h2 id="9-likely-interviewer-probes">9. Likely interviewer probes</h2>
+<ol>
+<li>
+<p><strong>"What happens when the node holding your single-writer partition dies mid-reservation?"</strong> Answer: synchronous log replication to at least one follower (Raft / Multi-Paxos); leader election triggered by failure detector; follower replays committed log entries; in-flight uncommitted requests are returned as "unknown" so client retries with idempotency key; bounded recovery time objective (RTO) of seconds, not minutes.</p>
+</li>
+<li>
+<p><strong>"You said you use a distributed lock. What if the lock holder GC-pauses for 15 seconds?"</strong> Answer: that is exactly why we use fencing tokens. The lock service issues a monotonically increasing token on every acquire. Every downstream storage operation includes the token; storage rejects tokens lower than the highest it has seen. The paused client wakes up, tries to write with stale token, gets rejected. This is THE central probe for distributed locking — interviewer is checking if you know Martin Kleppmann's article.</p>
+</li>
+<li>
+<p><strong>"How do you handle 500,000 users hitting the page at exactly 9:00:00.000?"</strong> Answer: shed load before it reaches the reservation service. Waiting-room pattern: edge servers issue queue tokens, slowly admit them into the checkout flow. Inventory service only sees demand at the rate it can confirm. CAPTCHA or proof-of-work at admission to defeat bots.</p>
+</li>
+<li>
+<p><strong>"What is the right TTL for a seat hold?"</strong> Answer: derive it, do not pick it. Under normal demand (capacity not the binding constraint) TTL is set generously from the user flow — typical checkout p95 is 60-180 seconds, so TTL of 5-10 minutes gives margin for slow card entry. Under flash-sale conditions the math flips: effective sellable inventory equals <code>capacity × (TTL / median_checkout_time)</code>, so a 10-minute TTL with 60-second checkouts effectively serializes inventory at 1/10 of capacity, suppressing demand. Compress TTL to ~60-120 seconds, display a visible countdown so users know they're racing, and measure two metrics post-event: <code>hold_to_confirm_ratio</code> (low means TTL too short or UX too slow) and <code>held_seat_recycle_count</code> (high means TTL too long for the demand level). Tune both.</p>
+</li>
+<li>
+<p><strong>"How do you prevent a user from holding 100 seats by spamming the reserve API?"</strong> Answer: per-user rate limit at edge. Per-user concurrent-hold limit enforced inside the reservation service (<code>max_holds_per_user</code>). Idempotency on <code>reserve</code> by <code>(user_id, request_id)</code> so retries do not multiply holds.</p>
+</li>
+<li>
+<p><strong>"Walk me through the payment flow when the user clicks confirm. What if the network drops mid-call?"</strong> Answer: idempotency key generated client-side at hold time, included on every confirm attempt. Payment provider de-duplicates by idempotency key. If the client times out and retries, the second call returns the result of the first. If the payment succeeds but our order finalize fails, a background reconciliation job catches the orphan payment and either finalizes the order or refunds.</p>
+</li>
+<li>
+<p><strong>"How do you audit that you never oversold?"</strong> Answer: every state transition (FREE → HELD → SOLD) is logged to an append-only event log. A nightly reconciliation job replays the log, recomputes per-SKU counts, compares to the source-of-truth row. Alarm on mismatch. Also, daily report of <code>count(orders WHERE sku=X) ≤ capacity(X)</code> per SKU; any violation is a Sev-1.</p>
+</li>
+<li>
+<p><strong>"Why not just use a single atomic <code>UPDATE inventory SET stock = stock - 1 WHERE sku = X AND stock &gt; 0</code> and call it a day?"</strong> Answer: for many products, that <em>is</em> the right answer. A single guarded UPDATE in Postgres or MySQL holds the row lock for ~tens of microseconds and trivially handles up to thousands of RPS per row without any oversell, because the database itself serializes the writes. The technique stack in this doc earns its complexity only when one of four constraints binds: (a) per-key throughput exceeds what one database row can serialize (single-writer partition); (b) the workflow has user think-time between intent and commit (reservation TTL); (c) the commit spans services that cannot share a transaction (Saga); (d) the resource lives outside any one database and an external lock manager is the only option (distributed lock + fencing). If none of those bind, the staff-level move is to call out the single-row UPDATE as sufficient and add only the database UNIQUE constraint as a belt-and-suspenders floor. Reaching for Chubby on a B2B inventory system that does 10 orders per minute is a red flag.</p>
+</li>
+</ol>
+<hr />
+<h2 id="10-common-traps-stronger-moves">10. Common traps → stronger moves</h2>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"Just use <code>SELECT FOR UPDATE</code>."</td>
+<td>Layer it: DB UNIQUE constraint as floor, reservation token with TTL for UX, single-writer partition for scale. State which layer absorbs which failure.</td>
+</tr>
+<tr>
+<td>Distributed lock without fencing token.</td>
+<td>Always pair the lock with a monotonic token enforced at the storage layer; otherwise a paused holder corrupts state.</td>
+</tr>
+<tr>
+<td>Treat retries as harmless.</td>
+<td>Idempotency key on every write; UNIQUE constraint on <code>(user, idem_key)</code>; retries must converge to the same outcome.</td>
+</tr>
+<tr>
+<td>Hide the contended key.</td>
+<td>Name it. Say: "the hot key is <code>sku=cybertruck-fs</code>. My design routes it to a dedicated single-writer node."</td>
+</tr>
+<tr>
+<td>Optimistic CAS at any scale.</td>
+<td>Acceptable under low contention; under high contention, retries explode. Switch to single-writer for known hot keys.</td>
+</tr>
+<tr>
+<td>Forget about phantom holds.</td>
+<td>Always pair holds with TTL + sweeper + lazy reclaim on the next read. State the TTL number and the recycle latency target.</td>
+</tr>
+<tr>
+<td>Sweeper is the only reclaim mechanism.</td>
+<td>Add lazy reclaim on read so even if the sweeper falls behind, the next caller can claim an expired hold.</td>
+</tr>
+<tr>
+<td>Stale "in stock" count on the marketing page.</td>
+<td>Use the contention layer as truth; let the marketing page be a derived projection that catches up within seconds. State the SLA on staleness.</td>
+</tr>
+<tr>
+<td>Two-phase commit (2PC) across services.</td>
+<td>2PC blocks on coordinator failure. Use Saga with explicit compensation and reconciliation.</td>
+</tr>
+<tr>
+<td>No upper bound on holds per user.</td>
+<td>Per-user concurrent-hold cap. Per-user rate limit at edge.</td>
+</tr>
+<tr>
+<td>Assume clocks agree across services.</td>
+<td>Use the storage's own clock for TTL expiry; never trust the client. Or rely on monotonic fencing tokens, not wall time.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11-staff-level-answer-checklist">11. Staff-level answer checklist</h2>
+<p>When you give a strong-consistency-under-contention answer, the interviewer should hear all of these in your spoken design:</p>
+<ul>
+<li>[ ] You named the invariant precisely: <code>commits == min(C, demand)</code>, no oversells, every loser sees "no" within a stated latency.</li>
+<li>[ ] You identified the hot key by name (not "the row," but "the row for <code>event_id=42, seat_id=A12</code>").</li>
+<li>[ ] You picked one primary serialization mechanism (single-writer, lock, CAS) and stated why.</li>
+<li>[ ] You layered a database UNIQUE constraint as the last line of defense.</li>
+<li>[ ] You used a reservation token with a TTL for any flow that has user think-time.</li>
+<li>[ ] You named idempotency by key on every retry-prone write.</li>
+<li>[ ] You discussed lock-holder pause and fencing tokens (if locks are in the design at all).</li>
+<li>[ ] You described the failover story for the serialization node (replication, leader election, RTO).</li>
+<li>[ ] You described how the read path stays fast (cache, projection) without being the source of truth.</li>
+<li>[ ] You named one or two metrics that would let an on-call engineer detect oversells, stuck holds, or contention storms.</li>
+<li>[ ] You discussed load shedding at the edge (waiting room, CAPTCHA, rate limit) so the contended layer is never overwhelmed.</li>
+<li>[ ] You distinguished between the legal Saga states and stated how a stuck Saga is detected and resolved.</li>
+</ul>
+<hr />
+<h2 id="12-cross-references">12. Cross-references</h2>
+<p>Related pattern docs in this collection:</p>
+<ul>
+<li><a href="../hot-key-skew/">hot-key-skew.md</a> — every contended resource is also a hot key by definition; load-shedding and pre-partitioning techniques live there.</li>
+<li><a href="../idempotency-exactly-once/">idempotency-exactly-once.md</a> — every write under contention must be safe to retry.</li>
+<li><a href="../coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a> — when the contested commit must trigger exactly one downstream effect.</li>
+<li><a href="../ordering-causal-consistency/">ordering-causal-consistency.md</a> — single-writer partition is the same machinery used for strict per-key ordering.</li>
+<li><a href="../durability-at-scale/">durability-at-scale.md</a> — the winner's commit must survive node loss.</li>
+<li><a href="../backpressure-flow-control/">backpressure-flow-control.md</a> — waiting-room pattern to keep contention bounded at the edge.</li>
+<li><a href="../cache-stampede-read-amplification/">cache-stampede-read-amplification.md</a> — the read side ("how many left?") is a separate problem from the authoritative decrement.</li>
+<li><a href="../fan-out-write-amplification/">fan-out-write-amplification.md</a> — the inverse problem (one write, many reads/recipients) often appears as the read side of contention systems.</li>
+</ul>
+<p>Related question docs where this pattern is the load-bearing concern:</p>
+<ul>
+<li><a href="../questions/design-ticketmaster.md">design-ticketmaster.md</a> — the canonical seat-reservation problem.</li>
+<li><a href="../questions/design-a-flash-sale-for-an-e-commerce-site.md">design-a-flash-sale-for-an-e-commerce-site.md</a> — limited inventory, massive concurrent demand.</li>
+<li><a href="../questions/design-a-stock-exchange.md">design-a-stock-exchange.md</a> — matching engine; single-writer per symbol with strict ordering.</li>
+<li><a href="../questions/design-a-payment-system.md">design-a-payment-system.md</a> — wallet debit must never go negative; idempotency and Sagas.</li>
+<li><a href="../questions/design-the-stripe-payment-gateway.md">design-the-stripe-payment-gateway.md</a> — multi-step payment with idempotency keys; classic contention against the payer's account.</li>
+<li><a href="../questions/design-a-distributed-lock-manager-like-chubby.md">design-a-distributed-lock-manager-like-chubby.md</a> — the building block for distributed locks with fencing tokens.</li>
+<li><a href="../questions/design-amazon-shopping-cart.md">design-amazon-shopping-cart.md</a> — checkout path; final inventory commit at order time.</li>
+<li><a href="../questions/design-the-uber-backend.md">design-the-uber-backend.md</a> — one driver / one rider matching, dispatch contention.</li>
+<li><a href="../questions/design-airbnb.md">design-airbnb.md</a> — overlapping date-range reservations; PostgreSQL exclusion constraint.</li>
+</ul>
+<p>Foundational reading inside this collection:</p>
+<ul>
+<li><a href="../questions/amazon-dynamo.md">amazon-dynamo.md</a> — the eventually-consistent counterpoint; vector clocks as a generalization of CAS-with-version.</li>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">STAFF_SYSTEM_DESIGN_GLOSSARY.md</a> — definitions for quorum, replica, vector clock, fencing token.</li>
+<li><a href="../STAFF_SYSTEM_DESIGN_INTERVIEW_PLAYBOOK.md">STAFF_SYSTEM_DESIGN_INTERVIEW_PLAYBOOK.md</a> — interview flow, framing scripts, the design spine.</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

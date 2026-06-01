@@ -1,0 +1,1003 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Idempotency / Exactly-Once — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design-patterns/">← Back to System Design Patterns</a>
+        <h1 class="article-title">Idempotency / Exactly-Once</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/31 &nbsp;·&nbsp; System Design Patterns
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>A design discipline for making operations safe to retry: the system produces the same observable effect whether a request is delivered one time or one hundred times, by deduplicating at well-chosen seams rather than chasing the impossible promise of "exactly once" on the wire. See <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">glossary</a> for related terms (quorum, vector clock, write-ahead log). Related question docs: <a href="../questions/design-a-payment-system.md">design-a-payment-system</a>, <a href="../questions/design-the-stripe-payment-gateway.md">design-the-stripe-payment-gateway</a>, <a href="../questions/design-a-delayed-payment-system.md">design-a-delayed-payment-system</a>, <a href="../questions/design-a-notification-system.md">design-a-notification-system</a>, <a href="../questions/apache-kafka.md">apache-kafka</a>, <a href="../questions/design-a-flash-sale-for-an-e-commerce-site.md">design-a-flash-sale-for-an-e-commerce-site</a>, <a href="../questions/design-a-reminder-alert-system.md">design-a-reminder-alert-system</a>.</p>
+</blockquote>
+<hr />
+<h2 id="1-the-fundamental-hardness">1. The fundamental hardness</h2>
+<p>"Did my request succeed?" is the only question that matters in a distributed system, and it is the one question the network refuses to answer. A client sends a <code>POST /charge</code>. The server commits to the database, the database flushes the write-ahead log (WAL), the response is serialized and put on the wire — and then a transient network drop, a load-balancer reset, a Linux conntrack timeout, or a half-closed Transmission Control Protocol (TCP) connection eats the acknowledgment. From the client's vantage point, the request is in an indeterminate state: it might have succeeded, it might have failed, it might have succeeded and the database has already debited the user's card. The only rational client behavior is to retry. The only rational server behavior is to assume retries will happen, even ones it cannot see (the client may have died and been replaced; a sibling service may be retrying on its behalf; a queue may redeliver hours later).</p>
+<p>This is the gap that every payment, signup, message-send, withdrawal, and order-placement system lives in. "Exactly once delivery" at the wire level does not exist: you get at-most-once (fire and forget; messages can be lost) or at-least-once (retry until acked; messages can duplicate). What you can build, by careful design at the application and storage layer, is <strong>exactly-once effect</strong> — meaning the user gets charged once, the email gets sent once, the row gets inserted once — even though the wire-level request may have arrived zero, one, two, or eleven times. The mechanism is always the same in spirit: assign a stable identifier to the <em>intent</em> of an operation, persist a record keyed by that identifier, and let the persistent record arbitrate whether to do the work or to return the previously computed result.</p>
+<p>A staff-level caveat up front: this machinery is not free. A dedup table is an extra row per request, an extra index, a TTL policy, and a piece of state whose availability budget must match the business write. For low-stakes mutations whose accidental duplication is cheap to detect and reverse (e.g., a "favorite" toggle, an analytics event, a cache invalidation), the naive design plus a downstream reconciliation job is often the correct answer. The pattern earns its complexity when duplication is expensive — money moved, inventory committed, externally visible side effects like an SMS or a refund. Name the cost of a duplicate before you reach for the toolkit.</p>
+<p>The Two Generals Problem captures the narrow version of why this is irreducible: two parties cannot reach common knowledge that a message was delivered over a lossy channel with a finite exchange, because the last sender can never know whether their final ack was received. The practical takeaway is more modest than the theorem is sometimes used to suggest — you can still build reliable systems, you just cannot rely on the <em>sender's view of delivery</em> to coordinate state. The escape is to make the operation's <em>effect</em> commutative under repetition. That is the whole game: make the second, third, and Nth attempts arithmetic no-ops with respect to externally visible state, while still returning a coherent answer to the caller.</p>
+<p>Three forces conspire to make this hard at scale. First, the dedup state must itself be highly available and consistent — if your dedup table goes down or returns stale answers, your idempotency guarantee evaporates. Second, dedup state grows without bound unless time-to-live (TTL) or compaction is designed in, and getting TTL wrong creates a different failure mode (late retry → double effect because the dedup record expired). Third, the operation often spans multiple systems — debit Ledger A, credit Ledger B, send a Kafka event, call a Stripe Application Programming Interface (API) — and idempotency must compose across each boundary independently or via an outbox + transactional pattern that turns the multi-system commit into a single-system one.</p>
+<hr />
+<h2 id="2-how-to-recognize-it-in-the-interview">2. How to recognize it in the interview</h2>
+<h3 id="prompt-phrases-that-signal-this-pattern">Prompt phrases that signal this pattern</h3>
+<ul>
+<li>"The client may retry."</li>
+<li>"Network is unreliable" / "what if the response is lost"</li>
+<li>"How do you prevent double charges / double sends / duplicate orders?"</li>
+<li>"What happens when the consumer crashes mid-batch?"</li>
+<li>"How do you guarantee a webhook is processed once?"</li>
+<li>"We use at-least-once delivery — how do you handle duplicates?"</li>
+<li>"What if the same payment authorization is submitted twice?"</li>
+<li>"Exactly once" anywhere in the prompt is a giant flashing sign.</li>
+</ul>
+<h3 id="architectural-smells-things-in-the-diagram-that-demand-this-pattern">Architectural smells (things in the diagram that demand this pattern)</h3>
+<ul>
+<li>A queue (Kafka, Simple Queue Service (SQS), RabbitMQ) feeding any consumer that mutates external state. Queues are at-least-once.</li>
+<li>A public Hypertext Transfer Protocol (HTTP) endpoint that mutates state and has any retry policy upstream (client retry, load balancer retry, service mesh retry, mobile network reconnection).</li>
+<li>A workflow with multiple write side-effects — a Saga, a payment flow, a "create user + send welcome email" combo.</li>
+<li>A webhook receiver: webhooks are at-least-once by every major provider's contract.</li>
+<li>Any cross-region / cross-system replication with retries.</li>
+<li>Cron jobs or schedulers that can fire twice on failover.</li>
+<li>Anywhere a developer says "we'll just check before we insert" — that is a Time-Of-Check-To-Time-Of-Use (TOCTOU) race waiting to happen.</li>
+</ul>
+<h3 id="example-interview-prompts-where-this-is-core">Example interview prompts where this is core</h3>
+<ol>
+<li>"Design Stripe's payment gateway." Every public Stripe write API takes an <code>Idempotency-Key</code> header. This is the canonical interview moment for this pattern. See <a href="../questions/design-the-stripe-payment-gateway.md">design-the-stripe-payment-gateway.md</a>.</li>
+<li>"Design a payment system" / "Design a delayed payment system." Authoritative ledger writes must be idempotent. See <a href="../questions/design-a-payment-system.md">design-a-payment-system.md</a> and <a href="../questions/design-a-delayed-payment-system.md">design-a-delayed-payment-system.md</a>.</li>
+<li>"Design a notification system." Sending the same push notification twice on a Kafka rebalance is the bug. See <a href="../questions/design-a-notification-system.md">design-a-notification-system.md</a>.</li>
+<li>"Design Kafka" or "Design a message queue." You will be asked about idempotent producers, transactional commits, and consumer offset management. See <a href="../questions/apache-kafka.md">apache-kafka.md</a>.</li>
+<li>"Design Uber" / "Design Uber Eats." Driver-accepts-trip and order-placement must be single-effect under client retry. See <a href="../questions/design-the-uber-backend.md">design-the-uber-backend.md</a> and <a href="../questions/design-uber-eats.md">design-uber-eats.md</a>.</li>
+<li>"Design a flash sale." Decrementing inventory under retry storms must not over-sell. See <a href="../questions/design-a-flash-sale-for-an-e-commerce-site.md">design-a-flash-sale-for-an-e-commerce-site.md</a>.</li>
+<li>"Design Ticketmaster." Seat reservation = intent record + commit; retries cannot double-reserve. See <a href="../questions/design-ticketmaster.md">design-ticketmaster.md</a>.</li>
+<li>"Design a job scheduler." Cron firing twice on leader failover. See <a href="../questions/design-a-distributed-job-scheduler-like-cron.md">design-a-distributed-job-scheduler-like-cron.md</a>.</li>
+</ol>
+<hr />
+<h2 id="3-60-second-spoken-framing">3. 60-second spoken framing</h2>
+<blockquote>
+<p>The invariant is exactly-once <em>effect</em>, not exactly-once <em>delivery</em>. At the network level, the client cannot tell whether a lost response means the server processed the request or not, so it must retry. I make retries safe by giving every state-changing request a stable idempotency key — usually a client-supplied Universally Unique Identifier (UUID) — and storing the operation outcome keyed by that UUID in a deduplication table inside the same transaction that mutates business state. The first request wins, computes the answer, and persists it; every later request with the same key short-circuits and replays the stored response. For multi-system effects, I use the transactional outbox pattern: the business write and an outbox row commit atomically in one database transaction, and a separate publisher with at-least-once semantics pushes the outbox row to Kafka or to downstream services, which themselves dedup by the outbox event identifier. The metric I care about is the duplicate-suppression rate, and the failure mode I budget for is the dedup table's TTL being shorter than the maximum retry horizon.</p>
+</blockquote>
+<hr />
+<h2 id="4-canonical-toolkit">4. Canonical toolkit</h2>
+<p>Seven techniques. Each is a piece of the puzzle; staff-level answers combine three or four.</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Technique</th>
+<th>Where it lives</th>
+<th>What it solves</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Client-supplied idempotency key + dedup table</td>
+<td>API boundary</td>
+<td>Duplicate HTTP requests from client retries</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Monotonic state machine</td>
+<td>Domain model</td>
+<td>Out-of-order or late retries that contradict committed state</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Two-phase intent → commit</td>
+<td>Multi-step workflows</td>
+<td>Pre-allocate resources atomically before the side-effect</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Transactional outbox</td>
+<td>Service boundary</td>
+<td>Atomic publish of events alongside business writes</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Change Data Capture (CDC)</td>
+<td>Replication / fan-out</td>
+<td>Outbox publishing without polling</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Kafka idempotent producer + transactions</td>
+<td>Streaming pipelines</td>
+<td>Producer retries within a single Kafka cluster</td>
+</tr>
+<tr>
+<td>7</td>
+<td>At-least-once-plus-idempotent-consumer</td>
+<td>Stream processing</td>
+<td>Consumer reprocessing on rebalance / restart</td>
+</tr>
+</tbody>
+</table>
+<h3 id="41-idempotency-key-handling">4.1 Idempotency key handling</h3>
+<p>The client generates a Universally Unique Identifier (UUID) v4 (or a deterministic hash of the request body if it controls retries) and sends it as a header on every retry of the same logical request. The server stores <code>(idempotency_key, request_fingerprint, response_body, status_code, created_at)</code> in a dedup table, keyed by <code>idempotency_key</code> with a unique index. The transaction that performs the business work and the transaction that inserts the dedup row are the same transaction.</p>
+<pre><code class="language-python"># Single-system idempotent write. Postgres-flavored pseudocode.
+
+import hashlib
+import json
+import uuid
+from dataclasses import dataclass
+
+@dataclass
+class IdempotentResult:
+    status_code: int
+    body: dict
+    replayed: bool  # True if served from dedup cache
+
+def charge(
+    db,
+    user_id: str,
+    amount_cents: int,
+    idempotency_key: str,
+    request_body: dict,
+) -&gt; IdempotentResult:
+    # Fingerprint guards against accidental key reuse on a *different* request.
+    fingerprint = hashlib.sha256(
+        json.dumps(request_body, sort_keys=True).encode()
+    ).hexdigest()
+
+    with db.transaction() as tx:
+        # Try to insert the dedup row first. The unique index on idempotency_key
+        # is what makes this safe against concurrent retries.
+        row = tx.execute(
+            &quot;&quot;&quot;
+            INSERT INTO idempotency_keys
+                (key, fingerprint, status, created_at)
+            VALUES (%s, %s, 'IN_FLIGHT', NOW())
+            ON CONFLICT (key) DO NOTHING
+            RETURNING id
+            &quot;&quot;&quot;,
+            (idempotency_key, fingerprint),
+        ).fetchone()
+
+        if row is None:
+            # A concurrent or prior request already owns this key.
+            existing = tx.execute(
+                &quot;SELECT fingerprint, status, response_body, status_code &quot;
+                &quot;FROM idempotency_keys WHERE key = %s&quot;,
+                (idempotency_key,),
+            ).fetchone()
+
+            if existing.fingerprint != fingerprint:
+                # Same key, different request body = client bug; reject loudly.
+                raise IdempotencyKeyConflict(idempotency_key)
+
+            if existing.status == 'IN_FLIGHT':
+                # Concurrent retry while the first is still running.
+                # Either block (with timeout) or return 409 and let client back off.
+                raise IdempotencyInFlight(idempotency_key)
+
+            return IdempotentResult(
+                status_code=existing.status_code,
+                body=json.loads(existing.response_body),
+                replayed=True,
+            )
+
+        # We are the first writer. Do the business work in the same transaction.
+        charge_id = str(uuid.uuid4())
+        tx.execute(
+            &quot;INSERT INTO charges (id, user_id, amount_cents, status) &quot;
+            &quot;VALUES (%s, %s, %s, 'AUTHORIZED')&quot;,
+            (charge_id, user_id, amount_cents),
+        )
+
+        response = {&quot;charge_id&quot;: charge_id, &quot;status&quot;: &quot;AUTHORIZED&quot;}
+
+        tx.execute(
+            &quot;&quot;&quot;
+            UPDATE idempotency_keys
+            SET status = 'DONE',
+                response_body = %s,
+                status_code = 200,
+                completed_at = NOW()
+            WHERE key = %s
+            &quot;&quot;&quot;,
+            (json.dumps(response), idempotency_key),
+        )
+
+        return IdempotentResult(status_code=200, body=response, replayed=False)
+</code></pre>
+<p>Three subtleties that separate junior from staff answers:</p>
+<ol>
+<li><strong>Fingerprint check.</strong> If the same idempotency key arrives with a different request body, that is a client bug — never replay the cached response, because the client thinks it is sending a new request. Return <code>409 Conflict</code>. Stripe does this; it catches an enormous class of bugs.</li>
+<li><strong>IN_FLIGHT state.</strong> Two retries can arrive concurrently (mobile network blips create bursts). The first one inserts with status <code>IN_FLIGHT</code>; the second one sees it, must not start a second write, and must either wait or return a <code>409</code> telling the client to retry after a backoff. Note: the code above shows a single-transaction flow where the IN_FLIGHT state is never observable to a concurrent retry because the row is not visible until commit. That is fine for the <em>pure-database</em> case (no external call between insert and commit). For a flow that calls an external service mid-transaction — see Section 5 — the IN_FLIGHT row must be committed <em>before</em> the external call so concurrent retries can observe it; the business writes then happen in a second transaction. Pick the shape that matches whether there is an external side effect in the middle.</li>
+<li><strong>Same atomicity domain.</strong> If the dedup record commits and the business row does not (or vice versa), you have lost the guarantee. For purely-database operations, both writes belong to the same database transaction (or are collapsed into one row, e.g., the charge row itself is keyed by <code>idempotency_key</code>). For operations with an external side effect, you split into two transactions and accept that the IN_FLIGHT → DONE transition is the atomicity boundary the system can offer — with the operational consequence that a crash mid-call leaves a stuck IN_FLIGHT row that a reaper must resolve.</li>
+</ol>
+<h3 id="42-dedup-table-schema-with-ttl">4.2 Dedup table schema with TTL</h3>
+<pre><code class="language-python"># Postgres DDL for the dedup table. Annotated.
+
+&quot;&quot;&quot;
+CREATE TABLE idempotency_keys (
+    key            TEXT PRIMARY KEY,                  -- client-supplied UUID
+    fingerprint    TEXT NOT NULL,                     -- sha256 of request body
+    status         TEXT NOT NULL,                     -- 'IN_FLIGHT' | 'DONE' | 'FAILED'
+    status_code    INT,
+    response_body  JSONB,
+    user_id        TEXT,                              -- for sharding / partition pruning
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at   TIMESTAMPTZ,
+    expires_at     TIMESTAMPTZ NOT NULL                -- TTL horizon
+);
+
+-- Partial index to quickly find expired rows for cleanup.
+CREATE INDEX idempotency_keys_expires_at ON idempotency_keys (expires_at)
+  WHERE status IN ('DONE', 'FAILED');
+
+-- Range-partition by created_at so TRUNCATE PARTITION can drop old data fast.
+-- Daily partitions × 30-day retention = 30 partitions.
+&quot;&quot;&quot;
+
+# Recommended TTL: longer than the maximum retry horizon for the API.
+# - Mobile clients: 24-72h is typical because that bounds offline app-resume retry.
+#   The 24h floor comes from &quot;user backgrounds the app overnight&quot;; pick the upper
+#   end if your client SDK persists pending requests across reinstalls.
+# - Server-to-server with a queue: max queue retention + safety margin
+#   (e.g., 7-day Kafka retention -&gt; TTL &gt;= 8 days).
+# - Webhooks delivered by external providers: match the provider's documented
+#   retry budget. Stripe retries webhooks for up to 3 days, so 7 days is the
+#   common floor for receivers. GitHub, Twilio, SNS all publish their own budgets.
+#
+# Failure modes of getting it wrong:
+# - TTL too short -&gt; late retry arrives after the dedup row was evicted, the
+#   server treats it as a brand-new request, and the effect happens twice. This
+#   is the *worse* failure mode because it is silent.
+# - TTL too long -&gt; table grows large (manageable with partitioning) and the
+#   chance of a client reusing the same UUID for a logically different request
+#   over a long window goes up slightly (caught by fingerprint check).
+# Default to &quot;too long&quot; when in doubt; partitioning makes storage cheap, but
+# double-effect on a missed dedup is a customer-facing incident.
+</code></pre>
+<h3 id="43-outbox-pattern-table-schema">4.3 Outbox pattern table schema</h3>
+<p>The outbox pattern is how you make "write to database AND publish to Kafka" atomic without a distributed transaction. You write a row to an <code>outbox</code> table in the same DB transaction as the business write. A separate publisher reads the outbox and pushes to Kafka with at-least-once semantics; downstream consumers dedup by event ID.</p>
+<p>Be honest about what this does and does not solve. It <em>does</em> solve the dual-write race: business state and the intent-to-publish commit atomically, so a crash between the database commit and the Kafka send no longer causes the event to be silently lost. It does <em>not</em> give you exactly-once delivery downstream — the publisher is at-least-once by design (it can crash after <code>kafka.send</code> succeeds but before <code>UPDATE outbox SET published_at</code>), so downstream consumers must still dedup by <code>event_id</code>. The benefit is that the system collapses to "at-least-once with idempotent consumers," which is the only shape that actually works in practice.</p>
+<pre><code class="language-python">&quot;&quot;&quot;
+CREATE TABLE outbox (
+    id              BIGSERIAL PRIMARY KEY,         -- monotonic publish order
+    event_id        UUID NOT NULL UNIQUE,          -- dedup key for consumers
+    aggregate_type  TEXT NOT NULL,                 -- e.g. 'charge', 'order'
+    aggregate_id    TEXT NOT NULL,                 -- e.g. charge_id
+    event_type      TEXT NOT NULL,                 -- e.g. 'charge.authorized'
+    payload         JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    published_at    TIMESTAMPTZ                    -- NULL until published
+);
+
+CREATE INDEX outbox_unpublished ON outbox (id) WHERE published_at IS NULL;
+&quot;&quot;&quot;
+
+def authorize_and_emit(db, user_id, amount_cents, idempotency_key, request_body):
+    with db.transaction() as tx:
+        charge_id = insert_charge(tx, user_id, amount_cents, idempotency_key)
+
+        # Same transaction! This is the entire point.
+        tx.execute(
+            &quot;&quot;&quot;
+            INSERT INTO outbox
+                (event_id, aggregate_type, aggregate_id, event_type, payload)
+            VALUES (%s, 'charge', %s, 'charge.authorized', %s)
+            &quot;&quot;&quot;,
+            (
+                str(uuid.uuid4()),
+                charge_id,
+                json.dumps({&quot;charge_id&quot;: charge_id, &quot;amount&quot;: amount_cents}),
+            ),
+        )
+        return charge_id
+
+# A separate worker process polls or tails the outbox:
+def publish_outbox_loop(db, kafka):
+    while True:
+        with db.transaction() as tx:
+            rows = tx.execute(
+                &quot;&quot;&quot;
+                SELECT id, event_id, event_type, payload
+                FROM outbox
+                WHERE published_at IS NULL
+                ORDER BY id
+                LIMIT 100
+                FOR UPDATE SKIP LOCKED
+                &quot;&quot;&quot;,
+            ).fetchall()
+
+            for row in rows:
+                # Kafka idempotent producer keys by event_id so a producer-side
+                # retry within the same producer session does not duplicate.
+                kafka.send(
+                    topic='charges',
+                    key=row.event_id,
+                    value=row.payload,
+                )
+
+            tx.execute(
+                &quot;UPDATE outbox SET published_at = NOW() &quot;
+                &quot;WHERE id = ANY(%s)&quot;,
+                ([r.id for r in rows],),
+            )
+</code></pre>
+<p>The outbox publisher is at-least-once: if it sends to Kafka but crashes before updating <code>published_at</code>, the next iteration republishes the same <code>event_id</code>. Consumers must dedup by <code>event_id</code>. That is fine — the system is at-least-once with idempotent consumers, which is the standard answer.</p>
+<p>A note on the polling-vs-CDC choice. The poll loop above is operationally simple but adds publish latency equal to the poll interval (commonly 100ms-1s) and constant database load proportional to publisher count. The Change Data Capture alternative — Debezium / Maxwell tailing the database's replication log — eliminates polling and reduces commit-to-publish latency to tens of milliseconds, but in exchange you take on a non-trivial piece of infrastructure: a stateful connector that owns a database replication slot, a schema-evolution story for the change stream, a separate operational surface for connector lag, and the failure mode of "the connector is the only thing publishing your events." Most systems start with polling and only graduate to CDC when publish-latency or database-load measurements force the move. The doc's recommendation is to default to polling at 100-500ms and reserve CDC for the cases where you have already measured the constraint.</p>
+<h3 id="44-monotonic-state-machine">4.4 Monotonic state machine</h3>
+<p>Many domains can use the business state itself as the dedup mechanism, eliminating the need for an external dedup table. A charge moves through <code>INITIATED → AUTHORIZED → CAPTURED → SETTLED</code>, and the transition table only allows forward moves.</p>
+<pre><code class="language-python"># State transition is the dedup mechanism.
+
+ALLOWED_TRANSITIONS = {
+    'INITIATED':  {'AUTHORIZED', 'FAILED'},
+    'AUTHORIZED': {'CAPTURED', 'VOIDED'},
+    'CAPTURED':   {'SETTLED', 'REFUNDED'},
+    'SETTLED':    {'REFUNDED'},
+    'FAILED':     set(),
+    'VOIDED':     set(),
+    'REFUNDED':   set(),
+}
+
+def transition(db, charge_id: str, target_status: str) -&gt; bool:
+    &quot;&quot;&quot;
+    Returns True if the transition happened on this call, False if it was a no-op
+    because the row was already past this state.
+    &quot;&quot;&quot;
+    with db.transaction() as tx:
+        # Conditional update: only transition if current status allows it.
+        row = tx.execute(
+            &quot;&quot;&quot;
+            UPDATE charges
+            SET status = %s, updated_at = NOW()
+            WHERE id = %s
+              AND status IN %s
+            RETURNING status
+            &quot;&quot;&quot;,
+            (
+                target_status,
+                charge_id,
+                tuple(s for s, allowed in ALLOWED_TRANSITIONS.items()
+                      if target_status in allowed),
+            ),
+        ).fetchone()
+
+        if row is None:
+            # Either the charge does not exist, or it is already in (or past)
+            # target_status, or it is in a state from which this target is illegal.
+            current = tx.execute(
+                &quot;SELECT status FROM charges WHERE id = %s&quot;, (charge_id,)
+            ).fetchone()
+            if current is None:
+                raise ChargeNotFound(charge_id)
+            if current.status == target_status:
+                return False  # idempotent no-op
+            # Else this is a state-machine violation, not a retry. Raise.
+            raise IllegalTransition(current.status, target_status)
+
+        return True
+</code></pre>
+<p>This is cleaner than a dedup table when the operation has a clear lifecycle. The retry is implicitly safe because the second call sees <code>status = AUTHORIZED</code> already and the conditional <code>UPDATE ... WHERE status IN ('INITIATED',)</code> matches zero rows. No external dedup state is needed.</p>
+<p>When this is the right tool: the domain entity naturally has a monotonic lifecycle (payment, order, reservation, deployment), the operation is a state transition on that entity, and the entity ID is a stable client-visible identifier the caller will supply on retry. When it is over-engineered: the operation is a one-shot mutation with no follow-up state (a "like" toggle, a profile field update, an analytics event), or the entity has no natural ordering. Forcing an artificial 4-state machine onto a single-write endpoint adds review surface without changing correctness — for those, a unique constraint on <code>(user_id, target_id)</code> or an idempotency-key dedup row is simpler.</p>
+<h3 id="45-two-phase-intent-commit">4.5 Two-phase intent → commit</h3>
+<p>For workflows where you must allocate resources before performing the externally visible side-effect (e.g., reserve a seat, place a hold on a card, lock inventory), separate the <em>intent</em> from the <em>commit</em>. Both phases are individually idempotent; the commit phase is gated on the intent record's existence.</p>
+<pre><code class="language-python">def reserve_seat(db, user_id: str, seat_id: str, idem_key: str) -&gt; str:
+    &quot;&quot;&quot;Phase 1: create the intent. Idempotent on idem_key.&quot;&quot;&quot;
+    with db.transaction() as tx:
+        row = tx.execute(
+            &quot;&quot;&quot;
+            INSERT INTO seat_reservations (id, user_id, seat_id, status, expires_at)
+            VALUES (%s, %s, %s, 'HELD', NOW() + INTERVAL '10 minutes')
+            ON CONFLICT (id) DO NOTHING
+            RETURNING id
+            &quot;&quot;&quot;,
+            (idem_key, user_id, seat_id),
+        ).fetchone()
+
+        if row is None:
+            existing = tx.execute(
+                &quot;SELECT user_id, seat_id, status FROM seat_reservations WHERE id = %s&quot;,
+                (idem_key,),
+            ).fetchone()
+            assert existing.user_id == user_id and existing.seat_id == seat_id
+            return idem_key  # replay
+
+        # Also conditionally mark seat as held (or fail if already held).
+        seat = tx.execute(
+            &quot;UPDATE seats SET held_by = %s WHERE id = %s AND held_by IS NULL &quot;
+            &quot;RETURNING id&quot;,
+            (idem_key, seat_id),
+        ).fetchone()
+        if seat is None:
+            raise SeatUnavailable(seat_id)
+
+        return idem_key
+
+def confirm_reservation(db, idem_key: str) -&gt; None:
+    &quot;&quot;&quot;Phase 2: commit. Idempotent on the reservation_id state machine.&quot;&quot;&quot;
+    with db.transaction() as tx:
+        result = tx.execute(
+            &quot;UPDATE seat_reservations SET status = 'CONFIRMED' &quot;
+            &quot;WHERE id = %s AND status = 'HELD' RETURNING id&quot;,
+            (idem_key,),
+        ).fetchone()
+        if result is None:
+            current = tx.execute(
+                &quot;SELECT status FROM seat_reservations WHERE id = %s&quot;, (idem_key,)
+            ).fetchone()
+            if current and current.status == 'CONFIRMED':
+                return  # idempotent replay
+            raise IllegalConfirmation(current)
+</code></pre>
+<p>If the intent is created but the user never confirms (or the network drops), the <code>expires_at</code> reaper releases the seat. If the confirm is retried, the state-machine guard short-circuits the second attempt.</p>
+<h3 id="46-kafka-idempotent-producer-transactional-commits">4.6 Kafka idempotent producer + transactional commits</h3>
+<p>Kafka markets these features as "exactly-once semantics" (EOS). The honest framing is <strong>exactly-once <em>within Kafka's boundary</em></strong> — i.e., a record produced as part of a committed transaction is visible to <code>read_committed</code> consumers exactly once, and the consume-process-produce loop does not double-write within the cluster. The moment a side effect leaves Kafka (a database row, an HTTP call, a push notification), EOS provides nothing; you are back to at-least-once-plus-idempotent-receiver. Treat EOS as a useful internal-pipeline tool, not as a system-wide guarantee.</p>
+<p>The two cooperating features:</p>
+<ul>
+<li><strong>Idempotent producer</strong> (<code>enable.idempotence=true</code>): every producer is assigned a producer ID (PID) and every batch carries a monotonic sequence number. The broker rejects duplicate sequence numbers from the same PID, so a producer-side retry of a previously-acked batch does not duplicate the message <em>within a single producer session</em>.</li>
+<li><strong>Transactional producer</strong> (<code>transactional.id=...</code>): groups produces across multiple topics/partitions and consumer offset commits into a single atomic transaction. A consumer reading with <code>isolation.level=read_committed</code> only sees messages from committed transactions.</li>
+</ul>
+<p>The pattern is "consume → process → produce → commit offset" as one transaction:</p>
+<pre><code class="language-python"># Pseudocode for the Kafka exactly-once-semantics (EOS) consumer pattern.
+
+producer = KafkaProducer(
+    bootstrap_servers=...,
+    enable_idempotence=True,
+    transactional_id='payment-enricher-v1',
+)
+producer.init_transactions()
+
+consumer = KafkaConsumer(
+    'charges',
+    isolation_level='read_committed',
+    enable_auto_commit=False,  # we commit offsets inside the transaction
+    group_id='payment-enricher',
+)
+
+for batch in consumer:
+    producer.begin_transaction()
+    try:
+        for msg in batch:
+            enriched = enrich(msg.value)
+            producer.send('enriched-charges', key=msg.key, value=enriched)
+        # Commit consumer offsets as part of the producer transaction.
+        producer.send_offsets_to_transaction(
+            offsets={tp: offset_for(tp, batch) for tp in batch.partitions()},
+            consumer_group_id='payment-enricher',
+        )
+        producer.commit_transaction()
+    except Exception:
+        producer.abort_transaction()
+        raise
+</code></pre>
+<p>Two caveats that matter at staff level:</p>
+<ul>
+<li>This only applies <em>inside</em> Kafka. The moment you have a side-effect outside Kafka (writing to a database, calling an external API), Kafka transactions do not cover it. You are back to the outbox pattern or idempotent receivers.</li>
+<li>Performance cost is non-trivial — transactional producers add coordinator overhead and increase end-to-end latency (commits batch every <code>commit.interval</code>, typically 100ms+). Reserve EOS for pipelines whose downstream is <em>also inside Kafka</em> and where dedup downstream is genuinely impractical. For most "Kafka in, side effect out" pipelines, at-least-once-plus-idempotent-consumer is both simpler and gives the same observable guarantee.</li>
+</ul>
+<h3 id="47-at-least-once-plus-idempotent-consumer">4.7 At-least-once-plus-idempotent-consumer</h3>
+<p>The most common production pattern, and usually the right interview answer when EOS is not specifically required.</p>
+<pre><code class="language-python">def handle_event(db, event):
+    &quot;&quot;&quot;Idempotent consumer. Safe to call N times for the same event_id.&quot;&quot;&quot;
+    with db.transaction() as tx:
+        row = tx.execute(
+            &quot;INSERT INTO processed_events (event_id, processed_at) &quot;
+            &quot;VALUES (%s, NOW()) ON CONFLICT (event_id) DO NOTHING &quot;
+            &quot;RETURNING event_id&quot;,
+            (event.id,),
+        ).fetchone()
+
+        if row is None:
+            return  # already processed
+
+        apply_effect(tx, event)  # business work in same transaction
+
+    # Commit Kafka offset *after* the DB transaction commits.
+    # If we crash between the two, the next read replays the message; the
+    # INSERT ... ON CONFLICT short-circuits and apply_effect is not re-run.
+</code></pre>
+<p>The dedup table here is the consumer's responsibility. It can be a dedicated <code>processed_events</code> table, or the business write itself can be conditional (e.g., <code>INSERT ... ON CONFLICT (event_id) DO NOTHING</code> directly on the target table).</p>
+<hr />
+<h2 id="5-worked-example-naive-broken-fixed">5. Worked example: naive → broken → fixed</h2>
+<h3 id="scenario">Scenario</h3>
+<p>A user taps "Pay $50" in a mobile app. The app calls <code>POST /charges</code> on the payment service. The payment service writes a row to its <code>charges</code> table and calls Stripe to authorize the card. The mobile network is flaky.</p>
+<h3 id="naive-design">Naive design</h3>
+<pre><code>Mobile app  ──POST /charges──►  PaymentService  ──auth──►  Stripe
+                                       │
+                                       ▼
+                                  charges table
+</code></pre>
+<pre><code class="language-python"># THE BROKEN VERSION. Do not ship this.
+def naive_charge(db, user_id, amount_cents):
+    stripe_charge_id = stripe.authorize(user_id, amount_cents)
+    db.execute(
+        &quot;INSERT INTO charges (id, user_id, amount_cents, stripe_id, status) &quot;
+        &quot;VALUES (%s, %s, %s, %s, 'AUTHORIZED')&quot;,
+        (uuid.uuid4(), user_id, amount_cents, stripe_charge_id),
+    )
+    return {&quot;status&quot;: &quot;ok&quot;}
+</code></pre>
+<h3 id="how-it-breaks">How it breaks</h3>
+<pre><code>t=0  app POSTs /charges                 [request id R1]
+t=1  PaymentService calls stripe.authorize
+t=2  Stripe debits the card, returns ch_abc
+t=3  PaymentService inserts charges row
+t=4  PaymentService returns 200 to app
+t=5  Mobile radio drops; app never sees the 200
+t=6  App's HTTP client times out, retries [request id R2]
+t=7  PaymentService calls stripe.authorize AGAIN
+t=8  Stripe debits the card AGAIN, returns ch_def
+t=9  PaymentService inserts a second charges row
+t=10 App sees 200, shows &quot;Payment successful&quot;
+</code></pre>
+<p>The user is charged twice. Two <code>charges</code> rows exist with different IDs. The reconciliation team finds the bug three days later when the customer complains.</p>
+<p>This is not a hypothetical. This is what happens to every payment system before it learns this pattern.</p>
+<h3 id="fixed-design-idempotency-key-state-machine-outbox">Fixed design: idempotency key + state machine + outbox</h3>
+<pre><code>Mobile app  ──POST /charges──►  PaymentService  ──auth──►  Stripe
+   │  Idempotency-Key: &lt;uuid&gt;            │
+   │                                     │  same transaction:
+   │                                     ▼
+   │                          ┌──────────────────┐
+   │                          │ idempotency_keys │
+   │                          │ charges          │
+   │                          │ outbox           │
+   │                          └──────────────────┘
+   │                                     │
+   │                                     ▼
+   │                              Outbox publisher
+   │                                     │
+   │                                     ▼
+   │                                   Kafka  (event_id = outbox.event_id)
+</code></pre>
+<pre><code class="language-python">def charge(db, user_id, amount_cents, idem_key, request_body):
+    fingerprint = sha256_json(request_body)
+
+    with db.transaction() as tx:
+        row = tx.execute(
+            &quot;INSERT INTO idempotency_keys (key, fingerprint, status) &quot;
+            &quot;VALUES (%s, %s, 'IN_FLIGHT') ON CONFLICT (key) DO NOTHING RETURNING id&quot;,
+            (idem_key, fingerprint),
+        ).fetchone()
+
+        if row is None:
+            existing = tx.execute(
+                &quot;SELECT fingerprint, status, response_body FROM idempotency_keys &quot;
+                &quot;WHERE key = %s&quot;, (idem_key,),
+            ).fetchone()
+            if existing.fingerprint != fingerprint:
+                raise IdempotencyKeyConflict()
+            if existing.status == 'IN_FLIGHT':
+                raise IdempotencyInFlight()
+            return json.loads(existing.response_body)
+
+        # First-time path. We are inside the transaction; Stripe call is OUTSIDE.
+        # We must commit the IN_FLIGHT row first so a concurrent retry sees it.
+        tx.commit()
+
+    # Outside the DB transaction now. Stripe's API is itself idempotent on its
+    # own key; we use the same idem_key so Stripe dedups on its side too.
+    try:
+        stripe_id = stripe.authorize(
+            user_id, amount_cents, idempotency_key=idem_key,
+        )
+    except StripeError as e:
+        with db.transaction() as tx:
+            tx.execute(
+                &quot;UPDATE idempotency_keys SET status='FAILED', &quot;
+                &quot;response_body=%s, status_code=502 WHERE key=%s&quot;,
+                (json.dumps({&quot;error&quot;: str(e)}), idem_key),
+            )
+        raise
+
+    # Stripe succeeded. Persist business state and dedup result atomically.
+    with db.transaction() as tx:
+        charge_id = str(uuid.uuid4())
+        tx.execute(
+            &quot;INSERT INTO charges (id, user_id, amount_cents, stripe_id, status) &quot;
+            &quot;VALUES (%s, %s, %s, %s, 'AUTHORIZED')&quot;,
+            (charge_id, user_id, amount_cents, stripe_id),
+        )
+        tx.execute(
+            &quot;INSERT INTO outbox (event_id, aggregate_type, aggregate_id, &quot;
+            &quot;event_type, payload) VALUES (%s, 'charge', %s, 'charge.authorized', %s)&quot;,
+            (str(uuid.uuid4()), charge_id, json.dumps({&quot;charge_id&quot;: charge_id})),
+        )
+        response = {&quot;charge_id&quot;: charge_id, &quot;status&quot;: &quot;AUTHORIZED&quot;}
+        tx.execute(
+            &quot;UPDATE idempotency_keys SET status='DONE', &quot;
+            &quot;response_body=%s, status_code=200 WHERE key=%s&quot;,
+            (json.dumps(response), idem_key),
+        )
+
+    return response
+</code></pre>
+<p>Now replay the failure timeline:</p>
+<pre><code>t=0  app POSTs /charges, Idempotency-Key=K1
+t=1  PaymentService INSERTs idempotency_keys(K1, IN_FLIGHT), commits
+t=2  PaymentService calls stripe.authorize(idempotency_key=K1)
+t=3  Stripe debits the card, returns ch_abc
+t=4  PaymentService INSERTs charges + outbox + updates K1 to DONE, commits
+t=5  PaymentService returns 200; mobile network drops
+t=6  App retries: POST /charges, Idempotency-Key=K1
+t=7  PaymentService tries INSERT idempotency_keys(K1, ...) → conflict
+t=8  PaymentService reads existing row, sees status=DONE, returns cached 200
+t=9  Card is charged exactly once. App is happy.
+</code></pre>
+<p>Three things to call out at the whiteboard:</p>
+<ol>
+<li>Stripe's own idempotency layer is invoked with the same key, so even if our service calls Stripe twice (e.g., we crash between t=2 and t=4), Stripe dedups for us.</li>
+<li>The IN_FLIGHT row is committed before the Stripe call so concurrent retries can see it and refuse to issue a second authorize.</li>
+<li>The outbox row is inserted in the same transaction as the charge row, so a single Kafka event represents this charge — downstream services that dedup by <code>event_id</code> cannot get the event twice from us either.</li>
+</ol>
+<p>One asymmetry the whiteboard answer should name explicitly. The flow has <em>two</em> commit boundaries (IN_FLIGHT commit, then final DONE commit), and the window between them is where Stripe is debited. If the service crashes inside that window, the next retry sees an IN_FLIGHT row and returns 409 — but the card is already charged. This is a <em>stuck IN_FLIGHT</em> state, and the system needs a reaper that resolves it: scan rows in <code>IN_FLIGHT</code> older than some threshold (longer than the worst-case Stripe call), then for each stuck row, query Stripe with the same idempotency key to learn whether the authorization succeeded, and transition the row to DONE (with the recovered response) or FAILED. The point is that exactly-once-effect across an external boundary is not free — you trade "rare lost-then-retried request" for "rare stuck-then-reconciled request," and you must own the reconciliation path. Symmetric idempotency between your service and Stripe is what makes the reaper safe to retry.</p>
+<hr />
+<h2 id="6-variants-and-how-to-choose">6. Variants and how to choose</h2>
+<table>
+<thead>
+<tr>
+<th>Technique</th>
+<th>Best when</th>
+<th>Cost / drawback</th>
+<th>Skip when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Client-supplied idempotency key + dedup table</td>
+<td>Public API; client controls retries; arbitrary request bodies</td>
+<td>Dedup table growth, TTL tuning, schema for storing responses</td>
+<td>Operation is naturally addressable by a business key</td>
+</tr>
+<tr>
+<td>Natural business key as dedup</td>
+<td>Operation maps to a unique business entity (e.g., order ID, transfer ID)</td>
+<td>Requires client to materialize a stable ID before calling</td>
+<td>Operation is anonymous / unstructured</td>
+</tr>
+<tr>
+<td>Monotonic state machine</td>
+<td>Lifecycle has clear forward-only transitions</td>
+<td>Designing the state machine; harder to retrofit</td>
+<td>Operation is one-shot with no follow-up state</td>
+</tr>
+<tr>
+<td>Two-phase intent → commit</td>
+<td>Multi-step workflow; need to reserve resources before commit</td>
+<td>Two round trips; intent-leak reaper</td>
+<td>Single-step operation</td>
+</tr>
+<tr>
+<td>Transactional outbox</td>
+<td>Need to publish events alongside DB writes; cannot use distributed transaction</td>
+<td>Outbox table growth, publisher lag, consumer dedup still required</td>
+<td>Single-system operation with no fan-out</td>
+</tr>
+<tr>
+<td>Outbox + Change Data Capture (CDC)</td>
+<td>Outbox publisher should not poll; want low latency from commit to publish</td>
+<td>CDC pipeline (Debezium, Maxwell) operational burden</td>
+<td>Polling at 100ms is acceptable</td>
+</tr>
+<tr>
+<td>Kafka idempotent producer + transactions</td>
+<td>All side effects live inside Kafka; need pipeline-internal EOS</td>
+<td>Producer / transaction coordinator overhead, complexity</td>
+<td>Single producer + simple consumer; downstream dedup is fine</td>
+</tr>
+<tr>
+<td>At-least-once + idempotent consumer</td>
+<td>Default; works everywhere; composes with everything</td>
+<td>Consumer must maintain dedup state</td>
+<td>Never skip this in interviews; it is the staple</td>
+</tr>
+</tbody>
+</table>
+<h3 id="decision-flow">Decision flow</h3>
+<pre><code>What is the cost of a duplicate effect?
+    └── Negligible (analytics, &quot;like&quot; toggle) ─► Do nothing structural.
+                                                  Rely on best-effort retries +
+                                                  downstream reconciliation.
+    └── Material (money, inventory, SMS)  ─► Continue.
+
+Is there a natural stable business identifier
+the client materializes before calling
+(order_id, transfer_id)?
+    └── Yes ─► Use it as the dedup key directly. No header needed.
+    └── No  ─► Require a client-supplied Idempotency-Key header + dedup table.
+
+Does the operation also publish events?
+    └── Yes ─► Add an outbox row in the same DB transaction.
+
+Does the operation have a clear lifecycle state?
+    └── Yes ─► Make the state machine monotonic; use it as a second dedup
+              layer on the business write.
+
+Does the operation require pre-allocating a resource?
+    └── Yes ─► Two-phase intent → commit. Reaper for stuck intents.
+
+Are all side effects inside Kafka?
+    └── Yes ─► Idempotent producer + transactional commits + read_committed.
+
+Anywhere else there is at-least-once delivery (queue, webhook, retry mesh)?
+    └── Default ─► Dedup at the consumer by event_id.
+</code></pre>
+<hr />
+<h2 id="7-failure-modes-and-operations">7. Failure modes and operations</h2>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Metric to alert on</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dedup table grows unbounded; storage and index blow up</td>
+<td><code>idempotency_keys</code> row count growth rate, table size</td>
+<td>Partition by <code>created_at</code> (daily / weekly partitions); TRUNCATE old partitions; aggressive TTL on <code>expires_at</code>; cold-tier eviction to compressed archive</td>
+</tr>
+<tr>
+<td>TTL too short: late retry arrives after eviction → double-effect</td>
+<td>Replayed-request rate vs request rate; "dedup miss" counter</td>
+<td>Set TTL &gt; maximum retry horizon (mobile offline window, queue retention, webhook provider's documented retry budget); use longer TTL than you think you need</td>
+</tr>
+<tr>
+<td>TTL too long: client reuses UUID across logically different requests</td>
+<td><code>IdempotencyKeyConflict</code> rate (fingerprint mismatch)</td>
+<td>Document UUID-per-request contract; reject loudly on mismatch; instrument the client SDK to generate keys at the right scope</td>
+</tr>
+<tr>
+<td>Outbox publisher lag: events backlog grows</td>
+<td><code>outbox</code> rows where <code>published_at IS NULL</code>, oldest row age</td>
+<td>Scale publisher horizontally (partition by <code>aggregate_id</code>); switch from polling to CDC; alert on max age &gt; SLO</td>
+</tr>
+<tr>
+<td>Outbox publisher crashes after publishing but before marking published</td>
+<td>Duplicate <code>event_id</code> emission rate (visible on consumer dedup metric)</td>
+<td>This is expected — consumers must dedup by <code>event_id</code>; alert only if rate is anomalously high</td>
+</tr>
+<tr>
+<td>Concurrent IN_FLIGHT retries deadlock or block</td>
+<td><code>IdempotencyInFlight</code> 409 rate</td>
+<td>Return 409 immediately rather than blocking; document client backoff; consider a short FOR UPDATE NOWAIT with retry</td>
+</tr>
+<tr>
+<td>Stuck IN_FLIGHT after server crash mid-external-call (e.g., crashed after debiting Stripe, before writing the charge row)</td>
+<td>Age histogram of <code>status='IN_FLIGHT'</code> rows; alert on rows older than 2-3x the worst-case external call</td>
+<td>Reaper that scans stuck rows, queries the downstream provider with the same idempotency key to learn the true outcome, then transitions to DONE (with the recovered response) or FAILED. Requires the downstream API to support lookup-by-idempotency-key (Stripe, most modern payment APIs do)</td>
+</tr>
+<tr>
+<td>Dedup table becomes a hot shard</td>
+<td>per-shard QPS on <code>idempotency_keys</code>; lock contention waits</td>
+<td>Shard by <code>idempotency_key</code> hash; use UUID v4 (uniform) or v7 (time-ordered, partition-friendly); colocate with business write if possible</td>
+</tr>
+<tr>
+<td>State-machine illegal transition under retry</td>
+<td><code>IllegalTransition</code> exception count</td>
+<td>Distinguish "client bug" (return 409, do not retry) from "legitimate replay" (return current state, 200)</td>
+</tr>
+<tr>
+<td>Stripe / external API is itself only idempotent on a key the caller supplies, and we forget to supply it</td>
+<td>External-API duplicate-charge rate</td>
+<td>Always forward the client's idempotency key to downstream providers that support it</td>
+</tr>
+<tr>
+<td>Two-phase intent never confirmed; resource held forever</td>
+<td>Open-intent age histogram; abandoned-intent rate</td>
+<td>Reaper sweeps <code>WHERE status='HELD' AND expires_at &lt; NOW()</code>; release resource; mark intent EXPIRED</td>
+</tr>
+<tr>
+<td>Kafka transaction stuck (transactional coordinator slow)</td>
+<td>Producer transaction commit p99</td>
+<td>Tune <code>transaction.timeout.ms</code>; alert on stuck transactions; do not raise transaction.timeout above your downstream reader lag tolerance</td>
+</tr>
+<tr>
+<td>Consumer offset committed but DB transaction failed (out-of-order commit)</td>
+<td>Discrepancy between consumer offset and processed_events row count</td>
+<td>Always commit DB transaction first, then Kafka offset. On crash between, the next message reread is a dedup-table hit, not a duplicate effect</td>
+</tr>
+</tbody>
+</table>
+<h3 id="key-operational-metrics">Key operational metrics</h3>
+<p>The percent ranges below are rules of thumb from public-API patterns, not universal numbers. The right baseline for your system is whatever the metric stabilizes at during a steady week; alert on <em>change</em>, not on an absolute threshold.</p>
+<ul>
+<li><strong>Duplicate-suppression rate</strong>: <code>replayed_requests / total_requests</code>. For mobile-client public APIs, low single digits is typical baseline. The shape that matters is the spike — a sudden multi-x jump means a network event, an upstream client bug retrying aggressively, or a regression that started returning non-2xx on the first attempt.</li>
+<li><strong>Idempotency-conflict rate</strong>: <code>409 conflict / total_requests</code>. Should be near zero; a non-zero rate means a client is reusing keys across different requests, which is a bug.</li>
+<li><strong>Dedup-table miss rate after retry</strong>: requires a separate event log; alert if you can detect a request that came after a TTL eviction (rare but devastating).</li>
+<li><strong>Outbox lag p99</strong>: time from <code>outbox.created_at</code> to <code>outbox.published_at</code>. Target depends on polling interval — sub-second for a 100ms poller, single-digit-seconds for a 1s poller. Alert on the <em>backlog of unpublished rows growing monotonically</em>, which catches publisher-stuck conditions independent of latency target.</li>
+<li><strong>Processed-event dedup rate at consumer</strong>: <code>events_short_circuited / events_received</code>. Baseline equals the upstream redelivery rate; the alert is on deviation from baseline, not on hitting a specific number.</li>
+</ul>
+<hr />
+<h2 id="8-combinations-with-other-patterns">8. Combinations with other patterns</h2>
+<p>Idempotency is a horizontal concern that shows up in nearly every other pattern. Cross-references:</p>
+<ul>
+<li><strong><a href="./coordination-exactly-one-execution.md">coordination-exactly-one-execution.md</a></strong> — Idempotency makes individual <em>operations</em> safe to retry; coordination/exactly-one-execution makes a <em>job</em> run on exactly one worker at a time (leader election, locks, leases). Together they cover both axes of "exactly once."</li>
+<li><strong><a href="./ordering-causal-consistency.md">ordering-causal-consistency.md</a></strong> — If retries arrive out of order, the state machine pattern (forward-only transitions) makes ordering hazards safe. If you need strict ordering, you typically need both a sequencer (ordering pattern) and idempotent application (this pattern).</li>
+<li><strong><a href="./strong-consistency-under-contention.md">strong-consistency-under-contention.md</a></strong> — Idempotency keys depend on a strongly consistent dedup store. A dedup table on an eventually consistent KV store is a footgun.</li>
+<li><strong><a href="./fan-out-write-amplification.md">fan-out-write-amplification.md</a></strong> — When a single write fans out to N downstream consumers, each consumer must be idempotent on the upstream event ID, or you multiply duplicates by N.</li>
+<li><strong><a href="./durability-at-scale.md">durability-at-scale.md</a></strong> — The outbox pattern's correctness depends on the outbox being on durable storage alongside the business data; otherwise a crash drops both.</li>
+<li><strong><a href="./backpressure-flow-control.md">backpressure-flow-control.md</a></strong> — Under load, retries multiply. Idempotency keeps correctness while backpressure keeps the system from collapsing.</li>
+<li><strong><a href="./real-time-aggregation.md">real-time-aggregation.md</a></strong> — Aggregators that double-count duplicate events corrupt metrics. Either dedup before aggregating or use a HyperLogLog / probabilistic structure that tolerates duplicates.</li>
+<li><strong><a href="./hot-key-skew.md">hot-key-skew.md</a></strong> — A popular idempotency key (e.g., a global "default" key from a bad client) becomes a hot row in the dedup table. Validate key cardinality.</li>
+<li><strong><a href="./cache-stampede-read-amplification.md">cache-stampede-read-amplification.md</a></strong> — Single-flight / dogpile-prevention is a read-side cousin of idempotency: many concurrent calls collapse to one execution and share the result. Same shape, different goal (latency, not correctness).</li>
+</ul>
+<hr />
+<h2 id="9-likely-interviewer-probes">9. Likely interviewer probes</h2>
+<ol>
+<li>
+<p><strong>"What if two clients send the same idempotency key concurrently for the same request?"</strong> — Answer: the unique index on the dedup table serializes them. The second one sees <code>IN_FLIGHT</code> and either waits (with timeout) or returns 409. Discuss the choice: blocking is simpler for clients, returning 409 is friendlier to server resources.</p>
+</li>
+<li>
+<p><strong>"What's your TTL on the dedup table and why?"</strong> — Answer: longer than the maximum retry horizon for that surface. For mobile APIs, 24-72 hours covers offline buffering. For webhooks delivered by Stripe / GitHub / Twilio, look up the provider's documented retry policy (Stripe retries up to 3 days). Never set TTL to "1 hour because storage is expensive" — that is how you ship a double-charge bug. If storage is a concern, partition the table by date and drop old partitions.</p>
+</li>
+<li>
+<p><strong>"Why not just use a primary key constraint on the business table directly?"</strong> — Answer: it works fine when (a) the client supplies or can derive a stable business ID before the call and (b) the database write is what gates the externally visible effect. For example, an <code>INSERT INTO orders (order_id, ...) ON CONFLICT DO NOTHING</code> is a perfectly adequate dedup mechanism if your retry path is "client retries with same <code>order_id</code>" and the order being inserted is what triggers downstream work via the outbox. The case where a separate dedup table earns its keep is when there is an external side effect <em>before</em> the database write — e.g., you call Stripe, then write the row. There, the primary-key constraint cannot prevent a duplicate Stripe call because the dedup point is <em>before</em> the row exists, which is why you need the IN_FLIGHT row committed up front. So: natural-key dedup for "DB write is the side effect"; separate idempotency-key dedup table for "external call before DB write." Don't reach for the heavier machinery if the lighter mechanism actually fits.</p>
+</li>
+<li>
+<p><strong>"How does the outbox pattern compare to two-phase commit (2PC) across the database and Kafka?"</strong> — Answer: 2PC requires a transaction coordinator and is operationally hostile (blocking, prepare-and-hang failure modes, very few systems support it cleanly). Outbox makes the multi-system commit into a single-system commit by writing the event to the database first; the publisher then has at-least-once semantics with downstream consumer dedup. It is the standard answer at scale.</p>
+</li>
+<li>
+<p><strong>"You said outbox publisher is at-least-once. How do downstream consumers dedup?"</strong> — Answer: each outbox row has a UUID <code>event_id</code>. Consumers maintain a <code>processed_events</code> table keyed by <code>event_id</code> and use <code>INSERT ... ON CONFLICT DO NOTHING</code> as the dedup gate. The Kafka offset is committed <em>after</em> the consumer's database transaction. This composes idempotent producer (within Kafka) with idempotent consumer (across the system boundary).</p>
+</li>
+<li>
+<p><strong>"What if the dedup table goes down?"</strong> — Answer: it is a critical-path dependency. Co-locate it with the business data (same database, same shard) so its availability matches the business write. Do not put it in a separate microservice with its own failure mode. If you must shard separately, consider colocating by <code>user_id</code> so a single user's writes always hit the same shard pair.</p>
+</li>
+<li>
+<p><strong>"How do you handle a request that times out mid-flight from the server's perspective — neither client retry nor server completion is observable to the other?"</strong> — Answer: the IN_FLIGHT row is exactly the mechanism. Server crashes after IN_FLIGHT but before DONE → client retries → sees IN_FLIGHT → returns 409 "in flight" → client backs off and retries → eventually a reaper transitions stale IN_FLIGHT rows to FAILED (or a side-channel like Stripe's idempotency window resolves it). Discuss the reaper interval and the choice between aggressive vs conservative cleanup.</p>
+</li>
+</ol>
+<hr />
+<h2 id="10-common-traps-stronger-moves">10. Common traps → stronger moves</h2>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"We'll just check if the row exists before inserting."</td>
+<td>Use the unique index and <code>INSERT ... ON CONFLICT DO NOTHING</code>. Read-then-write is a Time-Of-Check-To-Time-Of-Use (TOCTOU) race.</td>
+</tr>
+<tr>
+<td>Dedup table without a TTL or partitioning strategy.</td>
+<td>Range-partition by <code>created_at</code>; drop partitions on a cron; document the retention horizon as part of the API contract.</td>
+</tr>
+<tr>
+<td>Dedup state on a store whose durability or atomicity does not match the business write (e.g., Redis with no Append-Only File (AOF) persistence and no replication for a payment dedup table; a dedup KV in a different database that cannot share a transaction with the business write).</td>
+<td>Match the dedup store's durability and availability to the business write, and place it where it can atomically commit with the business state — typically the same relational database. Redis with AOF + replication can work for non-financial dedup, but for money-moving flows, prefer the same database as the business row.</td>
+</tr>
+<tr>
+<td>Same idempotency key for "create" and "update" (client treats it as session-level).</td>
+<td>Document key scope as per-logical-request, not per-session. Reject duplicate-key/different-fingerprint loudly with 409.</td>
+</tr>
+<tr>
+<td>"Stripe is idempotent on its side, so I don't need to be."</td>
+<td>Layered idempotency. Your service still needs to dedup because the client retries against <em>you</em>, not against Stripe. Forward the key to Stripe too for defense in depth.</td>
+</tr>
+<tr>
+<td>Outbox publisher does <code>SELECT ... FOR UPDATE</code> without <code>SKIP LOCKED</code>.</td>
+<td>Use <code>FOR UPDATE SKIP LOCKED</code> so multiple publisher workers can scan in parallel without blocking on each other.</td>
+</tr>
+<tr>
+<td>Commit Kafka offset <em>before</em> the consumer's DB transaction.</td>
+<td>Commit DB first, then Kafka offset. The crash-between window leaves a redelivery, which the dedup table absorbs. The reverse leaves a lost message.</td>
+</tr>
+<tr>
+<td>"Exactly once" claimed as a system property without naming the seam where dedup happens.</td>
+<td>Always specify: dedup at the API key, the business key, the event ID, or the state machine — and say where the dedup state lives.</td>
+</tr>
+<tr>
+<td>Ignoring the IN_FLIGHT state; only modeling DONE vs absent.</td>
+<td>Concurrent retries on the same key will both try to do the work. Model IN_FLIGHT explicitly and have a policy.</td>
+</tr>
+<tr>
+<td>Treating webhooks as exactly-once because "the provider guarantees it."</td>
+<td>No provider does. Stripe, GitHub, Twilio, Slack, AWS Simple Notification Service (SNS) — all at-least-once. Always dedup by the provider's event ID.</td>
+</tr>
+<tr>
+<td>Putting the dedup table on a different database from the business write.</td>
+<td>The atomicity of "insert dedup row AND insert business row" is gone. Co-locate.</td>
+</tr>
+<tr>
+<td>Using auto-incrementing IDs as event IDs in the outbox.</td>
+<td>Use UUIDs. Auto-increment leaks ordering, doesn't survive partitioning, and is not collision-safe across shards.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11-staff-level-answer-checklist">11. Staff-level answer checklist</h2>
+<ul>
+<li>Name the cost of a duplicate effect before reaching for the toolkit. Cheap-to-reverse duplicates may not warrant the machinery.</li>
+<li>Name the invariant explicitly: "exactly-once <em>effect</em>, not exactly-once <em>delivery</em>."</li>
+<li>Identify where retries originate: client, load balancer, service mesh, queue, webhook redelivery, scheduler.</li>
+<li>Choose the dedup seam: HTTP header, business key, event ID, state machine.</li>
+<li>Co-locate dedup state with the business write so both commit atomically.</li>
+<li>Model an <code>IN_FLIGHT</code> state for concurrent retries; choose blocking vs 409.</li>
+<li>Use the outbox pattern for cross-system fan-out; do not invoke distributed transactions.</li>
+<li>Forward idempotency keys to downstream providers that support them (Stripe, payment networks, internal services).</li>
+<li>State the TTL and tie it to the maximum retry horizon you support.</li>
+<li>Name the consumer-side dedup mechanism for any at-least-once stream you produce.</li>
+<li>Specify the operational metric you would alert on (replayed-request rate, outbox lag, conflict rate).</li>
+<li>Distinguish "legitimate retry" (return cached result) from "key reuse on different request" (return 409 — client bug).</li>
+<li>Discuss what breaks if the dedup store fails: it is critical-path, treat it as such.</li>
+<li>For Kafka pipelines: know when EOS is worth the cost vs at-least-once-plus-idempotent-consumer.</li>
+<li>Cite at least one production failure mode (dedup TTL eviction, outbox lag, stuck IN_FLIGHT) and its mitigation.</li>
+<li>Be explicit about Kafka "exactly-once": it is exactly-once within the Kafka boundary only; external side effects still need idempotent receivers.</li>
+</ul>
+<hr />
+<h2 id="12-cross-references">12. Cross-references</h2>
+<h3 id="sibling-patterns">Sibling patterns</h3>
+<ul>
+<li><a href="./coordination-exactly-one-execution.md">coordination-exactly-one-execution.md</a> — exactly-one <em>job</em>, this pattern covers exactly-one <em>effect</em></li>
+<li><a href="./ordering-causal-consistency.md">ordering-causal-consistency.md</a> — ordering hazards under retry</li>
+<li><a href="./strong-consistency-under-contention.md">strong-consistency-under-contention.md</a> — dedup store consistency requirements</li>
+<li><a href="./fan-out-write-amplification.md">fan-out-write-amplification.md</a> — dedup multiplies across consumers</li>
+<li><a href="./durability-at-scale.md">durability-at-scale.md</a> — outbox durability</li>
+<li><a href="./backpressure-flow-control.md">backpressure-flow-control.md</a> — retries under load</li>
+<li><a href="./real-time-aggregation.md">real-time-aggregation.md</a> — duplicate-tolerant aggregation</li>
+<li><a href="./hot-key-skew.md">hot-key-skew.md</a> — idempotency-key hot spots</li>
+<li><a href="./cache-stampede-read-amplification.md">cache-stampede-read-amplification.md</a> — single-flight on the read path</li>
+<li><a href="./search-and-ranking.md">search-and-ranking.md</a> — indexing dedup</li>
+<li><a href="./geo-spatial-queries.md">geo-spatial-queries.md</a> — ride-acceptance idempotency</li>
+</ul>
+<h3 id="related-question-docs">Related question docs</h3>
+<ul>
+<li><a href="../questions/design-the-stripe-payment-gateway.md">design-the-stripe-payment-gateway.md</a> — canonical idempotency-key API design</li>
+<li><a href="../questions/design-a-payment-system.md">design-a-payment-system.md</a> — ledger writes and double-entry idempotency</li>
+<li><a href="../questions/design-a-delayed-payment-system.md">design-a-delayed-payment-system.md</a> — scheduled-execution idempotency</li>
+<li><a href="../questions/design-a-notification-system.md">design-a-notification-system.md</a> — duplicate-suppression for push / email</li>
+<li><a href="../questions/design-a-flash-sale-for-an-e-commerce-site.md">design-a-flash-sale-for-an-e-commerce-site.md</a> — inventory decrement under retry storm</li>
+<li><a href="../questions/design-ticketmaster.md">design-ticketmaster.md</a> — seat reservation two-phase commit</li>
+<li><a href="../questions/design-the-uber-backend.md">design-the-uber-backend.md</a> — driver-accept idempotency</li>
+<li><a href="../questions/design-uber-eats.md">design-uber-eats.md</a> — order placement idempotency</li>
+<li><a href="../questions/design-a-distributed-job-scheduler-like-cron.md">design-a-distributed-job-scheduler-like-cron.md</a> — scheduler failover dedup</li>
+<li><a href="../questions/apache-kafka.md">apache-kafka.md</a> — idempotent producer + EOS internals</li>
+<li><a href="../questions/design-amazon-shopping-cart.md">design-amazon-shopping-cart.md</a> — cart-write idempotency under sloppy quorum</li>
+</ul>
+<h3 id="reference-docs">Reference docs</h3>
+<ul>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">STAFF_SYSTEM_DESIGN_GLOSSARY.md</a> — quorum, vector clock, write-ahead log</li>
+<li><a href="../STAFF_SYSTEM_DESIGN_INTERVIEW_PLAYBOOK.md">STAFF_SYSTEM_DESIGN_INTERVIEW_PLAYBOOK.md</a> — staff-level framing and spine</li>
+<li><a href="../STAFF_STORAGE_COMPARISON.md">STAFF_STORAGE_COMPARISON.md</a> — dedup-store options across storage engines</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

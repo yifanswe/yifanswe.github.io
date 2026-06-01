@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cache Stampede / Read Amplification — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design-patterns/">← Back to System Design Patterns</a>
+        <h1 class="article-title">Cache Stampede / Read Amplification</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/31 &nbsp;·&nbsp; System Design Patterns
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>A cache miss on a hot key sends every concurrent reader to the origin at the same moment, converting one missing entry into a self-inflicted denial-of-service against the database. The pattern is the toolkit for collapsing N concurrent misses into one origin fetch and for keeping hot entries warm so the miss never happens in the first place. See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for foundational terms (Time-To-Live (TTL), Content Delivery Network (CDN), cache-aside, etc.).</p>
+<p>Core question docs where this pattern is the center of gravity:
+- <a href="../questions/design-a-distributed-cache-like-redis.md">Design a Distributed Cache like Redis</a>
+- <a href="../questions/design-a-flash-sale-for-an-e-commerce-site.md">Design a Flash Sale for an E-commerce Site</a>
+- <a href="../questions/design-google-news-as-a-global-aggregator.md">Design Google News as a Global Aggregator</a>
+- <a href="../questions/design-twitter-timeline.md">Design Twitter Timeline</a>
+- <a href="../questions/design-youtube.md">Design YouTube</a>
+- <a href="../questions/design-ticketmaster.md">Design Ticketmaster</a>
+- <a href="../questions/design-typeahead-autocomplete.md">Design Typeahead Autocomplete</a></p>
+</blockquote>
+<hr />
+<h2 id="1-the-fundamental-hardness">1. The fundamental hardness</h2>
+<p>Caches exist because the origin — usually a relational database, a search index, or an object store — cannot service the steady-state read rate at acceptable latency or cost. A modern web property can run two to four orders of magnitude more reads per second than its database can sustain. The whole architecture is therefore implicitly a bet that the hit rate stays high. The bet is fine in steady state. The bet breaks the moment a hot entry is missing from cache and the front door does not know how to slow down.</p>
+<p>The breakage shape is the <strong>thundering herd</strong>: at time T the hot key expires (or evicts, or has never been written, or was just invalidated). Between T and T + Round-Trip-Time (RTT)-to-origin, every concurrent reader sees a miss and independently issues an origin fetch. The damage is the product of two numbers — concurrent missers × per-miss origin cost — and it only matters when that product saturates a downstream resource. Worked example: a key receiving 50,000 QPS at the cache, with a 30-millisecond origin query, sees ~1,500 concurrent missers during the gap; if the database connection pool is 200 and steady-state QPS to the database is 50, that single missing key drives 30x the design budget into the pool. The database saturates, latency climbs, the front door times out and retries, retries pile on top of misses, and the system enters cascade failure. The cache that was supposed to protect the database is now the trigger that destroys it.</p>
+<p>The corollary is the boundary condition: <strong>for cold keys with low concurrent miss counts, naive cache-aside is fine.</strong> A key that sees 5 QPS and a 10-millisecond database query produces ~0.05 concurrent missers at expiry — there is no stampede to mitigate. Stampede mitigation earns its complexity on the long tail of genuinely hot keys with expensive backing queries. The staff-level move is often to say "naive cache-aside is the right answer for 99% of keys; here is the small set where I'd add single-flight."</p>
+<p>The variants of the breakage are the same shape with different triggers. A <strong>cold start</strong> after a deploy or a node reboot starts with an empty cache and every first request is a miss — sustained for several minutes until the working set is warm. A <strong>mass eviction</strong> (the cache cluster OOMs, evicts an entire generation, or fails over and the new node has cold local memory) is functionally a cold start without a deploy. A <strong>flash crowd</strong> brings a key into hot range for the first time — the cache may have it, but the upstream CDN tier does not, and the origin shield gets every CDN edge's first request simultaneously. A <strong>synchronized expiry</strong> — every entry written at deploy time with the same TTL — turns into a synchronized miss storm at T + TTL.</p>
+<p>The deeper invariant the pattern protects is <strong>bounded origin work per unit of cache miss</strong>. Naively, one miss equals one origin fetch — but only if you collapse concurrent misses for the same key. The whole toolkit below is about making that statement true under contention, and about pushing the miss probability down so the toolkit rarely has to fire.</p>
+<hr />
+<h2 id="2-how-to-recognize-it-in-the-interview">2. How to recognize it in the interview</h2>
+<h3 id="prompt-phrases-that-signal-this-pattern">Prompt phrases that signal this pattern</h3>
+<ul>
+<li>"Cache the result."</li>
+<li>"Serve from cache, fall back to database."</li>
+<li>"Read-heavy."</li>
+<li>"Reduce database load."</li>
+<li>"Viral content / trending / breaking news."</li>
+<li>"Black Friday / Super Bowl / launch day traffic."</li>
+<li>"Cold start after deploy."</li>
+<li>"Hot row / hot key / hot URL."</li>
+<li>"Edge cache / CDN / origin shield."</li>
+<li>"TTL of N seconds."</li>
+<li>"Eviction policy / Least Recently Used (LRU) / Least Frequently Used (LFU)."</li>
+</ul>
+<h3 id="architectural-smells-in-stated-requirements">Architectural smells in stated requirements</h3>
+<ul>
+<li>A read-to-write ratio above roughly 50:1, so caching is the obvious cost lever.</li>
+<li>A single entity (post, video, product, ticker) is read by a large fraction of all readers — so a miss on that key has a herd waiting.</li>
+<li>Origin latency is much higher than cache latency (database query is 20 ms, cache is 0.5 ms — the herd window is 40x larger than the cache hit window).</li>
+<li>The product has a "going viral" or "trending" affordance — the workload distribution is heavy-tailed by definition.</li>
+<li>Multiple cache tiers are mentioned (CDN, edge, application-local, distributed cache) — every boundary is a potential stampede surface.</li>
+<li>The interviewer asks about "what happens when the cache fails" — they want to hear graceful degradation, not "we fall back to the database."</li>
+<li>The interviewer mentions invalidation, deploys, or warmup — they want to hear about cold start handling.</li>
+</ul>
+<h3 id="example-design-x-prompts-where-this-is-the-core-hardness">Example "design X" prompts where this is the core hardness</h3>
+<table>
+<thead>
+<tr>
+<th>Prompt</th>
+<th>Why cache stampede is the center</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Design a Distributed Cache like Redis</td>
+<td>The cache itself must defend against hot keys, mass eviction, and stampedes on its own clients. Single-flight, hot-key replication, and lease tokens are core.</td>
+</tr>
+<tr>
+<td>Design a Flash Sale</td>
+<td>Product page reads spike to millions of QPS at sale start; the inventory row is a single hot key; the read amplification problem is the dominant scaling problem for the public path.</td>
+</tr>
+<tr>
+<td>Design Google News as a Global Aggregator</td>
+<td>One breaking story is read by every reader in the world simultaneously; CDN origin shield miss on the canonical article is catastrophic.</td>
+</tr>
+<tr>
+<td>Design Twitter Timeline</td>
+<td>Celebrity tweet objects, trending topics, and view-count counters are all stampede surfaces; the per-user timeline cache is itself a cold-start hazard.</td>
+</tr>
+<tr>
+<td>Design YouTube</td>
+<td>Viral video metadata and recommendation feeds; CDN edges miss on a freshly viral video and the origin sees a herd.</td>
+</tr>
+<tr>
+<td>Design Ticketmaster</td>
+<td>A high-demand show's seat-map and event-detail pages are hot keys at on-sale moment; cold queue start has the same shape.</td>
+</tr>
+<tr>
+<td>Design Typeahead Autocomplete</td>
+<td>The top-100 prefix completions are vastly hotter than the long tail; a hot-key miss on "covid" or "election" during a news event sends the herd to the search backend.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="3-60-second-spoken-framing">3. 60-second spoken framing</h2>
+<blockquote>
+<p>The risk I am designing around is read amplification — one cache miss on a hot key turning into a flood of identical origin queries. But before reaching for techniques, I would scope the problem: for the long tail of keys with modest QPS and cheap backing queries, naive cache-aside is the right answer. The mitigations earn their complexity only on genuinely hot keys with expensive origin queries. For those, I'd defend in depth. First, in-process single-flight: a per-key lock so only one fetcher per application instance hits the origin and the rest wait — this caps origin QPS at N-application-instances per miss, not at concurrent-readers. Second, probabilistic early expiration so hot keys refresh asynchronously before they expire, not at the moment they expire — concretely justified when QPS-on-hot-key times origin-query-cost would saturate a downstream pool. Third, stale-while-revalidate so a miss still serves the previous value to clients while we refetch in the background — justified by a specific staleness SLO the product can name. Fourth, tiered caches — Content Delivery Network, edge, application-local Least Recently Used cache, distributed cache, origin — so each tier shields the next from herds. I'd only reach for distributed single-flight (Redis lock) if N-instances of in-process single-flight still overruns the origin. Operationally, I would alert on origin queries-per-second relative to baseline, cache hit rate by key class, and the fanout factor — concurrent waiters per single-flight slot. The thing I never want to see is a cache cluster failover triggering a mass-eviction cold start with no rate limit between the application and the database.</p>
+</blockquote>
+<hr />
+<h2 id="4-canonical-toolkit">4. Canonical toolkit</h2>
+<h3 id="41-single-flight-request-coalescing">4.1 Single-flight / request coalescing</h3>
+<p><strong>What it is.</strong> When N concurrent requests miss the same key, only one of them — the <em>leader</em> — actually calls the origin. The other N-1 — the <em>followers</em> — block on a per-key future and receive the same response. The N origin fetches collapse to one.</p>
+<pre><code>T=0   100 readers all miss key &quot;post:42&quot;
+        │
+        ▼
+   try acquire lock(&quot;post:42&quot;)
+        │
+        ├── reader 0 acquires lock ──► fetch from origin ──► populate cache ──► return
+        │
+        └── readers 1..99 wait on future ──► get same value when ready
+                                              (zero origin queries from them)
+</code></pre>
+<p><strong>Python sketch (asyncio).</strong> A per-key <code>asyncio.Lock</code> plus a per-key <code>Future</code> to broadcast the result. The lock keeps fetchers serialized; the future lets followers piggyback without re-entering the lock.</p>
+<pre><code class="language-python">import asyncio
+from typing import Awaitable, Callable, TypeVar
+
+V = TypeVar(&quot;V&quot;)
+
+
+class SingleFlight:
+    &quot;&quot;&quot;Coalesce concurrent calls for the same key into one origin fetch.&quot;&quot;&quot;
+
+    def __init__(self) -&gt; None:
+        # key -&gt; Future holding the in-flight result. Presence of the entry
+        # is itself the &quot;someone is already fetching&quot; signal.
+        self._inflight: dict[str, asyncio.Future[V]] = {}
+        # A coarse lock around the dict; per-key locking is via the future.
+        self._mu = asyncio.Lock()
+
+    async def do(self, key: str, fetch: Callable[[], Awaitable[V]]) -&gt; V:
+        async with self._mu:
+            existing = self._inflight.get(key)
+            if existing is not None:
+                fut = existing
+                is_leader = False
+            else:
+                fut = asyncio.get_running_loop().create_future()
+                self._inflight[key] = fut
+                is_leader = True
+
+        if not is_leader:
+            return await fut  # follower: just wait
+
+        # Leader: actually do the work, then publish the result.
+        try:
+            value = await fetch()
+            fut.set_result(value)
+            return value
+        except Exception as exc:
+            fut.set_exception(exc)
+            raise
+        finally:
+            async with self._mu:
+                # Remove the inflight entry so the next miss starts a new fetch.
+                self._inflight.pop(key, None)
+</code></pre>
+<p><strong>Distributed variant — and the asymmetry to call out.</strong> A per-key <code>asyncio.Lock</code> only coalesces requests on one process. The in-process version is cheap: a dict and a lock, microseconds of overhead per call. The cross-process version is <em>qualitatively different</em>: it requires a distributed lock — typically a short-lived Redis <code>SET key:lock NX PX 5000</code> with a unique token — which adds an extra cache round-trip on every miss path, plus a correctness story for lock TTL versus origin p99 latency, lock owner identification, and what happens when the lock holder dies. Followers either spin-poll the cache key (acceptable if cache RTT is single-digit ms) or subscribe to a pub/sub channel.</p>
+<p>The honest framing: if you have 200 application servers and the same key misses on all of them simultaneously, in-process single-flight gives you 200 origin fetches (one per box), not 1. That may or may not be acceptable. If the origin can take 200 QPS bursts comfortably (cache miss on the median hot key, with a moderate-cost query), stop there — distributed coordination is unjustified complexity. Reach for the Redis lock only when 200 concurrent origin fetches would actually hurt, which usually means the backing query is expensive (hundreds of ms) or the origin is already near capacity.</p>
+<p><strong>Subtleties to call out in interview.</strong>
+- The leader can die. Set a finite lock TTL so a crashed leader unblocks the followers — but pick TTL &gt; origin p99 latency or you'll get duplicate fetches.
+- The leader's fetch can be slow. Followers must have their own deadline; if the leader is taking too long, a follower should give up (and ideally serve stale) rather than blocking the user request indefinitely.
+- Single-flight does nothing for <em>different</em> keys missing concurrently — it only collapses identical key misses. Hot-key skew is the input; see <a href="./hot-key-skew.md">hot-key-skew.md</a>.</p>
+<h3 id="42-probabilistic-early-expiration-xfetch-vattani-et-al">4.2 Probabilistic early expiration (XFetch / Vattani et al.)</h3>
+<p><strong>What it is.</strong> A reader that finds a value in cache will, with probability that grows as the TTL approaches expiry, voluntarily refresh the value early instead of just returning it. By the time the entry actually expires, it has almost certainly been refreshed already, so there is no synchronized miss event.</p>
+<p><strong>The math (from Vattani, Chierichetti, Lowenstein, 2015 — "Optimal Probabilistic Cache Stampede Prevention").</strong> Each cached entry stores the time it was last computed and the time the computation took (delta). On read:</p>
+<pre><code>should_refresh_early  iff   now - delta * beta * ln(rand()) &gt;= expiry
+</code></pre>
+<p>where <code>beta</code> is a tuning constant (typically <code>beta = 1</code>), <code>rand()</code> is uniform in <code>(0, 1)</code>, and <code>delta</code> is the historical fetch latency for this key. Because <code>ln(rand())</code> is negative and unbounded below, the inequality is rarely true when <code>now</code> is far from <code>expiry</code>, and becomes true with rising probability as <code>now</code> approaches <code>expiry</code>. The expensive-to-fetch entries (large <code>delta</code>) refresh earlier, which is exactly the right policy — they cost the most to recompute on a hard miss.</p>
+<pre><code class="language-python">import math
+import random
+import time
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Optional
+
+
+@dataclass
+class CacheEntry:
+    value: object
+    delta: float       # how long the last fetch took, in seconds
+    expiry: float      # absolute unix time at which this becomes hard-stale
+
+
+async def get_with_early_expiration(
+    cache,
+    key: str,
+    fetch: Callable[[], Awaitable[object]],
+    ttl: float,
+    beta: float = 1.0,
+) -&gt; object:
+    entry: Optional[CacheEntry] = await cache.get(key)
+    now = time.time()
+
+    if entry is None or now &gt;= entry.expiry:
+        # Hard miss path. Combine with single-flight to avoid a herd here.
+        return await _refresh(cache, key, fetch, ttl)
+
+    # Early-expiration test. As now approaches entry.expiry, the chance of
+    # this test firing grows; for an entry that just refreshed, it almost
+    # never fires.
+    if now - entry.delta * beta * math.log(random.random()) &gt;= entry.expiry:
+        # Refresh in background; serve the current (still-valid) value now.
+        asyncio.create_task(_refresh(cache, key, fetch, ttl))
+
+    return entry.value
+
+
+async def _refresh(cache, key, fetch, ttl):
+    started = time.time()
+    value = await fetch()
+    delta = time.time() - started
+    await cache.set(
+        key,
+        CacheEntry(value=value, delta=delta, expiry=time.time() + ttl),
+        ttl=ttl,
+    )
+    return value
+</code></pre>
+<p><strong>Why this is the staff move.</strong> Early expiration is <em>decoupled from the herd</em>: each reader independently rolls the dice. There is no synchronization needed across processes or data centers. The aggregate effect is that the probability of any single reader triggering a hard miss approaches zero, while the steady-state refresh rate is one refresh per TTL per key. Combine with single-flight to guarantee that the rare hard-miss case still only fires one fetch.</p>
+<h3 id="43-stale-while-revalidate-swr-and-stale-if-error">4.3 Stale-while-revalidate (SWR) and stale-if-error</h3>
+<p><strong>What it is.</strong> When a cache entry's TTL expires, do not delete it. Mark it stale. On read of a stale entry, serve the stale value to the user immediately, and trigger a background refresh. The user never blocks on the origin.</p>
+<pre><code>read at T=0 (entry fresh):    cache HIT, return fresh value.
+read at T=TTL+1 (stale):      cache HIT (stale), return stale value
+                              + kick off background refresh.
+read at T=TTL+2 (refresh in flight): cache HIT (stale), return stale
+                              + DO NOT kick off another refresh
+                              (single-flight on the refresh job).
+read at T=TTL+5 (refresh done): cache HIT (fresh again), return fresh.
+</code></pre>
+<p><strong>Stale-if-error</strong> is the cousin: if the background refresh fails (origin down, timeout), keep serving the stale value past its nominal expiry rather than returning an error. The freshness budget you accept is the price of staying available.</p>
+<p><strong>Python sketch (decorator form).</strong></p>
+<pre><code class="language-python">import asyncio
+import time
+from functools import wraps
+
+
+def swr_cache(cache, ttl: float, stale_extension: float):
+    &quot;&quot;&quot;
+    Stale-while-revalidate decorator.
+
+    - For `ttl` seconds, the cached value is fresh.
+    - For an additional `stale_extension` seconds, the cached value is stale
+      but still served while a background refresh runs.
+    - After ttl + stale_extension, it is hard-expired.
+    &quot;&quot;&quot;
+    inflight: dict[str, asyncio.Task] = {}
+
+    def decorator(fetch):
+        @wraps(fetch)
+        async def wrapper(key: str, *args, **kwargs):
+            entry = await cache.get(key)
+            now = time.time()
+
+            if entry is None:
+                # Hard miss: must block on origin (still coalesce via single-flight).
+                value = await fetch(key, *args, **kwargs)
+                await cache.set(key, {&quot;value&quot;: value, &quot;stored_at&quot;: now}, ttl=ttl + stale_extension)
+                return value
+
+            age = now - entry[&quot;stored_at&quot;]
+
+            if age &lt; ttl:
+                # Fresh.
+                return entry[&quot;value&quot;]
+
+            # Stale but still within stale_extension. Serve stale, refresh async.
+            if key not in inflight:
+                async def refresh():
+                    try:
+                        v = await fetch(key, *args, **kwargs)
+                        await cache.set(key, {&quot;value&quot;: v, &quot;stored_at&quot;: time.time()},
+                                        ttl=ttl + stale_extension)
+                    finally:
+                        inflight.pop(key, None)
+
+                inflight[key] = asyncio.create_task(refresh())
+
+            return entry[&quot;value&quot;]
+        return wrapper
+    return decorator
+</code></pre>
+<p><strong>When to use.</strong> Anywhere the value is recomputable but a few seconds of staleness is acceptable. News articles, social media post bodies, product detail pages, recommendation feeds, search result pages — all of these are SWR-friendly. The pattern is built into Hypertext Transfer Protocol (HTTP) <code>Cache-Control</code> directives (<code>stale-while-revalidate</code>, <code>stale-if-error</code>) and is supported natively by CDNs like Fastly and Cloudflare.</p>
+<p><strong>When to avoid.</strong> Inventory counts, balances, anything where stale-by-five-seconds is a correctness violation. Use <a href="./strong-consistency-under-contention.md">strong-consistency-under-contention.md</a> instead.</p>
+<h3 id="44-background-refresh-async-warming">4.4 Background refresh / async warming</h3>
+<p><strong>What it is.</strong> Decouple cache population from user requests entirely. A cron job, a Kafka consumer, or a long-running worker recomputes the hot keys on a schedule and writes them to cache. The user-facing read path is supposed to <em>always hit</em>; a miss is an alert-worthy event.</p>
+<p><strong>When to use.</strong>
+- The set of hot keys is known and bounded — top 1,000 trending topics, the seat-map for the next 50 events going on sale, the metadata for the homepage carousel.
+- The recomputation is expensive (seconds per key — too slow to do inline on a miss).
+- The freshness requirement is loose enough that the schedule is acceptable (every 10 seconds for trending, every 60 seconds for a leaderboard).</p>
+<p><strong>Architectural picture.</strong></p>
+<pre><code>            ┌──────────────────────────┐
+            │  Hot-key registry        │
+            │  (Redis sorted set       │
+            │   of top-N keys)         │
+            └────────────┬─────────────┘
+                         │ produces refresh jobs
+                         ▼
+            ┌──────────────────────────┐
+            │  Refresh workers         │
+            │  (consume Kafka /        │
+            │   cron schedule)         │
+            └────────────┬─────────────┘
+                         │ writes
+                         ▼
+            ┌──────────────────────────┐
+            │  Distributed cache       │
+            └────────────┬─────────────┘
+                         │
+            ┌────────────▼─────────────┐
+            │  User request path:      │
+            │  cache MUST hit          │
+            └──────────────────────────┘
+</code></pre>
+<p><strong>Risk.</strong> Background refresh on its own is brittle. If the hot-key registry is wrong (some new key became hot but isn't on the list), the user path hits a hard miss and you're back to single-flight. If the refresh worker is slow or fails, the cache goes stale silently. Pair with SWR or single-flight as a fallback.</p>
+<h3 id="45-tiered-caching">4.5 Tiered caching</h3>
+<p><strong>What it is.</strong> Multiple caches stacked between the user and the origin. Each tier filters traffic from the next.</p>
+<pre><code>user ─► CDN edge (geo-near)
+          │ miss
+          ▼
+       CDN origin shield (one POP per region)
+          │ miss
+          ▼
+       Application local Least Recently Used cache (per process)
+          │ miss
+          ▼
+       Distributed cache (Memcached / Redis cluster)
+          │ miss
+          ▼
+       Origin database
+</code></pre>
+<p><strong>Why it works.</strong> Each tier is at most one cache miss away from being a stampede surface, but each tier also collapses the herd of the tier <em>above</em> it. CDN edges in 200 Points of Presence (POPs) talking to one origin shield mean the database sees at most one fetch per region per miss, not 200. The application-local LRU cache further collapses within a single server: 100 in-flight requests on one process share the local hit.</p>
+<p><strong>Key staff-level point.</strong> <em>The tiers must each have their own herd protection.</em> It is not enough to single-flight the application tier. The CDN must have origin shield (also called "tiered cache" by Cloudflare, "shield" by Fastly) to collapse cross-edge concurrent misses. The distributed cache must have replication of hot keys so the request rate to any one Redis shard is bounded.</p>
+<p><strong>The tax tiering imposes.</strong> Each tier is its own TTL, its own invalidation story, and its own consistency frontier. A correction to an article body must propagate through CDN edge → CDN origin shield → application-local LRU → distributed cache → origin; if any tier's TTL is long and the invalidation channel doesn't reach it, that tier serves stale data. In practice, this means you pay for: explicit purge APIs at every tier (CDN purge, app-local cache busting, Redis DEL), or aligned TTLs that bound the worst-case staleness window, or per-version cache keys (key includes a content hash so a new version creates a new key and old versions naturally age out). Adding a tier is not free — it's a layer of operational surface, not just a layer of performance.</p>
+<h3 id="46-negative-caching">4.6 Negative caching</h3>
+<p><strong>What it is.</strong> Cache the "not found" answer too. If a key doesn't exist in the origin, do not let every miss re-query the origin to confirm it still doesn't exist. Store a tombstone with a short TTL.</p>
+<p><strong>When it earns its place.</strong> Negative caching is cheap (it's just an extra <code>SET</code> with a sentinel value), so the cost-benefit bar is low — but it's not universally needed. The keys that benefit are those where misses are <em>expensive</em> (a full-text search that finds nothing still scans), or where the miss volume is <em>driven adversarially</em> (scrapers walking <code>/user/&lt;random&gt;</code>, attackers probing <code>/api/v1/&lt;garbage&gt;</code>). For a typical primary-key lookup on an indexed column, the "not found" path is already fast — adding a tombstone is fine but rarely the lever that saves you. The 404 path is also where a herd can be invisible — your hit rate looks fine but your database is being hammered by lookups that return zero rows, so it's worth instrumenting miss-by-result-type, not just miss rate.</p>
+<pre><code class="language-python">NOT_FOUND_SENTINEL = &quot;__NF__&quot;
+
+async def get_user(user_id: int):
+    cached = await redis.get(f&quot;user:{user_id}&quot;)
+    if cached == NOT_FOUND_SENTINEL:
+        return None
+    if cached is not None:
+        return deserialize(cached)
+
+    user = await db.fetch_user(user_id)
+    if user is None:
+        # Short TTL — the user might be created soon.
+        await redis.set(f&quot;user:{user_id}&quot;, NOT_FOUND_SENTINEL, ex=60)
+        return None
+
+    await redis.set(f&quot;user:{user_id}&quot;, serialize(user), ex=3600)
+    return user
+</code></pre>
+<p><strong>Subtleties.</strong> Short TTL on tombstones — if the entity is later created, you want the cache to learn about it within a minute. Sentinel value must be a sentinel, not an empty string, so you can distinguish "we know it does not exist" from "we have not asked yet."</p>
+<h3 id="47-lease-tokens-memcached-style">4.7 Lease tokens (Memcached-style)</h3>
+<p><strong>What it is.</strong> A protocol-level primitive that some caches expose to make single-flight a property of the cache itself, not of every client library. On a miss, the cache hands the first client a <em>lease token</em> — a permission slip to recompute. Subsequent missers either wait for the value or are told "someone else has the lease, back off and retry in N ms."</p>
+<p>Memcached's <code>gets</code>/<code>cas</code> with leases (per Facebook's <code>mcrouter</code> paper, "Scaling Memcache at Facebook," NSDI 2013) does exactly this. The lease prevents N missers from all writing the same key, and the wait protocol prevents N missers from all calling the origin.</p>
+<p><strong>Why staff candidates know this.</strong> It's the canonical citation for "we built single-flight into the cache because client-side coalescing was too easy to get wrong at scale."</p>
+<hr />
+<h2 id="5-worked-example-naive-broken-fixed">5. Worked example: naive → broken → fixed</h2>
+<h3 id="setup">Setup</h3>
+<p>A news site has just published a story that goes viral. The story body is cached in Redis as <code>article:12345</code> with TTL 5 minutes. At noon, the application tier is serving 5,000 reads per second for this article (the upstream CDN absorbs the bulk of the 50,000 reads per second of public traffic — at 50K QPS on a single key, the <em>first</em> fix is to make sure the CDN and edge tier are actually hit; the app cache is a backstop, not the front door). The story was first cached at 11:55 AM. The query that builds the article body is a join across <code>articles</code>, <code>authors</code>, and <code>topics</code> — about 30 milliseconds at p50, 200 milliseconds at p99 under normal load.</p>
+<p>(If the CDN tier isn't there — say this is a logged-in personalized view bypassing the CDN — the same analysis applies with the original numbers; the magnitudes scale but the techniques are the same.)</p>
+<h3 id="naive-design-vanilla-cache-aside">Naive design: vanilla cache-aside</h3>
+<pre><code class="language-python">async def get_article(article_id: int):
+    cached = await redis.get(f&quot;article:{article_id}&quot;)
+    if cached is not None:
+        return deserialize(cached)
+    article = await db.query_article(article_id)
+    await redis.set(f&quot;article:{article_id}&quot;, serialize(article), ex=300)
+    return article
+</code></pre>
+<h3 id="what-goes-wrong">What goes wrong</h3>
+<p>At 12:00:00 PM, the TTL of <code>article:12345</code> fires. The next read (12:00:00.001) sees a miss, queries the database (30 ms), and writes the cache. During those 30 ms, 5,000 reads per second × 0.030 seconds = <strong>150 concurrent readers</strong> also see the cache as empty and each issue their own database query.</p>
+<p>The article-fetch query has been carefully tuned to handle the steady-state ~50 QPS to the database (mostly long-tail articles, not the hot one). 150 simultaneous fetches against a 200-connection pool already crowd out other queries, blow through the connection pool budget when combined with normal load, queue up on lock contention in the query planner, and the p99 of that query goes from 200 ms to 5 seconds. The application's HTTP timeout fires; clients retry; retries arrive at the load balancer; the load balancer pushes more concurrent requests through the application; the application opens more database connections; the database refuses connections; the application returns 503. The whole site goes down because <em>one cache key expired</em>.</p>
+<p>(Note the calibration: 150 concurrent misses on a 30 ms query is the <em>real</em> stampede here. If the query were 5 ms instead of 30, you'd get 25 concurrent fetchers — annoying but probably survivable. The reason this stampede actually breaks the system is the multiplication: hot key × expensive query × shared pool with other traffic.)</p>
+<p>It gets worse the next day. The operator, blaming the TTL, raises it to 30 minutes. Now the cache hits 30 minutes between misses, the stampede effect is the same when the miss does happen, and now the staleness window is also 30 minutes long — the breaking-news team complains that corrections take half an hour to propagate.</p>
+<h3 id="fixed-design-probabilistic-early-expiration-single-flight-swr">Fixed design: probabilistic early expiration + single-flight + SWR</h3>
+<p>We layer three of the toolkit pieces.</p>
+<pre><code class="language-python">import asyncio
+import math
+import random
+import time
+
+from typing import Optional
+
+SINGLE_FLIGHT = SingleFlight()  # from section 4.1
+
+
+async def get_article(article_id: int):
+    key = f&quot;article:{article_id}&quot;
+    entry: Optional[dict] = await redis.get_json(key)
+    now = time.time()
+
+    if entry is None:
+        # Hard miss. In-process single-flight only. With N application instances
+        # the origin can still see up to N concurrent fetches on a hard miss;
+        # that's intentional — we accept N origin queries to avoid the extra
+        # round-trip and complexity of a distributed lock. Add a Redis lock here
+        # only if N origin queries is still too many.
+        return await SINGLE_FLIGHT.do(key, lambda: _fetch_and_store(article_id, key))
+
+    age = now - entry[&quot;stored_at&quot;]
+    ttl = 300                # 5 minutes &quot;fresh&quot;
+    stale_window = 60        # extra minute of &quot;stale but servable&quot;
+
+    if age &gt;= ttl + stale_window:
+        # Hard stale, treat as miss.
+        return await SINGLE_FLIGHT.do(key, lambda: _fetch_and_store(article_id, key))
+
+    if age &gt;= ttl:
+        # Stale-while-revalidate: serve stale, refresh in background.
+        asyncio.create_task(
+            SINGLE_FLIGHT.do(key, lambda: _fetch_and_store(article_id, key))
+        )
+        return entry[&quot;value&quot;]
+
+    # Fresh. Probabilistic early expiration: refresh early with rising
+    # probability as we approach the TTL.
+    delta = entry[&quot;delta&quot;]
+    expiry = entry[&quot;stored_at&quot;] + ttl
+    if now - delta * math.log(random.random()) &gt;= expiry:
+        asyncio.create_task(
+            SINGLE_FLIGHT.do(key, lambda: _fetch_and_store(article_id, key))
+        )
+
+    return entry[&quot;value&quot;]
+
+
+async def _fetch_and_store(article_id: int, key: str):
+    started = time.time()
+    article = await db.query_article(article_id)
+    delta = time.time() - started
+    await redis.set_json(
+        key,
+        {&quot;value&quot;: article, &quot;stored_at&quot;: time.time(), &quot;delta&quot;: delta},
+        ex=300 + 60,
+    )
+    return article
+</code></pre>
+<h3 id="what-changes">What changes</h3>
+<ul>
+<li>At 11:59:30, some lucky reader rolls a small random number and triggers an early refresh. The cache is rewritten with a fresh <code>stored_at</code>. No user blocks; no herd.</li>
+<li>At 12:00:00, the previous "expiry" comes and goes, but most likely the value has already been refreshed via early expiration. If it hasn't, the SWR window kicks in: the next reader sees a stale entry, returns it immediately, and triggers one background refresh — also coalesced by single-flight.</li>
+<li>The background refresh hits the database exactly once <em>per application instance</em> (since the <code>SingleFlight</code> shown is in-process). With N application servers, you get up to N concurrent fetches, not 1 — which is fine if N is small (say 20) and the query is 30 ms. If you need cross-process coalescing too, layer the Redis lock from Section 4.1 on top of the in-process single-flight.</li>
+<li>149 other concurrent readers on the leader's instance see the stale entry and serve happily; on the other N-1 instances, their followers behave the same way.</li>
+<li>The database sees roughly N queries per refresh cycle (one per application instance), not 150. For N=20, that's a 7.5x reduction — enough to pull the database out of the cascade-failure zone.</li>
+</ul>
+<p>If we further want to be paranoid — say this is a Super Bowl-grade event and one query per refresh is still too many to risk — we add a background warmer running every 30 seconds that touches the top-100 articles, so the cache is <em>never</em> close to expiry in steady state. Section 4.4.</p>
+<h3 id="what-we-paid">What we paid</h3>
+<ul>
+<li>Code complexity went up — we now have three interacting mechanisms (PEE, SWR, single-flight) plus a worker.</li>
+<li>Stale window: readers can see up to 60 seconds of staleness. The product team needs to be OK with that.</li>
+<li>Bookkeeping: we store <code>stored_at</code> and <code>delta</code> per entry, which inflates the cache value slightly.</li>
+</ul>
+<p>The tradeoff is well-bought. The system survives viral events.</p>
+<hr />
+<h2 id="6-variants-and-how-to-choose">6. Variants and how to choose</h2>
+<table>
+<thead>
+<tr>
+<th>Technique</th>
+<th>When it's the right pick</th>
+<th>When it's wrong</th>
+<th>Hidden cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single-flight (per-key lock)</td>
+<td>Concurrent misses on the same key need to collapse. Default-on for any read-through cache with hot keys.</td>
+<td>Misses on <em>different</em> keys (you have hot-key skew, not stampede). Use <a href="./hot-key-skew.md">hot-key-skew.md</a>.</td>
+<td>Followers' tail latency grows: they wait the leader's full origin latency. Need follower-side deadlines.</td>
+</tr>
+<tr>
+<td>Probabilistic early expiration</td>
+<td>TTL is the trigger; you want to spread the refresh load randomly across time and clients.</td>
+<td>Cold start (no entry to refresh early). Eviction-driven misses (cache forgot the entry).</td>
+<td>Each entry must store <code>delta</code> and <code>stored_at</code>; not all cache schemas support that without wrapping.</td>
+</tr>
+<tr>
+<td>Stale-while-revalidate</td>
+<td>Product tolerates a few seconds to a minute of staleness; user-blocking on origin is unacceptable.</td>
+<td>Inventory, balances, anything where stale equals wrong.</td>
+<td>The "freshness budget" needs to be communicated to product owners and to observability so a refresh worker stuck at 10 minutes raises an alarm.</td>
+</tr>
+<tr>
+<td>Background refresh / warming</td>
+<td>Hot key set is small, known, and expensive to recompute. Top trending topics, homepage modules, leaderboards.</td>
+<td>Hot-key set is unbounded or unpredictable (long-tail content goes viral).</td>
+<td>Worker fleet to operate; brittle if the hot-key registry diverges from reality.</td>
+</tr>
+<tr>
+<td>Tiered caches</td>
+<td>Read traffic is geographically distributed; multiple cache surfaces are natural (CDN + edge + app + distributed cache).</td>
+<td>Single-region small system; tiers add latency and ops cost.</td>
+<td>Each tier has its own invalidation story; propagating a busted entry through four tiers is hard.</td>
+</tr>
+<tr>
+<td>Negative caching</td>
+<td>Lookup pattern includes many "does this exist" queries; 404 path is hot.</td>
+<td>Per-user ACL checks where negative answers leak permission state.</td>
+<td>Coherence: if the entity is later created, cache must learn quickly.</td>
+</tr>
+<tr>
+<td>Lease tokens (cache-level)</td>
+<td>You control the cache server (Memcached) or use one that exposes leases natively.</td>
+<td>Most off-the-shelf Redis deployments don't expose this.</td>
+<td>Application code must understand the lease protocol; harder to mock in tests.</td>
+</tr>
+<tr>
+<td>Graceful degradation (stale-if-error)</td>
+<td>The right tail of cache misses is dominated by origin outages, not just expiry.</td>
+<td>Strong-consistency invariants.</td>
+<td>Need a hard upper bound on how stale you'll serve before failing the request.</td>
+</tr>
+</tbody>
+</table>
+<p>A decision tree worth walking the interviewer through:</p>
+<pre><code>Is the workload read-heavy with a hot key set?
+├─ No  ── caching is not the dominant lever; focus elsewhere.
+└─ Yes ── you need stampede protection.
+          │
+          Is the hot key set bounded and known?
+          ├─ Yes ── background refresh + warming, with single-flight as fallback.
+          └─ No  ── probabilistic early expiration + single-flight + SWR.
+                    │
+                    Is the product OK with stale reads?
+                    ├─ Yes ── add SWR for graceful degradation.
+                    └─ No  ── single-flight only; accept tail latency on miss.
+                             Then check if the consistency requirement is real;
+                             consider [strong-consistency-under-contention.md].
+</code></pre>
+<hr />
+<h2 id="7-failure-modes-and-operations">7. Failure modes and operations</h2>
+<p>A note on categorization before reading the table: not all of these are "cache stampede" problems in the strict design-pattern sense. They are the <em>family of incidents</em> a cache-fronted system experiences, but their mitigations come from different toolboxes:</p>
+<ul>
+<li><strong>Design-pattern problems</strong> (this doc): cold start, synchronized expiry storm, slow leader in single-flight, stampede on first-time-viral key. Single-flight, jitter, SWR, and early expiration are the answers.</li>
+<li><strong>Operational problems</strong>: mass eviction, cache failover triggers cold path. The fix is right-sizing, replica warming, and incident playbooks — not a design change.</li>
+<li><strong>Hot-key-skew problems</strong>: hot-key amplification (one key serves &gt;10% of traffic). Cross-ref <a href="./hot-key-skew.md">hot-key-skew.md</a>; replication and load-spreading, not single-flight, is the answer.</li>
+<li><strong>Security problems</strong>: cache poisoning. Validation, schema checks, and emergency invalidation — this is a correctness/trust problem, not a load problem.</li>
+<li><strong>CDN problems</strong>: origin shield miss on viral content. CDN configuration (tiered cache, shielding), not application-layer single-flight.</li>
+</ul>
+<p>They're listed together because they all show up on the same on-call dashboard. Knowing which one you have is half the fix.</p>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>What you observe</th>
+<th>Metric</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cold start after deploy</td>
+<td>Cache hit rate collapses from 95 percent to near zero; origin QPS spikes 20x; p99 latency climbs.</td>
+<td><code>cache_hit_rate</code> by tier, <code>origin_qps</code>.</td>
+<td>Pre-warm hot keys before serving traffic; staged rollout with traffic shifting; persistent local cache that survives restart.</td>
+</tr>
+<tr>
+<td>Mass eviction</td>
+<td>Sudden hit rate cliff without a deploy; usually correlated with memory pressure on the cache cluster.</td>
+<td><code>cache_evictions_per_second</code>, <code>cache_memory_usage</code>.</td>
+<td>Right-size the cache; partition hot tenants; admission control on what gets cached.</td>
+</tr>
+<tr>
+<td>Hot-key amplification</td>
+<td>One key serves &gt;10 percent of cache traffic; one Redis shard pegs at 100 percent CPU while others sit idle.</td>
+<td>per-key QPS histogram, per-shard CPU.</td>
+<td>Replicate hot keys to multiple shards; client-side load-balancing across replicas; see <a href="./hot-key-skew.md">hot-key-skew.md</a>.</td>
+</tr>
+<tr>
+<td>Cache poisoning</td>
+<td>One reader writes a bad value (a stack trace, an error object, a zero count); every subsequent reader serves it.</td>
+<td>error rate on cache hits, schema validation failures.</td>
+<td>Validate values before caching; never cache exceptions or partial responses; use short TTL on first-write; have an emergency invalidate-by-pattern operation.</td>
+</tr>
+<tr>
+<td>Synchronized expiry storm</td>
+<td>Every deploy writes entries with identical TTL; T + TTL minutes after each deploy, mass miss event.</td>
+<td>distribution of <code>time_until_expiry</code> across cache keys.</td>
+<td>Jitter the TTL (<code>ttl = base + uniform(-jitter, jitter)</code>); avoid simultaneous bulk warming.</td>
+</tr>
+<tr>
+<td>Stampede on first-time-viral key</td>
+<td>A long-tail key that was never hot suddenly is; not yet in cache; herd hits origin.</td>
+<td>origin QPS by key, sudden new entries to the per-key-QPS histogram.</td>
+<td>Single-flight as defense in depth; rate limit per-key origin queries; trending-detection pipeline that warms keys preemptively.</td>
+</tr>
+<tr>
+<td>Slow leader in single-flight</td>
+<td>One leader is slow (network blip to origin); 999 followers all blocked behind it; tail latency degrades.</td>
+<td><code>followers_per_leader</code> histogram, <code>single_flight_wait_p99</code>.</td>
+<td>Per-follower deadline; have followers serve stale if the leader exceeds budget; circuit-break and let one follower take over.</td>
+</tr>
+<tr>
+<td>Cache failover triggers cold path</td>
+<td>Redis primary fails over; new primary has cold local memory; backlog of writes; clients see misses; origin gets the herd.</td>
+<td>Redis <code>failover_count</code>, cache hit rate around failover events.</td>
+<td>Replica with warm memory; rate limit the origin from the application layer; circuit breaker that sheds load during failover.</td>
+</tr>
+<tr>
+<td>Origin shield miss on viral content</td>
+<td>First request to CDN per region; shield doesn't have it; herd of all regions hits origin.</td>
+<td>CDN origin shield hit rate, origin QPS during viral events.</td>
+<td>Cloudflare "tiered cache" or Fastly "shielding" enabled; origin-side single-flight as backstop.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="metrics-dashboard-a-staff-candidate-names">Metrics dashboard a staff candidate names</h3>
+<ul>
+<li><strong>Cache hit rate per tier.</strong> Trend over time, with anomaly detection at deploy boundaries.</li>
+<li><strong>Cache miss QPS to origin.</strong> This is the number that goes 100x in a stampede. Alert on rate-of-change, not absolute value.</li>
+<li><strong>Per-key QPS distribution.</strong> A long tail of hot keys is normal; a single key &gt;5 percent of total traffic is a hot key worth replicating.</li>
+<li><strong>Single-flight fanout.</strong> Followers-per-leader histogram. p99 &gt; 100 means you're frequently collapsing big herds — good if it's working, but it means your TTL or eviction strategy is letting the miss happen.</li>
+<li><strong>Stale-serve count.</strong> How often you're serving past the fresh TTL. A spike means refresh workers are unhealthy.</li>
+<li><strong>Coalescing latency penalty.</strong> p99 of follower wait time. If followers wait longer than they would have spent calling origin themselves, single-flight is mis-tuned.</li>
+</ul>
+<hr />
+<h2 id="8-combinations-with-other-patterns">8. Combinations with other patterns</h2>
+<p>This pattern lives at the intersection of several others. Some combinations are natural; some require care.</p>
+<ul>
+<li>
+<p><strong><a href="./hot-key-skew.md">hot-key-skew.md</a>.</strong> Cache stampede and hot-key skew are siblings, not the same. Stampede is about <em>temporal</em> concentration of misses (concurrent missers on one key in one short window). Skew is about <em>spatial</em> concentration of traffic on one cache shard. Single-flight collapses the temporal burst at each application instance (and distributed single-flight further collapses across instances at the cost of a lock round-trip); replication and load-spreading address the spatial concentration on a cache shard. A celebrity post often needs <em>both</em>: single-flight to handle TTL-driven misses on a hot article body, plus hot-key replication so the cache shard that owns the key doesn't melt under the steady-state read QPS.</p>
+</li>
+<li>
+<p><strong><a href="./fan-out-write-amplification.md">fan-out-write-amplification.md</a>.</strong> Fan-out on write builds per-recipient caches (timeline:user_42). Those caches have the same stampede surface as any other: when the timeline cache expires or evicts, the rebuild has to query a bunch of upstream stores. The pull path of a hybrid push-pull system inherits cache stampede risk for celebrity posts.</p>
+</li>
+<li>
+<p><strong><a href="./strong-consistency-under-contention.md">strong-consistency-under-contention.md</a>.</strong> SWR and stale-if-error are explicit decisions to <em>give up consistency</em> in exchange for availability and herd protection. If your invariant is strong consistency (inventory, payment authorization), you cannot use SWR; you have to single-flight only, and accept that misses block. Often the right move is to remove the read from the strict-consistency path entirely (use a separate display cache that lags) and keep the authority check on a different path.</p>
+</li>
+<li>
+<p><strong><a href="./idempotency-exactly-once.md">idempotency-exactly-once.md</a>.</strong> Single-flight requires that the fetch is safe to retry — if the leader fails partway through and a follower takes over, the origin fetch can run twice. For pure reads this is fine. For "fetch this expensive computation that has side effects" (e.g., debit-then-cache), you need idempotency on the origin side.</p>
+</li>
+<li>
+<p><strong><a href="./backpressure-flow-control.md">backpressure-flow-control.md</a>.</strong> When the herd does break through, the rate at which the application calls the origin must be capped — admission control, semaphore, or token bucket. Single-flight is the optimistic case; rate limiting on the cache→origin path is the pessimistic case for when single-flight isn't enough.</p>
+</li>
+<li>
+<p><strong><a href="./coordination-exactly-one-execution.md">coordination-exactly-one-execution.md</a>.</strong> Distributed single-flight (cross-process leader election per key) is a special case of "elect one worker to run this job," and the patterns rhyme. Redis <code>SETNX</code> with TTL, ZooKeeper ephemeral nodes, and etcd leases are all variants.</p>
+</li>
+<li>
+<p><strong><a href="./durability-at-scale.md">durability-at-scale.md</a>.</strong> Cache is not durable storage. If the cache cluster loses all state, the origin must be able to absorb the cold-start traffic for as long as it takes to repopulate. The capacity plan for the origin must be sized to "cache offline" mode, even if that's a degraded mode.</p>
+</li>
+</ul>
+<hr />
+<h2 id="9-likely-interviewer-probes">9. Likely interviewer probes</h2>
+<p>These are the deep-dive questions a staff-level interviewer is likely to push on. Have a real answer for each.</p>
+<ol>
+<li>
+<p><strong>"What TTL would you pick for the article body cache, and why?"</strong> Talk about the tradeoff between freshness and miss rate. Show that you'd jitter the TTL to avoid synchronized expiry. Mention that with SWR you decouple the <em>fresh window</em> from the <em>serve window</em> — you might pick 5 minutes fresh, 10 minutes serve-if-stale, 30 minutes hard-expire.</p>
+</li>
+<li>
+<p><strong>"What happens when your Redis cluster fails over to a secondary?"</strong> Acknowledge that secondaries usually have cold local CPU cache (even if replicated keys are present, the JIT and connection pools are cold). Talk about read load to the secondary spiking during failover, circuit breaker between application and origin to prevent thunderhead, and validation that your application library does sane connection pooling.</p>
+</li>
+<li>
+<p><strong>"How does single-flight work across N application servers?"</strong> This is the cross-process coordination question. Cover Redis <code>SET key:lock NX PX 5000</code> with a unique token, follower spin-polling (cheap if cache RTT is low), or pub/sub for completion notification. Mention the failure mode where the leader dies and the lock TTL has to be longer than origin p99 but short enough that a dead leader unblocks followers in seconds.</p>
+</li>
+<li>
+<p><strong>"Probabilistic early expiration with <code>beta=1</code> — what's the expected refresh rate per key?"</strong> Higher QPS means more dice rolls per unit time, which shifts the <em>expected</em> refresh time earlier within the TTL window (closer to TTL/2 for very hot keys, closer to TTL for cold ones). The property the paper actually proves is not "one refresh per TTL regardless of QPS" — it's that the <em>probability of any reader ever experiencing a hard miss</em> (i.e., observing <code>now &gt;= expiry</code> rather than triggering an early refresh first) decays exponentially with QPS. That's the desired property: hot keys self-protect, cold keys mostly don't bother. Showing you can distinguish "refresh rate" (grows slowly with QPS) from "hard-miss probability" (decays exponentially with QPS) is the staff signal.</p>
+</li>
+<li>
+<p><strong>"What's the difference between a cache miss and a cache stampede?"</strong> A miss is fine — by itself it's just one origin fetch. A stampede is a miss with <em>concurrency</em>: N parallel misses on the same key. The relevant metric is not "miss rate" but "concurrent missers per unique key."</p>
+</li>
+<li>
+<p><strong>"You mentioned negative caching. What's the security risk?"</strong> If user existence is a privacy-sensitive signal, a tombstone TTL that's different from the positive TTL leaks information. Also, an attacker who can mint nonexistent keys at high rate can fill cache memory with tombstones (Denial of Service via cache pollution). Limit by namespace and use cache admission policies (e.g., TinyLFU) that don't admit one-hit-wonders.</p>
+</li>
+<li>
+<p><strong>"How do you protect the cache itself from being the bottleneck?"</strong> Hot-key replication across shards, client-side load balancing across replicas (round-robin or consistent-hash-with-bounded-loads), and an application-local LRU as a top-tier filter. The cache is just another distributed system and has the same hot-shard problems as any other.</p>
+</li>
+</ol>
+<hr />
+<h2 id="10-common-traps-stronger-moves">10. Common traps → stronger moves</h2>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"I'll just cache it."</td>
+<td>"I'll cache it with single-flight on miss, jittered TTL, and stale-while-revalidate, and I'll alert on origin QPS as a leading indicator of cache failure."</td>
+</tr>
+<tr>
+<td>Uniform TTL across all keys.</td>
+<td>TTL with jitter (<code>base + uniform(-base*0.1, base*0.1)</code>) to prevent synchronized expiry storms.</td>
+</tr>
+<tr>
+<td>Increase TTL to "reduce database load."</td>
+<td>Lengthening TTL doesn't fix stampedes — it just makes them rarer and bigger. Add probabilistic early expiration so the database load is constant regardless of TTL.</td>
+</tr>
+<tr>
+<td>One global Redis cluster for all caching.</td>
+<td>Tiered caches: CDN, application-local LRU, distributed cache, origin. Each tier shields the next; failure of one doesn't take down the system.</td>
+</tr>
+<tr>
+<td>"Cache invalidation is hard, so I'll just use short TTLs."</td>
+<td>Cache invalidation is hard, but short TTLs trade one problem (staleness) for two (staleness <em>plus</em> stampede plus origin load). Use targeted invalidation on write and modest TTL with SWR.</td>
+</tr>
+<tr>
+<td>"Cache fallback to database on miss."</td>
+<td>Cache fallback to database on miss with single-flight, rate limiting, circuit breaker, and serve-stale on origin error. The fallback path must have its own herd protection or the cache is a liability, not an asset.</td>
+</tr>
+<tr>
+<td>Cache the exception when origin fails.</td>
+<td>Never cache exceptions, error responses, or partial results. Cache only well-formed successful responses. Errors are temporary; caching them turns transient outages into long ones.</td>
+</tr>
+<tr>
+<td>One cache server for the hot key.</td>
+<td>Replicate the hot key to N shards; clients pick a replica randomly or by hash; eliminates per-shard hot spotting.</td>
+</tr>
+<tr>
+<td>Assuming in-process single-flight is sufficient when the math says it isn't.</td>
+<td>Compute N-instances × cost-per-fetch versus origin budget. If 200 application servers each issuing one origin query (instead of one query total) still saturates the database, reach for distributed single-flight via per-key Redis lock with a unique-token holder. If N concurrent fetches is fine, stop at in-process — the distributed lock has its own correctness and latency costs.</td>
+</tr>
+<tr>
+<td>Cache aside, no SWR, no early expiration.</td>
+<td>Cache aside + early expiration + SWR + single-flight: a layered defense where any one layer being misconfigured doesn't take you down.</td>
+</tr>
+<tr>
+<td>Test cache behavior at steady state only.</td>
+<td>Run a deploy-and-warmup load test (full restart, cold cache, full peak traffic) at least monthly. The bug you find that way is the one that takes your site down.</td>
+</tr>
+<tr>
+<td>Treat CDN as a magic black box.</td>
+<td>Understand origin shielding and Vary headers; an unintentional <code>Vary: Cookie</code> reduces cache hit rate to near zero.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11-staff-level-answer-checklist">11. Staff-level answer checklist</h2>
+<p>When the interviewer pushes on read amplification or "what happens at viral scale," your answer should hit these points without prompting:</p>
+<ul>
+<li>[ ] Name the failure mode by its real name: cache stampede, thundering herd, read amplification. The vocabulary is itself a staff signal.</li>
+<li>[ ] Scope the problem before reaching for techniques: cache stampede mitigation is for keys where concurrent-missers times origin-cost actually saturates a resource. For median keys with cheap queries, naive cache-aside is fine — saying so is itself a staff move.</li>
+<li>[ ] Distinguish <em>temporal</em> stampede (concurrent misses on the same key at expiry or eviction) from <em>spatial</em> hot-key skew (one shard owning a heavily-trafficked key). Mention they need different solutions and they often coexist.</li>
+<li>[ ] Recommend in-process single-flight (asyncio lock) as the default for any hot key with expensive backing query; reach for cross-process single-flight (Redis lock or lease token) only when the math shows N-instances of in-process is still too much for the origin.</li>
+<li>[ ] Recommend probabilistic early expiration to flatten the load curve, with the staff-level reference to Vattani et al. or Memcached's lease tokens.</li>
+<li>[ ] Cite stale-while-revalidate and stale-if-error as availability tools, with the caveat that they trade staleness for availability — confirm the product tolerates it.</li>
+<li>[ ] Sketch tiered caches (CDN → application-local LRU → distributed cache → origin) and note that each tier needs its own stampede protection.</li>
+<li>[ ] Call out cold start as a distinct failure mode requiring pre-warming or staged traffic shift, not just steady-state cache design.</li>
+<li>[ ] Name the metrics: hit rate, origin QPS, per-key QPS, single-flight fanout, stale-serve count. Alert on rate-of-change, not absolute.</li>
+<li>[ ] Acknowledge cache poisoning: never cache exceptions, validate values, have an invalidate-by-pattern emergency operation.</li>
+<li>[ ] Connect to siblings: hot-key skew, fan-out, strong consistency, backpressure.</li>
+<li>[ ] State the tradeoff explicitly: "We are choosing availability over freshness here because the product tolerates 60 seconds of staleness on this read path; if it didn't, I would handle this differently."</li>
+<li>[ ] Mention TTL jitter to break synchronized expiry, and bounded follower deadlines so a slow leader doesn't take down latency.</li>
+<li>[ ] If the question is large enough, sketch the capacity plan with and without cache — show that the origin must survive in "cache cold" mode, possibly in degraded read-only state.</li>
+</ul>
+<hr />
+<h2 id="12-cross-references">12. Cross-references</h2>
+<p>Sibling pattern docs:</p>
+<ul>
+<li><a href="./fan-out-write-amplification.md">fan-out-write-amplification.md</a> — write-side amplification; per-recipient timeline caches are themselves stampede surfaces.</li>
+<li><a href="./hot-key-skew.md">hot-key-skew.md</a> — spatial hot key concentration; the spatial sibling to this temporal pattern.</li>
+<li><a href="./strong-consistency-under-contention.md">strong-consistency-under-contention.md</a> — when SWR / stale serving is <em>not</em> allowed; the alternative branch of the decision tree.</li>
+<li><a href="./idempotency-exactly-once.md">idempotency-exactly-once.md</a> — required when a single-flight leader can crash and be retaken.</li>
+<li><a href="./coordination-exactly-one-execution.md">coordination-exactly-one-execution.md</a> — leader election for distributed single-flight.</li>
+<li><a href="./backpressure-flow-control.md">backpressure-flow-control.md</a> — rate limiting the cache→origin path as the pessimistic backstop.</li>
+<li><a href="./durability-at-scale.md">durability-at-scale.md</a> — the origin must survive cache-offline mode.</li>
+<li><a href="./real-time-aggregation.md">real-time-aggregation.md</a> — hot counters and aggregates have the same stampede problem on cache miss.</li>
+<li><a href="./search-and-ranking.md">search-and-ranking.md</a> — top-prefix and trending-query caches are stampede surfaces.</li>
+</ul>
+<p>Question docs where this pattern shows up:</p>
+<ul>
+<li><a href="../questions/design-a-distributed-cache-like-redis.md">Design a Distributed Cache like Redis</a> — the cache itself defending against stampedes.</li>
+<li><a href="../questions/design-a-flash-sale-for-an-e-commerce-site.md">Design a Flash Sale</a> — inventory and product-detail caches under launch traffic.</li>
+<li><a href="../questions/design-google-news-as-a-global-aggregator.md">Design Google News</a> — viral article distribution through CDN tiers.</li>
+<li><a href="../questions/design-youtube.md">Design YouTube</a> — viral video metadata and recommendation feed caches.</li>
+<li><a href="../questions/design-twitter-timeline.md">Design Twitter Timeline</a> — celebrity post, trending topics, view counters.</li>
+<li><a href="../questions/design-ticketmaster.md">Design Ticketmaster</a> — on-sale moment for high-demand event.</li>
+<li><a href="../questions/design-typeahead-autocomplete.md">Design Typeahead Autocomplete</a> — top-prefix completions during news events.</li>
+</ul>
+<p>Foundational reading:</p>
+<ul>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> — Time-To-Live, cache-aside, write-through, eviction policies.</li>
+<li><a href="../STAFF_SYSTEM_DESIGN_INTERVIEW_PLAYBOOK.md">Staff System Design Interview Playbook</a> — the 45-minute flow and the language patterns.</li>
+</ul>
+<p>External canonical references to name-drop:</p>
+<ul>
+<li>Vattani, Chierichetti, Lowenstein, "Optimal Probabilistic Cache Stampede Prevention" (2015).</li>
+<li>Nishtala et al., "Scaling Memcache at Facebook" (NSDI 2013) — lease tokens and Mcrouter.</li>
+<li>Fastly / Cloudflare / Akamai documentation on origin shielding and tiered caching.</li>
+<li>Hypertext Transfer Protocol RFC 5861 — <code>stale-while-revalidate</code> and <code>stale-if-error</code> cache-control directives.</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

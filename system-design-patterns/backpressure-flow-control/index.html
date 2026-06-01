@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Backpressure / Flow Control — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design-patterns/">← Back to System Design Patterns</a>
+        <h1 class="article-title">Backpressure / Flow Control</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/31 &nbsp;·&nbsp; System Design Patterns
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>Backpressure is the discipline of making a producer slow down, drop, or be shed when a consumer cannot keep up — instead of letting the queue between them grow until something explodes. See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for shared vocabulary. Closely tied to <a href="../questions/apache-kafka.md">Apache Kafka</a>, <a href="../questions/design-an-api-rate-limiter.md">API Rate Limiter</a>, <a href="../questions/design-a-metrics-and-monitoring-system-like-datadog.md">Metrics and Monitoring (Datadog)</a>, <a href="../questions/design-an-ad-click-aggregator.md">Ad Click Aggregator</a>, <a href="../questions/design-a-web-crawler.md">Web Crawler</a>, <a href="../questions/design-a-notification-system.md">Notification System</a>, and <a href="../questions/design-youtube.md">YouTube</a>.</p>
+</blockquote>
+<hr />
+<h2 id="1-the-fundamental-hardness">1. The fundamental hardness</h2>
+<p>The shape of the bug is always the same: a producer emits work at rate <code>lambda</code> (events per second), a consumer drains at rate <code>mu</code>, and someone — explicitly or by accident — assumes <code>lambda &lt;= mu</code> will hold forever. It will not. Mobile clients hit a sale, a Graphics Processing Unit (GPU) shard goes offline, garbage collection (GC) pauses a consumer for 800 ms, a deploy halves consumer count, or upstream just grew faster than the team running the consumer noticed. The instant <code>lambda &gt; mu</code> sustains, the queue between them grows at rate <code>(lambda - mu)</code> and the system is on a deadline measured in seconds before memory, disk, or socket buffers are exhausted.</p>
+<p>The fundamental hardness is that <strong>an unbounded queue is not "buffering," it is a memory leak with extra steps</strong>. The queue absorbs the imbalance, hiding the problem from latency dashboards (writes still ack), until it tips over and every consumer fails at once. Worse, if you do nothing the failure mode is correlated: every queue tips in roughly the same minute, every downstream sees an outage at once, and recovery requires draining a multi-gigabyte backlog while live traffic is still arriving — a self-perpetuating overload.</p>
+<p><strong>Little's Law</strong> is the only math you need to ground the discussion. For a system in steady state:</p>
+<pre><code>L = lambda * W
+</code></pre>
+<p>where <code>L</code> is items in the system, <code>lambda</code> is arrival rate, and <code>W</code> is mean time spent in the system. If you cap <code>L</code> (a bounded queue) and <code>lambda</code> keeps rising, <code>W</code> must fall — which is impossible if <code>mu</code> is fixed — so the cap forces a decision: drop, reject, or sample. If you cap <code>W</code> (a service-level objective on tail latency) and <code>lambda</code> rises, you must either raise <code>mu</code> (autoscale, more shards), shrink <code>lambda</code> (rate limit upstream), or reduce the work per item (sample, batch, drop fields). Every backpressure technique below is a different answer to "which variable do we sacrifice when arithmetic stops being satisfied."</p>
+<p><strong>Three different shapes of <code>lambda &gt; mu</code> need three different responses.</strong> Conflating them is the most common interview mistake:</p>
+<table>
+<thead>
+<tr>
+<th>Shape</th>
+<th>Example</th>
+<th>Right response</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Sustained capacity mismatch</strong> (2x for hours, no end in sight)</td>
+<td>Customer growth outran the team's provisioning.</td>
+<td>Not a backpressure design problem — it is capacity planning. Add shards, partitions, consumers. Backpressure only bounds the damage while you wait for capacity.</td>
+</tr>
+<tr>
+<td><strong>Spike / burst</strong> (10x for seconds-to-minutes, then back to baseline)</td>
+<td>Flash sale, breaking-news event, deploy.</td>
+<td>Bounded queue + token bucket + shed-load. The whole canonical toolkit.</td>
+</tr>
+<tr>
+<td><strong>Metastable retry storm</strong> (sustained overload that <em>outlives</em> the original cause)</td>
+<td>A 30-second downstream blip triggered enough retries that the system can no longer drain itself.</td>
+<td>Exponential backoff with jitter at the client, circuit breaker between layers, mandatory <code>Retry-After</code> honored at the edge. The original cause is gone; you must break the feedback loop.</td>
+</tr>
+</tbody>
+</table>
+<p>The pattern is uniquely cruel because <strong>retries can convert a brief spike into a persistent failure</strong>. A naive client retrying a slow request triples or quadruples <code>lambda</code> exactly when <code>mu</code> has degraded — a positive feedback loop. Once the queue (or downstream) is past its tipping point, the <em>retries alone</em> exceed <code>mu</code>, so the system stays overloaded even after the original spike has ended. This is the <strong>metastable overload</strong>: the system has two stable states (healthy and overloaded) and gets stuck in the bad one. The only way out is to externally suppress traffic (firewall-drop, LB drain) until in-flight retries decay. Production systems must combine bounded queues, rate limits, circuit breakers, and exponential backoff with jitter; any one of these in isolation is insufficient.</p>
+<hr />
+<h2 id="2-how-to-recognize-it-in-the-interview">2. How to recognize it in the interview</h2>
+<h3 id="prompt-phrases">Prompt phrases</h3>
+<ul>
+<li>"...handle bursts of...", "...spiky traffic...", "...peak load is 10x average..."</li>
+<li>"Producers emit faster than..."</li>
+<li>"...what if the downstream is slow or unavailable?"</li>
+<li>"...absorb the spike during a flash sale / hot news event / live broadcast..."</li>
+<li>"...the consumer can only process X events per second, but..."</li>
+<li>"...keep the system from falling over when..."</li>
+<li>"...protect downstream..."</li>
+<li>"...gracefully degrade..."</li>
+</ul>
+<h3 id="architectural-smells">Architectural smells</h3>
+<ul>
+<li>A queue (Kafka topic, Simple Queue Service (SQS), Redis list, in-process Python <code>queue.Queue</code>) sits between two services with very different time-scales (synchronous Hypertext Transfer Protocol (HTTP) producer, batch consumer).</li>
+<li>Producers are clients you do not control (mobile apps, third-party webhooks, Internet of Things (IoT) sensors).</li>
+<li>The consumer's work is variable or expensive (GPU encode, machine learning (ML) feature extraction, third-party application programming interface (API) call).</li>
+<li>The interviewer specifies an upstream rate but not a downstream rate, or vice versa — they want you to notice.</li>
+<li>"Eventually consistent" or "best-effort" is in the requirements — implies some data loss is acceptable, which unlocks drop policies.</li>
+</ul>
+<h3 id="example-interview-prompts-where-backpressure-is-core">Example interview prompts where backpressure is core</h3>
+<ol>
+<li><strong>Log / event ingestion pipeline (Datadog, Splunk).</strong> Hundreds of thousands of agents emit metrics; ingestion clusters and downstream time-series databases (TSDBs) have hard write ceilings. See <a href="../questions/design-a-metrics-and-monitoring-system-like-datadog.md">Metrics and Monitoring</a>.</li>
+<li><strong>Ad click aggregator.</strong> Click events arrive in a bursty pattern (campaign launch, primetime); the aggregation pipeline has fixed window-flush cost. See <a href="../questions/design-an-ad-click-aggregator.md">Ad Click Aggregator</a>.</li>
+<li><strong>Web crawler frontier.</strong> Found-Uniform-Resource-Locator (URL) rate is multiplicative on pages crawled; politeness and downstream parser throughput are the binding constraint. See <a href="../questions/design-a-web-crawler.md">Web Crawler</a>.</li>
+<li><strong>Notification fan-out.</strong> A single celebrity post can enqueue 100M push-notifications; Apple Push Notification service (APNs) and Firebase Cloud Messaging (FCM) have per-app rate limits. See <a href="../questions/design-a-notification-system.md">Notification System</a>.</li>
+<li><strong>Video upload / transcoding pipeline.</strong> Uploads outpace GPU encoders during peak hours; users expect "uploaded" feedback in seconds but encoded output can lag. See <a href="../questions/design-youtube.md">YouTube</a>.</li>
+<li><strong>Live comment streaming.</strong> A live event drives bursty input; per-room write-fanout is bounded by socket and serialization throughput. See <a href="../questions/design-a-live-comment-streaming-service-like-twitch-chat.md">Live Comment Streaming</a>.</li>
+<li><strong>API gateway / rate limiter itself.</strong> The classic "limit traffic to backends" use case. See <a href="../questions/design-an-api-rate-limiter.md">API Rate Limiter</a>.</li>
+</ol>
+<p>If the interviewer hands you a system where one side is "lots of small events" and the other side is "expensive batch / persistent / external" — backpressure is the deep dive.</p>
+<hr />
+<h2 id="3-60-second-spoken-framing">3. 60-second spoken framing</h2>
+<blockquote>
+<p>The core issue is that the producer can sustain more events per second than the consumer can drain, so any queue between them will grow without bound under load. I will design from that invariant: <strong>never run with an unbounded queue, and never let retries amplify overload</strong>. My toolkit is a bounded queue with a defined drop policy, a token-bucket rate limit at the producer edge, autoscaling consumers with hysteresis so they do not flap, and circuit breakers plus bulkheads on downstream calls so one slow dependency cannot consume all worker threads. For data that cannot be dropped, I move it to a durable broker like Kafka and shed load at the edge with <code>503 Retry-After</code>. The metric I would alert on is queue depth and consumer lag — not just latency, because latency hides overload until the moment of collapse.</p>
+</blockquote>
+<hr />
+<h2 id="4-canonical-toolkit">4. Canonical toolkit</h2>
+<p>The seven techniques below are the staff-level inventory. In a real interview you pick three or four that fit the prompt and explain why the others are wrong or redundant for this problem.</p>
+<h3 id="41-bounded-queue-with-drop-policy">4.1 Bounded queue with drop policy</h3>
+<p>The single most important primitive. Any queue between two services has a fixed capacity (memory budget × per-item size); when full, you must pick one:</p>
+<table>
+<thead>
+<tr>
+<th>Policy</th>
+<th>What happens</th>
+<th>When to use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Tail-drop</strong></td>
+<td>New item rejected (<code>put</code> returns error).</td>
+<td>Producer can react: retry later, fall back to a slower path, surface error to user.</td>
+</tr>
+<tr>
+<td><strong>Head-drop (drop-oldest)</strong></td>
+<td>Oldest item evicted to make room.</td>
+<td>Streaming telemetry, real-time signals where newest is most valuable (live metrics, chat).</td>
+</tr>
+<tr>
+<td><strong>Random drop</strong></td>
+<td>Pick a random item to evict.</td>
+<td>Avoids systematic bias against any time slice; rare in practice.</td>
+</tr>
+<tr>
+<td><strong>Weighted Random Early Detection (WRED)</strong></td>
+<td>Probabilistically drop as queue fills past a threshold, with weights by priority/class.</td>
+<td>Network router primitive (designed to break global TCP-window synchronization). Borrowed for app queues only as inspiration for priority drop; the "early drop" benefit comes from desynchronizing TCP senders, which does not apply to non-TCP message queues. Prefer explicit priority drop in application queues.</td>
+</tr>
+<tr>
+<td><strong>Priority drop</strong></td>
+<td>Drop lowest-priority class first; preserve top class until full.</td>
+<td>Mixed-criticality streams (paid &gt; free, transactional &gt; analytics).</td>
+</tr>
+</tbody>
+</table>
+<p>Python sketch of a bounded queue with tail-drop and a drop-oldest variant:</p>
+<pre><code class="language-python">import collections
+import threading
+from typing import Optional, Any
+
+class BoundedQueue:
+    &quot;&quot;&quot;
+    Thread-safe bounded queue with configurable drop policy.
+
+    policy: 'tail_drop' rejects new items; 'drop_oldest' evicts head.
+    Returns (accepted: bool, dropped_item: Optional[Any]) on put.
+    &quot;&quot;&quot;
+    def __init__(self, capacity: int, policy: str = &quot;tail_drop&quot;):
+        assert policy in (&quot;tail_drop&quot;, &quot;drop_oldest&quot;)
+        self.capacity = capacity
+        self.policy = policy
+        self.buf: collections.deque = collections.deque()
+        self.lock = threading.Lock()
+        self.not_empty = threading.Condition(self.lock)
+        # Metrics — emit to your monitoring stack.
+        self.dropped_count = 0
+        self.enqueued_count = 0
+
+    def put(self, item: Any) -&gt; tuple[bool, Optional[Any]]:
+        with self.not_empty:
+            if len(self.buf) &lt; self.capacity:
+                self.buf.append(item)
+                self.enqueued_count += 1
+                self.not_empty.notify()
+                return True, None
+            if self.policy == &quot;tail_drop&quot;:
+                self.dropped_count += 1
+                return False, item  # caller decides what to do
+            # drop_oldest
+            evicted = self.buf.popleft()
+            self.buf.append(item)
+            self.dropped_count += 1
+            self.not_empty.notify()
+            return True, evicted
+
+    def get(self, timeout: Optional[float] = None) -&gt; Optional[Any]:
+        with self.not_empty:
+            if not self.buf and not self.not_empty.wait(timeout):
+                return None
+            return self.buf.popleft() if self.buf else None
+</code></pre>
+<p><strong>Interview-grade detail.</strong> Always state the capacity explicitly and justify it with Little's Law: <code>capacity &gt;= mu * W_acceptable</code> (sized against the <em>drain</em> rate, since once you exceed <code>mu</code> the queue is purely a buffer for time-shifted demand). A queue holding ~1 second of drain rate is a buffer; capacity equal to 1 hour × peak arrival is a liability — at 64KB per item and 10k items/sec arrival, a "1 hour" buffer is 2.3GB of RAM that masks an overload until it tips.</p>
+<p><strong>Drop-oldest vs tail-drop are not symmetric.</strong> They have different correctness implications, not just different operational ones:</p>
+<ul>
+<li><strong>Drop-oldest</strong> silently changes what data the consumer sees. For a counter or aggregate, that is a <em>correctness</em> change: the count is now under-reported with no error signal to anyone. Only use drop-oldest when "older" really is "stale and worthless" — live telemetry, current chat state, latest sensor reading.</li>
+<li><strong>Tail-drop</strong> preserves whatever already entered the system and returns an error to the producer. The producer (or its retry layer) becomes the place where the loss is observable. For request/response APIs and any data with idempotency keys, this is the default.</li>
+</ul>
+<p>The honest staff-level take: a bounded queue with tail-drop and a <code>503 Retry-After</code> is genuinely sufficient for most systems. The fancier drop policies (WRED-style probabilistic, priority-aware, key-aware) earn their complexity only when you have a real multi-class workload or a network-layer constraint.</p>
+<h3 id="42-token-bucket-on-the-producer">4.2 Token bucket on the producer</h3>
+<p>Rate limiting at the source is cheaper than rate limiting at the sink. A token bucket allows short bursts up to bucket size and sustains at refill rate.</p>
+<pre><code class="language-python">import time
+import threading
+
+class TokenBucket:
+    &quot;&quot;&quot;
+    Classic token bucket. capacity = max burst, refill_rate = tokens/sec.
+    try_acquire returns True if a token was deducted (request allowed).
+    &quot;&quot;&quot;
+    def __init__(self, capacity: float, refill_rate: float):
+        self.capacity = float(capacity)
+        self.refill_rate = float(refill_rate)
+        self.tokens = float(capacity)
+        self.last_refill = time.monotonic()
+        self.lock = threading.Lock()
+
+    def _refill(self) -&gt; None:
+        now = time.monotonic()
+        elapsed = now - self.last_refill
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+        self.last_refill = now
+
+    def try_acquire(self, cost: float = 1.0) -&gt; bool:
+        with self.lock:
+            self._refill()
+            if self.tokens &gt;= cost:
+                self.tokens -= cost
+                return True
+            return False
+
+    def acquire_blocking(self, cost: float = 1.0, timeout: float = 1.0) -&gt; bool:
+        deadline = time.monotonic() + timeout
+        while True:
+            with self.lock:
+                self._refill()
+                if self.tokens &gt;= cost:
+                    self.tokens -= cost
+                    return True
+                deficit = cost - self.tokens
+                wait = deficit / self.refill_rate
+            if time.monotonic() + wait &gt; deadline:
+                return False
+            time.sleep(min(wait, deadline - time.monotonic()))
+</code></pre>
+<p>The deeper conversation in the <a href="../questions/design-an-api-rate-limiter.md">API Rate Limiter</a> doc covers distributed counter consistency; here the parameter trade-off is the thing to be honest about. The bucket has two independent dials and they pull in opposite directions:</p>
+<ul>
+<li><code>refill_rate</code> is your sustained throughput ceiling — the producer cannot average more than this for any sustained window.</li>
+<li><code>capacity</code> is the burst tolerance — the largest single spike that passes through ungated.</li>
+</ul>
+<p>A "wider burst" (big capacity, modest refill) lets legitimate spikes pass but lets a misbehaving client hammer downstream for one bucket-width before the rate kicks in. A "smoother" bucket (small capacity, same refill) clips legitimate spikes. Token bucket is the right tool when bursts <em>are</em> legitimate; leaky bucket is the right tool only when downstream genuinely cannot tolerate spikes (a database that locks under burst, a third-party API with hard per-second limits and no burst credit).</p>
+<h3 id="43-circuit-breaker-state-machine">4.3 Circuit breaker state machine</h3>
+<p>The case for a circuit breaker is <strong>cascade prevention</strong>, not just "downstream is slow." A slow downstream by itself can be handled with a per-dependency timeout and a bulkhead. The circuit breaker earns its complexity when calls to a slow dependency <em>back up worker threads</em> and that exhaustion takes out unrelated paths in the same process — the classic synchronous-call cascade where one bad dependency takes down a whole tier. Use it specifically when (a) you have shared worker pools, (b) you have downstream calls that can hang for seconds, and (c) failing the call cheaply is preferable to waiting. For asynchronous or fully-bulkheaded paths a timeout is often enough.</p>
+<pre><code class="language-python">import time
+import threading
+from enum import Enum
+
+class State(Enum):
+    CLOSED = &quot;closed&quot;      # normal
+    OPEN = &quot;open&quot;          # short-circuit, do not call downstream
+    HALF_OPEN = &quot;half&quot;     # probe, allow one request through
+
+class CircuitBreaker:
+    &quot;&quot;&quot;
+    Standard three-state breaker.
+    - CLOSED: count failures; trip to OPEN when failure_rate &gt; threshold.
+    - OPEN: reject immediately for cooldown seconds, then -&gt; HALF_OPEN.
+    - HALF_OPEN: allow one probe; success -&gt; CLOSED, failure -&gt; OPEN.
+    &quot;&quot;&quot;
+    def __init__(
+        self,
+        failure_threshold: float = 0.5,
+        min_calls: int = 20,
+        cooldown_seconds: float = 30.0,
+    ):
+        self.failure_threshold = failure_threshold
+        self.min_calls = min_calls
+        self.cooldown = cooldown_seconds
+        self.state = State.CLOSED
+        self.failures = 0
+        self.successes = 0
+        self.opened_at = 0.0
+        self.lock = threading.Lock()
+
+    def allow(self) -&gt; bool:
+        with self.lock:
+            if self.state == State.CLOSED:
+                return True
+            if self.state == State.OPEN:
+                if time.monotonic() - self.opened_at &gt;= self.cooldown:
+                    self.state = State.HALF_OPEN
+                    return True  # one probe
+                return False
+            # HALF_OPEN: only the in-flight probe was allowed
+            return False
+
+    def record(self, success: bool) -&gt; None:
+        with self.lock:
+            if self.state == State.HALF_OPEN:
+                if success:
+                    self.state = State.CLOSED
+                    self.failures = self.successes = 0
+                else:
+                    self.state = State.OPEN
+                    self.opened_at = time.monotonic()
+                return
+            if success:
+                self.successes += 1
+            else:
+                self.failures += 1
+            total = self.failures + self.successes
+            if total &gt;= self.min_calls:
+                rate = self.failures / total
+                if rate &gt;= self.failure_threshold:
+                    self.state = State.OPEN
+                    self.opened_at = time.monotonic()
+                # rolling window reset; real impls use a time-windowed counter
+                self.failures = self.successes = 0
+</code></pre>
+<p>Mention the <strong>bulkhead</strong> companion: bound the concurrent in-flight calls to each downstream so one slow dependency cannot exhaust the whole worker pool. A bulkhead is a semaphore or a dedicated thread pool per dependency.</p>
+<p><strong>Asymmetry to call out.</strong> Open and half-open transitions are not mirror images. Going <em>closed → open</em> on threshold cleanly cuts off load. Going <em>open → half-open → closed</em> is dangerous: a single probe success returns the breaker to full traffic, which can immediately re-overload a downstream that only handled one request because it was idle. Better implementations gradually ramp traffic in half-open (allow N concurrent probes, only close after a window of successes), and they sample failure rate over a sliding <em>time</em> window rather than a fixed call count so a slow downstream cannot game the threshold by trickling successes.</p>
+<h3 id="44-sampling-and-adaptive-sampling">4.4 Sampling and adaptive sampling</h3>
+<p>When the data is statistical (metrics, traces, click events) and downstream cannot keep up, <strong>drop a fraction at the source</strong>. Two flavors:</p>
+<ul>
+<li><strong>Fixed-rate sampling.</strong> Keep 1 in N events. Simple, predictable, biased toward majority traffic.</li>
+<li><strong>Adaptive / tail-based sampling.</strong> Sample dynamically based on a signal — keep all errors, keep slow traces, downsample fast successful traces. Used in distributed tracing (OpenTelemetry, Jaeger).</li>
+<li><strong>Reservoir sampling.</strong> Keep a uniform random sample of size K from an unbounded stream when you want statistical guarantees.</li>
+</ul>
+<p>The rule is: <strong>sample at the producer, never at the consumer</strong>. Sampling at the consumer has already paid the cost of producing, serializing, and shipping the dropped data.</p>
+<h3 id="45-autoscaling-with-hysteresis">4.5 Autoscaling with hysteresis</h3>
+<p>Scale consumers based on the <em>queue</em> signal, not the consumer's own CPU. CPU lags queue depth by 30-60 seconds, which is enough to overshoot. Use two thresholds (hysteresis) to prevent flapping:</p>
+<pre><code>queue_depth &gt; scale_up_threshold for T_up seconds   -&gt; add N workers
+queue_depth &lt; scale_down_threshold for T_down sec   -&gt; remove N workers
+</code></pre>
+<p>Pick <code>T_down &gt; T_up</code> (e.g., 5 min vs 1 min) and <code>scale_down_threshold &lt;&lt; scale_up_threshold</code> (e.g., 20% vs 80% of capacity) so you scale up aggressively and scale down lazily. Scale-up and scale-down are asymmetric in real cost: scale-up has to pay container start, image pull, JIT warmup, connection-pool rebuild, and downstream cache warm — typically 30-180 seconds during which the queue is still filling. Scale-down only releases capacity, with no acute customer impact. That asymmetry is exactly why you scale up on a fast trigger and scale down on a slow one.</p>
+<p><strong>Autoscaling is not free.</strong></p>
+<ul>
+<li>It is not fast. From the moment you trip the scale-up threshold to the moment new capacity is draining, you should assume 1-3 minutes. The bounded queue and the edge load-shedder are what carry you through that window; autoscaling is the medium-term answer, not the spike answer.</li>
+<li>It does not help when the bottleneck is <em>downstream</em>. Adding more consumers to a Kafka topic doesn't help if Kafka or the database behind it is already at its ceiling — you just move where the queue lives.</li>
+<li>It costs you headroom. To absorb the scale-up delay you must run with enough slack that the bounded queue can hold (lambda - mu) × scale_up_delay items. If you size the queue too tight, you 503 customers during a routine scale event.</li>
+</ul>
+<p><strong>Bounded autoscale.</strong> Always set a maximum. An autoscaler with no ceiling will happily scale to infinity (or to your cloud bill alarm), which is a different kind of outage.</p>
+<h3 id="46-reactive-streams-credit-based-flow-control">4.6 Reactive streams / credit-based flow control</h3>
+<p>If you control both producer and consumer <strong>and the connection is long-lived and streaming</strong>, run a <strong>pull-based protocol</strong>: the consumer tells the producer "I have N credits, send me N items," and the producer never sends beyond credits. This is exactly what Transmission Control Protocol (TCP) does (window size), what gRPC streaming offers via <code>MaxConcurrentStreams</code> and HTTP/2 flow control, what RSocket implements as <code>request-N</code>, and what the Reactive Streams Java Virtual Machine (JVM) Specification Request (JSR) standardizes (Akka Streams, Project Reactor).</p>
+<pre><code>Consumer -- request(64) --&gt; Producer
+Consumer &lt;----  item ------ Producer  (1/64 credits consumed)
+Consumer &lt;----  item ------ Producer  (2/64)
+...
+Consumer -- request(32) --&gt; Producer  (top up as work completes)
+</code></pre>
+<p>Backpressure becomes a property of the protocol, not a property of any queue.</p>
+<p><strong>When credit-based actually beats acknowledgments.</strong> The specific case is <em>long-lived bidirectional streaming</em> — a single connection delivers many messages and you cannot afford a round-trip per message. Examples: a gRPC server stream pushing market data, an RSocket connection between two services, the inside of a single Kafka consumer's poll loop. For short-lived request/response, request/acknowledge already gives you backpressure for free (the producer cannot send the next request until it gets the prior response).</p>
+<p>Do not pull credit-based flow control into general designs just because throughput is high. Use it when:
+1. Both endpoints are services you control (it requires protocol cooperation).
+2. The connection is long-lived (the credit state has somewhere to live).
+3. Per-message acknowledgments would be too expensive (very small messages, very high rate, or strict latency budget).</p>
+<p>Do <strong>not</strong> use this when producers are external clients (you cannot make 50M mobile clients respect your <code>request-N</code>) or when the per-call rate is low enough that synchronous request/response is already fine.</p>
+<h3 id="47-shed-load-at-the-edge">4.7 Shed load at the edge</h3>
+<p>When everything else is saturated, <strong>return errors early and cheaply</strong>. A <code>503 Service Unavailable</code> with a <code>Retry-After: 30</code> header at the load balancer costs microseconds; letting the request flow to a queue and then time out costs seconds and a worker thread. Shed-load policies:</p>
+<ul>
+<li><strong>Static</strong>: at queue depth &gt; X, reject new requests with 503.</li>
+<li><strong>Adaptive (Concurrency Limits)</strong>: monitor request latency; if latency rises, lower the concurrency cap dynamically. Netflix's library <code>concurrency-limits</code> and Google's Site Reliability Engineering (SRE) Workbook describe this approach.</li>
+<li><strong>Priority-aware</strong>: shed best-effort traffic first; preserve transactional or paid-tier traffic.</li>
+</ul>
+<p>Always include <code>Retry-After</code> and add jitter advice in client documentation. A <code>Retry-After: 30</code> with no jitter creates a thundering herd at second 30.</p>
+<hr />
+<h2 id="5-worked-example-naive-broken-fixed">5. Worked example: naive → broken → fixed</h2>
+<p><strong>Scenario.</strong> A log ingestion service for an observability product. 50,000 production hosts run an agent that emits at average 2 events/sec each — <strong>100,000 events/sec aggregate, average</strong>. Peak is 3x (300k/sec) during deploys and incidents. Downstream is a Kafka cluster sized for <strong>60,000 messages/sec sustained</strong> to its current partition count. Each event is ~500 bytes.</p>
+<h3 id="step-1-naive-design">Step 1: naive design</h3>
+<pre><code>Agents (50k hosts) --HTTPS--&gt; Ingest API (auto-scaled Python workers)
+                                   |
+                                   v
+                         in-process asyncio.Queue
+                                   |
+                                   v
+                         Kafka producer thread
+                                   |
+                                   v
+                         Kafka topic (60k/sec ceiling)
+</code></pre>
+<p>The API accepts every POST, drops the event into an unbounded <code>asyncio.Queue</code>, returns 200. A background coroutine drains the queue to Kafka.</p>
+<h3 id="step-2-how-it-breaks">Step 2: how it breaks</h3>
+<table>
+<thead>
+<tr>
+<th>Hour</th>
+<th>What happens</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T+0</td>
+<td>Steady state. Queue depth oscillates around zero. Kafka producer drains at 100k/sec headroom (under partition limit when batched well). All fine.</td>
+</tr>
+<tr>
+<td>T+0:05</td>
+<td>A customer rolls out a deploy. Their fleet logs 5x for 10 minutes. Aggregate lambda = 200k/sec.</td>
+</tr>
+<tr>
+<td>T+0:06</td>
+<td>Kafka producer is now the bottleneck. mu = 60k/sec. Queue grows at (200k - 60k) = 140k items/sec.</td>
+</tr>
+<tr>
+<td>T+0:08</td>
+<td>Queue holds 16M events × 500 bytes = <strong>8 GB</strong> in memory. Worker container hits its memory limit. Linux Out-Of-Memory (OOM) killer reaps the process.</td>
+</tr>
+<tr>
+<td>T+0:08:01</td>
+<td>Load balancer fails over to siblings. They get <em>more</em> traffic. Their queues fill faster. They OOM in seconds.</td>
+</tr>
+<tr>
+<td>T+0:08:30</td>
+<td>Entire ingest fleet OOM-looping. Agents see 503/connection-refused, start <strong>retrying with no backoff</strong>. Effective lambda is now 3x what it was.</td>
+</tr>
+<tr>
+<td>T+0:15</td>
+<td>Even after the customer's deploy ends, the system cannot recover: replayed agent buffers + active retries exceed any reasonable mu. <strong>Metastable failure.</strong> Pager fires. On-call drops half the agents at the firewall to recover.</td>
+</tr>
+</tbody>
+</table>
+<p>What went wrong:</p>
+<ol>
+<li>Unbounded <code>asyncio.Queue</code> made memory the buffer. Memory ran out before backpressure was applied.</li>
+<li>API returned 200 before Kafka acked, so producers had no signal to slow down.</li>
+<li>No retry backoff on the client side, so failure amplified <code>lambda</code>.</li>
+<li>Autoscaling on CPU did not help because the bottleneck was downstream throughput, not local compute.</li>
+</ol>
+<h3 id="step-3-fixed-design">Step 3: fixed design</h3>
+<pre><code>                                    ┌─── token bucket (per-tenant) ────┐
+                                    │  burst=10k, refill=tenant_quota  │
+Agents ── exp. backoff + jitter ─── HTTPS ── Ingest API ──┐
+                                                          ▼
+                                          Bounded queue (cap = 60k items)
+                                          policy: tail_drop
+                                          (returns 503 Retry-After)
+                                                          │
+                                                          ▼
+                                          Kafka producer
+                                          - batched (linger=20ms)
+                                          - circuit breaker on Kafka
+                                          - bulkhead: max 16 in-flight
+                                                          │
+                                                          ▼
+                                          Kafka (60k/sec sustained)
+                                                          │
+                                                          ▼
+                                          TSDB writer (independent consumer,
+                                          autoscale on Kafka consumer lag,
+                                          hysteresis: scale-up 1m, scale-down 5m)
+</code></pre>
+<p>Specific decisions:</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Decision</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Agent</td>
+<td>Exponential backoff with jitter on 5xx; local on-disk buffer up to 30 min.</td>
+<td>Prevents retry storm; tolerates short ingest outages without data loss.</td>
+</tr>
+<tr>
+<td>Agent</td>
+<td>Local sampling: emit 100% of WARN/ERROR, 10% of INFO when local buffer &gt; 50% full.</td>
+<td>Sheds load at the source; preserves the high-signal events.</td>
+</tr>
+<tr>
+<td>API</td>
+<td>Per-tenant token bucket sized to contractual quota.</td>
+<td>Fairness: one customer's deploy spike does not drown others.</td>
+</tr>
+<tr>
+<td>API</td>
+<td>Bounded in-process queue, capacity = 60k items (~1 second at sustained Kafka rate), tail-drop returns <code>503 Retry-After: jittered(5..30)</code>.</td>
+<td>Forces backpressure to surface to the client in &lt;1s; no memory blowup.</td>
+</tr>
+<tr>
+<td>API → Kafka</td>
+<td>Batched producer with <code>linger.ms=20</code>, <code>batch.size=64KB</code>, compression=zstd.</td>
+<td>Raises sustained Kafka throughput by 3-5x at marginal latency cost.</td>
+</tr>
+<tr>
+<td>API → Kafka</td>
+<td>Circuit breaker: open after 50% failure rate over 20 calls; 30s cooldown.</td>
+<td>If Kafka degrades, fail fast and return 503 instead of piling on.</td>
+</tr>
+<tr>
+<td>Consumer (TSDB writer)</td>
+<td>Autoscale on Kafka <strong>consumer lag</strong>, not CPU. Threshold: scale up at lag &gt; 60s, scale down when lag &lt; 5s for 5 minutes.</td>
+<td>Lag is the true backpressure signal; CPU lags by minutes.</td>
+</tr>
+<tr>
+<td>Consumer</td>
+<td>Dead-letter topic (DLT) for messages that fail to decode or write 5 times.</td>
+<td>A single malformed event cannot stall the topic.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Verification by Little's Law.</strong> Bounded queue capacity 60k items, drain rate 60k/sec → in steady-state the average item waits at most <code>L / mu = 60k / 60k = 1 second</code>. Once arrival exceeds drain, the queue fills in <code>60k / (lambda - mu)</code> seconds — at the deploy spike (<code>lambda = 200k</code>) that is about <code>60k / 140k ≈ 0.4 sec</code> before the API starts returning 503s. That is the design intent: a sub-second window for normal jitter, then explicit shedding. Memory bound = 60k × 500 bytes = 30 MB, two orders of magnitude under the container limit.</p>
+<p><strong>The fix shape is honest about its costs.</strong> The per-tenant token bucket means a customer whose deploy generates a real burst of WARN logs <em>will</em> lose data — they get 503s, the agent buffers locally, and if the spike outlasts the local buffer they lose the tail. Sampling at the agent (10% of INFO when buffer is filling) is the same trade: the rate problem is solved by <em>throwing away data</em>. There is no version of this fix where every event survives a sustained <code>5x</code> overload; the design choice is <em>who</em> takes the loss (the noisy tenant, by their own quota) and <em>which</em> events are lost (INFO before WARN/ERROR). Autoscaling on consumer lag helps recovery time but cannot prevent the immediate drop window — Kafka consumer scale-up still takes 1-3 minutes and the topic partition ceiling is fixed in the short term.</p>
+<p><strong>Behavior under the same incident.</strong> The customer's 5x spike now hits the per-tenant token bucket and gets shaped to their contracted rate. The portion that exceeds the bucket gets 503'd with <code>Retry-After</code>, the agent buffers it locally, and ingest stays healthy for every other tenant. No OOM, no retry storm, no metastable collapse. The customer loses some events only if the spike outlasts their local agent buffer — which is the right person to take that loss.</p>
+<hr />
+<h2 id="6-variants-and-how-to-choose">6. Variants and how to choose</h2>
+<p>Backpressure is not one technique; it is a family of decisions. The first decision is always: <strong>is the data droppable?</strong></p>
+<table>
+<thead>
+<tr>
+<th>Data type</th>
+<th>Droppable?</th>
+<th>Primary technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Metrics / telemetry / clicks (statistical)</td>
+<td>Yes</td>
+<td>Sampling + drop-oldest</td>
+</tr>
+<tr>
+<td>User-generated content (uploads, posts)</td>
+<td>No</td>
+<td>Durable queue + shed-load at edge</td>
+</tr>
+<tr>
+<td>Financial events (payments, orders)</td>
+<td>No</td>
+<td>Durable queue + at-least-once with idempotency</td>
+</tr>
+<tr>
+<td>Real-time signals (live chat, sports score)</td>
+<td>Yes (newest wins)</td>
+<td>Drop-oldest + small bounded queue</td>
+</tr>
+<tr>
+<td>Notifications</td>
+<td>Partial (per priority)</td>
+<td>Priority queue + per-channel rate limit</td>
+</tr>
+</tbody>
+</table>
+<p>Decision table for the second-order choice:</p>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Best tool</th>
+<th>Second choice</th>
+<th>Avoid</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Producer you control, consumer you control</td>
+<td>Reactive streams (request-N)</td>
+<td>Bounded queue + drop-oldest</td>
+<td>Unbounded queue</td>
+</tr>
+<tr>
+<td>Producer external (mobile/IoT), data droppable</td>
+<td>Token bucket + tail-drop + 503</td>
+<td>Priority drop by class at the edge LB</td>
+<td>Backpressure into the device (you cannot)</td>
+</tr>
+<tr>
+<td>Producer external, data NOT droppable</td>
+<td>Durable broker (Kafka/SQS) + agent-side buffer + idempotent consumer</td>
+<td>Synchronous shed-load with 503 (client must retry)</td>
+<td>In-memory unbounded queue</td>
+</tr>
+<tr>
+<td>Spiky but bounded burst, sustained rate OK</td>
+<td>Token bucket sized to peak burst</td>
+<td>Bounded queue capacity = burst budget</td>
+<td>Pure leaky bucket (clips legitimate bursts)</td>
+</tr>
+<tr>
+<td>Sustained overload, can scale horizontally</td>
+<td>Autoscale consumers on lag</td>
+<td>Add Kafka partitions</td>
+<td>Throwing money at producer-side bucket</td>
+</tr>
+<tr>
+<td>Sustained overload, cannot scale (e.g., GPU-bound)</td>
+<td>Priority queue + shed best-effort</td>
+<td>Sampling</td>
+<td>Pretending it will be temporary</td>
+</tr>
+<tr>
+<td>Downstream is flaky / variable</td>
+<td>Circuit breaker + bulkhead</td>
+<td>Hedged requests with cancellation</td>
+<td>Unbounded retry</td>
+</tr>
+<tr>
+<td>Multi-tenant fairness required</td>
+<td>Per-tenant token bucket + per-tenant queue</td>
+<td>Priority-aware drop with tenant-class weights</td>
+<td>Single global queue</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The most common interview mistake</strong> is to reach for "just add Kafka." Kafka is a durable buffer, not a backpressure solution by itself. Kafka with no producer rate limit and no consumer autoscale still has a metastable failure mode: the topic gets so far behind that even after the spike ends, consumers cannot catch up before retention expires and data is lost.</p>
+<hr />
+<h2 id="7-failure-modes-and-operations">7. Failure modes and operations</h2>
+<p>The right metric to alert on is <strong>always the queue depth or consumer lag</strong>, never the consumer's own latency. Latency at the consumer hides overload until the moment the queue tips.</p>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Leading signal (metric)</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Queue depth runaway</td>
+<td><code>queue.size</code> &gt; 70% of capacity for &gt; 30s</td>
+<td>Autoscale up; if at max scale, start shedding load.</td>
+</tr>
+<tr>
+<td>Consumer lag growing</td>
+<td><code>kafka.consumer.lag</code> derivative &gt; 0 sustained</td>
+<td>Same as above. Lag derivative is the early signal.</td>
+</tr>
+<tr>
+<td>OOM on producer / API</td>
+<td>Container memory &gt; 80%; sudden RSS jumps</td>
+<td>Lower queue capacity, enforce tail-drop, scale horizontally.</td>
+</tr>
+<tr>
+<td>OOM on consumer</td>
+<td>Container memory &gt; 80% mid-batch</td>
+<td>Reduce batch size; enable prefetch backpressure (e.g., <code>max.poll.records</code> in Kafka).</td>
+</tr>
+<tr>
+<td>Retry storm</td>
+<td>Client retry rate &gt; baseline × 3</td>
+<td>Mandatory exponential backoff + jitter; return <code>Retry-After</code>; rate limit at edge.</td>
+</tr>
+<tr>
+<td>Metastable overload (cannot recover after cause clears)</td>
+<td>System remains overloaded with no traffic spike upstream</td>
+<td>Manual load shed at edge (firewall drop or LB drain). Add load-shedding by default in next iteration.</td>
+</tr>
+<tr>
+<td>Autoscale flapping</td>
+<td>Scale events per hour &gt; 4; container starts &gt; 4/hour</td>
+<td>Widen hysteresis gap; lengthen scale-down dwell time.</td>
+</tr>
+<tr>
+<td>Poison message</td>
+<td>Same offset retried &gt; N times; consumer crash loop</td>
+<td>Dead-letter queue; bound retry count per message.</td>
+</tr>
+<tr>
+<td>Hot partition / hot key</td>
+<td>Single partition lag while others are healthy</td>
+<td>Repartition by hashing on a different field; or split the hot key (see <a href="./hot-key-skew.md">hot-key-skew</a>).</td>
+</tr>
+<tr>
+<td>Slow downstream cascading</td>
+<td>p99 latency rising on dependent service</td>
+<td>Circuit breaker open; bulkhead caps; degrade gracefully.</td>
+</tr>
+<tr>
+<td>Client buffer overflow</td>
+<td>Agent buffer occupancy on the device</td>
+<td>Surface to client as warning; ensure server <code>Retry-After</code> is honest.</td>
+</tr>
+<tr>
+<td>Permanent under-capacity</td>
+<td>Queue depth never drains below 50% even at 4 a.m.</td>
+<td>Not a backpressure problem — capacity-plan, add partitions / shards / consumers.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Operational rituals.</strong></p>
+<ul>
+<li><strong>Run a load test that exceeds capacity.</strong> If your system has never been pushed past <code>mu</code>, you do not know its failure mode. Most production overloads are first observed during the on-call's first incident, which is too late.</li>
+<li><strong>Game-day the metastable case.</strong> Set traffic to 1.5x capacity, hold it there, then drop to 0.5x. The system must recover within minutes. If it stays overloaded after the spike ends, it has a metastable failure mode.</li>
+<li><strong>Alert on derivatives, not levels.</strong> "Queue depth is 1M" might be normal; "queue depth grew by 1M in 5 minutes" is always a problem.</li>
+<li><strong>Document the drop policy.</strong> Customers and on-call must know which events get dropped and which are guaranteed.</li>
+</ul>
+<hr />
+<h2 id="8-combinations-with-other-patterns">8. Combinations with other patterns</h2>
+<p>Backpressure rarely stands alone. It is the <em>substrate</em> that other patterns rely on.</p>
+<ul>
+<li><strong><a href="./hot-key-skew.md">Hot-key skew</a>.</strong> A single hot key creates per-partition backpressure even when global throughput is fine. The fix (split the key, add randomness to the routing) is upstream of any backpressure policy.</li>
+<li><strong><a href="./fan-out-write-amplification.md">Fan-out write amplification</a>.</strong> Fan-out multiplies producer rate. A 1k posts/sec API can become a 100M writes/sec fan-out. The backpressure unit is the fan-out worker, and you almost always need per-recipient rate limits in addition to the global one.</li>
+<li><strong><a href="./idempotency-exactly-once.md">Idempotency / exactly-once</a>.</strong> Backpressure implies retries; retries imply duplicates; duplicates imply you need idempotency keys. Designing one without the other is incomplete.</li>
+<li><strong><a href="./cache-stampede-read-amplification.md">Cache stampede / read amplification</a>.</strong> A cache miss storm is a read-side analog of backpressure. The toolkit (request coalescing, probabilistic early refresh, jittered Time To Live (TTL)) shares the same spirit: bound the work in flight.</li>
+<li><strong><a href="./real-time-aggregation.md">Real-time aggregation</a>.</strong> Aggregators have window-flush costs that dominate; backpressure into them means bounded windows and graceful overlap.</li>
+<li><strong><a href="./durability-at-scale.md">Durability at scale</a>.</strong> "Cannot drop" data forces you to a durable broker; the broker becomes the backpressure boundary. Sizing the broker (retention, partitions) is part of the backpressure design.</li>
+<li><strong><a href="./coordination-exactly-one-execution.md">Coordination / exactly-one execution</a>.</strong> Backpressure on a leader-coordinated workload also bounds how much work a single coordinator can issue; combine with leases.</li>
+<li><strong><a href="./strong-consistency-under-contention.md">Strong consistency under contention</a>.</strong> A consistency protocol (Paxos, two-phase commit) has a fixed <code>mu</code>; backpressure protects it from being driven into a degraded mode where it cannot make progress.</li>
+</ul>
+<hr />
+<h2 id="9-likely-interviewer-probes">9. Likely interviewer probes</h2>
+<p>Expect the interviewer to push on at least two of these:</p>
+<ol>
+<li><strong>"What happens if the queue is full?"</strong> — They want to hear "tail-drop with a 503 to the client, with <code>Retry-After</code>, <em>and</em> the client backs off exponentially with jitter so we do not get a retry storm." A weaker answer is "we just block." Blocking is fine for in-process flow control (a Python <code>BoundedSemaphore</code>) but death for a network API.</li>
+<li><strong>"How do you size the queue?"</strong> — Little's Law. Capacity = <code>lambda_peak * W_acceptable</code> (in items). Then memory = capacity × item size. Show the math.</li>
+<li><strong>"What if the consumer slows down further during incident?"</strong> — Backpressure must propagate. The bounded queue fills, producers get 503, clients back off — the whole pipeline adapts. Mention the metastable failure mode explicitly: a system that does not propagate backpressure cleanly will fail to recover after the cause clears.</li>
+<li><strong>"How is this different from rate limiting?"</strong> — Rate limiting caps <code>lambda</code> at the producer. Backpressure is the broader discipline that includes rate limiting <em>and</em> bounded queues, drop policies, circuit breakers, and autoscaling. Rate limiting alone does not protect you from a slow downstream; backpressure does.</li>
+<li><strong>"How do you decide drop-oldest vs tail-drop?"</strong> — Drop-oldest when newest is most valuable (live data, telemetry). Tail-drop when each item is equally valuable and the producer is the one that can react (API requests where the client retries).</li>
+<li><strong>"How do you handle a poison message?"</strong> — Bounded retry count per message, then dead-letter queue. Without this, a single corrupt event stalls the entire topic.</li>
+<li><strong>"Why not just autoscale infinitely?"</strong> — Cost ceiling (cloud bill), downstream constraints (database connection limits, third-party API rate limits), startup time (autoscale is 1-3 minutes; the incident is 30 seconds). Autoscaling complements, but does not replace, fast-acting backpressure.</li>
+<li><strong>"What metric do you alert on?"</strong> — Queue depth growth rate, consumer lag derivative, drop rate, circuit-breaker-open count. Not consumer p99 latency alone.</li>
+<li><strong>"How do you test this in pre-production?"</strong> — Synthetic load test at 1.5x and 2x capacity; chaos engineering (kill consumers, throttle downstream); a game-day drill that asserts recovery from sustained overload.</li>
+</ol>
+<hr />
+<h2 id="10-common-traps-stronger-moves">10. Common traps → stronger moves</h2>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"Just add a queue between them."</td>
+<td>Specify the queue's capacity, drop policy, ownership, and back-out path. An unbounded queue is a memory leak.</td>
+</tr>
+<tr>
+<td>Retry on every failure.</td>
+<td>Exponential backoff + jitter + bounded retry count, gated by a circuit breaker that opens when downstream is unhealthy.</td>
+</tr>
+<tr>
+<td>Autoscale on Central Processing Unit (CPU).</td>
+<td>Autoscale on queue depth / consumer lag. CPU is a lagging indicator; lag is the leading one.</td>
+</tr>
+<tr>
+<td>Block the producer thread when downstream is slow.</td>
+<td>Bounded queue + non-blocking offer + 503 to the client. Blocking gives you head-of-line blocking and exhausts thread pools.</td>
+</tr>
+<tr>
+<td>Apply rate limits only globally.</td>
+<td>Per-tenant or per-key rate limits prevent a single noisy customer from drowning everyone.</td>
+</tr>
+<tr>
+<td>"Kafka will absorb the spike."</td>
+<td>Kafka is durable but partitioned — a hot partition rate-limits you well below cluster capacity. Also, consumer lag must catch up before retention expires.</td>
+</tr>
+<tr>
+<td>Drop randomly.</td>
+<td>Drop with intent: oldest for live data, lowest priority for mixed criticality, by sampling key for telemetry.</td>
+</tr>
+<tr>
+<td>Same <code>Retry-After</code> for all clients.</td>
+<td>Add jitter; otherwise the client herd retries together.</td>
+</tr>
+<tr>
+<td>Treat backpressure as a one-time design.</td>
+<td>Make it a continuous practice: load test, game day, alert on derivatives, document the drop policy.</td>
+</tr>
+<tr>
+<td>Hide overload behind successful 200s.</td>
+<td>Return errors honestly when shedding load. A 200 with no work done is a correctness bug.</td>
+</tr>
+<tr>
+<td>Set autoscaler max = infinity.</td>
+<td>Always cap. Cost is also a failure mode.</td>
+</tr>
+<tr>
+<td>Only protect the happy path.</td>
+<td>Protect every external dependency with circuit breaker + bulkhead, not just the one that has had an incident recently.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11-staff-level-answer-checklist">11. Staff-level answer checklist</h2>
+<p>When backpressure is the deep dive, your answer should hit all of these:</p>
+<ul>
+<li>[ ] Name the invariant: "no unbounded queues, no positive feedback loops from retries."</li>
+<li>[ ] State <code>lambda</code>, <code>mu</code>, and target <code>W</code> (latency) for the system; use Little's Law to size the queue.</li>
+<li>[ ] Pick a drop policy and <strong>defend it</strong> (which data, why this policy, what the user loses).</li>
+<li>[ ] Place a token bucket or equivalent at the producer edge; explain per-tenant fairness if multi-tenant.</li>
+<li>[ ] Choose between durable broker (Kafka/SQS) and in-process queue based on droppability.</li>
+<li>[ ] Specify circuit breaker + bulkhead on every external dependency.</li>
+<li>[ ] Autoscale on the right signal (queue depth / consumer lag) with hysteresis to prevent flapping.</li>
+<li>[ ] Shed load at the edge with <code>503 Retry-After</code> and <strong>jitter</strong> in client backoff.</li>
+<li>[ ] Handle poison messages with bounded retry and dead-letter queue.</li>
+<li>[ ] Name the metastable failure mode and the test that proves you do not have it.</li>
+<li>[ ] Cross-link to idempotency: retries imply duplicates imply idempotency keys.</li>
+<li>[ ] Define the alert: derivative of queue depth, not absolute level.</li>
+<li>[ ] Mention multi-tenant fairness if the prompt has more than one customer class.</li>
+<li>[ ] Say what you would <em>not</em> do (e.g., "I am not going to recommend a leaky bucket here because legitimate bursts must pass through").</li>
+</ul>
+<hr />
+<h2 id="12-cross-references">12. Cross-references</h2>
+<p><strong>Sibling patterns.</strong></p>
+<ul>
+<li><a href="./fan-out-write-amplification.md">Fan-out write amplification</a> — the rate-multiplication problem on the write side, often the source of the backpressure you must absorb.</li>
+<li><a href="./hot-key-skew.md">Hot-key skew</a> — per-partition backpressure when global throughput is fine.</li>
+<li><a href="./strong-consistency-under-contention.md">Strong consistency under contention</a> — consistency protocols whose fixed <code>mu</code> must be protected with backpressure.</li>
+<li><a href="./idempotency-exactly-once.md">Idempotency / exactly-once</a> — required complement: backpressure means retries means deduplication.</li>
+<li><a href="./cache-stampede-read-amplification.md">Cache stampede / read amplification</a> — the read-side analog.</li>
+<li><a href="./real-time-aggregation.md">Real-time aggregation</a> — backpressure for window-based aggregators.</li>
+<li><a href="./ordering-causal-consistency.md">Ordering / causal consistency</a> — preserving order while dropping events is subtle.</li>
+<li><a href="./durability-at-scale.md">Durability at scale</a> — when "cannot drop" forces a durable broker boundary.</li>
+<li><a href="./coordination-exactly-one-execution.md">Coordination / exactly-one execution</a> — leader-coordinated work also needs bounded queues.</li>
+<li><a href="./search-and-ranking.md">Search and ranking</a> — indexing pipelines are textbook backpressure systems.</li>
+<li><a href="./geo-spatial-queries.md">Geo-spatial queries</a> — bursty location updates from mobile clients.</li>
+</ul>
+<p><strong>Question docs where backpressure is central.</strong></p>
+<ul>
+<li><a href="../questions/apache-kafka.md">Apache Kafka</a> — the canonical durable broker; the contract between producer and consumer is the backpressure interface.</li>
+<li><a href="../questions/design-an-api-rate-limiter.md">API Rate Limiter</a> — token bucket, leaky bucket, sliding window in depth.</li>
+<li><a href="../questions/design-a-metrics-and-monitoring-system-like-datadog.md">Metrics and Monitoring (Datadog)</a> — log/metric ingestion; the worked example in section 5 generalizes this.</li>
+<li><a href="../questions/design-an-ad-click-aggregator.md">Ad Click Aggregator</a> — bursty input + window-flush downstream.</li>
+<li><a href="../questions/design-a-web-crawler.md">Web Crawler</a> — frontier rate vs parser throughput; politeness as a rate limit.</li>
+<li><a href="../questions/design-a-notification-system.md">Notification System</a> — fan-out amplification; per-channel external rate limits (APNs, FCM).</li>
+<li><a href="../questions/design-youtube.md">YouTube</a> — upload vs encode pipeline; the durable-broker pattern.</li>
+<li><a href="../questions/design-a-live-comment-streaming-service-like-twitch-chat.md">Live Comment Streaming (Twitch Chat)</a> — bursty input, drop-oldest semantics for live data.</li>
+<li><a href="../questions/design-a-flash-sale-for-an-e-commerce-site.md">Flash Sale</a> — extreme producer spike; shed-load at the edge is mandatory.</li>
+</ul>
+<p><strong>Glossary.</strong> <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for terms like quorum, replica, vector clock that come up alongside backpressure in the broader designs.</p>
+<p><strong>Playbook.</strong> <a href="../STAFF_SYSTEM_DESIGN_INTERVIEW_PLAYBOOK.md">Staff System Design Interview Playbook</a> for the overall 45-minute structure into which this pattern slots as one deep dive.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

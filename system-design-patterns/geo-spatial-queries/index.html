@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Geo / Spatial Queries — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design-patterns/">← Back to System Design Patterns</a>
+        <h1 class="article-title">Geo / Spatial Queries</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/31 &nbsp;·&nbsp; System Design Patterns
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>Answer "what's near me" — or "who is in this region" — over a population whose 2D coordinates may be moving, at write rates and read latencies that a relational <code>WHERE lat BETWEEN ... AND lng BETWEEN ...</code> cannot satisfy. See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for shared terms.</p>
+</blockquote>
+<p>Related question docs:</p>
+<ul>
+<li><a href="../questions/design-uber-or-lyft.md">Design Uber or Lyft</a> — driver dispatch is the canonical sub-100ms nearest-neighbor problem.</li>
+<li><a href="../questions/design-the-uber-backend.md">Design the Uber Backend</a> — multi-resolution grids feed both dispatch and surge.</li>
+<li><a href="../questions/design-uber-eats.md">Design Uber Eats</a> — geo dispatch composed with prep-time prediction and batching.</li>
+<li><a href="../questions/design-yelp-or-nearby-friends.md">Design Yelp or Nearby Friends</a> — geo + category + rank, and ephemeral location sharing.</li>
+<li><a href="../questions/design-airbnb.md">Design Airbnb</a> — geo filter combined with availability calendar.</li>
+<li><a href="../questions/design-instagram.md">Design Instagram</a> — coarser "places nearby" for photo tagging.</li>
+</ul>
+<hr />
+<h2 id="1-the-fundamental-hardness">1. The fundamental hardness</h2>
+<p>Latitude/longitude is a pair of floats, and the problem is that <strong>a single hash key cannot preserve 2D locality.</strong> You can absolutely shard a geo system by city, country, or pre-assigned region — and for many products that is the right answer. What you cannot do is hash on raw <code>(lat, lng)</code> and still answer "nearby" queries efficiently: a hash scatters geographically adjacent points across every node in the cluster, so a 500 m disc query becomes a fan-out to all of them. A B-tree on either column alone leaves you with a 1D range scan that still has to filter on the other dimension. A composite B-tree on <code>(lat, lng)</code> only helps if the leading column is sufficiently selective — which it isn't, because every "nearby" query spans a tiny <code>Δlat</code> and a tiny <code>Δlng</code> simultaneously. The interesting bit isn't "lat/lng can't be a partition key"; it's that <strong>range queries cross partition boundaries unpredictably</strong>, so the shard scheme has to be aware of geographic adjacency rather than just hash distribution.</p>
+<p>Worth saying out loud: for moderate scale — one city, sub-million entities, tens to low hundreds of QPS — a PostGIS <code>GEOMETRY</code> column with a GiST index handles bounding-box and radius queries in 5-20 ms p50, and that is genuinely a fine answer. The exotic toolkit below earns its complexity when you cross into multi-metro scale, high write rates from moving entities, or strict tail latency (sub-50 ms p99). The staff-level move is to name when you've crossed that line, not to reach for H3 because the prompt mentioned a map.</p>
+<p>The second source of hardness is that the canonical query is <strong>a circular range over a sphere</strong>, not a rectangle on a plane. "Drivers within 1 km of me" is a great-circle disc; even at city scale, treating the Earth as flat introduces measurable error near the poles, and at all latitudes longitude degrees compress as you move away from the equator. Bounding-box pruning is a useful first cut, but the second cut — Haversine distance filtering — is non-trivial CPU work per row, and it has to happen at query time because pre-computing pairwise distances is O(n^2).</p>
+<p>The third source of hardness is the <strong>write/read rate asymmetry</strong>, but with a twist. In many systems writes dominate (location pings every 4 s from 1M active drivers ≈ 250k updates/sec). In Yelp-style search, reads dominate (10k QPS, businesses change weekly). In Tinder/Find-My-Friends, both rates are high but the <em>useful precision</em> of each location update is low (you don't care if someone moved 3 m). So unlike a typical OLTP index, you usually want a structure that is <strong>cheap to update in-place</strong>, <strong>cheap to query approximately</strong>, and <strong>happy to lose precision</strong> in exchange for both.</p>
+<p>Finally, the data has natural <strong>hot spots that mirror real geography</strong>: Manhattan at 6pm has 100x the drivers and 1000x the requests of a suburban cell of the same area. A naive uniform grid produces severe hot-cell load on a tiny number of partitions. The pattern interacts directly with <a href="./hot-key-skew.md">hot-key-skew.md</a>, and any production answer must address it.</p>
+<hr />
+<h2 id="2-how-to-recognize-it-in-the-interview">2. How to recognize it in the interview</h2>
+<p>Prompt phrases that signal this pattern:</p>
+<ul>
+<li>"Find the nearest X to a user." "Drivers within R of pickup." "Show me businesses near me."</li>
+<li>"Live location of friends / drivers / scooters / vehicles."</li>
+<li>"Geofencing": fire an event when a moving entity enters/leaves a polygon.</li>
+<li>"Surge pricing by region." "Heatmap of demand."</li>
+<li>"Photo tagged at this location." "Check-in." "Stories from your area."</li>
+<li>"Find available listings in this map viewport."</li>
+</ul>
+<p>Architectural smells that point here:</p>
+<ul>
+<li>The product has a map UI that pans/zooms, and the backend must answer viewport queries.</li>
+<li>The dataset is a mix of static (restaurants, listings) and moving (drivers, users) entities.</li>
+<li>Updates are frequent and idempotent (last writer wins on <code>(entity_id → location)</code>).</li>
+<li>Latency budget is tens to low hundreds of milliseconds for a query that touches a small geographic disc, but the index globally holds tens to hundreds of millions of points.</li>
+<li>The interviewer says "city" or "metro" — a strong hint that the city is the natural shard.</li>
+</ul>
+<p>Example interview prompts where this is core:</p>
+<ol>
+<li><strong>Uber dispatch:</strong> 10M drivers, find nearest driver to pickup with p99 &lt; 100 ms; assign atomically. See <a href="../questions/design-uber-or-lyft.md">design-uber-or-lyft.md</a>.</li>
+<li><strong>Yelp / restaurant search:</strong> geo filter + category + open-now + rank. See <a href="../questions/design-yelp-or-nearby-friends.md">design-yelp-or-nearby-friends.md</a>.</li>
+<li><strong>Find My Friends / Tinder swipe deck:</strong> k-nearest-other-users with privacy and freshness constraints. See <a href="../questions/design-yelp-or-nearby-friends.md">design-yelp-or-nearby-friends.md</a> (Nearby Friends plane).</li>
+<li><strong>Geofencing for couriers:</strong> detect when a courier enters a restaurant polygon to start the pickup timer.</li>
+<li><strong>Ride-share surge zones:</strong> stream-aggregate demand and supply by cell at coarse resolution; publish multipliers. See <a href="../questions/design-the-uber-backend.md">design-the-uber-backend.md</a>.</li>
+<li><strong>Airbnb map viewport search:</strong> "show me all listings in this map area, available for these dates." See <a href="../questions/design-airbnb.md">design-airbnb.md</a>.</li>
+<li><strong>Uber Eats restaurant discovery:</strong> filter merchants by delivery radius AND prep-aware ETA. See <a href="../questions/design-uber-eats.md">design-uber-eats.md</a>.</li>
+</ol>
+<hr />
+<h2 id="3-60-second-spoken-framing">3. 60-second spoken framing</h2>
+<blockquote>
+<p>"First, sanity-check the scale. For a single-city Yelp at 10k QPS over static businesses, PostGIS with a GiST index is fine and I'd say so. The interesting design starts at multi-metro scale with moving entities — Uber dispatch is the canonical case. There, raw <code>(lat, lng)</code> is the wrong shard key because a 'nearby' query straddles boundaries, so I assign each point to a discrete cell — H3, S2, or geohash — and shard the index by a coarse parent cell. A 'nearby' query becomes: compute the small set of cells covering the query disc, fan out to each cell's partition, union the candidates, then Haversine-filter and rank. For moving entities I keep the index in memory and update it only on cell-change pings; for static entities the cells live in a Postgres or KV with a (cell, category) secondary index. I'd run two resolutions — fine for nearest-neighbor, coarse for surge and aggregates — and shard by city to keep hot regions independently scalable. The interesting tradeoffs are cell shape (hexagons give equidistant neighbors, which matters for kNN), update path (every-ping vs cell-change-only), and how to absorb hot cells like downtown."</p>
+</blockquote>
+<hr />
+<h2 id="4-canonical-toolkit">4. Canonical toolkit</h2>
+<p>The seven techniques every staff-level answer should reach for:</p>
+<ol>
+<li><strong>Geohash:</strong> Z-order interleaving of lat/lng bits into a base-32 string. Prefix length controls resolution. Neighbors <em>usually</em> share a prefix, but the Z-curve has discontinuities — geographically adjacent points across some boundaries can have completely different prefixes (e.g., <code>7zzz...</code> and <code>s000...</code> at the prime meridian). The standard mitigation is to query the 9-cell neighborhood rather than relying on prefix-only.</li>
+<li><strong>S2 cells (Google):</strong> Project the sphere onto an inscribed cube, then recursively subdivide each face with a Hilbert curve into 30 levels of cells. Mostly-quadrilateral cells; the Hilbert curve gives better locality than Z-order. Excellent for global polygon coverage (the <code>S2RegionCoverer</code> returns a near-minimal cell set for an arbitrary region). Seams at face boundaries are the edge case.</li>
+<li><strong>H3 (Uber):</strong> Hexagonal hierarchical grid in 16 resolutions. Each hex has 6 neighbors at <em>roughly</em> equal distance — useful when the downstream query is kNN, because rectangular geohash cells make the diagonal neighbor ~1.41× farther than the edge neighbor, which biases nearest-neighbor scoring before Haversine reranks. (Both indexes find the same nearest point after a k-ring scan + Haversine filter; H3's win is that smaller k-rings are needed for the same coverage.) Tradeoff: hexagons don't tile the sphere perfectly, so H3 includes 12 pentagon cells globally where the icosahedron seams force a 5-neighbor cell — code must handle that.</li>
+<li><strong>R-tree / quadtree:</strong> Recursive subdivision of bounding rectangles. Great for static datasets with arbitrary polygon overlap queries. PostGIS, MySQL spatial, MongoDB 2dsphere. Adaptive depth handles skewed density without manual tuning; the downside is per-update cost on moving points (tree rebalancing) and that the depth varies by region, making latency less predictable than a flat grid.</li>
+<li><strong>Redis GEO commands:</strong> Sorted-set of geohash-encoded scores. <code>GEOADD</code>, <code>GEORADIUS</code>, <code>GEOSEARCH</code>. p50 ~1-5 ms per query on a single node; conceptually simple. Operationally tricky at scale because a single Redis key is a single shard, so per-city or per-region partitioning has to be done by the application.</li>
+<li><strong>Multi-resolution grids:</strong> Maintain the same data indexed at two or three resolutions simultaneously — fine for nearest-neighbor, coarse for heatmap/surge, coarsest for global aggregation. Not free: every cell-change update writes to multiple indexes, and you need a reconciliation story when one resolution lags behind another (see <a href="./fan-out-write-amplification.md">fan-out-write-amplification.md</a>).</li>
+<li><strong>kNN with bounded radius expansion:</strong> Start with a small disc, expand outward in rings until you have k candidates or hit the SLA budget. Bounded by an outer cap to avoid pathological "no driver within 50 km" scans. This is structurally different from a fixed-radius range query — call out which one the prompt is actually asking for.</li>
+</ol>
+<h3 id="geohash-how-the-encoding-actually-works">Geohash: how the encoding actually works</h3>
+<p>A geohash interleaves lat and lng bits. With 5-bit groups encoded as base-32 characters:</p>
+<pre><code>lat = 37.7749, lng = -122.4194
+binary lat (in [-90, 90]):   1 0 1 1 1 0 0 0 1 0 ...
+binary lng (in [-180, 180]): 0 1 1 1 1 1 0 0 1 1 ...
+interleave (lng first):      0 1 1 0 1 1 1 1 1 0 0 0 1 0 1 1 ...
+group into 5-bit chunks      -&gt;  9q8yyk8ytp...
+                                  ^ each char = ~25% of remaining box
+</code></pre>
+<p>Approximate cell sizes:</p>
+<table>
+<thead>
+<tr>
+<th>Geohash length</th>
+<th>Cell width × height (mid-latitude)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4</td>
+<td>~40 km × 20 km</td>
+</tr>
+<tr>
+<td>5</td>
+<td>~5 km × 5 km</td>
+</tr>
+<tr>
+<td>6</td>
+<td>~1.2 km × 0.6 km</td>
+</tr>
+<tr>
+<td>7</td>
+<td>~150 m × 150 m</td>
+</tr>
+<tr>
+<td>8</td>
+<td>~40 m × 20 m</td>
+</tr>
+<tr>
+<td>9</td>
+<td>~5 m × 5 m</td>
+</tr>
+</tbody>
+</table>
+<p>Python sketch (illustrative; production code should use a library):</p>
+<pre><code class="language-python">BASE32 = &quot;0123456789bcdefghjkmnpqrstuvwxyz&quot;
+
+def encode_geohash(lat: float, lng: float, precision: int = 7) -&gt; str:
+    lat_range = [-90.0, 90.0]
+    lng_range = [-180.0, 180.0]
+    bits: list[int] = []
+    use_lng = True  # interleave: lng first
+    while len(bits) &lt; precision * 5:
+        if use_lng:
+            mid = (lng_range[0] + lng_range[1]) / 2
+            if lng &gt;= mid:
+                bits.append(1); lng_range[0] = mid
+            else:
+                bits.append(0); lng_range[1] = mid
+        else:
+            mid = (lat_range[0] + lat_range[1]) / 2
+            if lat &gt;= mid:
+                bits.append(1); lat_range[0] = mid
+            else:
+                bits.append(0); lat_range[1] = mid
+        use_lng = not use_lng
+    # group 5 bits -&gt; base32 char
+    out = []
+    for i in range(0, len(bits), 5):
+        chunk = bits[i:i+5]
+        idx = sum(b &lt;&lt; (4 - j) for j, b in enumerate(chunk))
+        out.append(BASE32[idx])
+    return &quot;&quot;.join(out)
+</code></pre>
+<h3 id="neighbor-cells-the-9-cell-scan">Neighbor cells: the 9-cell scan</h3>
+<p>For a "nearby" query at geohash precision p, the standard move is to compute the query cell and its 8 neighbors, then scan all 9. This handles the boundary case where the user is near a cell edge and the nearest point is in the adjacent cell.</p>
+<pre><code class="language-python">def neighbor_geohashes(gh: str) -&gt; list[str]:
+    &quot;&quot;&quot;Return the 8 neighbors of geohash `gh` at the same precision.
+    Real implementations use Morton/Hilbert math on the bit layout; this
+    sketch encodes the idea.
+    &quot;&quot;&quot;
+    # Decode gh -&gt; (lat_center, lng_center, lat_err, lng_err)
+    lat, lng, dlat, dlng = decode_with_error(gh)
+    p = len(gh)
+    out = []
+    for d_lat_step in (-1, 0, 1):
+        for d_lng_step in (-1, 0, 1):
+            if d_lat_step == 0 and d_lng_step == 0:
+                continue
+            out.append(encode_geohash(
+                lat + d_lat_step * 2 * dlat,
+                lng + d_lng_step * 2 * dlng,
+                precision=p,
+            ))
+    return out
+</code></pre>
+<p>The catch: at higher precision, a query disc may extend beyond the 9-cell neighborhood. The correct algorithm is:</p>
+<ol>
+<li>Compute the bounding box of the query disc.</li>
+<li>Pick the geohash precision such that one cell is comparable to the disc radius.</li>
+<li>Enumerate all cells whose bounding box intersects the query box.</li>
+<li>Fetch candidates from each cell.</li>
+<li>Filter by exact Haversine distance.</li>
+<li>Rank by distance (or composite score).</li>
+</ol>
+<h3 id="multi-resolution-grid-scan">Multi-resolution grid scan</h3>
+<p>For dispatch, you want <strong>fine cells</strong> to bound the candidate set; for surge, you want <strong>coarse cells</strong> so demand/supply numerators and denominators are statistically meaningful. Maintain both.</p>
+<pre><code class="language-python">import h3
+
+def candidate_cells(lat: float, lng: float, radius_m: float,
+                    fine_res: int = 9) -&gt; set[str]:
+    &quot;&quot;&quot;Return the set of fine-resolution H3 cells covering a disc.
+
+    Resolution 9 is ~170 m edge length: useful for ~500 m dispatch queries.
+    &quot;&quot;&quot;
+    origin = h3.geo_to_h3(lat, lng, fine_res)
+    # k-ring: cells within k hex steps of origin. Pick k so k * edge &gt;= radius.
+    edge_m = h3.edge_length(fine_res, unit=&quot;m&quot;)
+    k = max(1, int(radius_m / edge_m) + 1)
+    return set(h3.k_ring(origin, k))
+
+def query_nearby_drivers(lat: float, lng: float, radius_m: float,
+                         k: int = 5) -&gt; list[Driver]:
+    cells = candidate_cells(lat, lng, radius_m, fine_res=9)
+    # fan out per shard; shard is hashed from a coarser parent cell
+    candidates = []
+    for cell in cells:
+        candidates.extend(driver_index.get(cell, ()))
+    # exact filter + rank
+    candidates = [
+        (haversine(lat, lng, d.lat, d.lng), d)
+        for d in candidates
+        if d.status == &quot;online_available&quot;
+    ]
+    candidates = [(dist, d) for (dist, d) in candidates if dist &lt;= radius_m]
+    candidates.sort(key=lambda x: x[0])
+    return [d for (_, d) in candidates[:k]]
+</code></pre>
+<p>The same <code>driver_index</code> keyed at resolution 6 (~3.7 km edge) feeds the surge engine, which streams <code>(supply_count, demand_count)</code> per coarse cell every few seconds.</p>
+<h3 id="choosing-precision">Choosing precision</h3>
+<p>Rule of thumb: the cell edge should be about 0.5× to 2× the typical query radius. Too fine and you fan out to dozens of shards per query. Too coarse and a single cell holds thousands of candidates that all have to be Haversine-filtered.</p>
+<table>
+<thead>
+<tr>
+<th>Query radius</th>
+<th>Suggested H3 resolution</th>
+<th>Edge length</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>100 m (foot-traffic, pickup)</td>
+<td>10</td>
+<td>~65 m</td>
+</tr>
+<tr>
+<td>500 m (urban dispatch)</td>
+<td>9</td>
+<td>~170 m</td>
+</tr>
+<tr>
+<td>2 km (Uber Eats delivery)</td>
+<td>8</td>
+<td>~460 m</td>
+</tr>
+<tr>
+<td>5 km (city-zone Yelp)</td>
+<td>7</td>
+<td>~1.2 km</td>
+</tr>
+<tr>
+<td>20 km (surge / metro view)</td>
+<td>6</td>
+<td>~3.7 km</td>
+</tr>
+</tbody>
+</table>
+<h3 id="haversine-the-second-stage-filter">Haversine: the second-stage filter</h3>
+<p>After the cell scan returns candidates, you still need true great-circle distance for ranking and for the radius cap. The relevant arithmetic:</p>
+<pre><code class="language-python">import math
+
+EARTH_RADIUS_M = 6_371_000.0
+
+def haversine(lat1: float, lng1: float, lat2: float, lng2: float) -&gt; float:
+    &quot;&quot;&quot;Great-circle distance in meters.&quot;&quot;&quot;
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lng2 - lng1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
+</code></pre>
+<p>For ranking by ETA you do <em>not</em> want straight-line distance; you want a routing-graph estimate (driving time over the real road network, with traffic). Haversine is the cheap radius prune; ETA is the rank.</p>
+<h3 id="radius-expansion-ring-search">Radius-expansion ring search</h3>
+<p>When the disc is sparse — early-morning in a suburb, or a brand-new market — you must expand outward until you find candidates or hit the SLA cap. The shape of this loop matters; running uncapped expansion is how dispatch latency degrades.</p>
+<pre><code class="language-python">def k_nearest_with_expansion(lat: float, lng: float, k: int = 5,
+                             start_radius_m: float = 300.0,
+                             max_radius_m: float = 5_000.0,
+                             deadline_ms: int = 80) -&gt; list[Driver]:
+    radius = start_radius_m
+    deadline = monotonic_ms() + deadline_ms
+    seen: set[str] = set()
+    results: list[Driver] = []
+    while radius &lt;= max_radius_m and monotonic_ms() &lt; deadline:
+        cells = candidate_cells(lat, lng, radius, fine_res=9)
+        new_cells = cells - seen
+        seen |= new_cells
+        for cell in new_cells:
+            results.extend(driver_index.get(cell, ()))
+        good = [d for d in results
+                if d.status == &quot;online_available&quot;
+                and haversine(lat, lng, d.lat, d.lng) &lt;= radius]
+        if len(good) &gt;= k:
+            good.sort(key=lambda d: haversine(lat, lng, d.lat, d.lng))
+            return good[:k]
+        radius *= 2  # geometric expansion: 300m, 600m, 1.2km, 2.4km, ...
+    return sorted(results, key=lambda d: haversine(lat, lng, d.lat, d.lng))[:k]
+</code></pre>
+<p>The geometric doubling matters. Linear expansion (+300 m each step) probes 16 rings to reach 5 km; geometric doubling reaches it in 4. The cost per ring grows as the area does, so the marginal cost of one more doubling stays roughly constant.</p>
+<hr />
+<h2 id="5-worked-example-naive-broken-fixed">5. Worked example: naive → broken → fixed</h2>
+<p><strong>Scenario:</strong> Uber dispatch in a single metro, 1M online drivers globally, 100k drivers in this city at peak, 1k pickup requests/second city-wide, p99 latency target 100 ms from request to candidate list.</p>
+<h3 id="naive-bounding-box-sql-scan-with-postgis">Naive: bounding-box SQL scan with PostGIS</h3>
+<p>The genuinely naive version is the WHERE-clause range scan:</p>
+<pre><code class="language-sql">SELECT driver_id, lat, lng
+FROM drivers
+WHERE status = 'online'
+  AND lat BETWEEN :lat - 0.01 AND :lat + 0.01
+  AND lng BETWEEN :lng - 0.01 AND :lng + 0.01;
+</code></pre>
+<p>A composite B-tree on <code>(lat, lng)</code> only helps with the leading column; the planner ranges on <code>lat</code> then filters on <code>lng</code>. The less-naive version is PostGIS with a GiST index on a <code>GEOMETRY</code> column, which handles the 2D filter properly in 5-20 ms p50.</p>
+<p>For Uber-scale dispatch, both still break, for different reasons:</p>
+<ul>
+<li><strong>Write load:</strong> 100k drivers × ping every 4 s = 25k UPDATE/sec on a single relational table. This is on the edge of what one well-tuned Postgres box can do for a row-level UPDATE — feasible at the low end, painful when you add WAL replication, indexing on the moving <code>geometry</code> column, and any contention. Vertical scaling stops working before you cover all metros on one box.</li>
+<li><strong>Read load:</strong> PostGIS GiST radius queries are fine (5-20 ms each, ~1k QPS = a few cores busy). The real read pain is multi-metro: you need the index to live near the dispatchers, and a single Postgres primary can't.</li>
+<li><strong>Sharding:</strong> You can shard <code>drivers</code> by <code>city_id</code> or by pre-assigned region, and that works. You cannot usefully shard by raw <code>(lat, lng)</code> because drivers move across shard boundaries on every cell change. Sharding by <code>driver_id</code> means every dispatch query fans out to every shard.</li>
+<li><strong>No bounded radius natively in the SQL above:</strong> the query is a square, not a disc. PostGIS <code>ST_DWithin</code> fixes this but still pays the GiST traversal per query.</li>
+<li><strong>No atomic match:</strong> Two requests can pick the same driver. This belongs to <a href="./strong-consistency-under-contention.md">strong-consistency-under-contention.md</a>, but it interacts with dispatch and we have to design for it.</li>
+</ul>
+<p>The honest line: PostGIS handles Yelp-style search and small-metro dispatch. It does not handle a global, multi-metro, 250k-writes-per-second moving-entity workload without significant sharding work — at which point you've reinvented the cell index, just with a heavier per-shard storage layer.</p>
+<h3 id="broken-the-common-first-attempt-just-use-redis-geo">Broken (the common first attempt): "just use Redis GEO"</h3>
+<p>A candidate proposes:</p>
+<pre><code class="language-text">GEOADD drivers:city:nyc &lt;lng&gt; &lt;lat&gt; &lt;driver_id&gt;     # on every ping
+GEOSEARCH drivers:city:nyc FROMLONLAT &lt;lng&gt; &lt;lat&gt;
+  BYRADIUS 1 km ASC COUNT 10
+</code></pre>
+<p>This is a real step up: O(log n) lookup via sorted set on geohash-encoded scores, in-memory, p50 ~1-5 ms. For <em>one city</em> at the numbers above (~26k ops/sec total, well under the single-node ceiling), this honestly works. The break is at the next scale step:</p>
+<ul>
+<li>A single Redis key (<code>drivers:city:nyc</code>) is a <strong>single shard</strong>. NYC at the same numbers is on the edge today; LA, Mumbai, and Jakarta at peak push above it, and during a major event (storm, concert letting out) the per-city key spikes well past the single-node ceiling. Redis is single-threaded per shard, so per-node throughput tops out around 100k-200k ops/sec depending on command mix.</li>
+<li>Sorted-set <code>GEORADIUS</code> over-returns near the score boundary (the geohash Z-curve interleave). Documented behavior, fine for product, but you must Haversine-recheck.</li>
+<li>No multi-resolution. The surge engine has no efficient way to count drivers per coarse zone without scanning the whole key.</li>
+<li>Replica failover loses recent location updates because Redis replication is async; for "where is this driver right now" this is usually tolerable, but it means the index is not the source of truth.</li>
+</ul>
+<p>The fix for "Redis GEO works but doesn't scale to one giant key" is partitioning by coarse parent cell — at which point you're building the cell index below, just with Redis as the per-shard storage. That's a legitimate design; the deeper change is the partition scheme, not the data structure.</p>
+<h3 id="fixed-in-memory-cell-index-sharded-by-coarse-parent-cell-with-city-pinned-shards">Fixed: in-memory cell index, sharded by coarse parent cell, with city-pinned shards</h3>
+<pre><code class="language-text">                                Drivers App
+                                     |
+                          location pings (every 4s)
+                                     |
+                                     v
+                           Location Ingest Tier
+                              (sharded by driver_id;
+                               stateless, computes cells)
+                                     |
+                                     v
+                     +-------------------------------+
+                     | Geo Index Tier (city-pinned)  |
+                     |  In-memory per-cell sets       |
+                     |  Sharded by H3 res-6 parent    |
+                     +-------------------------------+
+                       /            |             \
+                      v             v              v
+                   Shard A       Shard B        Shard C
+                  (downtown,    (airport,      (suburbs)
+                   replicated   replicated)
+                   3x)
+</code></pre>
+<p><strong>Write path (every ping):</strong></p>
+<ol>
+<li>Driver app → API gateway → Location Ingest (sharded by <code>driver_id</code> to keep one driver's pings ordered and serialized).</li>
+<li>Compute <code>cell_fine = H3(lat, lng, res=9)</code>, <code>cell_coarse = H3(lat, lng, res=6)</code>.</li>
+<li>Look up previous <code>cell_fine</code> from a per-driver KV (<code>Driver(driver_id) -&gt; last_cell, ts</code>).</li>
+<li>If <code>cell_fine</code> unchanged: no index update; just refresh TTL on the driver entry.</li>
+<li>If changed: send <code>REMOVE(driver_id, old_cell)</code> and <code>ADD(driver_id, new_cell)</code> to the geo index shard owning <code>cell_coarse</code>.</li>
+<li>Emit a <code>LocationChanged</code> event to the surge stream keyed by <code>cell_coarse</code>.</li>
+</ol>
+<p>This is where the index becomes cheap. <strong>Most pings do not change the fine cell</strong> — at city driving speeds with a 170 m cell, a driver crosses ~1 cell every 10-15 seconds, not every 4-second ping. Update volume drops 3-4x.</p>
+<p><strong>Read path (dispatch):</strong></p>
+<ol>
+<li>Rider request → Dispatch service.</li>
+<li>Compute <code>cell_fine</code> of pickup and the k-ring of cells covering a 500 m disc (typically 7 cells).</li>
+<li>Group cells by their <code>cell_coarse</code> parent → each group goes to one shard.</li>
+<li>Fan out, union driver IDs, hydrate with current <code>(lat, lng, status, eta_to_pickup)</code>.</li>
+<li>Filter <code>status == online_available</code>, Haversine ≤ radius.</li>
+<li>Rank by <code>eta_to_pickup</code> (not raw distance — uses routing graph).</li>
+<li>Offer to top candidate; on decline or timeout, offer to next.</li>
+<li>On accept, atomic compare-and-swap <code>Driver.status: online_available -&gt; online_on_trip</code> (see <a href="./strong-consistency-under-contention.md">strong-consistency-under-contention.md</a> and <a href="./idempotency-exactly-once.md">idempotency-exactly-once.md</a>).</li>
+<li>If no candidate at 500 m, expand to 1 km. If still none, expand to 2 km. Outer cap 5 km — beyond that, return "no drivers available."</li>
+</ol>
+<p><strong>Why the choices:</strong></p>
+<ul>
+<li><strong>H3 over geohash for this workload:</strong> the dispatch ranking is approximate kNN over a small candidate set. With geohash's rectangular cells, the four diagonal-neighbor cells in a 9-cell scan are ~1.41× farther than the four edge neighbors, so the candidate set is asymmetric in distance — fine after Haversine rerank, but you may need a larger ring at higher precision to guarantee coverage of a circular query disc. H3's hexagons give 6 neighbors at roughly equal center-to-center distance, so a fixed k-ring covers a circular disc more tightly. Both indexes return correct results once you Haversine-filter; the choice is about <em>how many cells you fetch per query</em>, not whether the right driver is found. The cost is H3's 12 global pentagon cells, which need defensive coding.</li>
+<li><strong>Coarse-parent sharding:</strong> keeps cells that frequently appear together (a 7-cell query) on the same shard, so most queries hit one or two shards, not seven.</li>
+<li><strong>City-pinning:</strong> each metro is independent. A failure in NYC doesn't degrade SF. Cross-city dispatch is a non-requirement.</li>
+<li><strong>In-memory:</strong> durability is not the index's job. Source of truth is the per-driver location stream (Kafka) plus the <code>Driver</code> KV. The index is a derived projection; it can be rebuilt from Kafka in minutes after a host loss. See <a href="./durability-at-scale.md">durability-at-scale.md</a>.</li>
+<li><strong>Multi-resolution:</strong> dispatch reads at res-9, surge reads at res-6, dashboards read at res-4. Same source-of-truth pings feed all three via stream fan-out. Cost: every cell-change writes to two or three indexes plus the surge stream, and a per-resolution drift monitor is required because the indexes can diverge transiently under partial failures.</li>
+</ul>
+<p><strong>Numbers check:</strong> Manhattan is roughly 60 km² ≈ 350 H3 res-6 cells, 13k res-9 cells. At 100k drivers in the metro and assume a third are in the Manhattan core: ~33k drivers across 13k fine cells → ~2-3 drivers per fine cell average, with the actual distribution heavily concentrated downtown. A 7-cell k-ring query returns ~15-25 candidates pre-filter in the median cell, hundreds in a downtown cell — Haversine on tens to low hundreds of rows is sub-millisecond CPU work, and the end-to-end query is dominated by the network fan-out to shards (single-digit ms) rather than the in-shard lookup. Total: well under the 100 ms budget. Downtown hot cells require the sub-sharding move covered in Section 7.</p>
+<hr />
+<h2 id="6-variants-and-how-to-choose">6. Variants and how to choose</h2>
+<table>
+<thead>
+<tr>
+<th>Index</th>
+<th>Cell shape</th>
+<th>Hierarchy</th>
+<th>Neighbor uniformity</th>
+<th>Best for</th>
+<th>Watch out for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Geohash</strong></td>
+<td>Rectangle (lat/lng aligned)</td>
+<td>Yes, prefix-based</td>
+<td>No — 8 neighbors at unequal distance; "ZZ vs A0" boundary jumps</td>
+<td>Simple text-prefix sharding; Redis ZSET; quick demos</td>
+<td>Z-order discontinuities; cells distort heavily near poles</td>
+</tr>
+<tr>
+<td><strong>S2</strong></td>
+<td>Quadrilateral (Hilbert curve on cube faces)</td>
+<td>Yes, 30 levels</td>
+<td>Mostly uniform within a face; seams at face boundaries</td>
+<td>Global polygon coverage; spatial joins; Google's infrastructure choice</td>
+<td>Library is heavier; non-trivial setup</td>
+</tr>
+<tr>
+<td><strong>H3</strong></td>
+<td>Hexagon</td>
+<td>Yes, 16 resolutions</td>
+<td>Yes — 6 equidistant neighbors</td>
+<td>Real-time dispatch; surge heatmaps; movement-heavy workloads</td>
+<td>Pentagons exist (12 of them globally) where the icosahedron seams force a 5-neighbor cell</td>
+</tr>
+<tr>
+<td><strong>Quadtree / R-tree</strong></td>
+<td>Adaptive rectangles</td>
+<td>Yes, data-dependent</td>
+<td>N/A — tree structure</td>
+<td>Static datasets; polygon-overlap queries; PostGIS</td>
+<td>Update cost on moving points; rebuilds; depth varies by density</td>
+</tr>
+<tr>
+<td><strong>Redis GEO</strong></td>
+<td>Geohash sorted-set internally</td>
+<td>No (single resolution)</td>
+<td>Inherits geohash issues</td>
+<td>Single-shard demos; small cities; quick prototypes</td>
+<td>Hot key per region; single-threaded; replication lag</td>
+</tr>
+</tbody>
+</table>
+<p>Decision tree:</p>
+<ul>
+<li><strong>Static dataset, complex polygons, rich attribute filters</strong> → PostGIS / R-tree. Yelp businesses, Airbnb listings. Also a fine answer for single-metro dispatch at sub-million-entity, sub-10k-QPS scale.</li>
+<li><strong>Moving points, real-time dispatch at multi-metro scale, kNN-style ranking</strong> → H3 or S2 in-memory. Uber, Lyft, large-scale food delivery.</li>
+<li><strong>Global spatial joins, polygon containment, multi-level hierarchy</strong> → S2. Google Maps internals, ad-tech location targeting.</li>
+<li><strong>Tiny scale or prototype, one shard per region</strong> → Redis GEO. Demo; one city; well under the per-node ops ceiling.</li>
+<li><strong>You truly own everything and want the simplest mental model</strong> → geohash strings as KV keys. Works, with caveats around Z-curve discontinuities at meridian/equator boundaries.</li>
+</ul>
+<p>A staff-level signal is to <strong>name the cell-boundary artifact and explain how your choice mitigates it</strong>: geohash has known Z-order discontinuities (cells with adjacent geography but unrelated prefixes), which you mitigate with the 9-cell neighborhood scan + Haversine rerank; H3 hexagons give more uniform neighbor distances at the cost of 12 pentagon edge cases; S2 has face-seam edge cases. None of them are "free."</p>
+<h3 id="when-to-keep-a-relational-spatial-index-anyway">When to keep a relational spatial index anyway</h3>
+<p>There is one case where the staff-level move is <em>not</em> H3-in-memory: when the dataset is small, static, and queried with arbitrary polygons rather than discs. Airbnb's listings are ~10M globally, change slowly, and are often queried by "in this map viewport" (a rectangle, not a disc) plus complex filters on price, beds, dates. A PostGIS GiST index on a <code>geometry</code> column handles this directly:</p>
+<pre><code class="language-sql">CREATE INDEX listings_geom_idx ON listings USING GIST (location);
+
+SELECT id, title, price
+FROM listings
+WHERE ST_Within(location, ST_MakeEnvelope(:minlng, :minlat, :maxlng, :maxlat, 4326))
+  AND beds &gt;= 2
+  AND price BETWEEN :min AND :max
+  AND id NOT IN (SELECT listing_id FROM bookings
+                 WHERE :checkin &lt; end_date AND :checkout &gt; start_date);
+</code></pre>
+<p>The query planner can combine the spatial filter with the secondary filters in one execution. You give up sub-millisecond hash-lookup performance, but you gain expressive composition with the rest of the relational model. The rule: <strong>moving entities and dispatch-style queries → in-memory cell index; static entities with rich filters → relational spatial index.</strong></p>
+<hr />
+<h2 id="7-failure-modes-and-operations">7. Failure modes and operations</h2>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Surface</th>
+<th>Metric to monitor</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cell-boundary artifact: nearest driver on the other side of a cell line, never returned.</td>
+<td>Wrong dispatch; user complains "there was an Uber across the street."</td>
+<td>Per-query candidate-count distribution; rate of single-cell-only queries; A/B vs k-ring expansion.</td>
+<td>Always query k-ring of cells, not just the home cell. Always Haversine-filter and re-rank. Prefer H3.</td>
+</tr>
+<tr>
+<td>Stale location: driver moved but index still says old cell.</td>
+<td>Bad ETA; driver assigned and then "no, I'm 5 minutes away."</td>
+<td><code>now - last_location_ts</code> per driver; p99 staleness; reassignment rate.</td>
+<td>Per-driver TTL (~30 s); on-trip-pickup recheck; mark <code>status=stale</code> and route to <code>online_unknown</code>. Don't dispatch stale.</td>
+</tr>
+<tr>
+<td>Hot cell: downtown Manhattan, airport on a Friday at 5pm.</td>
+<td>Shard overload; latency spike; failover cascades.</td>
+<td>Per-cell QPS; per-shard CPU; tail latency by coarse cell.</td>
+<td>Hot-cell-aware sub-sharding: split res-6 cell into res-7 children when QPS exceeds a threshold; rebalance shard map. Also see <a href="./hot-key-skew.md">hot-key-skew.md</a>.</td>
+</tr>
+<tr>
+<td>Index-truth divergence: index says driver is online, KV says on-trip.</td>
+<td>Double-booking attempt.</td>
+<td>Diff job: index ∪ KV mismatch count.</td>
+<td>Authority lives in <code>Driver</code> KV (CAS guarded). Index is read-side projection; on dispatch, re-read KV for status. Periodic reconciler emits <code>IndexDrift</code> event.</td>
+</tr>
+<tr>
+<td>Pentagon / face-seam edge cases (H3, S2).</td>
+<td>Off-by-one neighbor counts; algorithm assumes 6 neighbors and gets 5.</td>
+<td>Crash rate near known pentagon coordinates; null-cell errors.</td>
+<td>Library guards; defensively iterate the k-ring as a set, not by index.</td>
+</tr>
+<tr>
+<td>Index rebuild after host loss.</td>
+<td>New shard host comes up empty; no candidates returned for that cell.</td>
+<td>Index-shard build time; per-shard readiness flag.</td>
+<td>Bootstrap from the Kafka location stream (last 60 s window) before accepting reads; serve degraded responses meanwhile. See <a href="./durability-at-scale.md">durability-at-scale.md</a>.</td>
+</tr>
+<tr>
+<td>Location spoofing / GPS jitter.</td>
+<td>Driver appears to teleport; receives requests in wrong area.</td>
+<td>Per-driver velocity outliers (Δdistance / Δt &gt; vehicle max).</td>
+<td>Server-side smoothing / Kalman filter; drop pings violating physical limits; flag for fraud review.</td>
+</tr>
+<tr>
+<td>Geofence enter/leave double-fire.</td>
+<td>Pickup timer started twice, missed exit detection.</td>
+<td>Per-(driver, fence) state-change rate.</td>
+<td>Apply hysteresis: require N consecutive inside-pings before fire; record <code>inside_since</code> to make enter/leave idempotent. See <a href="./idempotency-exactly-once.md">idempotency-exactly-once.md</a>.</td>
+</tr>
+<tr>
+<td>Cold-start at outer search radius: no driver within cap.</td>
+<td>Customer sees "no drivers available" but actually there were drivers 5.5 km away.</td>
+<td>"No-result" rate by cell; matched-distance distribution by cell.</td>
+<td>Adaptive caps per region; outer radius driven by historical match distance, not a global constant.</td>
+</tr>
+<tr>
+<td>Privacy leakage via reverse-engineered cell membership.</td>
+<td>"Find My Friends" exposes precise location through repeated coarse queries.</td>
+<td>Per-user query rate by querier; cell-cardinality alerts.</td>
+<td>Coarsen reported precision (e.g., snap to res-8 cell, ~460 m); add jitter; per-friend ACL; TTL.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="8-combinations-with-other-patterns">8. Combinations with other patterns</h2>
+<p>Geo queries rarely live alone. The interesting staff-level answer is the composition:</p>
+<ul>
+<li><strong><a href="./hot-key-skew.md">hot-key-skew.md</a></strong> — every metro has a downtown. Cell-level QPS distribution looks like Zipf. The mitigation is cell-aware splitting, request coalescing, and city-shard isolation.</li>
+<li><strong><a href="./strong-consistency-under-contention.md">strong-consistency-under-contention.md</a></strong> — the geo index finds the candidates, but the <em>assignment</em> of driver to trip must be atomic. The CAS happens on the <code>Driver</code> row, not on the index. The index can be eventually consistent; the assignment cannot.</li>
+<li><strong><a href="./idempotency-exactly-once.md">idempotency-exactly-once.md</a></strong> — geofence enter/leave events and dispatch offers must be idempotent. Use <code>(driver_id, fence_id, inside_since)</code> as the dedup key; treat dispatch offers with a request_id.</li>
+<li><strong><a href="./real-time-aggregation.md">real-time-aggregation.md</a></strong> — surge zones are streaming <code>count(supply)</code> and <code>count(demand)</code> per coarse cell, with a <code>multiplier = f(demand / supply)</code> published every 10-30 s. Same pipeline pattern as click counting.</li>
+<li><strong><a href="./search-and-ranking.md">search-and-ranking.md</a></strong> — Yelp queries are geo-filter first, then text/category, then ranked by Bayesian-smoothed rating × distance decay × personalization. The geo filter is the first stage of a multi-stage funnel.</li>
+<li><strong><a href="./fan-out-write-amplification.md">fan-out-write-amplification.md</a></strong> — multi-resolution indexes mean every location ping writes to 2-3 derived indexes plus the surge stream. Fan-out is per-update, not per-follower, but the bookkeeping is the same.</li>
+<li><strong><a href="./backpressure-flow-control.md">backpressure-flow-control.md</a></strong> — the location-ingest tier sees 10M+ ev/s globally with bursty city peaks. Per-city queue depth and shed-load policy (drop oldest ping per driver, never the newest) keep the index fresh under overload.</li>
+<li><strong><a href="./cache-stampede-read-amplification.md">cache-stampede-read-amplification.md</a></strong> — popular Yelp queries ("coffee near me" in downtown SF) cache well; refresh under single-flight locks.</li>
+<li><strong><a href="./ordering-causal-consistency.md">ordering-causal-consistency.md</a></strong> — per-driver location pings must be processed in order so an old ping doesn't overwrite a new cell. Shard the ingest by <code>driver_id</code> for serialization.</li>
+<li><strong><a href="./durability-at-scale.md">durability-at-scale.md</a></strong> — the geo index is volatile; the source of truth is the Kafka location stream. Rebuild from stream on host loss.</li>
+</ul>
+<hr />
+<h2 id="9-likely-interviewer-probes">9. Likely interviewer probes</h2>
+<ol>
+<li>
+<p><strong>"Why H3 over geohash? Walk me through a specific case where the choice matters."</strong> The honest answer: both find the correct nearest point if you query the appropriate cell neighborhood and Haversine-rerank. Where H3 wins is <em>cell count per query for a given disc</em>: rectangular geohash cells need a 9- or 25-cell scan to cover a circular disc cleanly because the diagonal neighbors sit ~1.41× farther than edge neighbors, while H3's 6 equidistant neighbors cover the same disc with a tighter k-ring. At dispatch scale (millions of queries per second), that fewer-cells-per-query difference translates to fewer shard fan-outs and lower tail latency. Bonus points for naming pentagons (the 12 places on the globe where H3's icosahedral grid forces a 5-neighbor cell) and explaining that production code iterates the k-ring as a set rather than assuming exactly 6.</p>
+</li>
+<li>
+<p><strong>"How do you handle a driver who drives diagonally across a cell every ping? Doesn't your index thrash?"</strong> They want to hear about the dwell threshold (only update on cell-change), the cost-of-update math (one HSET + one HDEL on cell-change vs every ping), and possibly hysteresis ("must be in new cell N consecutive pings to switch").</p>
+</li>
+<li>
+<p><strong>"What about the downtown hot cell?"</strong> Expect a sketch: detect QPS threshold per coarse cell, split the cell across multiple shards by hashing on <code>driver_id</code> within the cell, refresh the cell-to-shard map, drain old shard. Compare to <a href="./hot-key-skew.md">hot-key-skew.md</a>. Mention that you do NOT split by sub-cell geographically — that creates new boundary artifacts and breaks adjacency.</p>
+</li>
+<li>
+<p><strong>"How does the surge engine talk to the geo index? Do they share storage?"</strong> No. Surge consumes the Kafka location stream at res-6 cell granularity; index is materialized at res-9 in-memory. Same source, two derived views. Cross-link to <a href="./real-time-aggregation.md">real-time-aggregation.md</a>.</p>
+</li>
+<li>
+<p><strong>"How would you implement geofencing for the courier-arrives-at-restaurant signal?"</strong> Maintain a per-restaurant polygon in S2 cell-covering form (<code>S2RegionCoverer</code> gives you the cells that approximate the polygon). On each courier ping, intersect their cell with the active fence-cell index. On state change <code>outside -&gt; inside</code>, emit <code>ArrivedAtRestaurant(courier_id, restaurant_id, ts)</code> with idempotency key <code>(courier, restaurant, attempt)</code>. Add hysteresis to avoid jitter around the boundary. See <a href="../questions/design-uber-eats.md">design-uber-eats.md</a>.</p>
+</li>
+<li>
+<p><strong>"How do you do k-nearest when k is large or when the area is sparse?"</strong> Radius-expansion ring search, capped by SLA budget and outer radius. Show the ring-iteration loop. Discuss the trade between completeness and latency. Mention that for sparse rural areas the answer is sometimes "no driver" and the UX must show that quickly rather than waiting for a 50 km scan.</p>
+</li>
+<li>
+<p><strong>"How would you migrate from a quadtree to H3 without downtime?"</strong> Dual-write to both indexes (the quadtree as truth, H3 as shadow) for a week. Compare query results offline (top-k overlap, distance distribution). Once shadow matches authority within a tolerance, flip reads to H3, run authority on H3 for a week, then decommission the quadtree. Generic backfill/migration pattern.</p>
+</li>
+</ol>
+<hr />
+<h2 id="10-common-traps-stronger-moves">10. Common traps → stronger moves</h2>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"Use bounding box SQL with a composite (lat, lng) index."</td>
+<td>"For static-entity, single-metro Yelp scale I'd say PostGIS with a GiST index — that's the honest answer. For multi-metro moving-entity dispatch, I'll discretize to cells (H3 res-9), shard by coarse parent, and query the k-ring around the pickup cell."</td>
+</tr>
+<tr>
+<td>"Use Redis GEO."</td>
+<td>"Redis GEO is the right primitive at one-city scale that fits under the single-node ops ceiling. Beyond that, a single per-city key is the hot shard; I'd partition by coarse parent cell and keep the same data structure per shard."</td>
+</tr>
+<tr>
+<td>"Just hash on lat/lng."</td>
+<td>"Geographic adjacency is the structure that matters for radius queries. A raw hash scatters it across all shards; I need a space-filling curve or hex grid that preserves locality, with sharding on the coarse cell."</td>
+</tr>
+<tr>
+<td>"I'll update the index on every location ping."</td>
+<td>"I'll update only on cell-change. At 170 m cells and city driving speeds, drivers cross a cell every 10-15 s rather than every 4 s, so update volume drops 3-4x. Within-cell pings just refresh the per-driver TTL."</td>
+</tr>
+<tr>
+<td>"Geohash is fine."</td>
+<td>"Geohash with a 9-cell scan + Haversine rerank is correct, and at moderate scale it's fine. H3 wins at high-query-rate kNN because its hexagonal neighbors are more uniform, so a smaller k-ring covers the disc and you fan out to fewer shards per query."</td>
+</tr>
+<tr>
+<td>"Strong consistency on the geo index."</td>
+<td>"The geo index is a read-side projection. Authority for <code>Driver.status</code> lives in the KV with CAS. Index can lag by a second; the assignment CAS catches double-book attempts."</td>
+</tr>
+<tr>
+<td>"Treat downtown as just another cell."</td>
+<td>"Downtown is a known hot cell. I'd shard the res-6 cell across multiple servers by hashing on driver_id within the cell — same geography, more compute. See hot-key-skew."</td>
+</tr>
+<tr>
+<td>"Find the nearest driver."</td>
+<td>"Find the nearest <em>acceptable</em> driver: filter by status, vehicle type, current trip eligibility, then rank by ETA via routing graph — raw distance is a weak proxy for pickup time."</td>
+</tr>
+<tr>
+<td>"GPS is the source of truth."</td>
+<td>"GPS is noisy. I smooth with a velocity-bounded Kalman filter and reject pings violating physical limits. Spoofing detection runs async."</td>
+</tr>
+<tr>
+<td>"Compute Haversine in the database."</td>
+<td>"Bound the candidate set with cell membership first; do Haversine on hundreds of rows in app code, not millions on disk."</td>
+</tr>
+<tr>
+<td>"Each city is one shard."</td>
+<td>"Each city is one <em>isolation domain</em> — but a city like NYC is several shards internally, split by coarse parent cell, so I can scale Manhattan independently of Staten Island."</td>
+</tr>
+<tr>
+<td>"Surge multiplier is computed per-query."</td>
+<td>"Surge is a streaming aggregate per coarse cell on a 10-30 s window. Dispatch reads it as a cached value, not a live count."</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11-staff-level-answer-checklist">11. Staff-level answer checklist</h2>
+<p>By the end of the deep dive on this pattern, you should have said the following out loud:</p>
+<ul>
+<li>The scale check: name when PostGIS + GiST is the right answer (static entities, single metro, moderate QPS) and when the in-memory cell index earns its complexity (multi-metro moving entities, tens of thousands of writes per second per city, sub-100 ms p99).</li>
+<li>The fundamental hardness: range queries cross partition boundaries, so the shard scheme has to be adjacency-aware; raw <code>(lat, lng)</code> hashes don't preserve 2D locality and B-trees only help on one dimension.</li>
+<li>The discretization choice: cells, with named tradeoffs between geohash, S2, H3, and quadtree/R-tree.</li>
+<li>A specific resolution-to-radius mapping (e.g., "res 9 for ~500 m queries").</li>
+<li>The query algorithm: candidate cells → fan-out → union → Haversine filter → rank.</li>
+<li>The update path: cell-change-only updates, not per-ping.</li>
+<li>The sharding choice: by coarse parent cell, with city-pinned isolation.</li>
+<li>The hot-cell story: detection metric, splitting strategy, what NOT to do (geographic sub-split).</li>
+<li>The authority/projection split: index is derived; authority for state lives in a CAS-guarded KV.</li>
+<li>The multi-resolution story: same data, two or three resolutions for different consumers.</li>
+<li>Two specific failure modes with metric + mitigation (boundary artifact and stale location are the easy ones; hot cell and index-truth divergence are the staff-level ones).</li>
+<li>The interaction with consistency: assignment is atomic via CAS, not via the index.</li>
+<li>The rebuild plan: index is rebuildable from the Kafka stream; no separate durability.</li>
+</ul>
+<p>A weak answer names geohash and stops. A staff answer connects geohash to sharding to hot cells to consistency to operational metrics.</p>
+<hr />
+<h2 id="12-cross-references">12. Cross-references</h2>
+<p>Sibling pattern docs:</p>
+<ul>
+<li><a href="./fan-out-write-amplification.md">fan-out-write-amplification.md</a> — every location ping writes to multiple derived indexes.</li>
+<li><a href="./hot-key-skew.md">hot-key-skew.md</a> — downtown surge zones and airport hot cells.</li>
+<li><a href="./strong-consistency-under-contention.md">strong-consistency-under-contention.md</a> — atomic driver assignment after the geo query returns candidates.</li>
+<li><a href="./idempotency-exactly-once.md">idempotency-exactly-once.md</a> — geofence enter/leave events and dispatch offer retries.</li>
+<li><a href="./search-and-ranking.md">search-and-ranking.md</a> — geo is the first stage of a multi-stage ranking funnel in Yelp/Airbnb.</li>
+<li><a href="./real-time-aggregation.md">real-time-aggregation.md</a> — surge multipliers as streaming aggregates per coarse cell.</li>
+<li><a href="./coordination-exactly-one-execution.md">coordination-exactly-one-execution.md</a> — at-most-one-driver-per-trip is the same flavor of single-execution coordination.</li>
+<li><a href="./ordering-causal-consistency.md">ordering-causal-consistency.md</a> — per-driver ping ordering during cell transitions.</li>
+<li><a href="./durability-at-scale.md">durability-at-scale.md</a> — Kafka as the durable source for an otherwise in-memory index.</li>
+<li><a href="./backpressure-flow-control.md">backpressure-flow-control.md</a> — location ingest tier under bursty city peaks.</li>
+<li><a href="./cache-stampede-read-amplification.md">cache-stampede-read-amplification.md</a> — popular geo+category queries (Yelp "coffee near me") and their cache lifecycle.</li>
+</ul>
+<p>Question docs that exercise this pattern:</p>
+<ul>
+<li><a href="../questions/design-uber-or-lyft.md">Design Uber or Lyft</a></li>
+<li><a href="../questions/design-the-uber-backend.md">Design the Uber Backend</a></li>
+<li><a href="../questions/design-uber-eats.md">Design Uber Eats</a></li>
+<li><a href="../questions/design-yelp-or-nearby-friends.md">Design Yelp or Nearby Friends</a></li>
+<li><a href="../questions/design-airbnb.md">Design Airbnb</a></li>
+<li><a href="../questions/design-instagram.md">Design Instagram</a> (places nearby for photo tagging)</li>
+</ul>
+<p>Foundational reading:</p>
+<ul>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a></li>
+<li><a href="../STAFF_SYSTEM_DESIGN_INTERVIEW_PLAYBOOK.md">Staff System Design Interview Playbook</a></li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

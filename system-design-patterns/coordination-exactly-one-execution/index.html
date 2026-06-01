@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Coordination / Exactly-One Execution — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design-patterns/">← Back to System Design Patterns</a>
+        <h1 class="article-title">Coordination / Exactly-One Execution</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/31 &nbsp;·&nbsp; System Design Patterns
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>One-sentence definition.</strong> When a system needs exactly one actor to perform an operation (run the 3am payment job, own the shard, hold the lock), coordination is the discipline of ensuring that <strong>even during network partitions, GC pauses, or clock skew, two nodes do not simultaneously act as if they are the chosen one</strong> — usually by combining consensus on identity with fencing tokens at the resource.</p>
+</blockquote>
+<p>Read the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for shared vocabulary on terms like quorum, lease, replica, and consensus.</p>
+<p>Related question docs (cross-link aggressively while answering):</p>
+<ul>
+<li><a href="../questions/design-a-distributed-lock-manager-like-chubby.md">Distributed Lock Manager like Chubby</a> — the canonical coordination service.</li>
+<li><a href="../questions/design-a-distributed-job-scheduler-like-cron.md">Distributed Job Scheduler like Cron</a> — exactly-one-execution per scheduled occurrence.</li>
+<li><a href="../questions/design-a-payment-system.md">Payment System</a> — the cost of double-execution measured in dollars.</li>
+<li><a href="../questions/design-the-stripe-payment-gateway.md">Stripe Payment Gateway</a> — idempotency keys as a complementary tool.</li>
+<li><a href="../questions/design-a-stock-exchange.md">Stock Exchange</a> — primary-failover for a partitioned order book.</li>
+<li><a href="../questions/design-a-reminder-alert-system.md">Reminder / Alert System</a> — single-firing of time-based triggers.</li>
+<li><a href="../questions/apache-kafka.md">Apache Kafka</a> — single-leader-per-partition as a coordination primitive.</li>
+</ul>
+<hr />
+<h2 id="1-the-fundamental-hardness">1. The fundamental hardness</h2>
+<p>The naive picture of coordination is: "elect one leader, everyone else waits." This breaks the moment you ask a harder question: <strong>how does the leader know it is still the leader?</strong> A node can be the leader at time T, then experience a 30-second JVM garbage-collection pause, while the rest of the cluster declares it dead and elects a successor. When the original node wakes up, it still believes — locally — that it holds the lock. Both nodes will now try to act. This is the <strong>split-brain problem</strong>: two nodes simultaneously think they are authoritative.</p>
+<p>Worse, "just check if you are still the leader before acting" is insufficient. Suppose the leader checks with the consensus service immediately before issuing a write. The check returns "yes, you are the leader." Then the network partitions for 200 ms. The lease expires. A new leader is elected. The old leader's write — still in flight — arrives at the resource (the database, the payment processor, the inventory store) <strong>after</strong> the new leader's write. From the resource's perspective, two different leaders just both told it to act. Time-of-check vs time-of-use is fundamentally broken across a network.</p>
+<p>The way out has two halves. <strong>First</strong>, agree on identity through consensus (Raft, Paxos, ZAB — Zab is the ZooKeeper Atomic Broadcast protocol) so that "who is leader" is a single replicated decision, not local opinion. <strong>Second</strong>, attach a <strong>monotonically increasing fencing token</strong> to every grant. Each new leader gets a strictly higher token than any predecessor. The downstream resource — the thing being protected — refuses any operation whose token is lower than the highest token it has ever seen. Note the asymmetry: the new leader's correct write succeeds and bumps <code>max_token_seen</code>; the old leader's stale write arrives later and is rejected — not because the old leader was detected as stale, but because the resource has already committed to a higher token. Coordination correctness moves from "the leader is honest" to "the resource is paranoid."</p>
+<p>The corollary, and the place most "we have a lock service" designs break: <strong>you cannot make coordination safe purely in the coordination layer</strong>. The resource side must participate. A lock service that doesn't expose a token the resource can validate is, in adversarial conditions, just an optimization — not a correctness mechanism. This is why Chubby returns sequence numbers and why a "Redis lock" that gives you only a string token (with no atomic compare-and-swap at the resource) cannot, on its own, guarantee mutual exclusion under arbitrary pauses. The honest caveat: this entire apparatus is only worth its cost when <em>exactly-one execution</em> is the requirement. If the action is idempotent and double-execution is tolerable (most read-only refreshes, most cache rebuilds, most reconciliation jobs), at-least-once delivery plus idempotency is the staff-level answer — not consensus.</p>
+<hr />
+<h2 id="2-how-to-recognize-it-in-the-interview">2. How to recognize it in the interview</h2>
+<p><strong>Prompt phrases</strong> that signal this pattern:</p>
+<ul>
+<li>"Exactly one node should..."</li>
+<li>"...must run exactly once."</li>
+<li>"Avoid duplicate execution of..."</li>
+<li>"Elect a primary that..."</li>
+<li>"Survive a partition without two leaders..."</li>
+<li>"What happens if the scheduler/leader crashes?"</li>
+<li>"Failover within seconds."</li>
+<li>"Single writer per shard/partition/tenant."</li>
+</ul>
+<p><strong>Architectural smells</strong> in the candidate's own design that should make you reach for this pattern:</p>
+<ul>
+<li>A drawing has "scheduler" or "coordinator" with no replica box next to it (single point of failure).</li>
+<li>A "leader" without a lease or term number (no way to detect that it lost authority).</li>
+<li>A retry that calls a remote system without idempotency or a fencing token (will execute twice on retry).</li>
+<li>"We use a heartbeat to detect failure" — but no answer to "what if heartbeat lies due to a pause?"</li>
+<li>"We use Redis SETNX for locking" — without describing fencing or atomic compare-and-set on the resource.</li>
+<li>Cron-like fan-out with no durable occurrence row that one and only one worker can claim.</li>
+</ul>
+<p><strong>Example interview prompts where this is core:</strong></p>
+<ol>
+<li>Design a distributed cron / job scheduler (<a href="../questions/design-a-distributed-job-scheduler-like-cron.md">cron doc</a>).</li>
+<li>Design Chubby / ZooKeeper / etcd (<a href="../questions/design-a-distributed-lock-manager-like-chubby.md">Chubby doc</a>).</li>
+<li>Design a payment dispatcher that must not double-charge (<a href="../questions/design-a-payment-system.md">payment system</a>).</li>
+<li>Design the Kafka controller / partition leader (<a href="../questions/apache-kafka.md">Kafka doc</a>).</li>
+<li>Design a primary-replica MySQL/Postgres failover orchestrator.</li>
+<li>Design a stock exchange matching engine with primary failover (<a href="../questions/design-a-stock-exchange.md">stock exchange</a>).</li>
+<li>Design a leader-driven cache invalidation service.</li>
+</ol>
+<p>If two or more of these signals are present, name the pattern explicitly. Staff candidates earn points by saying out loud: <em>"This is fundamentally an exactly-one-execution problem. I want to design the coordination layer before I draw anything else, because the rest of the architecture inherits its safety from this layer."</em></p>
+<hr />
+<h2 id="3-60-second-spoken-framing">3. 60-second spoken framing</h2>
+<blockquote>
+<p>Before I reach for consensus, I want to know whether double-execution is actually unsafe. If the action is idempotent — re-running it produces the same effect — then at-least-once with a dedupe key is enough, and a coordination layer is overhead I don't need to pay for. The hard case is when the side effect is <em>not</em> naturally idempotent and the resource can't dedupe on its own. Then I would build coordination on a Raft-based consensus service like etcd or ZooKeeper. The leader holds a lease with a strictly monotonic fencing token; the lease is renewed on heartbeat. Every action against the downstream resource carries the token, and the resource itself rejects any token lower than the highest it has seen — so if the old leader gets paused for 30 seconds and wakes up still believing it is leader, its stale writes are rejected at the resource, not at the leader. As belt-and-suspenders, I still make the side effect idempotent where I can. Safety comes from three things, in order of necessity: idempotency on the side effect, fencing tokens enforced at the resource, and consensus on identity at the coordination layer.</p>
+</blockquote>
+<hr />
+<h2 id="4-canonical-toolkit">4. Canonical toolkit</h2>
+<p>Seven techniques every staff candidate should be able to name and contrast.</p>
+<h3 id="41-replicated-consensus-raft-paxos-zab">4.1 Replicated consensus: Raft, Paxos, ZAB</h3>
+<p>All three solve the same problem — get an odd-numbered cluster of replicas to agree on the next entry in a log — but with different ergonomics.</p>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Raft (etcd, Consul)</th>
+<th>Multi-Paxos (Chubby, Spanner)</th>
+<th>ZAB (ZooKeeper)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mental model</td>
+<td>Strong leader + replicated log; understandable on a whiteboard.</td>
+<td>Decoupled proposer/acceptor; many variants, fewer constraints.</td>
+<td>Leader-based, ordered broadcast; designed for primary-backup.</td>
+</tr>
+<tr>
+<td>Leader role</td>
+<td>Single leader handles all writes; followers replicate.</td>
+<td>Single distinguished proposer in steady state; can switch.</td>
+<td>Single leader (primary) broadcasts in order.</td>
+</tr>
+<tr>
+<td>Failover trigger</td>
+<td>Election timeout (typically 150-300 ms).</td>
+<td>Higher proposal number forces a new ballot.</td>
+<td>Epoch change; followers reject lower epochs.</td>
+</tr>
+<tr>
+<td>Term / epoch number</td>
+<td>Term integer, monotonic.</td>
+<td>Ballot / proposal number, monotonic.</td>
+<td>Epoch / zxid, monotonic and globally ordered.</td>
+</tr>
+<tr>
+<td>Common production use</td>
+<td>etcd, Consul, CockroachDB, TiKV.</td>
+<td>Chubby (Google), Spanner, Megastore.</td>
+<td>ZooKeeper, used by Kafka (legacy), HBase, Solr.</td>
+</tr>
+<tr>
+<td>Best for</td>
+<td>New systems; well-documented Go/Rust libs.</td>
+<td>Embedded in larger systems by experienced teams.</td>
+<td>Hierarchical config / watch primitives.</td>
+</tr>
+</tbody>
+</table>
+<p>In an interview, <strong>say "Raft" unless you have a reason not to</strong> — it is the default for new builds because the protocol is comprehensible and reference implementations (etcd, hashicorp/raft) are battle-tested. Reach for Paxos only when discussing Google-internal systems or when the interviewer pushes on the historical/theoretical angle. Reach for ZAB when discussing ZooKeeper.</p>
+<p>What they all give you: a <strong>monotonically increasing term/epoch number</strong> on every leader change. This number is the foundation of fencing.</p>
+<p><strong>Cost baseline you should be able to quote.</strong> A Raft write requires one round-trip from the leader to a majority of followers plus a disk fsync — typically p50 5-10 ms within a single availability zone, p99 20-50 ms; cross-zone or cross-region adds the inter-zone/region round-trip time directly. Throughput is bounded by the single leader's disk and network — etcd benchmarks comfortably at a few thousand writes/sec, ZooKeeper similar; both are an order of magnitude slower than a single-node KV. The implication: do not run application data through Raft. Use it for metadata, identity, and small replicated state. If you are tempted to put every business write through etcd, you have picked the wrong layer.</p>
+<h3 id="42-fencing-tokens">4.2 Fencing tokens</h3>
+<p>A fencing token is a strictly monotonically increasing integer issued by the consensus layer on every grant of a lock or lease. The contract:</p>
+<ol>
+<li>The consensus layer guarantees no two grants ever receive the same token, and the token never decreases.</li>
+<li>Every action against the protected resource carries the token.</li>
+<li>The resource records the highest token it has ever accepted.</li>
+<li>The resource rejects any operation with a lower token.</li>
+</ol>
+<pre><code>Leader A acquires lock, token = 17.
+Leader A pauses (GC, network).
+Lease expires.
+Leader B acquires lock, token = 18.
+Leader B writes to DB with token 18 → DB records max_token = 18.
+Leader A wakes up, attempts write with token 17 → DB rejects: 17 &lt; 18.
+</code></pre>
+<p>The token is what makes coordination safe under unbounded pauses. Without it, you are relying on the leader being honest about whether it is still the leader, which is unsafe under any model that admits GC pauses, OS scheduling delays, or network buffering.</p>
+<p>A minimal Python sketch of the resource-side check:</p>
+<pre><code class="language-python">class FencedResource:
+    def __init__(self):
+        self._max_token_seen = 0
+        self._state = None
+        self._lock = threading.Lock()
+
+    def write(self, token: int, value):
+        &quot;&quot;&quot;Apply a write only if token &gt;= max_token_seen.
+        Returns True on accept, False on reject.&quot;&quot;&quot;
+        with self._lock:
+            if token &lt; self._max_token_seen:
+                # Stale leader. Reject.
+                return False
+            self._max_token_seen = token
+            self._state = value
+            return True
+</code></pre>
+<p>And the leader-side action:</p>
+<pre><code class="language-python">def perform_action(lock_client, resource, payload):
+    # 1. Confirm we still hold the lock; receive the current token.
+    grant = lock_client.who_holds(lock_id=&quot;payments-cron&quot;)
+    if grant.owner != my_node_id:
+        raise NotLeader()
+    token = grant.token  # monotonically increasing integer
+
+    # 2. Carry the token to the resource. The RESOURCE enforces fencing.
+    accepted = resource.write(token=token, value=payload)
+    if not accepted:
+        raise StaleLeader(f&quot;resource rejected token {token}&quot;)
+</code></pre>
+<p>Critically, the <code>resource.write</code> call is what makes this safe — <strong>not</strong> the <code>lock_client.who_holds</code> call. The check before the call is best-effort; the enforcement at the resource is authoritative. This is the principle that the <a href="../questions/design-a-distributed-lock-manager-like-chubby.md">Chubby question</a> hammers on.</p>
+<h3 id="43-leases-with-heartbeat-renewal">4.3 Leases (with heartbeat renewal)</h3>
+<p>A lease is a lock with a TTL — a duration after which the lock is automatically released if not renewed. The leader renews the lease via heartbeats. If heartbeats fail (the leader crashed, partitioned, or paused), the lease expires and a new election can proceed.</p>
+<p>Why leases instead of pure locks held forever:</p>
+<ul>
+<li><strong>Liveness under failure.</strong> A crashed leader holding a permanent lock would freeze the system.</li>
+<li><strong>No need for failure detection in the consensus layer.</strong> The clock does it. If you do not hear from the leader within the lease, it is effectively gone.</li>
+</ul>
+<p>Lease design parameters:</p>
+<ul>
+<li><strong>TTL duration.</strong> Too short: false-positive failovers under GC. Too long: slow failover. Typical: 5-15 seconds.</li>
+<li><strong>Renewal interval.</strong> Typically 1/3 the TTL so two renewal attempts can fail without losing the lease.</li>
+<li><strong>Clock assumption.</strong> Servers must use the same clock or use a "compare to local elapsed time" model. See <a href="#7-failure-modes-and-operations">section 7</a> on clock skew.</li>
+</ul>
+<h3 id="44-single-leader-per-partition">4.4 Single-leader-per-partition</h3>
+<p>Instead of one global leader, partition the keyspace and elect one leader per partition. This is how <strong>Kafka partition leaders</strong>, <strong>Spanner Paxos groups</strong>, <strong>Cassandra LWT (lightweight transactions) per token range</strong>, and <strong>HBase region servers</strong> work.</p>
+<p>Properties:</p>
+<ul>
+<li>Per-partition leader scales horizontally; the consensus group sizes stay small (usually 3 or 5).</li>
+<li>Cross-partition operations need two-phase commit or sagas — coordination cost is paid only when crossing.</li>
+<li>A node can be leader of partition 1 and follower of partition 17, balancing load.</li>
+</ul>
+<p>This is also called <strong>sharded consensus</strong> or <strong>multi-Raft / multi-Paxos</strong>. Most modern strongly-consistent databases (CockroachDB, TiKV, YugabyteDB, Spanner) follow this pattern.</p>
+<p>See the partition-leader discussion in the <a href="../questions/apache-kafka.md">Kafka doc</a> and the <a href="../questions/apache-cassandra.md">Cassandra doc</a>.</p>
+<h3 id="45-heartbeat-lease-for-failover">4.5 Heartbeat + lease for failover</h3>
+<p>The composite mechanism that gives a system its observable "the primary failed over in 8 seconds" behavior:</p>
+<pre><code>Primary holds lease, TTL = 10s, renews every 3s.
++----+----+----+----+----+----+----+----+----+----+----+----+----+
+0    1    2    3    4    5    6    7    8    9   10   11   12   13  time (s)
+
+t=0:  primary acquires lease (token=42), TTL until t=10.
+t=3:  primary renews (TTL extended to t=13).
+t=5:  primary crashes (its last successful renewal was at t=3 → TTL until t=13).
+t=6:  standby misses heartbeat, starts watching.
+t=13: lease expires (the renewal at t=3 had extended TTL to t=13).
+t=13-15: standby tries acquire, wins (token=43).
+t=15: standby becomes new primary, starts issuing writes with token=43.
+</code></pre>
+<p>The observed failover time is roughly <strong>(time-since-last-renew) + lease_TTL + election_RTT</strong>, with the worst case being the lease was renewed just before the crash. Note an asymmetry that catches people: the renewal interval (3 s) and the TTL (10 s) describe <em>different</em> things. The renewal interval controls how often the leader proves liveness; the TTL controls how long a crashed leader can keep "owning" the lease before someone else can take it. Shrinking the renewal interval does <strong>not</strong> speed up failover; only shrinking the TTL does, at the cost of false failovers when the leader stalls for less than TTL (a 6-second GC pause under TTL=5 s is fatal).</p>
+<h3 id="46-quorum-based-decisions">4.6 Quorum-based decisions</h3>
+<p>For decisions that do not justify standing up a full consensus group, a <strong>quorum write</strong> to a set of replicas provides linearizability:</p>
+<ul>
+<li>Write must be acked by <code>W</code> replicas; read must touch <code>R</code> replicas; with <code>R + W &gt; N</code>, every read overlaps with the latest write.</li>
+<li>Used by Dynamo-style systems with LWT/Paxos overlays (Cassandra), and by single-decision coordination (e.g., "is this the leader?").</li>
+</ul>
+<p>See the <a href="../questions/amazon-dynamo.md">Dynamo doc</a> for the broader treatment of (N, R, W).</p>
+<h3 id="47-idempotency-as-a-fallback-belt-and-suspenders-sometimes-the-whole-answer">4.7 Idempotency as a fallback (belt-and-suspenders, sometimes the whole answer)</h3>
+<p>Even with consensus + fencing, <strong>make the side-effect itself idempotent</strong>. If a fencing-token check is too late (e.g., the call already left the building), idempotency is the last line of defense. See the sibling pattern <a href="./idempotency-exactly-once.md">idempotency-exactly-once.md</a>.</p>
+<p>For a large class of jobs — cache warmers, materialized-view rebuilds, reconciliation scans, anything that converges by re-running — idempotency <em>is</em> the answer, and the coordination layer is overhead you don't pay for. Two cron nodes both run the materialized-view rebuild at 03:00; the second one's writes overwrite the first one's with the same values; nothing is wrong. Staff-level move: ask whether the action is idempotent before reaching for Raft.</p>
+<p>The combined invariant in production systems where idempotency alone is insufficient (money movement, external side effects with no dedupe, single-writer ledgers):</p>
+<blockquote>
+<p>Exactly-one <em>execution</em> may be impossible; exactly-one <em>effect</em> is achievable through consensus on identity + fencing tokens on the resource + idempotency on the side effect.</p>
+</blockquote>
+<p>The strong system relies on all three layers because each fails in different ways:</p>
+<ul>
+<li>Consensus fails under quorum loss.</li>
+<li>Fencing fails if the resource cannot store / check tokens.</li>
+<li>Idempotency fails if the dedup key is missing or its window expires.</li>
+</ul>
+<p>Together, they make double-execution vanishingly unlikely.</p>
+<hr />
+<h2 id="5-worked-example-naive-broken-fixed">5. Worked example: naive → broken → fixed</h2>
+<h3 id="setup">Setup</h3>
+<p>A payments company runs a daily settlement job at 03:00 UTC. The job reads pending charges and submits a batched call to the bank that moves money. <strong>Running the job twice means submitting the batch twice, which means the bank double-debits the merchant accounts.</strong> No reversal endpoint exists; reconciliation costs five-figure dollars per incident.</p>
+<h3 id="naive-design">Naive design</h3>
+<pre><code>+----------+      +----------+      +----------+
+| cron-1   |      | cron-2   |      | cron-3   |
+| (asg=3)  |      |          |      |          |
++----+-----+      +----+-----+      +----+-----+
+     |                 |                  |
+     | &quot;is it 3am?     | &quot;is it 3am?     | &quot;is it 3am?
+     |  yes — run.&quot;    |  yes — run.&quot;    |  yes — run.&quot;
+     v                 v                  v
+        +-----------------------------+
+        |     Bank batch endpoint     |
+        +-----------------------------+
+</code></pre>
+<p>Three identical scheduler nodes for HA, each running the same crontab. Result: the bank receives three identical batch submissions at 03:00:00.</p>
+<p><strong>Why it fails:</strong> there is no notion of "only one runs." Each node acts on local time independently.</p>
+<h3 id="first-fix-attempt-redis-setnx-lock">First fix attempt: Redis SETNX lock</h3>
+<pre><code class="language-python"># pseudo
+def run_settlement():
+    got_lock = redis.set(&quot;settlement:2024-01-15&quot;, node_id, nx=True, ex=300)
+    if not got_lock:
+        return
+    submit_batch_to_bank()
+    redis.delete(&quot;settlement:2024-01-15&quot;)
+</code></pre>
+<p>Looks safe. It is not, in several modes:</p>
+<ol>
+<li><strong>Redis primary fails.</strong> The replica is async — the lock key may not have replicated. New Redis primary has no lock; another node acquires; double-execution.</li>
+<li><strong>GC pause on the holder.</strong> Node A acquires the lock, hits a 6-minute GC pause. TTL expires. Node B acquires. Node A wakes up and runs <code>submit_batch_to_bank()</code>, never knowing it lost the lock. The bank receives two batches.</li>
+<li><strong>Network partition.</strong> Same scenario; lock TTL expires; new holder elected; old holder still running.</li>
+</ol>
+<p>This is the <strong>"Redis distributed lock" controversy</strong>: Martin Kleppmann's critique of Redlock (the multi-node Redis lock algorithm). The protocol cannot guarantee mutual exclusion without <strong>fencing tokens enforced at the resource</strong>, because no amount of consensus on lock ownership protects against an old leader writing after losing the lock. See <a href="#9-likely-interviewer-probes">section 9 on the Redlock controversy</a> for the full debate.</p>
+<h3 id="stronger-fix-consensus-fencing-tokens">Stronger fix: consensus + fencing tokens</h3>
+<p>Architecture:</p>
+<pre><code>                            +-----------------+
+                            |   etcd cluster  |
+                            |  (Raft, n=5)    |
+                            +--------+--------+
+                                     | grants lease + token
+                +--------------------+--------------------+
+                |                    |                    |
+            +---v-----+         +----v----+         +-----v---+
+            | sched-1 |         | sched-2 |         | sched-3 |
+            +---+-----+         +---------+         +---------+
+                | I hold lease &quot;settlement-cron&quot;
+                | with token=42
+                v
+            +-------+
+            | Bank  |  &lt;-- stores max_token_seen per job_id
+            | API   |      rejects requests with token &lt; max
+            +-------+
+</code></pre>
+<p>Settlement code:</p>
+<pre><code class="language-python">def run_settlement(now_utc):
+    # 1. Acquire (or confirm) the lease + token via etcd.
+    grant = etcd.acquire_or_refresh(
+        lock_key=&quot;settlement-cron&quot;,
+        lease_ttl=15,  # seconds
+        holder_id=NODE_ID,
+    )
+    if grant.holder_id != NODE_ID:
+        return  # someone else holds it
+
+    # 2. Materialize the &quot;expected run&quot; row with a unique key.
+    occurrence_id = f&quot;settlement:{now_utc.date().isoformat()}&quot;
+    inserted = catalog.try_insert_occurrence(
+        occurrence_id=occurrence_id,
+        scheduled_at=now_utc,
+    )
+    if not inserted:
+        return  # already created; another scheduler did it
+
+    # 3. Dispatch the work with the fencing token.
+    bank_api.submit_batch(
+        idempotency_key=occurrence_id,
+        fencing_token=grant.token,  # the token MUST be checked downstream
+        payload=load_pending_charges(now_utc),
+    )
+</code></pre>
+<p>Bank API resource (the side that enforces fencing):</p>
+<pre><code class="language-python">def submit_batch(idempotency_key, fencing_token, payload):
+    with db.transaction():
+        row = db.select_for_update(
+            &quot;bank_jobs&quot;, where={&quot;job_id&quot;: &quot;settlement-cron&quot;}
+        )
+        if fencing_token &lt; row.max_token_seen:
+            # Stale leader. Refuse.
+            raise StaleLeaderError(
+                f&quot;got {fencing_token}, have {row.max_token_seen}&quot;
+            )
+        if db.exists(&quot;bank_batches&quot;, idempotency_key=idempotency_key):
+            # Belt-and-suspenders: idempotency dedup.
+            return db.lookup(&quot;bank_batches&quot;, idempotency_key=idempotency_key)
+        db.update(&quot;bank_jobs&quot;, job_id=&quot;settlement-cron&quot;,
+                  max_token_seen=fencing_token)
+        result = execute_batch(payload)
+        db.insert(&quot;bank_batches&quot;,
+                  idempotency_key=idempotency_key, result=result)
+        return result
+</code></pre>
+<p>Now consider the broken scenarios again:</p>
+<ol>
+<li><strong>sched-1 holds token=42, GC-pauses 6 minutes.</strong> etcd lease expires; sched-2 wins, token=43. sched-2 calls the bank with token=43; bank records max=43. sched-1 wakes up, calls bank with token=42. Bank refuses: 42 &lt; 43. Fencing saved us. <strong>Safe.</strong></li>
+<li><strong>etcd primary fails.</strong> Raft elects a new etcd primary from the remaining 4 replicas. Lease state is replicated; no loss. Consensus saved us. <strong>Safe.</strong></li>
+<li><strong>sched-1's request arrives at the bank <em>before</em> sched-2's, even though sched-1 had already lost its lease.</strong> Bank sees token=42, has never seen anything higher, accepts; sets max=42, processes batch. sched-2 arrives with token=43; bank sets max=43 (43 ≥ 42, fencing passes) — but the <strong>idempotency key</strong> is <code>settlement:2024-01-15</code>, the same as before. Bank dedupes: returns the cached result instead of executing again. <strong>Note: fencing alone did not save us here</strong> — both tokens were monotone-acceptable in the order they arrived. Idempotency saved us. <strong>Safe.</strong></li>
+</ol>
+<p>Scenario 3 is the one that proves the three layers are not redundant. Fencing protects against an old leader writing <em>after</em> a new leader's higher token has landed; it does <strong>not</strong> protect against an old leader's write landing <em>first</em>, which can happen when the old leader didn't know it had lost the lease and the network reordered packets. Idempotency catches that case. None of the three layers alone is sufficient; together they produce exactly-one effect.</p>
+<hr />
+<h2 id="6-variants-and-how-to-choose">6. Variants and how to choose</h2>
+<table>
+<thead>
+<tr>
+<th>Variant</th>
+<th>What it solves</th>
+<th>Toolkit</th>
+<th>When to use</th>
+<th>When NOT to use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Leader election</strong></td>
+<td>One node owns a global role (run cron, drive failover).</td>
+<td>etcd/ZK/Chubby + lease + fencing token.</td>
+<td>Single global decision-maker (orchestrator, primary).</td>
+<td>Hot path that needs to scale beyond one node's throughput.</td>
+</tr>
+<tr>
+<td><strong>Distributed lock</strong></td>
+<td>Mutual exclusion over a named resource for a finite window.</td>
+<td>Chubby / ZooKeeper ephemeral node / etcd lease.</td>
+<td>Coarse-grained ownership claims, leader election as a degenerate case, infrequent critical sections.</td>
+<td>Fine-grained per-row mutex (use DB transactions).</td>
+</tr>
+<tr>
+<td><strong>Single-leader-per-partition</strong></td>
+<td>Scale: one leader per shard.</td>
+<td>Per-shard Raft group; managed by a meta-coordinator (e.g., Kafka controller).</td>
+<td>Sharded data stores, partitioned consensus (CockroachDB, Spanner, Kafka).</td>
+<td>Small data set where one Raft group suffices.</td>
+</tr>
+<tr>
+<td><strong>Consensus state machine (replicated)</strong></td>
+<td>The state IS the consensus, not just leader identity.</td>
+<td>Raft / Paxos directly storing application state.</td>
+<td>Strongly consistent KV / metadata (etcd, Consul, ZooKeeper as a tiny DB).</td>
+<td>Large state; consensus is throughput-bound, not for primary storage.</td>
+</tr>
+<tr>
+<td><strong>Optimistic primary + idempotency</strong></td>
+<td>"Run-anywhere" with safety via the resource.</td>
+<td>Idempotency keys + DB constraints + reconciliation.</td>
+<td>When you cannot afford a coordination layer, or as fallback.</td>
+<td>When the resource cannot enforce idempotency atomically.</td>
+</tr>
+</tbody>
+</table>
+<p>Decision flow:</p>
+<pre><code>&quot;Need exactly one actor?&quot;
+        |
+        v
+Is the state being protected a fixed, small role
+(primary, scheduler, controller)?
+        |
+   yes --&gt; Leader election with fencing tokens.
+        |
+        no
+        v
+Is it many resources, each needing one writer?
+        |
+   yes --&gt; Single-leader-per-partition (sharded consensus).
+        |
+        no
+        v
+Is it occasional access to a named resource?
+        |
+   yes --&gt; Distributed lock (with fencing).
+        |
+        no
+        v
+Is the state itself what needs replication?
+        |
+   yes --&gt; Replicated state machine on top of consensus (Raft/Paxos).
+        |
+        no
+        v
+Reconsider: maybe coordination isn't needed; pure idempotency suffices.
+</code></pre>
+<p>In an interview, <strong>say which variant you chose and why</strong> — e.g., <em>"For a daily payments cron, a single leader-elected scheduler is right because the action is global and infrequent. I would not partition; the coordination cost is negligible compared to the safety win."</em></p>
+<hr />
+<h2 id="7-failure-modes-and-operations">7. Failure modes and operations</h2>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Symptom</th>
+<th>Metric to watch</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Clock skew between consensus replicas</strong></td>
+<td>Lease expiry decisions disagree; spurious failovers; double-grants.</td>
+<td>NTP drift per node; clock_offset_seconds.</td>
+<td>Use NTP + leap-smear; treat lease expiry as elapsed wall-clock since last heartbeat, on the <strong>server</strong> side, not the client side. Spanner uses TrueTime to bound this explicitly.</td>
+</tr>
+<tr>
+<td><strong>Lease expiry race (long GC pause)</strong></td>
+<td>Old leader thinks it holds; new leader elected; both attempt writes.</td>
+<td>gc_pause_p99; lease_lost_count.</td>
+<td>Fencing tokens at the resource. Lease TTL must exceed worst-case GC; do not shrink TTL to chase failover speed without addressing GC.</td>
+</tr>
+<tr>
+<td><strong>Network partition (split-brain)</strong></td>
+<td>Two leaders elected in two partitions; both write.</td>
+<td>partition_detected events; quorum_unhealthy.</td>
+<td>Consensus requires majority for grants — minority side cannot elect a new leader. Resource-side fencing still required because old leader on majority side may have lost its lease before becoming aware.</td>
+</tr>
+<tr>
+<td><strong>Quorum loss (more failures than tolerated)</strong></td>
+<td>Cluster cannot elect or commit; system halts writes.</td>
+<td>unhealthy_replicas; commit_latency p99.</td>
+<td>Run with n=5 not n=3 for critical systems; spread replicas across availability zones; have a documented disaster-recovery plan (manual majority override is dangerous — accept that strong consistency means halt-on-failure).</td>
+</tr>
+<tr>
+<td><strong>Heartbeat amplification</strong></td>
+<td>Many followers heartbeat the leader; the leader CPU saturates.</td>
+<td>leader_cpu_pct; heartbeat_qps.</td>
+<td>Bound the number of clients per coordination cell (Chubby uses cells of ~10K clients); shard if larger.</td>
+</tr>
+<tr>
+<td><strong>Slow disk on the leader's WAL</strong></td>
+<td>Commit latency rises; clients see timeouts; spurious failovers.</td>
+<td>wal_fsync_p99; commit_latency p99.</td>
+<td>Dedicated SSDs for the consensus log; do not co-locate with noisy workloads.</td>
+</tr>
+<tr>
+<td><strong>Watch storm on leader change</strong></td>
+<td>Many clients re-acquire leases simultaneously after a failover; thundering herd.</td>
+<td>reacquire_qps spike.</td>
+<td>Jittered backoff on re-acquire; bounded fan-in.</td>
+</tr>
+<tr>
+<td><strong>Old leader resurrects after long partition</strong></td>
+<td>Stale leader returns to a network that has moved on; tries to write with old token.</td>
+<td>rejected_writes by token.</td>
+<td>Fencing tokens reject this at the resource. Also: leader self-checks that it can still hear from a majority of peers, and self-demotes if it cannot.</td>
+</tr>
+<tr>
+<td><strong>Resource cannot store fencing token</strong></td>
+<td>The downstream system (e.g., an email API) has no token field; coordination correctness reduces to lease honesty.</td>
+<td>side_effects_without_fencing.</td>
+<td>Make the side effect idempotent (idempotency key + dedup window). Treat the lock as best-effort. Document the residual risk.</td>
+</tr>
+<tr>
+<td><strong>Lease TTL set too short</strong></td>
+<td>Frequent failovers under normal GC; flapping.</td>
+<td>failover_count/hour; leader_age p50.</td>
+<td>Increase TTL; profile worst-case stop-the-world pauses; tune renewal interval to TTL/3.</td>
+</tr>
+<tr>
+<td><strong>Lease TTL set too long</strong></td>
+<td>Slow failover; users see multi-minute outages.</td>
+<td>mean_failover_seconds.</td>
+<td>Decrease TTL but only after addressing GC causes.</td>
+</tr>
+</tbody>
+</table>
+<p>Operational instrumentation that every coordination layer should emit:</p>
+<ul>
+<li><strong>Per-lock metrics</strong>: holder identity, token, lease remaining, acquire/renew/lose counters.</li>
+<li><strong>Per-replica metrics</strong>: term, role (leader/follower/candidate), commit index, wal_fsync p99.</li>
+<li><strong>Per-client metrics</strong>: token rejected count (smoke test that fencing is actually enforced), reacquire count.</li>
+<li><strong>Audit log</strong>: every grant, every release, every expiry. This is your forensic trail when "who ran the job?" becomes a question.</li>
+</ul>
+<hr />
+<h2 id="8-combinations-with-other-patterns">8. Combinations with other patterns</h2>
+<p>Coordination rarely stands alone. The full safety story usually involves three or four sibling patterns.</p>
+<table>
+<thead>
+<tr>
+<th>Sibling pattern</th>
+<th>How it combines</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="./idempotency-exactly-once.md">idempotency-exactly-once.md</a></td>
+<td>Coordination gives <strong>exactly-one execution attempt</strong>; idempotency gives <strong>exactly-one effect even under retries</strong>. Always pair them for money-moving or external-side-effect actions.</td>
+</tr>
+<tr>
+<td><a href="./strong-consistency-under-contention.md">strong-consistency-under-contention.md</a></td>
+<td>Coordination is <em>how</em> you achieve strong consistency on identity. The contention pattern covers the downstream (rows, balances) — coordination covers the actor.</td>
+</tr>
+<tr>
+<td><a href="./hot-key-skew.md">hot-key-skew.md</a></td>
+<td>A single leader is, by definition, a hot key. Mitigate by partitioning the work (single-leader-per-partition), not by lying about coordination.</td>
+</tr>
+<tr>
+<td><a href="./ordering-causal-consistency.md">ordering-causal-consistency.md</a></td>
+<td>The consensus log itself provides total ordering. If you use a Raft log as the truth, you get ordering for free across leader changes.</td>
+</tr>
+<tr>
+<td><a href="./fan-out-write-amplification.md">fan-out-write-amplification.md</a></td>
+<td>If the leader fans out work, retries on fan-out must be safe under leader change — idempotency keys plus fencing tokens.</td>
+</tr>
+<tr>
+<td><a href="./backpressure-flow-control.md">backpressure-flow-control.md</a></td>
+<td>The consensus layer is itself rate-limited; protect it from the herd of clients heartbeating after a failover.</td>
+</tr>
+<tr>
+<td><a href="./durability-at-scale.md">durability-at-scale.md</a></td>
+<td>The consensus log must be durable across the quorum; lose durability and you lose coordination correctness.</td>
+</tr>
+</tbody>
+</table>
+<p>A staff-level answer connects these explicitly: <em>"The coordination layer ensures one scheduler triggers the job. Idempotency at the bank API ensures the effect is exactly one. The double-entry ledger gives the audit trail. Each layer covers a failure mode the others don't."</em></p>
+<hr />
+<h2 id="9-likely-interviewer-probes">9. Likely interviewer probes</h2>
+<p>Expect at least three of these. Have rehearsed answers ready.</p>
+<h3 id="91-explain-the-redlock-controversy">9.1 "Explain the Redlock controversy."</h3>
+<p><strong>Redlock</strong> is the algorithm Salvatore Sanfilippo (Redis author) proposed for distributed locking across N independent Redis nodes: acquire the lock on a majority of N=5 nodes within a time bound; lock holder uses the lock for the remaining time minus a clock-drift allowance.</p>
+<p><strong>Martin Kleppmann's 2016 critique</strong> is sharper than "Redis is unsafe." His central claim is that <em>any</em> lock service — Redlock, Chubby, ZooKeeper, your home-rolled one — that only hands the client an opaque lock identity is insufficient when the protected resource lives elsewhere. After acquiring the lock, the client can be paused (GC, swap, OS scheduling, virtualization stall) for longer than the lease TTL; meanwhile a second client acquires the lock and writes to the resource; then the first client resumes and writes too. The remedy Kleppmann insists on is <strong>fencing tokens enforced at the resource</strong> — the resource records the highest token it has ever seen and rejects lower ones. Redlock's specific gap is that it does not issue such a token; the same gap exists, technically, for "Chubby without a sequencer" or "ZooKeeper without using the zxid."</p>
+<p>Antirez's response: in practice, GC pauses long enough to break Redlock are observable and rare; Redlock is a reasonable tradeoff for systems that cannot afford a Raft/Paxos cluster. Kleppmann's counter: "rare" is not a correctness argument for money-moving operations.</p>
+<p>The staff-level synthesis:</p>
+<blockquote>
+<p>The controversy is not Redis-vs-Raft. It is about <strong>where mutual exclusion is enforced</strong>: at the lock service (necessary but never sufficient) or at the resource (the only place that can actually keep two writers apart). A lock service without a fencing token is best-effort. A lock service with a fencing token is correct <em>if and only if the resource checks the token</em>. Chubby, ZooKeeper, and etcd all support fencing tokens; Redlock does not natively. But the failure mode generalizes: any design where the lock service is the only line of defense is broken under adversarial pauses, regardless of whose name is on the lock service.</p>
+</blockquote>
+<h3 id="92-what-if-the-consensus-cluster-loses-quorum">9.2 "What if the consensus cluster loses quorum?"</h3>
+<p>Answer: the cluster halts writes. Consensus is <strong>CP</strong> in the CAP sense — partition tolerance and consistency, at the cost of availability under quorum loss. Document this. Don't try to "fix" it by allowing minority writes (that re-introduces split-brain).</p>
+<p>Mitigations: run n=5 not n=3 (tolerates 2 failures, not just 1); spread replicas across AZs; have a documented manual recovery path that involves snapshotting the minority and bootstrapping a new majority — accepting the data loss explicitly.</p>
+<h3 id="93-why-not-just-use-a-database-row-lock">9.3 "Why not just use a database row lock?"</h3>
+<p>It works for some cases — e.g., a <code>SELECT ... FOR UPDATE</code> on a single-leader Postgres can absolutely serve as a coordination primitive. The limits:</p>
+<ul>
+<li>The database becomes a SPOF for coordination; if it dies, no one can coordinate.</li>
+<li>Failover of the database itself reintroduces the coordination problem one level down (which Postgres replica is now primary?).</li>
+<li>Throughput is bound by row-lock contention.</li>
+</ul>
+<p>The win of a dedicated consensus service: it is purpose-built for high availability of small, hot, contended state.</p>
+<h3 id="94-how-fast-can-you-fail-over">9.4 "How fast can you fail over?"</h3>
+<p>Worst-case = lease_TTL + election_RTT (the consensus election timeout, typically 150-300 ms for Raft on a healthy LAN). With TTL = 10 s, that puts observed failover in the 10-15 s range. To go faster you have to shrink the TTL — and that is where the asymmetry lives: shrinking TTL below your worst-case stop-the-world pause (JVM GC, Go STW, hypervisor steal) trades real failover speed for a real risk of false failovers under load. "5-second failover" is achievable only if you have either characterized your worst-case pause empirically <em>or</em> moved the runtime off the JVM. The "pre-warmed standby" point is real but orthogonal: it shortens the post-election warm-up, not the election itself.</p>
+<h3 id="95-what-if-the-leader-is-a-byzantine-actor-malicious-or-buggy">9.5 "What if the leader is a Byzantine actor (malicious or buggy)?"</h3>
+<p>Standard consensus (Raft, Paxos, ZAB) tolerates <strong>crash failures</strong>, not Byzantine ones. If you need Byzantine fault tolerance, you need PBFT, Tendermint, or HotStuff — at significant overhead. In a typical cloud system you assume non-Byzantine.</p>
+<p>Practical mitigation against buggy-leader cases: leader self-checks (am I still in the majority? can I commit?); circuit breakers in the leader's outgoing calls; canary deployments; the resource-side fencing token is the final word.</p>
+<h3 id="96-why-does-kafka-use-zookeeper-kraft-instead-of-just-electing-controllers-via-gossip">9.6 "Why does Kafka use ZooKeeper / KRaft instead of just electing controllers via gossip?"</h3>
+<p>Gossip provides eventual consistency on membership, not strong agreement on identity. The Kafka controller needs strict single-writer semantics for partition leadership assignments. ZooKeeper (and now KRaft, which is internal Raft) provides that. Gossip-based controllers would risk split-brain in metadata.</p>
+<h3 id="97-how-does-this-interact-with-multi-region">9.7 "How does this interact with multi-region?"</h3>
+<p>Cross-region consensus pays the cross-region RTT on every write — often 50-100 ms. For latency-sensitive coordination, either:</p>
+<ul>
+<li>Keep consensus regional and have a separate coordination layer for cross-region (e.g., Spanner's Paxos groups are within a region for hot path; cross-region uses external coordinators).</li>
+<li>Use a global consensus only for rare, high-stakes decisions (DR failover).</li>
+<li>Accept eventual-consistency for cross-region coordination and use idempotency to absorb the looseness.</li>
+</ul>
+<hr />
+<h2 id="10-common-traps-stronger-moves">10. Common traps → stronger moves</h2>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"We use Redis SETNX as a lock."</td>
+<td>"We use Redis as a hint; correctness comes from fencing tokens enforced at the database via a <code>WHERE max_token_seen &lt;= :token</code> update."</td>
+</tr>
+<tr>
+<td>"The leader checks if it's still leader before acting."</td>
+<td>"Every action carries the lease's fencing token; the resource — not the leader — enforces freshness."</td>
+</tr>
+<tr>
+<td>"We use heartbeats to detect failure."</td>
+<td>"We use a lease with TTL; heartbeats renew the lease. Failure detection is the elapsed-time clock, not a separate signal."</td>
+</tr>
+<tr>
+<td>"If the leader crashes, the standby takes over instantly."</td>
+<td>"Failover time is lease_TTL + election_RTT, typically 5-15 seconds. Faster requires accepting higher false-positive rate."</td>
+</tr>
+<tr>
+<td>"We trust the cluster won't partition."</td>
+<td>"We design for partitions: the minority side halts writes; the majority side serves; resources enforce fencing so a returning minority leader cannot corrupt."</td>
+</tr>
+<tr>
+<td>"One leader for the whole system."</td>
+<td>"One leader per partition; meta-coordinator assigns partition leaders. Scales horizontally without a global bottleneck."</td>
+</tr>
+<tr>
+<td>"Consensus runs on n=3 for cost."</td>
+<td>"Critical paths run n=5 so we tolerate 2 simultaneous failures (e.g., one for a planned upgrade plus one unplanned)."</td>
+</tr>
+<tr>
+<td>"Raft is hard, we'll write our own protocol."</td>
+<td>"We use etcd / ZooKeeper / a managed service. Custom consensus is a multi-year project and a footgun."</td>
+</tr>
+<tr>
+<td>"Idempotency makes coordination unnecessary."</td>
+<td>"Sometimes true: for cache rebuilds, materialized-view refreshes, or any naturally-idempotent job, idempotency <em>is</em> the answer and consensus is overhead. For non-idempotent side effects (the bank API has no dedupe, the email provider sends one per call), coordination + fencing + idempotency together is the staff-level answer. Ask which case you're in before reaching for Raft."</td>
+</tr>
+<tr>
+<td>"We don't need fencing because our lock service is reliable."</td>
+<td>"We add fencing because no lock service is reliable against a 30-second JVM GC pause. Fencing is cheap; absence of fencing is unbounded risk."</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11-staff-level-answer-checklist">11. Staff-level answer checklist</h2>
+<p>When the interviewer touches this pattern, hit these signals in order:</p>
+<ul>
+<li>[ ] <strong>First, decide whether you even need consensus.</strong> If the side effect is idempotent, say so and propose at-least-once + idempotency. Reaching for Raft when the job is <code>INSERT ... ON CONFLICT DO NOTHING</code> is overengineering, and a sharp interviewer will mark you down.</li>
+<li>[ ] <strong>Name the invariant out loud.</strong> "At most one actor performs this operation, even under partition." This phrase is what the interviewer is grading on.</li>
+<li>[ ] <strong>Identify the consensus layer.</strong> Raft (etcd / Consul / managed), Paxos (Chubby / Spanner), or ZAB (ZooKeeper). Don't roll your own.</li>
+<li>[ ] <strong>Specify the fencing token.</strong> Where it comes from, how it's monotonic, and — critically — <strong>where it is enforced</strong>. Saying "fencing token" without specifying the resource check is incomplete.</li>
+<li>[ ] <strong>Talk about the lease, not just the lock.</strong> TTL, renewal interval, and the failover time it implies.</li>
+<li>[ ] <strong>Address the GC pause / partition scenario explicitly.</strong> Walk through what happens when the old leader wakes up after the lease expired.</li>
+<li>[ ] <strong>Acknowledge the Redlock-style controversy.</strong> Show you understand the difference between lock semantics and fencing semantics.</li>
+<li>[ ] <strong>Combine with idempotency.</strong> Coordination is the first line; idempotency is the second. Both are required for money-moving operations.</li>
+<li>[ ] <strong>Discuss observability.</strong> What metric tells you fencing rejected a stale write? (You'd be alarmed by a leader self-fencing on its own writes.)</li>
+<li>[ ] <strong>Pick a variant explicitly.</strong> Leader election vs distributed lock vs single-leader-per-partition vs consensus state machine — and justify the choice.</li>
+<li>[ ] <strong>State the failover time budget.</strong> "5-15 seconds with TTL=10s, by design." Not "instant."</li>
+<li>[ ] <strong>Acknowledge halt-on-quorum-loss.</strong> Consensus is CP. Document the recovery procedure.</li>
+<li>[ ] <strong>Avoid Byzantine claims.</strong> Standard consensus is not Byzantine fault tolerant; say so.</li>
+</ul>
+<p>If you hit 9 of these 13, you sound like a staff engineer who has run a coordination layer in production. If you hit fewer than 5, you sound like you've read the Raft paper but never owned the on-call.</p>
+<hr />
+<h2 id="12-cross-references">12. Cross-references</h2>
+<p>Sibling patterns:</p>
+<ul>
+<li><a href="./idempotency-exactly-once.md">idempotency-exactly-once.md</a> — the natural pair; coordination + idempotency = exactly-one effect.</li>
+<li><a href="./strong-consistency-under-contention.md">strong-consistency-under-contention.md</a> — uses consensus on data, not just identity.</li>
+<li><a href="./hot-key-skew.md">hot-key-skew.md</a> — a single leader is a hot key by definition.</li>
+<li><a href="./ordering-causal-consistency.md">ordering-causal-consistency.md</a> — consensus log gives total order across leader changes.</li>
+<li><a href="./fan-out-write-amplification.md">fan-out-write-amplification.md</a> — leaders that fan out must use idempotency keys for safe retry.</li>
+<li><a href="./backpressure-flow-control.md">backpressure-flow-control.md</a> — protect the coordination layer from thundering herds.</li>
+<li><a href="./durability-at-scale.md">durability-at-scale.md</a> — durability of the consensus log underpins everything above.</li>
+<li><a href="./search-and-ranking.md">search-and-ranking.md</a>, <a href="./geo-spatial-queries.md">geo-spatial-queries.md</a>, <a href="./real-time-aggregation.md">real-time-aggregation.md</a>, <a href="./cache-stampede-read-amplification.md">cache-stampede-read-amplification.md</a> — less direct overlap, but the partition-leader idea recurs.</li>
+</ul>
+<p>Most relevant question docs:</p>
+<ul>
+<li><a href="../questions/design-a-distributed-lock-manager-like-chubby.md">Chubby</a> — canonical coordination service.</li>
+<li><a href="../questions/design-a-distributed-job-scheduler-like-cron.md">Distributed Job Scheduler / Cron</a> — exactly-one-execution per occurrence.</li>
+<li><a href="../questions/design-a-payment-system.md">Payment System</a> — cost of double-execution.</li>
+<li><a href="../questions/design-the-stripe-payment-gateway.md">Stripe Payment Gateway</a> — idempotency key complements coordination.</li>
+<li><a href="../questions/design-a-stock-exchange.md">Stock Exchange</a> — primary failover for the order book.</li>
+<li><a href="../questions/design-a-reminder-alert-system.md">Reminder / Alert System</a> — single-firing of triggers.</li>
+<li><a href="../questions/apache-kafka.md">Apache Kafka</a> — single-leader-per-partition pattern.</li>
+<li><a href="../questions/apache-cassandra.md">Apache Cassandra</a> — LWT (lightweight transactions) as Paxos overlay.</li>
+<li><a href="../questions/amazon-dynamo.md">Amazon Dynamo</a> — counter-example: avoids coordination via quorum + vector clocks.</li>
+<li><a href="../questions/google-bigtable.md">Google Bigtable</a> — uses Chubby for tablet master election.</li>
+</ul>
+<p>Foundational reading:</p>
+<ul>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> — terms like quorum, lease, replica, consensus.</li>
+<li><a href="../STAFF_SYSTEM_DESIGN_INTERVIEW_PLAYBOOK.md">Staff System Design Interview Playbook</a> — interview flow, time budget, opening script.</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

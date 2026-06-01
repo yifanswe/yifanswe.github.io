@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Durability at Scale — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design-patterns/">← Back to System Design Patterns</a>
+        <h1 class="article-title">Durability at Scale</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/31 &nbsp;·&nbsp; System Design Patterns
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>Designing storage so that bytes you accepted never disappear, even at petabyte scale where disks die routinely, bits silently rot, and whole racks or regions can vanish at once.</p>
+</blockquote>
+<p>This pattern is the durability-first lens applied to bulk storage. For terminology see the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a>. Related question docs:</p>
+<ul>
+<li><a href="../questions/design-amazon-s3.md">Amazon S3</a> — eleven nines, erasure coding, cross-region replication.</li>
+<li><a href="../questions/hadoop-distributed-file-system.md">Hadoop Distributed File System (HDFS) / Google File System (GFS)</a> — block replication, rack-aware placement, BlockScanner.</li>
+<li><a href="../questions/google-bigtable.md">Google BigTable</a> — durability delegated to GFS; SSTables + commit log.</li>
+<li><a href="../questions/design-dropbox.md">Dropbox</a> — file sync, chunk-level deduplication, durable backup.</li>
+<li><a href="../questions/design-youtube.md">YouTube</a> — multi-region video storage with cold tiers.</li>
+<li><a href="../questions/design-instagram.md">Instagram</a> — photo storage durability.</li>
+<li><a href="../questions/amazon-dynamo.md">Amazon Dynamo</a> — replication and anti-entropy in a quorum store.</li>
+</ul>
+<hr />
+<h2 id="1-the-fundamental-hardness">1. The Fundamental Hardness</h2>
+<p>Eleven nines of durability — <code>99.999999999%</code> — is the number Amazon Simple Storage Service (S3) advertises. The unit matters: it is a <em>per-object, per-year</em> expected loss probability of <code>10^-11</code>, not a per-system uptime number. The literal claim is: if you store 10,000,000,000 (ten billion) objects, the expected number lost per year is <code>0.1</code> (<code>10^10 * 10^-11</code>). Equivalently, the expected time to lose a single object from a 10,000-object bucket is roughly 10,000,000 years. Note this is also distinct from <em>availability</em> — S3 advertises eleven nines of durability but only four nines of availability; durability says "we still have your bytes," availability says "you can read them right now." These are different design problems with different mitigations.</p>
+<p>The naive answer is "store three copies." This works fine at gigabyte scale and is genuinely fine up to roughly tens of petabytes — <code>3x</code> across three Availability Zones (AZs), with scrubbing, gets you to eleven nines on paper. Where it stops being the right answer is the storage bill. At 100 petabytes (PB) raw, <code>3x</code> is 300 PB of disk; at exabyte scale <code>3x</code> is hundreds of millions of dollars per year in disk that erasure coding could shave by half. The interview question is not "is replication wrong" — it is "at what scale does the cost math justify the complexity of erasure coding, and how do you defend the durability number under realistic failure correlations." Industry Annualized Failure Rate (AFR) for spinning disks is typically <code>1-4%</code>; at 100,000 disks you lose roughly <code>3-11</code> per day, and the system must repair faster than the next coincident failure window. Failures are correlated, not independent. A rack switch dies and takes 40 nodes with it. A power phase trips and takes half a datacenter. A bad firmware push corrupts a model of drive across the fleet. Independent-failure math hides all the interesting risk.</p>
+<p>Bit rot — silent data corruption on disk where bytes flip without any read error — is real. Studies of large fleets (Bairavasundaram et al., FAST 2008; Google's "What does an exabyte of storage smell like?") put silent corruption rates between <code>10^-14</code> and <code>10^-15</code> per bit read. At exabyte scale you encounter silent corruption every day. If you never read the data, you never notice — until you do, and then the parity you would have used to repair it is also rotted. Durability is not a one-time encode decision; it is a continuous verification job.</p>
+<p>The interview question is therefore not "do you know what replication is." It is "how do you stack the layers — replication, erasure coding, geo-replication, scrubbing, anti-entropy, durable Write-Ahead Logs (WALs), durability classes — so that under realistic failure models (correlated rack failures, regional disasters, silent corruption, repair storms) you can defend a <code>1-10^-11</code> annual loss number to the interviewer with arithmetic, not vibes."</p>
+<hr />
+<h2 id="2-how-to-recognize-it-in-the-interview">2. How to Recognize It in the Interview</h2>
+<h3 id="prompt-phrases">Prompt phrases</h3>
+<ul>
+<li>"It must never lose data."</li>
+<li>"Eleven nines of durability."</li>
+<li>"Customers pay us to keep this safe forever."</li>
+<li>"Petabyte" / "exabyte" / "billions of objects."</li>
+<li>"Backup," "archive," "compliance retention," "legal hold."</li>
+<li>"Survive a region failure."</li>
+<li>"Storage cost is dominant" (signals erasure coding pressure).</li>
+<li>"Append-mostly," "write-once-read-many" (signals object store, blob store).</li>
+</ul>
+<h3 id="architectural-smells">Architectural smells</h3>
+<ul>
+<li>Storage is the bottleneck dollar-wise, not Central Processing Unit (CPU) or network.</li>
+<li>Data is large and immutable or append-only (videos, photos, logs, backups).</li>
+<li>Read traffic is bursty or cold; most bytes are rarely accessed.</li>
+<li>A single object loss is a customer-visible failure or a compliance incident.</li>
+<li>The system spans multiple Availability Zones (AZs) or regions by requirement.</li>
+</ul>
+<h3 id="example-interview-prompts-where-this-is-core">Example interview prompts where this is core</h3>
+<ol>
+<li>Design S3 / a planet-scale object store.</li>
+<li>Design GFS / HDFS / a distributed file system for analytics.</li>
+<li>Design YouTube or Netflix video storage (with cold tiers).</li>
+<li>Design a photo storage system like Instagram or Facebook Haystack.</li>
+<li>Design Dropbox / Google Drive (chunked file sync with durable backend).</li>
+<li>Design a backup / archive service (Glacier-style cold storage).</li>
+<li>Design a blockchain ledger or append-only audit log.</li>
+<li>Design a metrics / logs long-term store like Datadog's archival tier.</li>
+</ol>
+<hr />
+<h2 id="3-60-second-spoken-framing">3. 60-Second Spoken Framing</h2>
+<blockquote>
+<p>The invariant is that any byte we acknowledged to the client must survive any single rack failure with very high probability and any single Availability Zone failure with high probability, and we should be able to recover from a region loss if the customer paid for it. I will hit eleven nines by stacking three layers: erasure coding across failure domains inside a region for cost-efficient redundancy, asynchronous cross-region replication for regional disasters, and continuous background scrubbing plus Merkle-tree anti-entropy to catch bit rot before the redundancy is exhausted. I will keep a durable Write-Ahead Log on the metadata path so an in-flight write is not lost during a failover, and I will tier cold data to cheaper media with the same durability target but worse latency. The math I want to walk through is the per-object annual loss probability under correlated rack failure plus repair time, because that is what drives the erasure coding rate <code>M+K</code>.</p>
+</blockquote>
+<hr />
+<h2 id="4-canonical-toolkit">4. Canonical Toolkit</h2>
+<h3 id="41-replication-nx-copies">4.1 Replication (<code>Nx</code> copies)</h3>
+<p>Keep <code>N</code> identical copies on different failure domains. Reads can go to any copy; writes go to all <code>N</code> (or a quorum <code>W</code>).</p>
+<ul>
+<li>Pros: simple, fast reads (no decode), fast repair (just copy one block), easy to reason about.</li>
+<li>Cons: <code>Nx</code> storage overhead. At <code>3x</code> and 100 PB that is 200 PB of "wasted" disk.</li>
+<li>Where it shines: small objects (encoding overhead dominates the data), hot data (any replica can serve), low-latency writes (no parity compute).</li>
+</ul>
+<h3 id="42-erasure-coding-reed-solomon-m-k">4.2 Erasure Coding (Reed-Solomon <code>M + K</code>)</h3>
+<p>Split an object into <code>M</code> data chunks; compute <code>K</code> parity chunks; store all <code>M+K</code> chunks on different failure domains. Tolerate any <code>K</code> losses. Storage overhead is <code>(M+K)/M</code>.</p>
+<p>Common configurations:</p>
+<table>
+<thead>
+<tr>
+<th>Scheme</th>
+<th>Overhead</th>
+<th>Tolerates</th>
+<th>Used by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>3x</code> replication</td>
+<td><code>3.00x</code></td>
+<td>2 losses</td>
+<td>HDFS default, Dynamo, Cassandra</td>
+</tr>
+<tr>
+<td>Reed-Solomon <code>6+3</code></td>
+<td><code>1.50x</code></td>
+<td>3 losses</td>
+<td>HDFS Erasure Coding, Ceph</td>
+</tr>
+<tr>
+<td>Reed-Solomon <code>10+4</code></td>
+<td><code>1.40x</code></td>
+<td>4 losses</td>
+<td>S3 large objects</td>
+</tr>
+<tr>
+<td>Reed-Solomon <code>12+4</code></td>
+<td><code>1.33x</code></td>
+<td>4 losses</td>
+<td>Facebook f4 warm storage</td>
+</tr>
+<tr>
+<td>Reed-Solomon <code>17+3</code></td>
+<td><code>1.18x</code></td>
+<td>3 losses</td>
+<td>Google ColossusFS (typical)</td>
+</tr>
+</tbody>
+</table>
+<p>Pros: lower storage cost than replication for the same fault tolerance. <code>10+4</code> survives any 4-chunk loss with only <code>1.4x</code> overhead; equivalent replication tolerance would be <code>5x</code>.</p>
+<p>Cons (this is not a free lunch — call these out explicitly in the interview):</p>
+<ul>
+<li><strong>Read tail latency.</strong> A read must reach <code>M</code> chunks; one slow shard makes the whole read wait. Replication can hedge to the fastest of <code>N</code> replicas — erasure coding cannot, unless you over-read (fetch <code>M+1</code> and race), which costs network. EC read p99 is structurally worse than replicated read p99.</li>
+<li><strong>Repair amplification.</strong> Rebuilding one chunk requires reading <code>M</code> other chunks. At <code>10+4</code>, a single disk-loss repair drags <code>10x</code> the data of replicated repair across the network. At petabyte scale this can become the dominant network cost.</li>
+<li><strong>Write latency and CPU.</strong> Encode is a Galois-field matrix multiply (cheap per byte, but non-zero); writes block on <code>M+K</code> chunk placements across <code>M+K</code> failure domains instead of <code>N</code> replicas. The write commit-point is the slowest of <code>M+K</code>, not the fastest of <code>N</code>.</li>
+<li><strong>Small-object overhead.</strong> Chunk metadata and the <code>M+K</code> placement records can exceed the data for objects under ~1 MB. Production object stores route small objects through a replicated sidecar path.</li>
+</ul>
+<h3 id="43-conceptual-python-sketch-of-reed-solomon-mk">4.3 Conceptual Python Sketch of Reed-Solomon <code>M+K</code></h3>
+<p>Real implementations (Jerasure, ISA-L, Backblaze's <code>reedsolomon</code>) operate over Galois Field <code>GF(2^8)</code>. The conceptual core is a Vandermonde matrix multiplication: encode treats data chunks as a vector and multiplies by an <code>(M+K) × M</code> matrix whose top <code>M × M</code> block is the identity (so the first <code>M</code> rows of output equal the original data, making it a <em>systematic</em> code). Any <code>M</code> of the <code>M+K</code> output rows form an invertible matrix, so any <code>M</code> surviving chunks can reconstruct the original.</p>
+<pre><code class="language-python"># Conceptual only. Real code uses GF(2^8) arithmetic, not floats.
+import numpy as np
+
+def vandermonde_systematic(m: int, k: int) -&gt; np.ndarray:
+    &quot;&quot;&quot;Return an (m+k) x m generator matrix whose top m rows are I_m.&quot;&quot;&quot;
+    # Top: identity so encoded chunks 0..m-1 equal original data (systematic).
+    top = np.eye(m)
+    # Bottom: a Vandermonde-style parity matrix. Any m rows of the
+    # full (m+k) x m matrix must be invertible; Vandermonde guarantees this.
+    bottom = np.array([[(i + 1) ** j for j in range(m)]
+                       for i in range(k)], dtype=float)
+    return np.vstack([top, bottom])
+
+def encode(data_chunks: list[bytes], m: int, k: int) -&gt; list[bytes]:
+    &quot;&quot;&quot;Encode m data chunks into m+k chunks. m original + k parity.&quot;&quot;&quot;
+    G = vandermonde_systematic(m, k)
+    # Each chunk treated as a byte vector; multiply column-wise.
+    data_matrix = np.stack([np.frombuffer(c, dtype=np.uint8)
+                            for c in data_chunks])
+    encoded = G @ data_matrix      # (m+k) x chunk_size
+    return [row.astype(np.uint8).tobytes() for row in encoded]
+
+def decode(surviving_chunks: dict[int, bytes], m: int, k: int) -&gt; list[bytes]:
+    &quot;&quot;&quot;Recover the original m data chunks from any m of the m+k chunks.&quot;&quot;&quot;
+    G = vandermonde_systematic(m, k)
+    indices = sorted(surviving_chunks)[:m]
+    # Submatrix of the rows we received; invert it to solve for data.
+    sub_G = G[indices, :]
+    sub_data = np.stack([np.frombuffer(surviving_chunks[i], dtype=np.uint8)
+                         for i in indices])
+    recovered = np.linalg.solve(sub_G, sub_data)
+    return [row.astype(np.uint8).tobytes() for row in recovered]
+</code></pre>
+<p>Production codes do not use floats — that loses information and is non-deterministic. They use <code>GF(2^8)</code> field arithmetic where addition is <code>XOR</code> and multiplication is a small table lookup. The conceptual takeaway: encode is a matrix multiply, decode is solving a linear system over the surviving rows.</p>
+<h3 id="44-ascii-layout-of-mk-63-example">4.4 ASCII Layout of <code>M+K</code> (<code>6+3</code> example)</h3>
+<pre><code>Object 1 GiB, M=6 data + K=3 parity
+=============================================================
+
+   chunk_0   chunk_1   chunk_2   chunk_3   chunk_4   chunk_5
+   ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐
+   │ D0  │  │ D1  │  │ D2  │  │ D3  │  │ D4  │  │ D5  │   &lt;- data (systematic)
+   └─────┘  └─────┘  └─────┘  └─────┘  └─────┘  └─────┘
+   ┌─────┐  ┌─────┐  ┌─────┐
+   │ P0  │  │ P1  │  │ P2  │                              &lt;- parity
+   └─────┘  └─────┘  └─────┘
+
+Placement across 9 racks in 3 Availability Zones:
+
+   AZ-1                  AZ-2                  AZ-3
+   ┌────┬────┬────┐     ┌────┬────┬────┐     ┌────┬────┬────┐
+   │R1  │R2  │R3  │     │R4  │R5  │R6  │     │R7  │R8  │R9  │
+   │ D0 │ D1 │ D2 │     │ D3 │ D4 │ D5 │     │ P0 │ P1 │ P2 │
+   └────┴────┴────┘     └────┴────┴────┘     └────┴────┴────┘
+
+Failure of ANY rack -&gt; 1 chunk lost; tolerable (K=3 allowed).
+Failure of ANY AZ   -&gt; 3 chunks lost; AT THE EDGE; one more rack
+                      failure during repair = data loss.
+
+Lesson: K should exceed the largest correlated failure domain you
+want to lose. K=3 with 3 AZs is too tight; production uses K&gt;=4 or
+spreads chunks across MORE AZs to avoid losing K chunks at once.
+</code></pre>
+<h3 id="45-geo-replication-cross-region-async">4.5 Geo-Replication (Cross-Region, Async)</h3>
+<p>Replicate the durable object (after local encoding) to a second region asynchronously. Default is "eventually durable in two regions"; some classes commit synchronously to both for higher Recovery Point Objective (RPO) guarantees.</p>
+<p>The async/sync split is a direct durability-vs-latency trade — don't paper over it:</p>
+<ul>
+<li><strong>Async cross-region.</strong> Cheap, write latency stays local (single-region commit). The cost is a non-zero RPO: in a sudden region loss, the trailing writes that had not yet been shipped are lost. Defensible only when the product can tolerate seconds-to-minutes of write loss on a region-loss event.</li>
+<li><strong>Sync cross-region.</strong> Write latency now includes inter-region Round-Trip Time (RTT) of <code>60-200 ms</code> (US-east to US-west) on every commit. RPO is zero, but throughput drops and write tail latency grows substantially. Used for regulatory requirements (financial ledgers, healthcare) and for products that genuinely cannot tolerate a non-zero RPO.</li>
+<li><strong>Cross-region replication is not "extra nines" on the same durability number.</strong> It is a separate defense against a <em>different</em> failure mode (region loss). The advertised eleven-nines durability is a per-object disk/rack number; cross-region is what backs the RPO/Recovery Time Objective (RTO) for regional disasters.</li>
+</ul>
+<h3 id="46-write-ahead-log-wal-checkpoints">4.6 Write-Ahead Log (WAL) + Checkpoints</h3>
+<p>Every state change is appended to a durable log before being applied to in-memory state. On crash, replay log forward from the last checkpoint. The WAL itself must be durable — usually <code>3x</code> replicated or written to a durable log service (Apache BookKeeper, AWS Kinesis, Apache Kafka with <code>acks=all</code>).</p>
+<ul>
+<li>BigTable: every write hits the GFS commit log before the memtable update is acknowledged. A tablet server crash replays the commit log on a new server.</li>
+<li>Spanner, CockroachDB: the Raft log is the WAL.</li>
+<li>The WAL ensures <em>in-flight</em> writes survive a failure — replication alone does not, because a write acknowledged from only one replica might be lost.</li>
+</ul>
+<h3 id="47-background-scrubbing-bit-rot-detection">4.7 Background Scrubbing / Bit Rot Detection</h3>
+<p>Continuously read every chunk, verify its stored checksum (typically Cyclic Redundancy Check 32 (CRC32C) or 256-bit Secure Hash Algorithm (SHA-256)), and re-replicate on mismatch. Scrub the entire fleet every 14-30 days. Without scrubbing, parity also rots and you discover loss only on read — by which time it is too late.</p>
+<p>Scrubbing is not free. A 30-day scrub cycle on 100 PB is a sustained <code>~38 Gbps</code> of background reads (<code>100 PB / 30 days</code>), which competes with serving I/O on the same disks. Production systems throttle scrub to a small fraction of disk bandwidth (often <code>&lt; 5%</code>), accepting longer cycle times for cold tiers. The interview honesty move: scrubbing is mandatory for durability but it is a real, persistent slice of the I/O budget, not a side process.</p>
+<pre><code>Scrub loop per disk:
+  for chunk in chunks_on_disk:
+      stored_hash = chunk.metadata.sha256
+      computed = sha256(chunk.bytes)
+      if stored_hash != computed:
+          mark_chunk_corrupt(chunk)
+          schedule_repair(chunk)        # reconstruct from peers
+          alert(&quot;silent corruption&quot;, disk_id, chunk.id)
+</code></pre>
+<h3 id="48-merkle-trees-anti-entropy">4.8 Merkle Trees / Anti-Entropy</h3>
+<p>Each replica or chunk-group maintains a Merkle tree of its contents. Peers exchange tree summaries; mismatches identify the specific divergent keys without exchanging full state. Dynamo and Cassandra use Merkle anti-entropy to repair long-lived divergence; S3 uses similar mechanisms to verify cross-region replicas match. See <a href="../questions/amazon-dynamo.md">Amazon Dynamo</a> for the canonical writeup.</p>
+<h3 id="49-multi-az-writes-with-quorum">4.9 Multi-AZ Writes with Quorum</h3>
+<p>A write is durable when <code>W</code> of <code>N</code> replicas, spread across <code>N</code> distinct AZs, have persisted it. Common: <code>N=3, W=2</code> (write returns when 2 of 3 AZs have it) or <code>N=5, W=3</code> (Spanner / Aurora style). The point is that the durability commit cannot complete from a single AZ.</p>
+<h3 id="410-durability-classes-tiering">4.10 Durability Classes / Tiering</h3>
+<p>Not every byte deserves eleven nines at hot-tier cost. Production object stores expose classes:</p>
+<table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Durability</th>
+<th>Availability</th>
+<th>Retrieval</th>
+<th>Cost</th>
+<th>Use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>S3 Standard</td>
+<td>11 nines (multi-AZ)</td>
+<td>4 nines</td>
+<td>ms</td>
+<td><code>1.0x</code></td>
+<td>Active data</td>
+</tr>
+<tr>
+<td>S3 Standard-IA (Infrequent Access)</td>
+<td>11 nines (multi-AZ)</td>
+<td>3 nines</td>
+<td>ms</td>
+<td><code>0.55x</code></td>
+<td>Backups</td>
+</tr>
+<tr>
+<td>S3 One Zone-IA</td>
+<td>11 nines <em>conditional on the AZ surviving</em></td>
+<td>2 nines</td>
+<td>ms</td>
+<td><code>0.45x</code></td>
+<td>Reproducible data</td>
+</tr>
+<tr>
+<td>S3 Glacier Instant Retrieval</td>
+<td>11 nines (multi-AZ)</td>
+<td>4 nines</td>
+<td>ms</td>
+<td><code>0.25x</code></td>
+<td>Archives, instant read</td>
+</tr>
+<tr>
+<td>S3 Glacier Deep Archive</td>
+<td>11 nines (multi-AZ)</td>
+<td>n/a</td>
+<td>hours</td>
+<td><code>0.05x</code></td>
+<td>Cold archives</td>
+</tr>
+</tbody>
+</table>
+<p>A subtlety to call out: S3 One Zone-IA does <em>not</em> survive an AZ loss. Its eleven-nines number applies only to per-object failure inside the surviving AZ; it is not equivalent durability to the multi-AZ classes. That is the explicit price for the <code>0.45x</code> cost.</p>
+<p>Cold-tier migration policies (lifecycle rules) move data automatically: "after 30 days no access, move to IA; after 90 days, to Glacier." The total dollar saving at 100 PB is dramatic; the operational risk is restoration latency from Glacier (minutes to hours) and the retrieval-cost spike if a customer suddenly needs cold data back. Glacier and Standard share the same durability <em>class</em>; what differs is retrieval latency and per-GB retrieval cost.</p>
+<h3 id="411-lineage-write-fence-for-in-flight-writes-during-failover">4.11 Lineage / Write-Fence for In-Flight Writes During Failover</h3>
+<p>When a primary fails and a standby takes over, you must not lose writes that the primary acknowledged but had not yet replicated. Two techniques work together:</p>
+<ul>
+<li><strong>Write fence.</strong> The old primary's writes are rejected the moment the new primary takes over (via lease expiration in Chubby / ZooKeeper / Etcd, or a fencing token bumped on the metadata side). This prevents split-brain — the old primary cannot keep acking writes after losing leadership — but on its own it does not save writes that were acked before the fence.</li>
+<li><strong>Lineage on the WAL.</strong> Every write carries a monotonic Log Sequence Number (LSN). A write is only acknowledged to the client <em>after</em> it is replicated to a quorum of WAL replicas. The new primary on takeover reads the highest committed LSN visible to the quorum and replays forward from the last checkpoint. Anything not present in a quorum of WAL replicas was never acknowledged, so the client must retry (which is safe under idempotency).</li>
+</ul>
+<p>The combination matters: the fence stops the old primary from creating new acked writes, and the WAL quorum invariant guarantees that all <em>previously</em> acked writes are visible to whoever wins the election.</p>
+<p>Pairs with <a href="./idempotency-exactly-once.md">Idempotency / Exactly-Once</a> — clients retrying after a failover need idempotent writes to avoid duplicates.</p>
+<h3 id="412-local-reconstruction-codes-lrc-tiered-parity">4.12 Local Reconstruction Codes (LRC) — Tiered Parity</h3>
+<p>Pure Reed-Solomon repair is expensive: rebuilding one chunk costs reading <code>M</code> other chunks. At exabyte scale, repair bandwidth dominates the network budget. <strong>Local Reconstruction Codes</strong> (used by Azure Storage, Facebook's f4) add a layer of <em>local</em> parity over small subgroups of data chunks, plus <em>global</em> parity over the whole stripe.</p>
+<pre><code>LRC (12,2,2):  12 data chunks, 2 local parity, 2 global parity
+                = 16 chunks total, overhead 1.33x
+
+   group A: D0..D5  ─►  LA  (local parity for group A)
+   group B: D6..D11 ─►  LB  (local parity for group B)
+   all:     D0..D11 ─►  G0, G1  (global parity)
+
+   Single chunk loss in group A: rebuild from D0..D5 + LA  (6 reads)
+                                 instead of all 12 + globals (12 reads)
+   Two chunk losses: must use global parity; still recoverable.
+</code></pre>
+<p>The single-chunk failure case (overwhelmingly the most common) reads <code>M/2</code> chunks instead of <code>M</code>, halving repair bandwidth. The tradeoff vs pure Reed-Solomon: LRC trades a slightly weaker worst-case fault tolerance for dramatically cheaper common-case repair. Reed-Solomon <code>12+4</code> tolerates <em>any</em> 4 chunk losses; LRC <code>(12,2,2)</code> tolerates any 4 losses only in some configurations — adversarially placed losses spanning both local groups can be unrecoverable with fewer than 4 lost. LRC is the right choice when single-chunk-loss repair bandwidth is your bottleneck (typical at exabyte scale); pure Reed-Solomon is the right choice when worst-case fault tolerance dominates. The interview move is to name the tradeoff, not to claim LRC is strictly better.</p>
+<hr />
+<h2 id="5-worked-example-naive-broken-fixed">5. Worked Example: Naive → Broken → Fixed</h2>
+<h3 id="scenario">Scenario</h3>
+<p>A 100 PB object store, 100,000 spinning disks at <code>4 TB</code> each, AFR <code>4%</code>, distributed across <code>3</code> Availability Zones in one region. Repair bandwidth budget is <code>10 Gbps</code> per node. Average object size <code>1 MB</code>, so <code>~100 billion objects</code>.</p>
+<h3 id="naive-3x-replication-across-3-azs">Naive: <code>3x</code> replication across 3 AZs</h3>
+<p>Cost math:</p>
+<ul>
+<li>Raw data: 100 PB.</li>
+<li>Stored: 300 PB (<code>3x</code>).</li>
+<li>At <code>$0.02 / GB / month</code> raw, monthly cost: <code>300 * 10^6 * $0.02 = $6M/month</code>.</li>
+<li>Network: writes amplify <code>3x</code>; reads do not.</li>
+</ul>
+<p>Durability math (back-of-envelope):</p>
+<ul>
+<li><code>100,000</code> disks, AFR <code>4%</code> → expected <code>4,000</code> disk failures per year, <code>~11</code> per day.</li>
+<li>A 4 TB disk holds <code>~4 * 10^6</code> chunks (<code>1 MB</code> each); each chunk has 2 surviving replicas.</li>
+<li>Repair time for one disk: <code>4 TB / 10 Gbps ≈ 55 minutes</code> of pure transfer; in practice contention and metadata work push it to several hours.</li>
+<li>Per-disk hourly failure probability under AFR <code>4%</code> is <code>~4.6 * 10^-6</code>. For a specific chunk to be permanently lost, both surviving replicas must fail inside the repair window. Under the (false but useful for sanity) independent-failure assumption with a 1-hour window, that joint probability is <code>~(4.6 * 10^-6)^2 ≈ 2 * 10^-11</code> per chunk per failure event. Multiplied across <code>~4 * 10^9</code> total events per year per disk, the <em>independent-failure</em> number lands well below eleven nines.</li>
+</ul>
+<p>So <code>3x</code> looks fine on the independent-failure spreadsheet. Where the spreadsheet lies:</p>
+<h3 id="broken-correlated-failures-repair-storms">Broken: correlated failures + repair storms</h3>
+<ul>
+<li><strong>Correlated failures</strong>: HDFS default placement puts replicas as <code>(local, remote-rack, remote-rack-same)</code>. A rack power failure takes 2 of 3 replicas. If the third disk has even one stale chunk (bit rot you didn't notice), you have lost data. AFR is no longer the right model — rack failure rate is, and that is dominated by power, network, firmware, and human error, not disk mechanical failure.</li>
+<li><strong>Repair storms</strong>: A single datacenter network event kills 100 disks at once. You now need to repair 400 TB across the fleet, contending for the same network and CPU as live traffic. Repair window stretches from 1 hour to 24 hours; durability degrades by ~24x during the storm. Coincident failures during the storm are now likely.</li>
+<li><strong>Storage cost</strong>: <code>$6M/month</code> for just the bits. Hardware refresh and power-cooling pushes total cost above <code>$10M/month</code>. The CFO asks why we can't be more efficient.</li>
+</ul>
+<h3 id="fixed-reed-solomon-63-cross-az-placement-scrub-cross-region">Fixed: Reed-Solomon <code>6+3</code> + cross-AZ placement + scrub + cross-region</h3>
+<p><strong>Local encoding</strong>: <code>6+3</code> Reed-Solomon, chunks placed <code>1 per rack across 9 racks</code> distributed <code>3 racks per AZ</code>.</p>
+<ul>
+<li>Storage overhead: <code>1.5x</code> instead of <code>3x</code>. Saved <code>150 PB</code> of disk. Direct cost saving: <code>~$3M/month</code>.</li>
+<li>Fault tolerance: survives any 3 chunk losses. Survives any rack loss (1 chunk). Survives an AZ loss (3 chunks) at the edge — but barely; one more rack failure during repair = data loss. So actually push to <code>6+4</code> or <code>10+4</code> (or spread chunks across more AZs) for AZ-loss-plus-repair tolerance.</li>
+</ul>
+<p><strong>Background scrub</strong>: every chunk is read and checksummed every 14 days. Bit rot caught and re-encoded before the parity is exhausted. Without scrub, you would only catch corruption on read — and 90% of objects are cold.</p>
+<p><strong>Cross-region async replication</strong>: opt-in per bucket; a second region holds a fully encoded copy. RPO: typically seconds. Survives region loss with one bucket-level config flip.</p>
+<p><strong>Durability math, fixed configuration</strong>:</p>
+<ul>
+<li>Per-disk hourly failure probability: <code>~4.6 * 10^-6</code> (from AFR <code>4%</code>).</li>
+<li>Probability that 4 of the remaining 8 chunks (in <code>6+3</code>, after one chunk loss) fail inside a 1-hour repair window, independent: <code>C(8, 4) * (4.6 * 10^-6)^4 ≈ 3 * 10^-20</code>. Annualized across 8760 hours and <code>~10^11</code> objects, this is still safely under <code>10^-11</code> per object per year.</li>
+<li>That number is the <em>floor</em> under independent failures. The real risk is correlated rack/AZ failures, which is why placement spreads chunks across <code>9</code> distinct failure domains and <code>K</code> is chosen larger than the number of chunks that any single rack or AZ holds. With <code>K=3</code> and 3 AZs (3 chunks per AZ), one full-AZ loss leaves zero margin; the design should move to <code>6+4</code> or spread across more AZs.</li>
+<li>Cross-region async replication is a separate threat model — it defends against region loss with an explicit Recovery Point Objective (RPO) of seconds (the trailing un-replicated writes are at risk). It is not "extra nines on the same durability number"; it is a different number for a different failure mode.</li>
+</ul>
+<p>Total: defensible eleven nines against disk/rack failures, with an explicit RPO for region loss. Cost is <code>1.5x</code> in-region plus <code>1x</code> cross-region = <code>~2.5x</code> total, versus naive <code>3x</code> single-region. Whether the complexity of erasure coding earns its keep depends on scale: at 100 PB the storage saving is <code>~$3M/month</code> of disk, which pays for the engineering and operations of running EC. At 10 PB, the saving is <code>~$300K/month</code> and <code>3x</code> replication may be the staff-level answer.</p>
+<hr />
+<h2 id="6-variants-and-how-to-choose">6. Variants and How to Choose</h2>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Storage overhead</th>
+<th>Fault tolerance</th>
+<th>Write latency</th>
+<th>Read latency</th>
+<th>Repair cost</th>
+<th>Best for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>3x</code> replication, intra-AZ</td>
+<td><code>3x</code></td>
+<td>2 disks</td>
+<td>low</td>
+<td>low</td>
+<td>low (copy one block)</td>
+<td>Single-AZ workloads, hot databases</td>
+</tr>
+<tr>
+<td><code>3x</code> replication, cross-AZ</td>
+<td><code>3x</code></td>
+<td>1 AZ + extra disks</td>
+<td>medium</td>
+<td>low</td>
+<td>medium (cross-AZ network)</td>
+<td>HDFS default, Dynamo / Cassandra</td>
+</tr>
+<tr>
+<td>Reed-Solomon <code>6+3</code></td>
+<td><code>1.5x</code></td>
+<td>3 chunks</td>
+<td>medium</td>
+<td>medium (decode <code>M</code>)</td>
+<td>high (<code>M</code> chunks per repair)</td>
+<td>Large objects, warm tier</td>
+</tr>
+<tr>
+<td>Reed-Solomon <code>10+4</code></td>
+<td><code>1.4x</code></td>
+<td>4 chunks</td>
+<td>medium</td>
+<td>medium</td>
+<td>high</td>
+<td>S3 Standard for large objects</td>
+</tr>
+<tr>
+<td>Reed-Solomon <code>17+3</code></td>
+<td><code>1.18x</code></td>
+<td>3 chunks</td>
+<td>medium</td>
+<td>medium</td>
+<td>very high</td>
+<td>Colossus, deep warm</td>
+</tr>
+<tr>
+<td>Tiered: hot replicated + cold EC</td>
+<td>varies</td>
+<td>mixed</td>
+<td>low (hot)</td>
+<td>low (hot)</td>
+<td>mixed</td>
+<td>Object stores with lifecycle</td>
+</tr>
+<tr>
+<td>Cold archive (Glacier-class)</td>
+<td><code>~1.4x</code> on tape</td>
+<td>4 chunks</td>
+<td>seconds (write)</td>
+<td>hours (read)</td>
+<td>very high</td>
+<td>Compliance, backups</td>
+</tr>
+</tbody>
+</table>
+<h3 id="sync-vs-async-geo-replication">Sync vs Async Geo-Replication</h3>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>RPO</th>
+<th>Write latency</th>
+<th>Best for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sync (multi-region quorum)</td>
+<td>0</td>
+<td>inter-region RTT (60-200 ms)</td>
+<td>Financial ledgers, payments</td>
+</tr>
+<tr>
+<td>Async with monitoring</td>
+<td>seconds</td>
+<td>local</td>
+<td>Most object storage, blob storage</td>
+</tr>
+<tr>
+<td>Async with re-anchored guarantee</td>
+<td>minutes</td>
+<td>local</td>
+<td>Backups, archives</td>
+</tr>
+<tr>
+<td>Manual / batch DR</td>
+<td>hours</td>
+<td>local</td>
+<td>Cold archives</td>
+</tr>
+</tbody>
+</table>
+<h3 id="when-to-switch-from-replication-to-erasure-coding">When to switch from replication to erasure coding</h3>
+<p>The honest threshold is dollars, not nines — both schemes can hit eleven nines if placed correctly.</p>
+<ul>
+<li><strong>Scale floor.</strong> Under ~10 PB raw, <code>3x</code> replication across AZs is genuinely fine; the storage saving from EC does not pay back the engineering, operational complexity, and worse read-tail latency. The "staff move" at single-digit PB is often to <em>not</em> introduce erasure coding.</li>
+<li><strong>Object size <code>&gt; ~1 MB</code>.</strong> Below this, chunk metadata and the <code>M+K</code> placement records can exceed the data; small objects belong in a replicated sidecar path. S3 internally splits small and large object paths.</li>
+<li><strong>Read traffic not latency-critical.</strong> Decode adds latency and, more importantly, EC reads have a structurally worse tail (you wait for the slowest of <code>M</code> shards, with no fast-replica hedging). Hot, latency-sensitive data often stays replicated even at large scale.</li>
+<li><strong>Repair traffic can be absorbed.</strong> EC repair amplifies network use by <code>~M</code>. Confirm the cluster network has headroom in the off-peak window for repair to complete inside the failure-correlation budget.</li>
+<li><strong>Storage cost dominates the budget.</strong> Once disk is the largest line item, <code>1.4x</code> vs <code>3x</code> at hundreds of petabytes is millions of dollars per year — at that point EC earns its complexity.</li>
+</ul>
+<hr />
+<h2 id="7-failure-modes-and-operations">7. Failure Modes and Operations</h2>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Metric to watch</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Disk failure (single drive)</td>
+<td>AFR, missing-chunk count</td>
+<td>Background re-replication; placement diversity.</td>
+</tr>
+<tr>
+<td>Silent data corruption (bit rot)</td>
+<td>Scrub mismatch rate</td>
+<td>Continuous scrubbing; re-encode from parity.</td>
+</tr>
+<tr>
+<td>Correlated rack failure</td>
+<td>Rack failure rate; under-replication count per rack</td>
+<td>Cross-rack placement constraint; <code>K</code> exceeds rack count in a failure domain.</td>
+</tr>
+<tr>
+<td>AZ failure</td>
+<td>AZ availability, chunk-loss-per-AZ-event</td>
+<td>Cross-AZ placement; <code>K &gt;=</code> chunks per AZ.</td>
+</tr>
+<tr>
+<td>Region failure</td>
+<td>Cross-region replication lag</td>
+<td>Async geo-replication; tested DR runbooks.</td>
+</tr>
+<tr>
+<td>Repair storm (mass disk loss)</td>
+<td>Repair backlog, repair bandwidth utilization</td>
+<td>Throttled repair; prioritize most-under-replicated chunks; reserve repair capacity.</td>
+</tr>
+<tr>
+<td>Stale metadata (mismapped chunks)</td>
+<td>Metadata-vs-data audit divergence</td>
+<td>Merkle anti-entropy; periodic full audit.</td>
+</tr>
+<tr>
+<td>In-flight write lost during failover</td>
+<td>WAL lag at failover, lost-write counter</td>
+<td>Durable WAL with lineage; client idempotency.</td>
+</tr>
+<tr>
+<td>Hot disk overload during repair</td>
+<td>Per-disk QPS, repair-induced latency</td>
+<td>Spread repair source across many disks; rate-limit.</td>
+</tr>
+<tr>
+<td>Bad firmware fleet-wide</td>
+<td>Fleet-wide error rate by drive model</td>
+<td>Diverse drive vendors / models in a placement group.</td>
+</tr>
+<tr>
+<td>Operator deletion (fat-finger)</td>
+<td>Delete-rate spike</td>
+<td>Versioning + soft delete + delete protection + delayed garbage collection (GC).</td>
+</tr>
+<tr>
+<td>Ransomware / poisoned encrypts</td>
+<td>Versioning churn</td>
+<td>Object lock, immutability windows, air-gapped backup.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-rules-of-thumb">Operational rules of thumb</h3>
+<ul>
+<li>Repair must complete faster than the Mean Time Between Failures (MTBF) of <code>K</code> coincident chunk losses; if not, you are durability-bankrupt.</li>
+<li>Scrub interval should be shorter than the time for bit rot to exhaust your parity budget.</li>
+<li>Placement engine must encode the failure-domain hierarchy: <code>disk -&gt; node -&gt; rack -&gt; AZ -&gt; region</code>. <code>K</code> must exceed the count of chunks in the largest failure domain you tolerate losing.</li>
+<li>Always alert on under-replication count and on repair backlog growth, not on repair rate alone — a high repair rate that keeps up is fine; a low repair rate with a growing backlog is fatal.</li>
+<li>Test failover at least quarterly. Untested failover is fictional failover. Many region-loss "DR plans" only exist on paper until the first real fire.</li>
+<li>Track durability events at the per-customer level. A single bucket losing one object is a customer-trust incident even if the aggregate eleven-nines number is met.</li>
+<li>Maintain a "lost object" runbook. When an actual object is unrecoverable, you owe the customer (a) which object, (b) the exact time it was lost, (c) which redundancy layers failed, (d) what is changing so it does not recur. S3 issues credits and writes an incident memo per lost-object event.</li>
+</ul>
+<h3 id="a-worked-metric-set">A worked metric set</h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Definition</th>
+<th>Alert</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Under-replicated chunks</td>
+<td>Chunks with fewer than target survivors</td>
+<td>Page if growing; ticket if non-zero for <code>&gt;1h</code></td>
+</tr>
+<tr>
+<td>Repair backlog bytes</td>
+<td>Total bytes pending re-encode / re-replicate</td>
+<td>Page if growth rate exceeds throughput</td>
+</tr>
+<tr>
+<td>Scrub coverage <code>%</code></td>
+<td>Fraction of fleet scrubbed in last 30d</td>
+<td>Page if <code>&lt; 95%</code></td>
+</tr>
+<tr>
+<td>Silent corruption rate</td>
+<td>Scrub mismatches per TB read</td>
+<td>Trend chart; investigate spikes</td>
+</tr>
+<tr>
+<td>Cross-region replication lag (p99)</td>
+<td>Seconds between write and cross-region durable</td>
+<td>Page if <code>&gt; RPO_target</code></td>
+</tr>
+<tr>
+<td>WAL lag (replica)</td>
+<td>Bytes the replica is behind the leader</td>
+<td>Page if <code>&gt; threshold</code>; block failover</td>
+</tr>
+<tr>
+<td>Lost object count</td>
+<td>Objects that cannot be reconstructed</td>
+<td>Always a page; incident review</td>
+</tr>
+<tr>
+<td>Annualized data loss rate</td>
+<td>Lost bytes per stored byte per year</td>
+<td>Track vs eleven-nines target</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="8-combinations-with-other-patterns">8. Combinations with Other Patterns</h2>
+<ul>
+<li><strong><a href="./idempotency-exactly-once.md">Idempotency / Exactly-Once</a></strong> — In-flight write recovery after failover requires idempotent client retries. The WAL gives the system a chance to recover; idempotency keys give the client a chance to retry without duplicate effects.</li>
+<li><strong><a href="./strong-consistency-under-contention.md">Strong Consistency Under Contention</a></strong> — A durable write that is not yet visible to readers is a consistency, not a durability, problem. S3 went from eventual to strong read-after-write in 2020 by tightening the metadata service while keeping the same durability stack.</li>
+<li><strong><a href="./coordination-exactly-one-execution.md">Coordination / Exactly-One Execution</a></strong> — Chubby / ZooKeeper / Etcd leases provide the fencing tokens that make WAL-lineage-based failover safe.</li>
+<li><strong><a href="./ordering-causal-consistency.md">Ordering / Causal Consistency</a></strong> — WAL ordering (LSN) is what makes failover safe. The same primitive supports causal consistency in higher-level systems.</li>
+<li><strong><a href="./hot-key-skew.md">Hot Key Skew</a></strong> — Durable storage with hot prefixes will see repair-traffic skew during a failure; prefix-aware placement and adaptive partitioning matter.</li>
+<li><strong><a href="./fan-out-write-amplification.md">Fan-Out Write Amplification</a></strong> — <code>3x</code> replication is <code>3x</code> write amplification; erasure coding is <code>(M+K)/M</code> bytes but <code>K</code> independent parity calculations. Cross-region adds another <code>1x</code>. Plan write-bandwidth headroom accordingly.</li>
+<li><strong><a href="./cache-stampede-read-amplification.md">Cache Stampede / Read Amplification</a></strong> — Erasure-coded reads have inherent <code>M</code>-fold read amplification; a CDN or hot-replica tier in front of cold EC storage absorbs that.</li>
+<li><strong><a href="./backpressure-flow-control.md">Backpressure / Flow Control</a></strong> — Repair traffic must be backpressured against live traffic; otherwise a repair storm eats client SLO.</li>
+</ul>
+<hr />
+<h2 id="9-likely-interviewer-probes">9. Likely Interviewer Probes</h2>
+<ol>
+<li>
+<p><strong>"Walk me through why S3 advertises eleven nines, with arithmetic."</strong> Expect: state the unit first — eleven nines is <code>10^-11</code> <em>per object per year</em>, not a system uptime number, and it is separate from S3's four-nines <em>availability</em>. Then: encoding rate <code>M+K</code>, failure-domain diversity, repair-time math (<code>P(K coincident failures during the repair window)</code>), bit-rot scrubbing, and cross-region replication as a separate defense against region loss with its own RPO.</p>
+</li>
+<li>
+<p><strong>"How do you choose <code>M</code> and <code>K</code> in Reed-Solomon?"</strong> Expect: storage overhead target (<code>(M+K)/M</code>), fault tolerance budget (<code>K</code> greater than the largest correlated failure domain), read amplification cost (smaller <code>M</code> = less read amplification but more overhead), and repair amplification (larger <code>M</code> = more chunks to read for each repair). Concrete examples: <code>10+4</code> for hot, <code>17+3</code> for cold.</p>
+</li>
+<li>
+<p><strong>"Why not just use <code>5x</code> or <code>7x</code> replication instead of erasure coding?"</strong> Expect: at multi-PB scale, cost (<code>5x</code> vs <code>~1.4x</code>) is the answer, plus the point that <code>5x</code> replication only helps if those 5 copies live on 5 disjoint failure domains — at which point an equivalent erasure code achieves the same protection cheaper. Also acknowledge the inverse: at single-digit PB, <code>3x</code> replication is the right answer because the storage saving doesn't pay back EC's repair amplification and read-tail cost.</p>
+</li>
+<li>
+<p><strong>"How does scrubbing actually work? What does the production scrub schedule look like?"</strong> Expect: per-chunk CRC32C / SHA-256 stored at write; scrub reads chunks at a throttled rate, recomputes, compares; on mismatch, re-encode from peers and re-place. Scrub frequency <code>14-30</code> days; cold-tier scrub is less frequent. Throttle to <code>&lt; 5%</code> of disk bandwidth.</p>
+</li>
+<li>
+<p><strong>"A write was acknowledged to the client, then the primary died. How do you guarantee no data loss?"</strong> Expect: Write-Ahead Log on durable storage, written before ack; failover waits until the new primary catches up to the highest committed Log Sequence Number; fencing token prevents the old primary from acking more writes. Plus client-side idempotency for retries that crossed the failover.</p>
+</li>
+<li>
+<p><strong>"What happens during a repair storm?"</strong> Expect: throttling, prioritization by current redundancy level (chunks with only <code>M</code> survivors get repaired first), repair-bandwidth reservation, alerting on repair backlog growth rate, and the math behind why repair must be faster than the time to the next coincident <code>K</code>-failure.</p>
+</li>
+<li>
+<p><strong>"How does cross-region replication interact with strong consistency?"</strong> Expect: typically async (so cross-region is eventually consistent), with the regional layer providing strong consistency. Sync cross-region exists (Spanner) but pays inter-region RTT on every write. For object stores, async + monitoring + RPO <code>&lt; 1 minute</code> is the norm.</p>
+</li>
+<li>
+<p><strong>"How do you survive ransomware or a malicious insider?"</strong> Expect: object versioning (every overwrite is a new version, the prior version stays for a retention window), object lock / Write-Once-Read-Many (WORM) for compliance buckets, role-based delete restrictions, MFA-Delete (Multi-Factor Authentication required for deletes), and air-gapped backups whose credentials are not reachable from the production control plane. Durability has to defend against the operator and the attacker, not just hardware.</p>
+</li>
+<li>
+<p><strong>"What if your placement engine itself has a bug?"</strong> Expect: a periodic placement-audit job that walks the metadata and verifies that each chunk's actual locations satisfy the placement constraint (cross-rack, cross-AZ). Bugs that secretly co-locate chunks are the most dangerous because the durability number lies until the correlated failure happens. Treat the placement audit as a first-class durability mechanism alongside scrubbing.</p>
+</li>
+</ol>
+<hr />
+<h2 id="10-common-traps-stronger-moves">10. Common Traps → Stronger Moves</h2>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"<code>3x</code> replication is enough."</td>
+<td>Distinguish independent vs correlated failures; show that <code>3x</code> co-located gives ~1 nine of real durability under rack failure. Add cross-AZ placement, then erasure coding for cost.</td>
+</tr>
+<tr>
+<td>"Just store more copies."</td>
+<td>At scale this is unaffordable. <code>Reed-Solomon M+K</code> gives the same fault tolerance at <code>(M+K)/M</code> overhead.</td>
+</tr>
+<tr>
+<td>"Disks just fail; AFR explains it."</td>
+<td>Real risk is correlated failures: rack switch, power phase, bad firmware, datacenter event, human error. Independent-failure math hides these.</td>
+</tr>
+<tr>
+<td>"Replication = durability."</td>
+<td>Replication of <em>committed</em> state is durability for stored data. <em>In-flight</em> data needs a durable Write-Ahead Log. Otherwise a primary crash can lose acked writes.</td>
+</tr>
+<tr>
+<td>"We have replication, so we don't need scrubbing."</td>
+<td>Without scrubbing, bit rot silently exhausts your parity; you discover loss on read, too late. Scrubbing is a continuous-time component of durability, not a setup-time one.</td>
+</tr>
+<tr>
+<td>"Erasure coding everywhere."</td>
+<td>Small objects pay encode overhead in metadata and chunk-management; replicate small objects, encode large ones. Hot data may want a replicated front to avoid <code>M</code>-fold read amplification.</td>
+</tr>
+<tr>
+<td>"Cross-region replication = <code>2x</code> durability."</td>
+<td>Async cross-region has RPO <code>&gt; 0</code> — the trailing seconds of writes can be lost in a region disaster. State this explicitly and have a runbook for it.</td>
+</tr>
+<tr>
+<td>"Backup is durability."</td>
+<td>Backup snapshots are a defense against logical corruption, ransomware, and operator error; they do not replace replication / EC. Independent threat model.</td>
+</tr>
+<tr>
+<td>"Glacier is just slow storage."</td>
+<td>Glacier has the same durability target as S3 Standard. The tradeoff is retrieval latency and cost, not durability. Pair with lifecycle policies.</td>
+</tr>
+<tr>
+<td>"I will just use the cloud's <code>eleven nines</code>."</td>
+<td>The interviewer wants to see you design <em>to</em> eleven nines, not invoke a service. Walk the encoding rate, failure domain placement, scrub cadence, and repair math.</td>
+</tr>
+<tr>
+<td>"We use <code>Nx</code> replication and don't worry about it."</td>
+<td>Quantify Mean Time To Data Loss (MTTDL): function of <code>N</code>, AFR, repair time, and failure-domain diversity. Show the arithmetic.</td>
+</tr>
+<tr>
+<td>"Repair is automatic, so we are safe."</td>
+<td>Show repair-backlog metrics, repair-bandwidth budgeting, and the under-replication histogram. A growing repair backlog is the leading indicator of pending data loss.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="bonus-probe-what-is-the-dominant-cost-in-your-durability-story-disk-network-cpu-or-operations">Bonus probe: "What is the dominant cost in your durability story — disk, network, CPU, or operations?"</h3>
+<p>Strong answer: it depends on tier. Hot tier — disk dominates (replication or <code>M+K</code> overhead times petabyte-scale). Cold archive — tape and cooling dominate; encode CPU is once per object. Repair-heavy fleets — network dominates because each repair drags <code>M</code> chunks across racks. Operations dominates when scrub, repair, audit, and DR drills require dedicated SRE / Storage Reliability Engineering headcount, which they do at exabyte scale. Naming the cost dimension tells the interviewer you have operated, not just designed, this layer.</p>
+<hr />
+<h2 id="11-staff-level-answer-checklist">11. Staff-Level Answer Checklist</h2>
+<ul>
+<li>[ ] State the durability target in nines and convert to a per-object annual loss probability.</li>
+<li>[ ] Identify the failure-domain hierarchy: <code>disk → node → rack → AZ → region</code>.</li>
+<li>[ ] Choose a redundancy scheme (<code>Nx</code> replication or Reed-Solomon <code>M+K</code>) and justify the choice against storage cost and read amplification.</li>
+<li>[ ] Make <code>K</code> exceed the largest correlated failure domain you commit to tolerating.</li>
+<li>[ ] Place chunks across diverse failure domains; encode the placement constraint in the placement engine, not in a comment.</li>
+<li>[ ] Add background scrubbing with a cadence shorter than your parity-exhaustion timeline.</li>
+<li>[ ] Use a durable Write-Ahead Log for in-flight writes; failover waits on WAL catch-up.</li>
+<li>[ ] Add cross-region replication with an explicit RPO target.</li>
+<li>[ ] Define durability classes / tiering with lifecycle policies; cold tiers do not lose durability, only latency.</li>
+<li>[ ] Track repair backlog and under-replication count; alert on growth rate, not raw rate.</li>
+<li>[ ] Defend against operator error and ransomware via versioning, object lock, and immutability windows.</li>
+<li>[ ] Walk the arithmetic: per-chunk failure probability, repair time, coincident-failure probability, and final per-object durability number.</li>
+<li>[ ] Name the metric for each failure mode (correlated rack failure, bit rot, repair storm, region loss, in-flight loss).</li>
+<li>[ ] Mention the operational practices: scrub schedule, repair throttling, DR drills, fleet-wide vendor / firmware diversity.</li>
+</ul>
+<hr />
+<h2 id="12-cross-references">12. Cross-References</h2>
+<p>Inside this pattern collection:</p>
+<ul>
+<li><a href="./idempotency-exactly-once.md">Idempotency / Exactly-Once</a> — Client retries during failover.</li>
+<li><a href="./strong-consistency-under-contention.md">Strong Consistency Under Contention</a> — Durability vs visibility.</li>
+<li><a href="./coordination-exactly-one-execution.md">Coordination / Exactly-One Execution</a> — Fencing tokens for primary handoff.</li>
+<li><a href="./ordering-causal-consistency.md">Ordering / Causal Consistency</a> — WAL Log Sequence Numbers.</li>
+<li><a href="./fan-out-write-amplification.md">Fan-Out Write Amplification</a> — Replication and EC are write amplification.</li>
+<li><a href="./hot-key-skew.md">Hot Key Skew</a> — Repair traffic skew during failure events.</li>
+<li><a href="./cache-stampede-read-amplification.md">Cache Stampede / Read Amplification</a> — EC reads amplify <code>M</code>-fold.</li>
+<li><a href="./backpressure-flow-control.md">Backpressure / Flow Control</a> — Throttling repair vs live traffic.</li>
+<li><a href="./real-time-aggregation.md">Real-Time Aggregation</a> — Metrics on durability events.</li>
+<li><a href="./search-and-ranking.md">Search and Ranking</a>, <a href="./geo-spatial-queries.md">Geo-Spatial Queries</a> — Often built atop durable object stores.</li>
+</ul>
+<p>Question docs that ride on durable storage:</p>
+<ul>
+<li><a href="../questions/design-amazon-s3.md">Amazon S3</a> — Eleven nines, Reed-Solomon <code>10+4</code>, async cross-region.</li>
+<li><a href="../questions/hadoop-distributed-file-system.md">Hadoop Distributed File System (HDFS)</a> — <code>3x</code> block replication with rack-aware placement; HDFS Erasure Coding for warm data.</li>
+<li><a href="../questions/google-bigtable.md">Google BigTable</a> — Tablets store SSTables and commit logs on GFS; BigTable delegates durability to the underlying file system.</li>
+<li><a href="../questions/amazon-dynamo.md">Amazon Dynamo</a> — Quorum-based replication; Merkle-tree anti-entropy.</li>
+<li><a href="../questions/apache-cassandra.md">Apache Cassandra</a> — Dynamo-style replication tuning; hinted handoff; read repair.</li>
+<li><a href="../questions/apache-kafka.md">Apache Kafka</a> — In-Sync Replica (ISR) replication for durable logs.</li>
+<li><a href="../questions/design-dropbox.md">Dropbox</a> — Chunked deduplicated storage on durable backend.</li>
+<li><a href="../questions/design-youtube.md">YouTube</a> — Multi-tier video storage with cold archives.</li>
+<li><a href="../questions/design-netflix.md">Netflix</a> — Content delivery atop durable object storage.</li>
+<li><a href="../questions/design-instagram.md">Instagram</a> — Photo storage durability.</li>
+<li><a href="../questions/design-google-docs.md">Google Docs</a>, <a href="../questions/design-dropbox.md">Google Drive / Dropbox</a> — Document and file durability.</li>
+</ul>
+<p>External reading:</p>
+<ul>
+<li>The Amazon S3 durability blog post (and the <code>1-10^-11</code> derivation).</li>
+<li>"What does an exabyte of storage smell like?" (Google).</li>
+<li>Bairavasundaram et al., "An Analysis of Data Corruption in the Storage Stack" (FAST 2008).</li>
+<li>The Backblaze Drive Statistics quarterly reports.</li>
+<li>The HDFS Erasure Coding design document.</li>
+<li>Facebook's f4 paper ("warm BLOB storage with Reed-Solomon <code>10+4</code>").</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

@@ -1,0 +1,839 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Aggregation — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/system-design-patterns/">← Back to System Design Patterns</a>
+        <h1 class="article-title">Real-Time Aggregation</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/05/31 &nbsp;·&nbsp; System Design Patterns
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p>Continuous, incremental computation over an unbounded firehose of events to produce up-to-the-second counts, rollups, top-K lists, or anomaly signals — built around windows, watermarks, checkpointed keyed state, an honest delivery contract (at-least-once + idempotent sink, effectively-once, or true Kafka-to-Kafka Exactly-Once Semantics (EOS)), and approximate sketches. See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a>. Core question docs: <a href="../questions/design-an-ad-click-aggregator.md">ad click aggregator</a>, <a href="../questions/design-a-youtube-likes-counter.md">YouTube likes counter</a>, <a href="../questions/design-a-metrics-and-monitoring-system-like-datadog.md">Datadog-style metrics and monitoring</a>, <a href="../questions/design-google-news-as-a-global-aggregator.md">Google News aggregator</a>, <a href="../questions/design-google-ads.md">Google Ads</a>, <a href="../questions/design-typeahead-suggestion.md">typeahead suggestion</a>, <a href="../questions/apache-kafka.md">Apache Kafka</a>.</p>
+</blockquote>
+<hr />
+<h2 id="1-the-fundamental-hardness">1. The fundamental hardness</h2>
+<p>A batch system answers "how many clicks did campaign 42 get yesterday?" with <code>SELECT COUNT(*) FROM clicks WHERE campaign_id = 42 AND day = ...</code>. The data is finite, fully arrived, and indexed. The query runs once, scans, returns. The real-time version of the same question — "how many clicks in the last five minutes, refreshed every second, for every active campaign, across one million events per second" — cannot be answered that way. The dataset is unbounded; it has no end. You cannot scan it. You cannot wait for it to stop arriving. You must compute incrementally, holding only state, never history.</p>
+<p>That single shift — from finite scan to infinite incremental compute — drags in three problems that batch never had to solve. The first is <strong>event time versus processing time</strong>. A click happened at 12:00:01 on a phone with a flaky network; it shows up at your ingestion pipeline at 12:00:47. The user belongs to the 12:00 minute window, but processing time says 12:00 closed 47 seconds ago. If you bucket by processing time you get wrong counts. If you bucket by event time you have to decide when a window is "done" given that more events for that window might still arrive. That decision is the <strong>watermark</strong>: a heuristic timestamp saying "I believe no more events older than this will arrive." Watermarks are wrong sometimes — they are a guess about the tail of a distribution — and the system has to choose between freshness (close the window early, lose late events) and completeness (close the window late, hurt freshness). There is no free answer.</p>
+<p>The second problem is <strong>state</strong>. A counter has no problem; it is one integer per key. But "top 100 trending hashtags across the last hour with one-minute slides" requires keeping per-hashtag counts for the last 60 windows, indexed for fast top-K, replicated for fault tolerance, checkpointed so a worker crash does not lose the last 10 minutes of computation. State can grow to terabytes. It can become hotter than the event stream itself. State management — sharded, embedded (RocksDB) versus remote, checkpointed, restorable — is the real engineering of stream processing. Everything else is filters and maps.</p>
+<p>The third problem is <strong>at-least-once delivery and its side effects</strong>. The naive pipeline is "Kafka consumer reads click, increments a database row." Now the consumer crashes after the increment but before committing the Kafka offset. On restart it reads the same click and increments again. Or the database commit fails and you retry, double-incrementing. The framework-marketing term for the fix is <strong>end-to-end exactly-once</strong>, but it is worth being precise about what that actually buys you. Flink and Kafka Streams give you exactly-once <em>within Kafka</em>: source offsets, operator state, and a transactional Kafka sink commit as one atomic unit. The moment the sink is something else — Cassandra, Redis, MySQL — the engine cannot give you a real distributed transaction with that store, and you fall back to one of two real-world strategies: (a) deterministic replay plus an idempotent upsert keyed by <code>(aggregation_key, window)</code>, which yields <em>effectively-once</em> output as long as the aggregation is deterministic; or (b) at-least-once with downstream dedup. The choice is never "exactly-once everywhere" by magic; it is a design decision per pipeline. For many production aggregations — dashboards, trending lists, metrics — at-least-once plus idempotent sink is the honest answer and Flink's transactional commits are overkill.</p>
+<p>These three constraints — event-time semantics, large managed state, and at-least-once-with-idempotent-sink (or effectively-once) delivery — define the pattern. Every other tool (Flink, Kafka Streams, Spark Structured Streaming, Beam) is a different opinion about how to handle them.</p>
+<p>One framing trap worth flagging up front: "real-time" alone does not justify Flink. A 5-minute freshness budget is comfortably met by a 1-minute Spark Structured Streaming micro-batch, or even a periodic batch job, with far less operational surface. Streaming earns its complexity when (a) the freshness budget is seconds-to-sub-second, (b) the state is large enough to make recomputation from scratch infeasible, or (c) event-time correctness against late arrivals is required. If none of those apply, the staff-level move is to say so and pick the simpler tool.</p>
+<hr />
+<h2 id="2-how-to-recognize-it-in-the-interview">2. How to recognize it in the interview</h2>
+<h3 id="prompt-phrases-that-signal-this-pattern">Prompt phrases that signal this pattern</h3>
+<ul>
+<li>"real-time" or "near real-time" with freshness budgets in seconds to minutes</li>
+<li>"trending" / "top N" / "leaderboard" updated continuously</li>
+<li>"click counter" / "impression counter" / "view count" at scale</li>
+<li>"metrics rollup" / "p99 latency over the last 5 minutes per service"</li>
+<li>"anomaly detection" / "fraud signals as events arrive"</li>
+<li>"live aggregation" / "live dashboard"</li>
+<li>"session reconstruction" from a stream of events</li>
+<li>"windowed" computation, or "rolling X-minute average"</li>
+</ul>
+<h3 id="architectural-smells">Architectural smells</h3>
+<ul>
+<li>Read QPS for "the count" dwarfs write QPS for the underlying event ("we have 1M clicks/sec but the dashboard only shows the rollup")</li>
+<li>The same number must be wrong in the same way for every reader (you cannot compute it on demand per reader; it has to be precomputed and consistent)</li>
+<li>The aggregate must be cheap and fast to serve, but the events behind it are too big and too fast to scan</li>
+<li>The product tolerates a small freshness lag (seconds to a few minutes) but not staleness measured in hours, ruling out daily batch</li>
+<li>The product can tolerate approximate answers within a small error bound (allowing sketches like HyperLogLog (HLL) and Count-Min Sketch (CMS))</li>
+</ul>
+<h3 id="example-interview-prompts-where-this-is-core">Example interview prompts where this is core</h3>
+<ol>
+<li>Design an ad click aggregator that counts impressions and clicks per campaign per minute, with five-minute freshness, at one million events per second. (<a href="../questions/design-an-ad-click-aggregator.md">doc</a>)</li>
+<li>Design a Datadog-like metrics and monitoring system that ingests per-host counters and gauges and supports per-tag rollups at 10-second resolution. (<a href="../questions/design-a-metrics-and-monitoring-system-like-datadog.md">doc</a>)</li>
+<li>Design a YouTube likes counter that appears instant to the liker but reaches global consistency within seconds. (<a href="../questions/design-a-youtube-likes-counter.md">doc</a>)</li>
+<li>Design Google News as a global aggregator that surfaces trending topics across regions in near real time. (<a href="../questions/design-google-news-as-a-global-aggregator.md">doc</a>)</li>
+<li>Design a typeahead suggestion service whose ranking incorporates the last hour of query frequency. (<a href="../questions/design-typeahead-suggestion.md">doc</a>)</li>
+<li>Design a fraud detection pipeline that flags suspicious payment sequences within seconds of the events arriving. (Related: <a href="../questions/design-a-delayed-payment-system.md">delayed payment system</a>, <a href="../questions/design-a-payment-system.md">payment system</a>.)</li>
+</ol>
+<hr />
+<h2 id="3-60-second-spoken-framing">3. 60-second spoken framing</h2>
+<blockquote>
+<p>I would treat this as a stream processing problem rather than a database problem. Events land in a partitioned log like Apache Kafka, partitioned by the aggregation key so that all events for one campaign or one host land on one consumer. A stream processor — Apache Flink in production, Kafka Streams for lighter workloads — consumes those partitions, maintains per-key windowed state in a local RocksDB-backed state backend, and emits rollups when watermarks advance past window boundaries. State and source offsets checkpoint together so we can replay from a known-good point on failure. For unique-count metrics like distinct users, I use HyperLogLog so memory stays bounded; for top-K I use Count-Min Sketch plus a heap. The serving layer reads completed rollups from a key-value store like Apache Cassandra or a time-series store. The invariant I design around is that no committed event is double-counted and no event is silently dropped, even under worker crashes, rebalances, and late arrivals.</p>
+</blockquote>
+<hr />
+<h2 id="4-canonical-toolkit">4. Canonical toolkit</h2>
+<h3 id="41-the-processing-engines">4.1 The processing engines</h3>
+<table>
+<thead>
+<tr>
+<th>Engine</th>
+<th>Sweet spot</th>
+<th>State model</th>
+<th>Watermarks</th>
+<th>Exactly-once</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Apache Flink</td>
+<td>Low-latency, large state, complex windows.</td>
+<td>Managed, RocksDB backend, incremental checkpoints to remote storage.</td>
+<td>First-class, per-operator.</td>
+<td>End-to-end with transactional sinks.</td>
+</tr>
+<tr>
+<td>Kafka Streams</td>
+<td>Lightweight, embedded in app, Kafka-only world.</td>
+<td>Local RocksDB, changelog topic for recovery.</td>
+<td>Yes, simpler API.</td>
+<td>Yes, Kafka-to-Kafka.</td>
+</tr>
+<tr>
+<td>Spark Structured Streaming</td>
+<td>Micro-batch, mixed batch and streaming workloads.</td>
+<td>Spark state store, checkpointed to distributed file system.</td>
+<td>Yes, but coarser.</td>
+<td>Yes, with idempotent or transactional sinks.</td>
+</tr>
+<tr>
+<td>Apache Beam (Dataflow)</td>
+<td>Portable across runners, advanced windowing model.</td>
+<td>Runner-dependent.</td>
+<td>First-class, defines the model.</td>
+<td>Runner-dependent.</td>
+</tr>
+</tbody>
+</table>
+<p>The default in a staff-level answer is Flink for "real-time with non-trivial state" and Kafka Streams for "stays inside Kafka and the state is small." Spark Structured Streaming is acceptable when the interviewer mentions an existing Spark batch pipeline; do not introduce a new engine just for streaming.</p>
+<h3 id="42-windows">4.2 Windows</h3>
+<p>Three window types cover almost every interview prompt.</p>
+<pre><code>Tumbling (non-overlapping, fixed size):
+   [---- W1 ----][---- W2 ----][---- W3 ----]
+   t=0          5             10            15
+
+Sliding (overlapping, fixed size, step &lt; size):
+   [---- W1 ----]
+        [---- W2 ----]
+             [---- W3 ----]
+   t=0   2    4    6   8    10
+
+Session (gap-based, dynamic boundaries):
+   user A:   ev ev ev    [gap &gt;30s closes window]   ev ev
+            [-- S1 --]                              [- S2 -]
+</code></pre>
+<ul>
+<li><strong>Tumbling</strong>: per-minute click counts. Cheap; each event belongs to one window. The default.</li>
+<li><strong>Sliding</strong>: "five-minute moving average updated every 30 seconds." Each event belongs to multiple windows; cost multiplies. Use when smoothness matters.</li>
+<li><strong>Session</strong>: "user activity session bounded by 30 minutes of inactivity." Window boundaries depend on data, not the clock. Expensive state because you must track an open session per key.</li>
+</ul>
+<h3 id="43-watermarks">4.3 Watermarks</h3>
+<p>A watermark is a monotonic timestamp asserting "no event with event-time earlier than W will arrive in the future." Engines emit watermarks based on observed timestamps minus a configured <strong>allowed lateness</strong>. When the watermark crosses a window's end, the window fires.</p>
+<pre><code>event-time line ─────────────────────────────────────►
+                  e1   e2  e3        e4       e5
+                  10s  12s 11s       14s      18s
+                                            watermark = max_seen - 5s = 13s
+                                            window [0s, 10s] closes when watermark &gt; 10s
+                                            window [10s, 20s] still open
+</code></pre>
+<p>Late events arriving after watermark either: (1) are dropped, (2) trigger a window re-fire with updated state (Flink "allowed lateness" + side outputs), or (3) go to a dead-letter side output for offline reconciliation. The choice is a product decision; surface it.</p>
+<h3 id="44-exactly-once-via-checkpointed-barriers-and-what-it-actually-guarantees">4.4 Exactly-once via checkpointed barriers — and what it actually guarantees</h3>
+<p>The Flink-style mechanism, simplified: periodic <strong>barriers</strong> are injected into the stream by sources. Each operator, when it has seen the barrier on all its inputs, snapshots its state to durable storage and forwards the barrier downstream. When the sink acks the barrier and commits its transaction, the checkpoint is complete. On failure, all operators roll back to the last completed checkpoint and sources rewind to the recorded offsets.</p>
+<p>The honest version of this story has three asymmetries the doc-writing brain wants to flatten:</p>
+<ol>
+<li><strong>Within Flink, this is exactly-once.</strong> State is consistent with the checkpoint, and replay is deterministic.</li>
+<li><strong>Kafka-to-Kafka EOS is exactly-once.</strong> When the sink is also a transactional Kafka topic, the source-offset commit and the sink-output commit are bundled in one Kafka transaction. This is the only case where the framework itself gives you end-to-end exactly-once.</li>
+<li><strong>Kafka-to-external-store is not.</strong> Cassandra, Redis, MySQL, S3, ClickHouse — none of these participate in a Flink/Kafka transaction. You get end-to-end correctness only if the sink writes are <em>idempotent and deterministic</em>: same input window produces the same output row, and the upsert is keyed by <code>(aggregation_key, window)</code>. This is "effectively-once," not exactly-once in the textbook sense; if any operator does anything non-deterministic (random sampling, calls a wall clock, reads an external feature store at runtime), the property breaks and you can re-emit different values for the same window after a crash.</li>
+</ol>
+<p>See <a href="../idempotency-exactly-once/">idempotency-exactly-once.md</a> for the dual treatment.</p>
+<h3 id="45-state-backends">4.5 State backends</h3>
+<table>
+<thead>
+<tr>
+<th>Backend</th>
+<th>When</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>In-memory (heap).</td>
+<td>State fits in RAM; tiny key cardinality.</td>
+<td>GC pressure; loss on crash unless checkpointed.</td>
+</tr>
+<tr>
+<td>Embedded RocksDB.</td>
+<td>Large state per task, local-disk speed.</td>
+<td>Disk I/O; serialization overhead; the standard choice.</td>
+</tr>
+<tr>
+<td>Remote (S3 / HDFS) checkpoints.</td>
+<td>Durable snapshots, not live reads.</td>
+<td>Snapshot cost; recovery latency.</td>
+</tr>
+<tr>
+<td>Remote state store (e.g., FoundationDB, Tair).</td>
+<td>Disaggregated compute and state; rare.</td>
+<td>Network on every state access.</td>
+</tr>
+</tbody>
+</table>
+<p>Default: RocksDB local with incremental remote checkpoints. Mention the alternative only if the interviewer probes recovery time or compute-state disaggregation.</p>
+<h3 id="46-approximate-algorithms">4.6 Approximate algorithms</h3>
+<p>When exact counting is too expensive, sketches give probabilistic answers in bounded memory.</p>
+<h4 id="hyperloglog-hll-for-unique-counts">HyperLogLog (HLL) for unique counts</h4>
+<p>Counts distinct elements in roughly <code>1.04/sqrt(m)</code> relative error using <code>m</code> registers. With <code>p=14</code> (m=16384 registers), that is ~0.8% relative error in ~16KB. Crucially, HLLs are <strong>mergeable</strong>: union of two HLLs is the HLL of the union of their inputs (it is the elementwise max of the register arrays). This means per-shard parallelism is cheap — the merge cost is O(m), independent of cardinality — but it is not literally free: registers still have to be shipped across the wire at merge time, and at very small <code>p</code> the relative error blows up.</p>
+<p>The error bound matters. ~0.8% sounds tight until you remember it is <em>relative</em> and <em>probabilistic</em>: at a true cardinality of 100M unique users, the typical error band is ±800K. That is fine for "distinct users who saw this campaign today" on a dashboard; it is not fine for "distinct payers we owe a refund to," where you need an exact <code>COUNT DISTINCT</code> against the source-of-truth event log. The rule: use HLL when the consumer of the number is a human looking at a graph or a ranking; use exact counting when the consumer is an accounting system, a regulator, or a deduplication path that must not miss.</p>
+<pre><code class="language-python">import math
+import hashlib
+
+class HyperLogLog:
+    def __init__(self, p=14):
+        # p = log2(m). p=14 -&gt; m=16384 registers, ~0.8% error, ~16KB.
+        self.p = p
+        self.m = 1 &lt;&lt; p
+        self.registers = [0] * self.m
+
+    def _hash(self, item):
+        h = hashlib.sha1(str(item).encode()).digest()
+        return int.from_bytes(h[:8], &quot;big&quot;)
+
+    def add(self, item):
+        x = self._hash(item)
+        idx = x &gt;&gt; (64 - self.p)            # top p bits select register
+        w = (x &lt;&lt; self.p) &amp; ((1 &lt;&lt; 64) - 1) # remaining bits
+        # rank = position of leftmost 1-bit + 1, in the remaining 64-p bits
+        rank = 1
+        mask = 1 &lt;&lt; 63
+        while rank &lt;= 64 - self.p and (w &amp; mask) == 0:
+            rank += 1
+            mask &gt;&gt;= 1
+        if rank &gt; self.registers[idx]:
+            self.registers[idx] = rank
+
+    def estimate(self):
+        alpha = 0.7213 / (1 + 1.079 / self.m)
+        z = sum(2.0 ** -r for r in self.registers)
+        return alpha * self.m * self.m / z
+
+    def merge(self, other):
+        assert self.p == other.p
+        self.registers = [max(a, b) for a, b in zip(self.registers, other.registers)]
+</code></pre>
+<p>Use cases: distinct users per campaign, unique IPs per minute, distinct query strings.</p>
+<h4 id="count-min-sketch-cms-for-heavy-hitters-and-frequency-estimation">Count-Min Sketch (CMS) for heavy hitters and frequency estimation</h4>
+<p>CMS is a 2-D array of <code>d</code> rows by <code>w</code> columns. Each item is hashed <code>d</code> times; each hash increments one cell per row. Query returns the <strong>minimum</strong> of the <code>d</code> cells, which is an over-estimate bounded by <code>epsilon = e/w</code> with probability <code>1 - 1/e^d</code>.</p>
+<pre><code class="language-python">import hashlib
+
+class CountMinSketch:
+    def __init__(self, w=2048, d=5):
+        # w controls error, d controls confidence.
+        self.w = w
+        self.d = d
+        self.table = [[0] * w for _ in range(d)]
+
+    def _hashes(self, item):
+        b = str(item).encode()
+        for i in range(self.d):
+            h = hashlib.blake2b(b, digest_size=8, person=str(i).encode()).digest()
+            yield int.from_bytes(h, &quot;big&quot;) % self.w
+
+    def add(self, item, count=1):
+        for i, j in enumerate(self._hashes(item)):
+            self.table[i][j] += count
+
+    def estimate(self, item):
+        return min(self.table[i][j] for i, j in enumerate(self._hashes(item)))
+
+    def merge(self, other):
+        assert self.w == other.w and self.d == other.d
+        for i in range(self.d):
+            for j in range(self.w):
+                self.table[i][j] += other.table[i][j]
+</code></pre>
+<p>Pair CMS with a small min-heap of size K to get streaming top-K: when an item's estimated frequency exceeds the heap's min, evict and insert.</p>
+<p>Use cases: trending hashtags, hot keys for cache pre-warm, fraud heavy hitters.</p>
+<h4 id="bloom-filter-for-streaming-membership">Bloom filter for streaming membership</h4>
+<p>For "have I seen this event ID before in this window?" Used to deduplicate at the edges of an at-least-once pipeline. False positives mean an event might be wrongly discarded; tune <code>m</code> and <code>k</code> accordingly.</p>
+<h4 id="reservoir-sampling-for-streaming-uniform-sample">Reservoir sampling for streaming uniform sample</h4>
+<p>To keep a uniformly random sample of <code>k</code> items from an unbounded stream without knowing the total size:</p>
+<pre><code class="language-python">import random
+
+class Reservoir:
+    def __init__(self, k):
+        self.k = k
+        self.buf = []
+        self.seen = 0
+
+    def add(self, x):
+        self.seen += 1
+        if len(self.buf) &lt; self.k:
+            self.buf.append(x)
+        else:
+            j = random.randrange(self.seen)
+            if j &lt; self.k:
+                self.buf[j] = x
+</code></pre>
+<p>Use cases: log sampling, anomaly investigation, training-data sampling from production traffic.</p>
+<h3 id="47-tumbling-window-aggregation-with-watermark-sketch">4.7 Tumbling-window aggregation with watermark (sketch)</h3>
+<p>A self-contained Python pseudocode of how an engine handles per-key tumbling windows with an event-time watermark. Real engines do this with much more care around state and checkpointing.</p>
+<pre><code class="language-python">from collections import defaultdict
+
+WINDOW_SIZE_MS = 60_000
+ALLOWED_LATENESS_MS = 30_000
+
+class TumblingAggregator:
+    def __init__(self):
+        # key -&gt; window_start_ms -&gt; count
+        self.state = defaultdict(lambda: defaultdict(int))
+        self.watermark = 0
+        self.max_event_time = 0
+
+    def window_start(self, ts):
+        return (ts // WINDOW_SIZE_MS) * WINDOW_SIZE_MS
+
+    def on_event(self, key, event_time_ms):
+        if event_time_ms + ALLOWED_LATENESS_MS &lt; self.watermark:
+            # Too late: route to side output for offline reconciliation.
+            return (&quot;late&quot;, key, event_time_ms)
+        ws = self.window_start(event_time_ms)
+        self.state[key][ws] += 1
+        self.max_event_time = max(self.max_event_time, event_time_ms)
+        # Watermark = max observed event time minus configured lateness.
+        self.watermark = max(self.watermark,
+                             self.max_event_time - ALLOWED_LATENESS_MS)
+        return self._fire_closed_windows()
+
+    def _fire_closed_windows(self):
+        emissions = []
+        for key, windows in list(self.state.items()):
+            for ws in list(windows.keys()):
+                if ws + WINDOW_SIZE_MS &lt;= self.watermark:
+                    emissions.append((key, ws, windows[ws]))
+                    del windows[ws]
+            if not windows:
+                del self.state[key]
+        return emissions
+</code></pre>
+<p>The interview value of this sketch is to show that you understand: per-key state, window assignment by event time, watermark derived from max observed event time minus lateness, and firing on watermark advance. In a real Flink job all of this is hidden behind <code>keyBy(...).window(...).aggregate(...)</code> but you must be able to explain the machinery underneath.</p>
+<hr />
+<h2 id="5-worked-example-naive-broken-fixed">5. Worked example: naive → broken → fixed</h2>
+<h3 id="scenario">Scenario</h3>
+<p>An ad click aggregator. Inputs:</p>
+<ul>
+<li>1,000,000 click events per second at peak, partitioned across regions.</li>
+<li>5,000,000 impression events per second.</li>
+<li>100,000 active campaigns. Long tail: 1% of campaigns get 80% of traffic.</li>
+<li>Freshness target: counts visible to the billing dashboard within 5 minutes of the event.</li>
+<li>Correctness target: per-minute campaign counts must be accurate within 0.1% (this is billing-grade; double-counting means refunds and fraud risk).</li>
+</ul>
+<h3 id="naive-design-the-trap">Naive design (the trap)</h3>
+<pre><code>Click producer ──► Kafka topic &quot;clicks&quot;
+                       │
+                       ▼
+                  Consumer group
+                       │
+                       ▼
+   For each event: UPDATE counters SET c = c + 1
+                   WHERE campaign_id = X AND minute = Y
+                       │
+                       ▼
+                   MySQL
+</code></pre>
+<p>A junior answer. It fails on every axis.</p>
+<h3 id="why-it-breaks">Why it breaks</h3>
+<ol>
+<li><strong>Lock contention on hot rows.</strong> The top campaign gets ~50,000 clicks per second. Each <code>UPDATE counters SET c = c + 1 WHERE campaign_id = X AND minute = Y</code> takes an exclusive row lock and an fsync at commit; on a single InnoDB row this realistically caps at a few thousand updates per second per row even with group commit, well below the offered load. The result is not just slow updates — it is unbounded lock-wait queue growth, the consumer falling behind on Kafka, and <code>Lock wait timeout exceeded</code> errors as transactions are killed. The fix is to never write per-event; pre-aggregate in memory and write per-window.</li>
+<li><strong>Duplicate increments under retry.</strong> The consumer reads a batch, increments rows, then crashes before committing Kafka offsets. On restart it re-reads the batch, increments again. There is no idempotency key on the database side. Per-campaign counts drift up by a few percent over a day. Billing is wrong. See <a href="../idempotency-exactly-once/">idempotency-exactly-once.md</a> and <a href="../coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a>.</li>
+<li><strong>No event-time semantics.</strong> A click that happened at 12:00:30 but arrived at 12:05:01 is credited to the 12:05 minute, not 12:00. Per-minute reports are wrong at the boundaries.</li>
+<li><strong>No backpressure handling.</strong> When MySQL slows down, the consumer can either drop events, OOM, or block — and Kafka does not push back on producers. See <a href="../backpressure-flow-control/">backpressure-flow-control.md</a>.</li>
+<li><strong>Hot key kills one MySQL shard.</strong> Even sharding by campaign ID does not help: the top campaign hash always lands on one shard and dominates it. See <a href="../hot-key-skew/">hot-key-skew.md</a>.</li>
+<li><strong>Scan-based dashboard.</strong> Every dashboard query joins by minute and campaign and aggregates. Reads of the most-recent minute are hot and synchronous with the writer.</li>
+</ol>
+<h3 id="fixed-design">Fixed design</h3>
+<pre><code>                   (events partitioned by campaign_id mod N)
+Click producer ──► Kafka &quot;clicks&quot; (200 partitions)
+                       │
+                       ▼
+       ┌───────────────┴───────────────┐
+       ▼                               ▼
+  Flink job (taskmanager 1)       Flink job (taskmanager N)
+   - keyBy(campaign_id)            (each owns a partition subset)
+   - tumbling(1 minute, event time)
+   - allowed lateness 2 minutes
+   - state: RocksDB local
+   - checkpoint every 30s to S3
+       │
+       ▼
+   Per-minute (campaign_id, minute, count) records
+       │
+       ├──► Kafka &quot;rollups&quot; topic (transactional sink, exactly-once)
+       │       │
+       │       ▼
+       │   Sink consumer with idempotent upsert (PK = campaign_id, minute)
+       │       │
+       │       ▼
+       │   Apache Cassandra: counts_per_minute(campaign_id, minute) ── PK ──
+       │       │
+       │       ▼
+       │   Dashboard / billing reads
+       │
+       └──► (optional) HyperLogLog merged across partitions for unique-user counts
+</code></pre>
+<p>Key design choices and why each one is right:</p>
+<ol>
+<li><strong>Partition by campaign_id.</strong> All clicks for one campaign land on the same Flink keyed-stream slot. State is local; no cross-task coordination per event.</li>
+<li><strong>Hot key salting where needed.</strong> The top 10 campaigns are pre-identified and rekeyed to <code>(campaign_id, salt)</code> where <code>salt = hash(event_id) mod 16</code>. Sixteen sub-counters are then merged in a second Flink stage. Trades latency (one extra hop) for parallelism on the hot key. See <a href="../hot-key-skew/">hot-key-skew.md</a>.</li>
+<li><strong>Event-time tumbling windows of 1 minute</strong> with 2-minute allowed lateness. Watermarks derived from per-partition max event time minus lateness. Late events past 2 minutes go to a side-output topic that a batch job reconciles nightly.</li>
+<li><strong>Effectively-once into Cassandra.</strong> Flink barriers checkpoint operator state and Kafka source offsets together; that gets us exactly-once <em>within Flink</em> and into the intermediate Kafka rollups topic. From Kafka into Cassandra, the sink consumer upserts on <code>(campaign_id, minute)</code> as the primary key. Because the upstream window aggregation is deterministic on replay from a checkpoint, the upsert is idempotent by construction — a retry writes the same row with the same value. The honest label for this is "effectively-once": end-to-end correctness holds as long as the aggregation stays deterministic. There is no two-phase commit between Flink and Cassandra; we get there through replay determinism plus idempotent keys, not magic.</li>
+<li><strong>Cassandra for serving.</strong> Wide-row layout: partition key <code>campaign_id</code>, clustering key <code>minute</code>. Dashboard query for the last 60 minutes of one campaign is a single-partition range scan. Hot-campaign reads are addressed with a thin read-through cache or per-campaign replicas. See <a href="../questions/apache-cassandra.md">apache-cassandra.md</a>.</li>
+<li><strong>Pre-aggregation before the sink.</strong> Within each 1-minute window, the Flink task emits one (campaign, minute, count) record at window close, not one per event. This is the entire reason the design works: 1M events/sec collapses to ~100K rollup records/minute, which Cassandra handles easily.</li>
+<li><strong>Approximate unique users via HLL.</strong> Per-window HLL with <code>p=14</code> (~16KB, 0.8% error). HLLs across partitions are merged into a global HLL at the second stage. Cardinality is read off the merged register.</li>
+<li><strong>Backfill and reconciliation.</strong> A nightly Spark job reads the raw click topic from cold storage (S3 export from Kafka) and recomputes exact counts; the streaming counts are reconciled against the batch result with a tolerance. Drift exceeding 0.1% pages on-call. This is <strong>lambda architecture</strong> for billing-grade correctness; pure kappa is acceptable for dashboards but rarely for money.</li>
+</ol>
+<h3 id="capacity-sanity-check">Capacity sanity check</h3>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Volume</th>
+<th>Bottleneck candidate</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Kafka ingest</td>
+<td>6M ev/s</td>
+<td>Producer ack latency.</td>
+<td>acks=1 with idempotent producer, 200 partitions.</td>
+</tr>
+<tr>
+<td>Flink state</td>
+<td>100K campaigns x 60 windows x ~50 bytes ≈ 300 MB hot, x replicas.</td>
+<td>RocksDB compaction.</td>
+<td>Incremental checkpoints; tune block cache.</td>
+</tr>
+<tr>
+<td>Cassandra writes</td>
+<td>100K rollups/minute ≈ 1.7K/s.</td>
+<td>Trivial.</td>
+<td>Default replication factor 3.</td>
+</tr>
+<tr>
+<td>Cassandra reads</td>
+<td>dashboard QPS, say 10K/s.</td>
+<td>Hot campaign rows.</td>
+<td>Cache hot partitions; pre-cluster by minute desc.</td>
+</tr>
+<tr>
+<td>Late-event side output</td>
+<td>&lt;0.01% of stream.</td>
+<td>Storage.</td>
+<td>30-day retention on side-output topic.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="6-variants-and-how-to-choose">6. Variants and how to choose</h2>
+<h3 id="61-exact-versus-approximate">6.1 Exact versus approximate</h3>
+<table>
+<thead>
+<tr>
+<th>Need</th>
+<th>Use exact</th>
+<th>Use approximate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Billing, regulatory, settlement.</td>
+<td>Yes — must be exact. Reconcile with batch.</td>
+<td>Never.</td>
+</tr>
+<tr>
+<td>User-facing counters (likes, views).</td>
+<td>Acceptable to be exact.</td>
+<td>Acceptable; HLL on uniques, exact on totals.</td>
+</tr>
+<tr>
+<td>Trending / top-K dashboards.</td>
+<td>Often overkill.</td>
+<td>CMS + heap is the right answer.</td>
+</tr>
+<tr>
+<td>Distinct-user metrics at high cardinality.</td>
+<td>Cost-prohibitive.</td>
+<td>HLL, mergeable across shards.</td>
+</tr>
+<tr>
+<td>Per-event audit and replay.</td>
+<td>Yes — keep raw events.</td>
+<td>Sketches lose the underlying events.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="62-tumbling-versus-sliding-versus-session">6.2 Tumbling versus sliding versus session</h3>
+<table>
+<thead>
+<tr>
+<th>Window</th>
+<th>Choose when</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tumbling.</td>
+<td>Per-minute / per-hour reports; default.</td>
+<td>One state entry per (key, window).</td>
+</tr>
+<tr>
+<td>Sliding.</td>
+<td>Smooth dashboards; "moving average."</td>
+<td>N x tumbling cost where N = size/slide.</td>
+</tr>
+<tr>
+<td>Session.</td>
+<td>Per-user sessionization; activity grouping.</td>
+<td>State per open session; gap timer per key.</td>
+</tr>
+<tr>
+<td>Global.</td>
+<td>One result over all data.</td>
+<td>Single shared state; usually do not use.</td>
+</tr>
+</tbody>
+</table>
+<p>A trap: candidates choose sliding windows by default because they sound more sophisticated. The cost is real. If the product only needs a per-minute number, tumbling is the right answer.</p>
+<h3 id="63-lambda-versus-kappa">6.3 Lambda versus kappa</h3>
+<pre><code>Lambda:                              Kappa:
+  raw events ──► Kafka                  raw events ──► Kafka
+                  ├─► stream layer ──► serving         └─► stream layer ──► serving
+                  └─► batch layer  ──► serving
+                       (HDFS, Spark, daily/hourly)
+
+  Two pipelines, two codebases,         One pipeline.
+  reconciled to one answer.             Replay from Kafka for backfill.
+</code></pre>
+<ul>
+<li><strong>Lambda</strong> — keep batch as truth, stream as fast approximate. Use when the stream cannot be trusted for billing or compliance, or when historical reprocessing requires logic the streaming engine cannot easily express.</li>
+<li><strong>Kappa</strong> — stream is the only path. Reprocessing means re-reading Kafka from the beginning with a new job and switching the consumer. Use when stream correctness is sufficient and you do not want two codebases. Requires long Kafka retention or tiered storage.</li>
+</ul>
+<p>In an interview, propose kappa first as the <em>conceptual</em> default — one pipeline, one codebase, one mental model — but be honest about the operational cost. Kappa's "just replay Kafka" is fine for replaying a few hours; replaying 90 days of click data through a Flink job to backfill a schema change can take days of cluster time, during which you are running two Flink jobs in parallel (the live one and the replay), and Kafka or tiered storage has to retain the entire window. Production teams often end up with lambda anyway because the batch path also supports ad-hoc analytical SQL on the same raw events — they get the batch layer "for free" from their existing data lake, so the marginal cost of running it as a reconciliation source of truth is low. Pick kappa when the use case is genuinely append-only and bounded in history; pick lambda when (a) you need billing-grade reconciliation, (b) you need analytical SQL over the raw events anyway, or (c) your retention window for stream replay is shorter than the history you need to reprocess.</p>
+<h3 id="64-engine-selection-table">6.4 Engine selection table</h3>
+<table>
+<thead>
+<tr>
+<th>Constraint</th>
+<th>Likely choice</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Existing Kafka, small-to-medium state, no other engine.</td>
+<td>Kafka Streams.</td>
+</tr>
+<tr>
+<td>Large state, complex windows, low latency required.</td>
+<td>Apache Flink.</td>
+</tr>
+<tr>
+<td>Existing Spark batch pipelines, micro-batch latency acceptable.</td>
+<td>Spark Structured Streaming.</td>
+</tr>
+<tr>
+<td>Portability across cloud runners.</td>
+<td>Apache Beam on Dataflow / Flink runner.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="7-failure-modes-and-operations">7. Failure modes and operations</h2>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Metric to watch</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Late events arriving after watermark.</td>
+<td>Late-event rate (side output).</td>
+<td>Increase allowed lateness; route to reconciliation job; surface as known correctness lag.</td>
+</tr>
+<tr>
+<td>State size explosion (per-user session never closes).</td>
+<td>RocksDB on-disk bytes per task; checkpoint size.</td>
+<td>TTL on state; explicit session-close events; cap per-key state with eviction.</td>
+</tr>
+<tr>
+<td>Hot key in keyed stream.</td>
+<td>Per-task event rate; CPU per task.</td>
+<td>Salt the hot key, aggregate in two stages; see <a href="../hot-key-skew/">hot-key-skew.md</a>.</td>
+</tr>
+<tr>
+<td>Checkpoint failure / timeout.</td>
+<td>Checkpoint duration p99; failed-checkpoint count.</td>
+<td>Switch to incremental checkpoints; reduce state per task; increase checkpoint timeout.</td>
+</tr>
+<tr>
+<td>Watermark stalls (one partition idle).</td>
+<td>Per-partition watermark age.</td>
+<td>Idle-source detection; emit synthetic watermarks; alarms on watermark age &gt; N.</td>
+</tr>
+<tr>
+<td>Skewed partitions (one Kafka partition hot).</td>
+<td>Per-partition lag.</td>
+<td>Repartition upstream; salt before producing; see <a href="../hot-key-skew/">hot-key-skew.md</a>.</td>
+</tr>
+<tr>
+<td>Exactly-once gap at sink.</td>
+<td>Output duplicate rate (idempotency key collisions vs expected).</td>
+<td>Transactional sink; idempotent upsert; dedupe with Bloom filter at boundary.</td>
+</tr>
+<tr>
+<td>Consumer lag growing.</td>
+<td>Kafka lag per partition.</td>
+<td>Add Flink parallelism; check downstream sink throughput; backpressure visible. See <a href="../backpressure-flow-control/">backpressure-flow-control.md</a>.</td>
+</tr>
+<tr>
+<td>Backfill correctness drift vs batch.</td>
+<td>Streaming-vs-batch diff per (key, day).</td>
+<td>Reconciliation job; alert at threshold; investigate window misassignment, dropped late events, or sketch error.</td>
+</tr>
+<tr>
+<td>Schema change in event payload.</td>
+<td>Deserialization failure rate.</td>
+<td>Schema registry; forward/backward compatible Avro/Protobuf; dead-letter queue for poison events.</td>
+</tr>
+<tr>
+<td>Recovery time too long after crash.</td>
+<td>Time-to-resume after restart.</td>
+<td>Incremental checkpoints; warmer standby tasks; smaller state per task.</td>
+</tr>
+<tr>
+<td>Cluster restart loses last-N seconds.</td>
+<td>Recovery lag (gap between crash and restart).</td>
+<td>Acceptable if exactly-once preserves correctness; lag becomes a freshness incident, not a correctness incident.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics-to-call-out-by-name">Operational metrics to call out by name</h3>
+<ul>
+<li><strong>Per-partition watermark age</strong>: max(now - watermark) across partitions. The single most important freshness metric.</li>
+<li><strong>Checkpoint duration and size</strong>: leading indicator of state-management problems.</li>
+<li><strong>Records-late-after-watermark</strong>: correctness budget consumption.</li>
+<li><strong>Sink commit latency</strong>: where exactly-once contracts hide their cost.</li>
+<li><strong>Restart count and recovery time</strong>: operational health of the cluster.</li>
+</ul>
+<hr />
+<h2 id="8-combinations-with-other-patterns">8. Combinations with other patterns</h2>
+<p>Real-time aggregation rarely stands alone. Common pairings:</p>
+<ul>
+<li><strong><a href="../idempotency-exactly-once/">Idempotency / exactly-once</a></strong> — the sink commit is where end-to-end exactly-once is realized. Upserts on <code>(key, window)</code> are the cleanest mechanism.</li>
+<li><strong><a href="../hot-key-skew/">Hot-key skew</a></strong> — the top-K campaigns or users dominate any keyed stream. Salting and two-stage aggregation are mandatory at scale.</li>
+<li><strong><a href="../backpressure-flow-control/">Backpressure / flow control</a></strong> — when sinks slow down, the stream must propagate backpressure rather than buffer indefinitely. Flink does this natively; Kafka does not push back on producers.</li>
+<li><strong><a href="../fan-out-write-amplification/">Fan-out write amplification</a></strong> — if rollups feed many downstream subscribers (per-region dashboards, ML feature stores, alerting), the fan-out itself becomes the bottleneck.</li>
+<li><strong><a href="../ordering-causal-consistency/">Ordering and causal consistency</a></strong> — event-time semantics require careful timestamp assignment; out-of-order events within a key require either reordering buffers or commutative aggregation.</li>
+<li><strong><a href="../durability-at-scale/">Durability at scale</a></strong> — Kafka retention plus checkpoint storage define the recovery RPO/RTO.</li>
+<li><strong><a href="../coordination-exactly-one-execution/">Coordination exactly-one execution</a></strong> — at-most-once side effects (sending an alert) on top of an at-least-once stream require dedup at the boundary.</li>
+<li><strong><a href="../search-and-ranking/">Search and ranking</a></strong> — trending-topic pipelines feed ranking; the aggregation pattern produces the features, the ranking pattern consumes them.</li>
+<li><strong><a href="../cache-stampede-read-amplification/">Cache stampede / read amplification</a></strong> — pre-aggregated rollups are themselves a cache; a stampede on the most-recent window read is the typical failure mode if the cache layer is misdesigned.</li>
+<li><strong><a href="../strong-consistency-under-contention/">Strong consistency under contention</a></strong> — when the aggregate must be transactionally consistent with the underlying writes (e.g., available budget for an ad campaign), the streaming-aggregate-as-derived-projection model breaks; you need synchronous decrements with reservation semantics instead.</li>
+</ul>
+<hr />
+<h2 id="9-likely-interviewer-probes">9. Likely interviewer probes</h2>
+<ol>
+<li>
+<p><strong>"Walk me through what happens when a Flink task crashes mid-window. Where does state come from on restart? Do we lose the partial count?"</strong>
+   - State restored from last completed checkpoint in remote storage. Kafka offsets rewound to the offsets recorded in that checkpoint. The partial window is replayed deterministically from those offsets. No partial loss; the price is recovery time, bounded by checkpoint interval plus restore latency.</p>
+</li>
+<li>
+<p><strong>"How do you handle a click that arrives 10 minutes late because the user was on a plane?"</strong>
+   - Configure allowed lateness to 2 minutes for the primary window. Anything later goes to a side-output topic. A nightly reconciliation job reads the side output, looks up the original (campaign, minute) record in Cassandra, and applies a correction. The dashboard shows "preliminary" vs "final" for the most recent hour. Trade: freshness budget plus correctness budget jointly negotiated with the product.</p>
+</li>
+<li>
+<p><strong>"Why HyperLogLog over a HashSet for distinct counts? When would you not use HLL?"</strong>
+   - HashSet is exact but memory grows with cardinality; 100M unique users per day at 50 bytes each is 5 GB per key per day. HLL is ~16 KB per key with ~0.8% error and is mergeable across partitions. Do not use HLL for billing where exactness is required, or when cardinality is low enough that a HashSet is cheaper than the HLL constant overhead.</p>
+</li>
+<li>
+<p><strong>"Your top campaign gets 50K clicks/sec. Walk me through what your Flink job actually does."</strong>
+   - Without mitigation, one keyed-stream slot is doing 50K ops/sec while others are idle — that slot becomes the bottleneck. Mitigation: salt the campaign_id into <code>(campaign_id, salt)</code> where <code>salt = event_hash mod 16</code>, parallelizing across 16 slots. Stage two re-keys by <code>campaign_id</code> only, sums the 16 sub-counts, and emits the final per-minute record. Latency cost: one extra stage and one network shuffle.</p>
+</li>
+<li>
+<p><strong>"What is the difference between processing-time and event-time, and why does it matter?"</strong>
+   - Processing time is when the stream operator saw the event; event time is when the event happened in the real world. Bucketing by processing time means events that arrived late get counted in the wrong bucket; reports are wrong at minute boundaries, and replaying the stream produces a different result than the original run. Event time, anchored by watermarks, is deterministic across replays and correct under network delay. The cost is the watermark machinery and the need to handle late events.</p>
+</li>
+<li>
+<p><strong>"How do you guarantee exactly-once when the sink is Cassandra, not Kafka?"</strong>
+   - Cassandra does not support multi-row transactions across the Flink commit boundary. You make the sink commit idempotent: every emitted record has a deterministic primary key <code>(campaign_id, minute)</code> and the operation is <code>UPSERT</code>. A retry writes the same row with the same value (because the upstream window aggregation is deterministic on replay from a checkpoint). End-to-end exactly-once is achieved by deterministic replay plus idempotent upsert. The cost is that all aggregations must be deterministic — no random sampling, no wall-clock-dependent logic.</p>
+</li>
+<li>
+<p><strong>"What metric tells you the pipeline is healthy?"</strong>
+   - Three: watermark age per partition (freshness), checkpoint duration and success rate (state health), and reconciliation drift vs batch (correctness). Any one of them moving is an incident class. Records-late-after-watermark and Kafka lag per partition are secondary.</p>
+</li>
+<li>
+<p><strong>"What if I tell you the dashboard must reflect a click within 1 second, not 5 minutes?"</strong>
+   - That changes the design. Tumbling windows of 1 minute do not meet 1-second freshness; you need either continuous incremental output (emit on every event, not on window close — Flink supports this with <code>aggregate</code> + early triggers), or you abandon window semantics and use per-key running counters with periodic flushing. The cost is that "the count" is now a moving target during the window — readers must accept eventual values that may revise downward when late events arrive or a worker re-emits after a crash.</p>
+</li>
+</ol>
+<hr />
+<h2 id="10-common-traps-stronger-moves">10. Common traps → stronger moves</h2>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"We will just increment a Redis counter on every event."</td>
+<td>Pre-aggregate in a stream processor; one rollup write per window, not per event.</td>
+</tr>
+<tr>
+<td>Bucketing by processing time.</td>
+<td>Event-time windows with watermarks and explicit allowed lateness.</td>
+</tr>
+<tr>
+<td>Reaching for Flink because the prompt says "real-time."</td>
+<td>Quote the freshness budget. 5-minute SLO with modest state? A periodic batch or Spark micro-batch is simpler and cheaper. Flink earns its complexity at seconds-to-sub-second freshness or with large keyed state.</td>
+</tr>
+<tr>
+<td>Treating exactly-once as a checkbox the framework provides for free.</td>
+<td>Identify the sink contract — transactional Kafka (true EOS), deterministic-replay + idempotent upsert (effectively-once), or at-least-once with downstream dedup — and explain which one you are buying.</td>
+</tr>
+<tr>
+<td>Sliding windows by default.</td>
+<td>Tumbling by default; sliding only when smoothness is required, and budget the multiplicative state cost.</td>
+</tr>
+<tr>
+<td>One global counter per metric.</td>
+<td>Partition by key; aggregate per partition; merge if needed at a second stage.</td>
+</tr>
+<tr>
+<td>Storing every event in the state for "trending top 100."</td>
+<td>Count-Min Sketch plus a small heap; bounded memory, bounded error.</td>
+</tr>
+<tr>
+<td>HashSet for distinct counts at scale.</td>
+<td>HyperLogLog with <code>p=14</code> (~16KB, ~0.8% error) and mergeability across shards.</td>
+</tr>
+<tr>
+<td>Single-stage aggregation on a hot key.</td>
+<td>Two-stage with salting on stage one and rekey on stage two.</td>
+</tr>
+<tr>
+<td>Ignoring late events.</td>
+<td>Allowed-lateness window plus side-output topic plus reconciliation job.</td>
+</tr>
+<tr>
+<td>Lambda everywhere by reflex.</td>
+<td>Kappa first; lambda only when batch is the source of truth for billing or compliance.</td>
+</tr>
+<tr>
+<td>"We will scale by adding more Kafka partitions."</td>
+<td>Partitions are an upper bound on consumer parallelism, not a magic knob; rebalance cost is non-trivial; choose the partition count for the next 1-2 years, not for today.</td>
+</tr>
+<tr>
+<td>Glossing over recovery time.</td>
+<td>Quote checkpoint interval, restore time, and Kafka rewind window as a concrete recovery budget.</td>
+</tr>
+<tr>
+<td>Treating the streaming layer as truth.</td>
+<td>The Kafka log is truth; the stream is a derived projection; you can rebuild the projection by reprocessing.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11-staff-level-answer-checklist">11. Staff-level answer checklist</h2>
+<p>When you finish answering a real-time aggregation question, the interviewer should have heard you:</p>
+<ul>
+<li>Name the freshness budget (seconds, minutes) and the correctness budget (exact vs approximate, error bound) as explicit numbers, not adjectives.</li>
+<li>Identify the partition key and explain why it gives parallelism without cross-task coordination.</li>
+<li>Choose a window type (tumbling / sliding / session) and justify it.</li>
+<li>Choose event-time over processing-time, define the watermark heuristic, and pick an allowed-lateness value with a reason.</li>
+<li>Pick a state backend and justify it against your state-size estimate.</li>
+<li>Specify the delivery contract end to end and use the right label: exactly-once <em>within Kafka</em> (Flink transactional sink to a Kafka topic), <em>effectively-once</em> into an external store (deterministic replay plus idempotent upsert), or at-least-once with downstream dedup. Saying "exactly-once" without naming the sink is the staff-level red flag.</li>
+<li>Estimate state size and checkpoint cost, not just throughput.</li>
+<li>Identify the hot key(s) and propose salting / two-stage aggregation.</li>
+<li>Choose an approximate algorithm (HLL, CMS, Bloom, reservoir) only when the product allows it, and quote the memory/error tradeoff.</li>
+<li>Propose lambda vs kappa explicitly and choose based on whether the use case is billing-grade or dashboard-grade.</li>
+<li>Name the three operational metrics: watermark age, checkpoint duration, reconciliation drift.</li>
+<li>Acknowledge the reprocessing story: how do you re-run the pipeline against three months of history?</li>
+<li>Acknowledge schema evolution: a new field in the event payload should not break the pipeline.</li>
+<li>Tie the design back to a single invariant: "no event is counted twice and no event is silently dropped within the freshness budget."</li>
+</ul>
+<hr />
+<h2 id="12-cross-references">12. Cross-references</h2>
+<h3 id="pattern-siblings">Pattern siblings</h3>
+<ul>
+<li><a href="../idempotency-exactly-once/">idempotency-exactly-once.md</a> — the dual of this pattern when side effects matter.</li>
+<li><a href="../hot-key-skew/">hot-key-skew.md</a> — every real-time aggregator at scale hits this.</li>
+<li><a href="../backpressure-flow-control/">backpressure-flow-control.md</a> — what happens when the sink slows down.</li>
+<li><a href="../fan-out-write-amplification/">fan-out-write-amplification.md</a> — when rollups feed many downstream consumers.</li>
+<li><a href="../ordering-causal-consistency/">ordering-causal-consistency.md</a> — out-of-order events within a key.</li>
+<li><a href="../coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a> — at-most-once side effects on top of at-least-once streams.</li>
+<li><a href="../strong-consistency-under-contention/">strong-consistency-under-contention.md</a> — the case where streaming aggregation is not enough.</li>
+<li><a href="../durability-at-scale/">durability-at-scale.md</a> — Kafka retention plus checkpoint storage as the recovery substrate.</li>
+<li><a href="../search-and-ranking/">search-and-ranking.md</a> — downstream consumer of trending features.</li>
+<li><a href="../cache-stampede-read-amplification/">cache-stampede-read-amplification.md</a> — rollups are a cache; stampedes apply.</li>
+<li><a href="../geo-spatial-queries/">geo-spatial-queries.md</a> — geo-bucketed streaming aggregation (rideshare heatmaps, nearby trending).</li>
+</ul>
+<h3 id="question-docs-where-this-pattern-is-core">Question docs where this pattern is core</h3>
+<ul>
+<li><a href="../questions/design-an-ad-click-aggregator.md">design-an-ad-click-aggregator.md</a> — the canonical exercise.</li>
+<li><a href="../questions/design-a-youtube-likes-counter.md">design-a-youtube-likes-counter.md</a> — counter at viral scale with low freshness budget.</li>
+<li><a href="../questions/design-a-metrics-and-monitoring-system-like-datadog.md">design-a-metrics-and-monitoring-system-like-datadog.md</a> — per-tag rollups across hosts.</li>
+<li><a href="../questions/design-google-news-as-a-global-aggregator.md">design-google-news-as-a-global-aggregator.md</a> — trending topics globally.</li>
+<li><a href="../questions/design-google-ads.md">design-google-ads.md</a> — ad metrics, budget pacing.</li>
+<li><a href="../questions/design-typeahead-suggestion.md">design-typeahead-suggestion.md</a> — query frequency as a streaming feature.</li>
+<li><a href="../questions/design-twitter-search.md">design-twitter-search.md</a> — trending hashtags.</li>
+<li><a href="../questions/design-twitter-timeline.md">design-twitter-timeline.md</a> — for engagement-feature rollups.</li>
+<li><a href="../questions/apache-kafka.md">apache-kafka.md</a> — the substrate.</li>
+<li><a href="../questions/apache-cassandra.md">apache-cassandra.md</a> — typical serving store for rollups.</li>
+</ul>
+<h3 id="glossary-anchors">Glossary anchors</h3>
+<ul>
+<li><a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> — terms.</li>
+<li><a href="../STAFF_SYSTEM_DESIGN_INTERVIEW_PLAYBOOK.md">Staff System Design Interview Playbook</a> — interview flow.</li>
+<li><a href="../STAFF_STORAGE_COMPARISON.md">Staff Storage Comparison</a> — for the serving-layer choice.</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>
