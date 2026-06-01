@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ad Click Aggregator (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Ad Click Aggregator (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Hard · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build the system that counts ad clicks. Every click on a display ad routes through us. We attribute it (which ad, which campaign), dedupe bots, and aggregate counts that advertisers see on a dashboard. Real-time dashboards within seconds, exact-ish counts within an hour. 10B clicks/day, ~115k/sec average, ~1M/sec during major events.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Click goes through us; record click event with attributes.
+- Aggregate counts at per-ad / per-campaign / per-advertiser, per-minute / per-hour / per-day.
+- Dashboard shows near-real-time counts.</p>
+<p>I'd defer impressions, attribution (last-touch vs multi-touch), and billing reconciliation depth.</p>
+<p><strong>Non-functional</strong>
+- Counts approximately correct in real-time (~5 s lag); exact counts within 1 hour.
+- Idempotent click ingestion — never double-count a deduped click.
+- High availability — every uncounted click is potentially uncollected revenue.
+- Survive 10× spike on Super Bowl day.</p>
+<p><strong>Capacity</strong>
+- 10B clicks/day × ~500 B per event = ~5 TB/day raw.
+- Aggregates: ~10M unique (ad_id × minute) buckets/day. Multiple roll-up granularities.
+- Average ingest is ~115k clicks/sec; design for ~1M/sec peak. At 3× replication, 7-day Kafka retention is ~105 TB before compression. Raw event storage dominates cost; aggregate buckets are small.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Click</strong> — <code>click_id, ad_id, campaign_id, advertiser_id, user_id, ts, ip, ua, referrer</code>.</li>
+<li><strong>Aggregate bucket</strong> — <code>(ad_id, minute) → count</code>. Same for <code>(campaign, minute)</code>, <code>(advertiser, minute)</code>, etc.</li>
+<li><strong>Dedup record</strong> — <code>click_id</code> (signed) to prevent reuse.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>GET   /click/{signed_token}                  // user-facing redirect; we record then 302 to ad URL
+
+// Internal dashboard:
+GET /v1/advertisers/{id}/stats?range=1h     → { per_ad: { count }, totals }
+</code></pre>
+<p>Signed token contains <code>ad_id, campaign_id, exp, nonce, HMAC</code>.</p>
+<p>The stats cursor is time-based rather than offset-based: <code>{advertiser_id, start_minute, end_minute, rollup_level, last_bucket}</code> so pagination does not drift while fresh buckets are still changing.</p>
+<hr />
+<h2 id="4-data-flow-5-min">4. Data Flow (~5 min)</h2>
+<p>User clicks ad → redirect through us → click event published to Kafka → dedup → stream aggregator computes per-minute rollups → writes to OLAP (online analytical processing) store → dashboards read from OLAP + a Redis "live count" layer for sub-second freshness.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Click ingest endpoint.</strong> Receives <code>GET /click/{token}</code> → validates HMAC → emits a <code>Click</code> event to Kafka → immediately 302-redirects to the advertiser's destination URL. The 302 is the user-visible action; counting is fire-and-forget within the same request.</li>
+<li><strong>Kafka.</strong> Partitioned by <code>ad_id</code> so all clicks for one ad land in order on the same partition. Long retention (e.g., 7 days) gives us replay.</li>
+<li><strong>Dedup service.</strong> Stream processor that filters out duplicate <code>click_id</code>s seen within a window (e.g., 24 h). Backed by a Redis set or RocksDB-backed Flink state.</li>
+<li><strong>Aggregation pipeline.</strong> Flink job consumes deduped events, maintains tumbling windows (1 min) keyed by <code>(ad_id, minute)</code>, emits to:
+   - <strong>Real-time tier:</strong> Redis counters (<code>INCRBY</code> per minute) for the live dashboard.
+   - <strong>Persistent tier:</strong> OLAP store (ClickHouse or Druid) for hourly+ aggregates and historical query.</li>
+<li><strong>Dashboards.</strong> API queries Redis for the live window and ClickHouse for everything beyond. Time-range queries fan out across the two layers.</li>
+<li><strong>Reconciliation.</strong> Batch job runs hourly from the raw Kafka topic → exact counts → upserted into ClickHouse (corrects any drift from the streaming layer).</li>
+<li><strong>Bot filtering.</strong> ML model + heuristics on the dedup stream classify clicks as valid/bot. Bot clicks counted separately (kept for analysis, excluded from advertiser-facing totals).</li>
+</ol>
+<p>End-to-end narration: a user clicks a banner → browser hits <code>gad.com/click/eyJhbGciO...</code> → ingest validates HMAC, emits Click event to Kafka, returns 302 to destination URL within 50 ms. Flink consumes, dedupes (click_id not seen), increments per-minute bucket in Redis and writes to ClickHouse. Advertiser opens dashboard → sees clicks-this-minute updating live (Redis), historical from last hour from ClickHouse.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">                       +-------------------------------+
+                       | CLIENTS                       |
+                       | browser click / advertiser UI |
+                       +-----------+-------------------+
+                                   |
+                 +-----------------+------------------+
+                 |                                    |
+      GET /click/{signed_token}          GET /v1/advertisers/{id}/stats
+                 |                                    |
+                 v                                    v
+        +-------------------+                  +---------------+
+        | Click Ingest /    | -- 302 -------&gt;  | Advertiser    |
+        | Redirect Service  |                  | Landing Page  |
+        +---------+---------+                  +---------------+
+                  | publish Click(ad_id, click_id)
+                  v
+        +-------------------------------------------------------+
+        | ASYNC / EVENT ROW                                    |
+        | Kafka click_raw[hash(ad_id)+salt] -&gt; Flink Dedup +   |
+        | Bot Filter -&gt; Flink 1-min Aggregator -&gt; Reconcile Job |
+        +---------+--------------------+------------------------+
+                  |                    | uses
+                  |                    v
+                  |          +-------------------+
+                  |          | Bot Model / Rules |
+                  |          +-------------------+
+                  v
+        +-------------------------------------------------------+
+        | STORE / CACHE GROUP                                  |
+        | Redis live:{ad_id}:{minute} integer counter, TTL 2 h  |
+        | Redis live:{ad_id}:{salt}:{minute} for hot ads        |
+        | RocksDB dedup:{click_id}, bot:{click_id}, TTL 24 h    |
+        | ClickHouse (day, advertiser_id, ad_id, minute) rows   |
+        | S3 s3://clicks/dt=YYYY-MM-DD/hour=HH/ Parquet events |
+        +--------------------------+----------------------------+
+                                   ^
+                                   | Redis open-bucket miss /
+                                   | repair from replay
+                                   |
+                         +---------+---------+
+                         | Stats API         |
+                         | ClickHouse closed |
+                         | buckets + Redis   |
+                         | live overlay      |
+                         +-------------------+
+</code></pre>
+<p>Concrete write path:</p>
+<ol>
+<li>Browser calls <code>GET /click/{token}</code>; ingest validates HMAC and extracts <code>click_id</code>, <code>ad_id</code>, <code>campaign_id</code>, <code>advertiser_id</code>, and destination URL.</li>
+<li>Ingest writes <code>click_id</code> to the producer retry queue only if Kafka publish fails; the normal path publishes to Kafka topic <code>click_raw</code> partitioned by <code>hash(ad_id)</code>.</li>
+<li>Flink consumes <code>click_raw</code>, checks dedup state keyed by <code>click_id</code>, and emits valid events to <code>click_valid</code>.</li>
+<li>Aggregator updates Redis live counters and writes minute rows into ClickHouse. The Redis and ClickHouse writes can run in parallel because ClickHouse rows are idempotent by <code>(ad_id, minute, version)</code>.</li>
+<li>Dashboard reads ClickHouse for closed windows and Redis for the currently open minute, then adds them client-side.</li>
+</ol>
+<p>Dashboard read path:</p>
+<ol>
+<li>Stats API authenticates the advertiser and parses <code>{range, granularity, cursor}</code>; the shard key is <code>advertiser_id</code> for query routing and authorization.</li>
+<li>It queries ClickHouse for closed buckets, partition-pruned by <code>day</code> and filtered by <code>(advertiser_id, campaign_id?, ad_id?)</code>.</li>
+<li>In parallel, it reads Redis keys <code>live:{ad_id}:{minute}</code> for the open minute only; if there are many ads, it batches by Redis shard and caps the fan-out to the advertiser's active ad set.</li>
+<li>On a Redis miss, it returns ClickHouse-only results and marks the open bucket as provisional; the next poll usually fills from Redis or from the first flushed ClickHouse row.</li>
+<li>Cursor state is opaque and server-issued: <code>{advertiser_id, range_start, range_end, granularity, last_bucket, freshness_cutoff}</code>. The cursor pins <code>freshness_cutoff</code> so page 2 does not drift while minute buckets are still moving.</li>
+</ol>
+<p>Hot vs cold dashboard path:</p>
+<pre><code>Hot recent range:  client -&gt; Stats API -&gt; Redis live counters
+                                      \-&gt; ClickHouse closed buckets
+
+Cold old range:    client -&gt; Stats API -&gt; ClickHouse only -&gt; object archive only for audit export
+
+Replay repair:     Kafka/S3 raw -&gt; batch recon job -&gt; ClickHouse replace partition
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Idempotency / dedup.</strong> Every click is signed with a unique nonce in the token. Two routes for dedup:
+- <strong>At ingest:</strong> check the nonce against a Redis bloom filter of recent nonces; reject if seen. Bloom false-positives drop some legit clicks (rare, acceptable).
+- <strong>In the stream:</strong> Flink keys by <code>click_id</code>, dedupes within a 24-h window. More accurate but accepts the duplicate into Kafka first.
+I'd default to in-stream dedup for accuracy and use ingest-level dedup only for crude bot mitigation.</p>
+<p>Concrete stores:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key pattern</th>
+<th>Value / data structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Kafka raw</td>
+<td><code>click_raw[{partition}]</code></td>
+<td>append-only click events</td>
+<td style="text-align: right;">~500 B/event</td>
+<td>7 days hot</td>
+<td><code>hash(ad_id)</code> plus salt for hot ads</td>
+</tr>
+<tr>
+<td>Flink dedup state</td>
+<td><code>dedup:{click_id}</code></td>
+<td>RocksDB bool + event minute</td>
+<td style="text-align: right;">~40 B</td>
+<td>24 h</td>
+<td><code>hash(click_id)</code></td>
+</tr>
+<tr>
+<td>Redis live counter</td>
+<td><code>live:{ad_id}:{minute}</code></td>
+<td>integer counter</td>
+<td style="text-align: right;">~32 B</td>
+<td>2 h</td>
+<td><code>hash(ad_id)</code></td>
+</tr>
+<tr>
+<td>ClickHouse minute row</td>
+<td><code>(day, advertiser_id, ad_id, minute)</code></td>
+<td>counts by valid/bot/source</td>
+<td style="text-align: right;">~80-120 B</td>
+<td>2 years aggregate</td>
+<td><code>advertiser_id</code>, partition by day</td>
+</tr>
+<tr>
+<td>Raw cold archive</td>
+<td><code>s3://clicks/dt=YYYY-MM-DD/hour=HH/</code></td>
+<td>compressed Parquet event rows</td>
+<td style="text-align: right;">~150-250 B compressed</td>
+<td>90 days+</td>
+<td>date/hour</td>
+</tr>
+<tr>
+<td>Bot decision cache</td>
+<td><code>bot:{click_id}</code></td>
+<td>valid/bot reason code</td>
+<td style="text-align: right;">~32 B</td>
+<td>24 h</td>
+<td><code>hash(click_id)</code></td>
+</tr>
+</tbody>
+</table>
+<p>Capacity math: 10B raw events/day x 500 B = 5 TB/day. Kafka x3 replicas x7 days = 105 TB uncompressed, usually ~35-60 TB with compression. Dedup state is one day of click IDs: 10B x 40 B x replication/overhead ~= 0.5-1 TB of RocksDB state. Bot decision cache is another bounded 10B x 32 B ~= 320 GB before overhead if kept outside Flink state, so I would usually fold it into stream state. Redis live counters are tiny: 10M buckets/day x 32 B x only 2 hours retained ~= a few GB. ClickHouse aggregates for 2 years at 10M buckets/day x 100 B x 730 ~= 730 GB before replication/compression. The raw event stream is the bill.</p>
+<p>The two-view pattern is the main architectural move: raw clicks are the immutable content log, while Redis and ClickHouse are serving indexes over that same log. Redis is indexed by <code>(ad_id, open_minute)</code> for freshness; ClickHouse is indexed by <code>(advertiser_id, day, minute)</code> for dashboard scans. They are not competing sources of truth, and replay can rebuild both.</p>
+<p><strong>Exactly-once vs approximate.</strong> Sub-second dashboards: approximate counts from Redis. Reconciled-exact counts: hourly batch from Kafka → ClickHouse with upsert semantics. The advertising contract typically requires the reconciled number; the dashboard caveat is small print.</p>
+<p><strong>Why Kafka + Flink + ClickHouse.</strong> Kafka is the durable replay log; Redis Streams or Pub/Sub cannot give 7-day replay at this volume, and Kinesis/Pulsar are also fine if that is the company's standard. Flink is useful because the hard part is keyed window state and replay, not just queue consumption. ClickHouse is a better fit than MySQL for dashboard scans because queries are columnar ranges over <code>(advertiser_id, time)</code>; Druid is the closest alternative and wins if you want built-in rollup/serving, while ClickHouse is simpler when you can own the schema.</p>
+<p><strong>Aggregation correctness under failures.</strong> Flink with RocksDB state + Kafka source replays from offsets on task failure. Exactly-once write to ClickHouse via two-phase commit or idempotent upserts keyed by <code>(window, ad_id)</code>.</p>
+<p><strong>Bot filtering.</strong> Heuristics: same IP burst, no referrer, suspicious UA, click-without-prior-impression, click-too-fast-after-impression. Plus a model trained on labeled bot traffic. Filtered clicks are stored separately for visibility but excluded from billable counts.</p>
+<p><strong>Hot keys (Super Bowl ad).</strong> One ad gets 10M clicks in a minute. Kafka partitioning by <code>ad_id</code> puts them on one partition — could saturate. Mitigation: salt the partition key for hot ads (<code>hash(ad_id) + small random</code>) and merge on aggregation. Detection: monitor partition lag.</p>
+<p>Hot-ad state machine:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source / write pattern</th>
+<th>Latency target</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>normal</td>
+<td>unsalted</td>
+<td><code>partition = hash(ad_id)</code></td>
+<td>dashboard lag &lt;5 s</td>
+</tr>
+<tr>
+<td>hot detected</td>
+<td>salted</td>
+<td><code>partition = hash(ad_id, salt_0..15)</code></td>
+<td>lag &lt;10 s while merging</td>
+</tr>
+<tr>
+<td>extreme</td>
+<td>sampled live + exact later</td>
+<td>Redis live counter samples; Kafka keeps all events</td>
+<td>live approximate, hourly exact</td>
+</tr>
+<tr>
+<td>recovery</td>
+<td>compact salts</td>
+<td>merge salted buckets into normal ClickHouse rows</td>
+<td>next closed window</td>
+</tr>
+</tbody>
+</table>
+<p>Dashboard freshness state machine:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Fallback / latency budget</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fresh open minute</td>
+<td>live overlay</td>
+<td>Redis <code>live:{ad_id}:{minute}</code> + ClickHouse closed buckets</td>
+<td>&lt;500 ms API p99</td>
+</tr>
+<tr>
+<td>Redis exhausted</td>
+<td>provisional closed-only</td>
+<td>ClickHouse only</td>
+<td>&lt;1 s, open bucket marked provisional</td>
+</tr>
+<tr>
+<td>stream lag</td>
+<td>delayed freshness cutoff</td>
+<td>ClickHouse up to last committed watermark</td>
+<td>dashboard lags by watermark, not wrong totals</td>
+</tr>
+<tr>
+<td>reconciliation repair</td>
+<td>replace corrected partitions</td>
+<td>hourly batch from raw log/archive</td>
+<td>minutes, used for billing truth</td>
+</tr>
+</tbody>
+</table>
+<p>Edge stress tests:</p>
+<table>
+<thead>
+<tr>
+<th>Edge</th>
+<th>Design response</th>
+<th>Budget</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dormant advertiser opens a 1-year dashboard</td>
+<td>Skip Redis, scan ClickHouse by <code>advertiser_id</code> and day partitions; paginate with fixed <code>freshness_cutoff</code></td>
+<td>first page &lt;2 s</td>
+</tr>
+<tr>
+<td>Dashboard paginates past cached live window</td>
+<td>Cursor naturally switches to ClickHouse-only closed buckets</td>
+<td>stable page order</td>
+</tr>
+<tr>
+<td>Burst writes from one celebrity ad</td>
+<td>Salt Kafka and Redis counter keys as <code>live:{ad_id}:{salt}:{minute}</code>, then merge salts at flush</td>
+<td>live lag &lt;10 s</td>
+</tr>
+<tr>
+<td>Multi-region drift</td>
+<td>Ingest locally, replicate raw log asynchronously, reconcile by <code>(click_id, event_time)</code> in home region</td>
+<td>regional dashboard may lag; billing reconciles</td>
+</tr>
+<tr>
+<td>Cold start after Flink deploy</td>
+<td>Restore RocksDB state from checkpoint; Redis live counters repopulate from replay for current windows</td>
+<td>sub-minute freshness recovery</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Interview punch line:</strong> the dashboard is allowed to show a provisional live overlay, but billing should always be reproducible from the immutable click log.</p>
+<p><strong>Interview punch line:</strong> I would make the redirect path highly available and the counting path replayable. The user-visible click should finish fast; money accuracy comes from idempotent replay and reconciliation, not from trying to do every aggregate synchronously.</p>
+<p><strong>Latency budget.</strong> Ingest must be &lt; 100 ms so the redirect is snappy. Kafka publish is async — <code>acks=1</code> on the producer keeps the publish under 5 ms. Click event emission can be fire-and-forget with retry queue on producer-side failure (rare).</p>
+<p><strong>Backfill / replay.</strong> If aggregation breaks, replay from Kafka. Aggregations are deterministic given the same input stream and the same windows, so re-run produces the same numbers.</p>
+<p><strong>Multi-tenancy / sharding.</strong> ClickHouse partitioned by date + advertiser_id. Hot advertisers get dedicated shards if their query load is heavy. Smaller advertisers share.</p>
+<p><strong>Cost.</strong> Storage of raw events for 90 days at 5 TB/day = 450 TB. Aggregates a tiny fraction. Tier raw events to cold storage after 7 days; keep aggregates hot.</p>
+<p><strong>Click attribution (touch).</strong> A click on an ad now might lead to a purchase later. Attribution is a downstream concern: stream the click + the eventual conversion event through a join with a configurable window. Out of scope to design fully here.</p>
+<p><strong>What I'd defer.</strong> Impression counting (similar pipeline at higher volume), advanced attribution windows, ad-fraud detection depth, real-time budget pacing (cutting off campaigns mid-flight).</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

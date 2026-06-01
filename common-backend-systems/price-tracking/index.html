@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Price Tracking Service — Camelcamelcamel-Style (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Price Tracking Service — Camelcamelcamel-Style (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Medium · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build a price tracking service. Users subscribe to products on Amazon/Walmart/etc., we crawl prices on a schedule, and we alert users when a product hits their target price. 10M users, 100M tracked products, prices crawled every 10 minutes for hot items, hourly for the long tail.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Add a product URL to track; we extract the canonical product, current price, and start scraping it.
+- Set a target price; receive an alert (email/push) when current price drops to or below target.
+- View price history chart for a tracked product.</p>
+<p>I'd defer cross-retailer matching ("is this the same product on Amazon and Walmart?"), browser extension, and affiliate revenue.</p>
+<p><strong>Non-functional</strong>
+- Crawl freshness within target cadence (10 min hot, 1 h long tail).
+- Alert delivery within 5 min of detected price drop.
+- Be polite to retailers — respect robots.txt, throttle per host, identify ourselves.
+- Survive retailer-side anti-bot measures.</p>
+<p><strong>Capacity</strong>
+- 100M products tracked. Each price record ~50 bytes. 100M × 100 (10-min crawls/day) = 10B price records/day if all hot — realistically a mix; say 1B/day → 50 GB/day.
+- 10M users; avg 5 alerts → 50M user-product subscriptions.
+- Price history dominates: 1B records/day × 50 B × 90 d × 3 replicas ≈ 13.5 TB for raw hot history before indexes. Rollups are much smaller and can live for years.
+- Catalog and subscriptions are modest: 100M products × ~1 KB × 3 ≈ 300 GB; 50M subscriptions × ~150 B × two indexes × 3 ≈ 45 GB.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Product</strong> — <code>product_id</code>, retailer, retailer_sku, canonical_url, name, image.</li>
+<li><strong>PriceRecord</strong> — <code>product_id, ts, price, in_stock</code>.</li>
+<li><strong>Subscription</strong> — <code>user_id, product_id, target_price, alert_channel</code>.</li>
+<li><strong>CrawlJob</strong> — <code>product_id, next_crawl_at, cadence</code>.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST  /v1/products/track          { url, target_price? }   → { product_id }
+GET   /v1/products/{id}           → { product, current_price, history_url }
+GET   /v1/products/{id}/history?range=30d   → PriceRecord[]
+DELETE /v1/subscriptions/{id}
+</code></pre>
+<p>User from token.</p>
+<hr />
+<h2 id="4-data-flow-5-min">4. Data Flow (~5 min)</h2>
+<p>User adds URL → resolve canonical product → upsert into catalog → schedule crawl → crawler scrapes price → write PriceRecord → if price ≤ any subscription's target, fire alert event → notification service delivers.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>URL resolution service.</strong> When a user submits a URL, normalize it, fetch once, extract product identity (retailer + SKU). Dedupe against catalog — multiple users tracking the same product share one crawl.</li>
+<li><strong>Catalog store.</strong> Products in MySQL (sharded by <code>product_id</code>). Subscriptions in a separate table indexed by both <code>user_id</code> (for "my list") and <code>product_id</code> (for fan-out on price change).</li>
+<li><strong>Crawl scheduler.</strong> Priority queue (Redis sorted set by <code>next_crawl_at</code>). Each product has a cadence based on popularity (subscriber count, volatility).</li>
+<li><strong>Crawler pool.</strong> Per-retailer workers pulling from the scheduler. Per-host rate limit. Uses headless browser for JS-heavy retailers; cheap HTTP for static pages. Rotates residential-IP proxy pool.</li>
+<li><strong>Parser.</strong> Per-retailer parser modules. Versioned because retailers change HTML frequently.</li>
+<li><strong>Price store.</strong> Time-series store for <code>PriceRecord</code> — InfluxDB or a sharded MySQL table keyed by <code>(product_id, ts)</code> with retention policies (raw 90 d, 1 h aggregates 1 y, daily aggregates forever).</li>
+<li><strong>Alert pipeline.</strong> Each new PriceRecord publishes an event to Kafka. Alert worker:
+   - Looks up subscriptions for the product (cached by product_id).
+   - Filters to those with <code>target_price &gt;= new_price</code>.
+   - Deduplicates against last-alert-sent timestamp per subscription.
+   - Emits alert events to the notification service.</li>
+<li><strong>Notification service.</strong> Email / mobile push / browser push. Out of scope to design in detail.</li>
+</ol>
+<p>End-to-end narration: Alice adds an Instant Pot listing → URL resolver extracts product PXC123 → catalog upsert → subscription row with <code>target_price = $59</code>. Crawler hits it on the next cadence, finds price $79, writes record. Two days later, price drops to $55 — alert worker reads the event, finds Alice's subscription with target $59 ≥ $55, hasn't alerted in 24 h, fires email + push.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">                         +--------------------------------+
+                         | USERS AND RETAILER SITES      |
+                         +----------+-------------+-------+
+                                    |             |
+        POST /products/track        |             | polite crawl / parse
+        GET /products/{id}/history  |             v
+                                    v      +------+-------+
+                         +----------+---+  | Crawler Pool |
+                         | URL Resolver  |  | + Parser     |
+                         +------+-------+  +------+-------+
+                                |                 |
+                                v                 | price.changed
+                         +------+-------+         v
+                         | Subscription|   +-----+-------+
+                         | Service     |   | Alert Worker|
+                         +------+-------+   +-----+-------+
+                                |                 |
+                                |                 v
+                                |          Notification Service
+                                v
+        +----------------------------------------------------------+
+        | STORE / CACHE                                            |
+        | product:{product_id} catalog row; unique(retailer, sku)  |
+        | subs_by_user:{user_id} tracked-product targets           |
+        | subs_by_product:{product_id} subscription IDs + targets  |
+        | crawl_due:{retailer} Redis ZSET member=product_id        |
+        | price:{product_id}:{day} time-series price records       |
+        | alerted:{subscription_id} last price + last sent ts      |
+        +-----------+----------------------------+-----------------+
+                    | latest/history miss        ^ due crawl pop
+                    v                            |
+          +-------------------+          +-------+--------+
+          | Price tail +      |          | Crawl         |
+          | rollup archive    |          | Scheduler     |
+          +-------------------+          +-------+--------+
+                                              |
+                                429 / Retry-After backoff
+                                              v
+                                      Per-host token bucket
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete stores and shard keys.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key pattern</th>
+<th>Data structure / entry</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Product catalog</td>
+<td><code>product:{product_id}</code></td>
+<td>MySQL row, retailer SKU/name/image/canonical URL, ~1 KB</td>
+<td>forever</td>
+<td><code>product_id</code></td>
+</tr>
+<tr>
+<td>User subscriptions</td>
+<td><code>subs_by_user:{user_id}</code></td>
+<td>rows/list of product targets, ~150 B/sub</td>
+<td>until deleted</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Product subscribers</td>
+<td><code>subs_by_product:{product_id}</code></td>
+<td>index of subscription IDs + target price, ~80 B/sub</td>
+<td>until deleted</td>
+<td><code>product_id</code></td>
+</tr>
+<tr>
+<td>Crawl schedule</td>
+<td><code>crawl_due:{retailer}</code></td>
+<td>Redis ZSET, member=<code>product_id</code>, score=<code>next_crawl_at</code>, ~40 B</td>
+<td>no TTL; updated every crawl</td>
+<td><code>retailer</code></td>
+</tr>
+<tr>
+<td>Price history</td>
+<td><code>price:{product_id}:{day}</code></td>
+<td>time-series partition, <code>(ts, price, stock)</code>, ~50 B/record</td>
+<td>raw 90 d; hourly 1 y; daily forever</td>
+<td><code>product_id</code></td>
+</tr>
+<tr>
+<td>Alert dedupe</td>
+<td><code>alerted:{subscription_id}</code></td>
+<td>last price + last sent timestamp, ~80 B</td>
+<td>TTL 30–90 d</td>
+<td><code>subscription_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>Redis stores scheduling indexes, not price history. The durable time-series store is the byte-heavy system.</p>
+<p><strong>Capacity by store.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store / index</th>
+<th>Math</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Product catalog</td>
+<td>100M products × 1 KB × 3 ≈ 300 GB</td>
+<td>canonical SKU content</td>
+</tr>
+<tr>
+<td>User subscription index</td>
+<td>50M subs × 150 B × 3 ≈ 22.5 GB</td>
+<td><code>user_id</code> view</td>
+</tr>
+<tr>
+<td>Product subscriber index</td>
+<td>50M subs × 80 B × 3 ≈ 12 GB</td>
+<td>fan-out view on price drop</td>
+</tr>
+<tr>
+<td>Crawl schedule</td>
+<td>100M products × 40 B × Redis overhead ≈ 15–50 GB real memory</td>
+<td>mutable due-time index</td>
+</tr>
+<tr>
+<td>Raw price history</td>
+<td>1B/day × 50 B × 90 d × 3 ≈ 13.5 TB</td>
+<td>dominant durable store</td>
+</tr>
+<tr>
+<td>Alert dedupe</td>
+<td>50M subs × 80 B × 3 ≈ 12 GB</td>
+<td>TTL-bounded, avoids spam</td>
+</tr>
+<tr>
+<td>Crawl throughput</td>
+<td>1B crawls/day ≈ 11.6k/sec average</td>
+<td>per-retailer caps, not global capacity, usually bind first</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Track-product path.</strong>
+1. User posts a URL; resolver normalizes host/path and extracts <code>(retailer, sku)</code>.
+2. Catalog lookup uses unique key <code>(retailer, sku)</code>; if absent, resolver fetches once and creates <code>product:{product_id}</code>.
+3. Subscription service writes both <code>subs_by_user:{user_id}</code> and <code>subs_by_product:{product_id}</code> in one transaction or outbox-backed dual write.
+4. Scheduler inserts/updates <code>crawl_due:{retailer}</code> with the product's cadence; if the product already had subscribers, no duplicate crawl is created.</p>
+<p><strong>Product read / history path.</strong>
+1. <code>GET /v1/products/{id}</code> reads <code>product:{product_id}</code> and the latest price cache in parallel; if the latest cache is missing, it reads the tail of <code>price:{product_id}:{today}</code>.
+2. <code>GET /history?range=30d</code> reads raw <code>price:{product_id}:{day}</code> partitions for the requested days, shard key <code>product_id</code>, and returns an opaque cursor <code>{product_id, end_ts, granularity}</code> for longer charts.
+3. If the requested range extends beyond raw 90-day retention, the same cursor switches to hourly/daily rollups. The UI gets lower resolution, not an empty chart.
+4. If a dormant product has no fresh crawl, the API returns the last good price with <code>stale_at</code> and optionally schedules a one-off refresh job; the page view should not synchronously scrape the retailer.</p>
+<p><strong>Two-index framing.</strong> <code>Subscription</code> is one logical dataset with two physical views: <code>subs_by_user:{user_id}</code> for "my tracked items" and <code>subs_by_product:{product_id}</code> for alert fan-out. The dual-write must be transactional or outbox-backed because a missing product index silently drops alerts.</p>
+<p><strong>Price-drop path.</strong>
+1. Crawler pops due product IDs per retailer, respecting host token buckets.
+2. Parser extracts price; writer upserts <code>price:{product_id}:{day}</code> with unique <code>(product_id, ts_minute)</code>.
+3. Price event goes to Kafka; alert worker reads <code>subs_by_product:{product_id}</code>, filters <code>target_price &gt;= price</code>, and checks <code>alerted:{subscription_id}</code>.
+4. Matching subscriptions are batched to the notification service; alert dedupe is updated after enqueue, not after email success, so retries do not spam.</p>
+<p><strong>Crawl scheduling and politeness.</strong> Per-host token bucket; never more than N concurrent requests to one retailer. Distribute work so multiple workers don't pile on the same host. Honor <code>Retry-After</code> and 429s.</p>
+<p>Why Redis ZSET scheduler instead of scanning a SQL table: due-time pop is exactly a sorted-set operation, and scanning 100M products every minute is wasted work. A Kafka delay topic can work for immutable one-shot timers, but crawl cadence changes often with subscriber count and retailer backoff, so a mutable priority queue is cleaner.</p>
+<p><strong>Anti-bot defenses.</strong> Retailers actively block scrapers. Mitigations: residential proxy pool, realistic browser headers, randomized timing jitter, occasional cookie maintenance per host. Mention these as a known cat-and-mouse problem, not solved by us alone.</p>
+<p><strong>Cadence by popularity.</strong> A product with 10k subscribers gets crawled every 10 min. A product with 1 subscriber crawls hourly. Recompute cadence weekly based on subscriber count and historical price volatility.</p>
+<p><strong>Time-series storage and queries.</strong> Raw records keyed by <code>(product_id, ts)</code> — cheap append. For history charts, downsample on read or maintain rollups (1-min → 1-h → 1-d). InfluxDB or TimescaleDB native; on plain SQL, a partitioned table per month works.</p>
+<p>For this workload I would choose TimescaleDB/Influx-style time-series storage if the team already operates it; otherwise a partitioned MySQL/Postgres table is acceptable because reads are almost always single-product range scans. Cassandra is a fit only if write throughput and multi-region active-active matter more than ad hoc chart queries.</p>
+<p><strong>Fan-out on price drop.</strong> A hot product (e.g., new iPhone) has tens of thousands of subscribers. A single price drop triggers ten of thousands of alerts. Defenses:
+- Batch alert dispatch into the notification queue.
+- Per-user rate-limit alerts (don't email someone 10 times in 5 min).
+- For very large subscriber sets, fan-out via a background worker pool rather than synchronously.</p>
+<p><strong>Idempotent crawls.</strong> Crawler may retry on transient failures; the price store should treat <code>(product_id, ts_minute)</code> as a unique key to avoid double-counting.</p>
+<p><strong>Detecting "real" drops.</strong> Avoid alerting on transient blips. Require N consecutive crawls below target, or 2 records ≥ 5 min apart, before firing.</p>
+<p><strong>Freshness state machine.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Transition</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fresh hot</td>
+<td>10-min crawl</td>
+<td><code>crawl_due:{retailer}</code> + latest price</td>
+<td>many subscribers or high volatility</td>
+</tr>
+<tr>
+<td>Fresh long tail</td>
+<td>hourly crawl</td>
+<td>scheduler cadence</td>
+<td>low subscribers, stable price</td>
+</tr>
+<tr>
+<td>Stale</td>
+<td>last good price</td>
+<td><code>price:{product_id}</code></td>
+<td>retailer 429/parser failure</td>
+</tr>
+<tr>
+<td>On-demand refresh queued</td>
+<td>async refresh</td>
+<td>one-off crawl job</td>
+<td>user page view or manual refresh</td>
+</tr>
+<tr>
+<td>Rollup-only history</td>
+<td>low-resolution chart</td>
+<td>hourly/daily aggregates</td>
+<td>raw 90-day window exhausted</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Cross-retailer match (optional).</strong> "Same product, different retailer" requires product matching: name normalization + UPC if available + image embedding similarity. Out of scope to design in 45 min but worth mentioning.</p>
+<p><strong>Compliance and ToS.</strong> Retailers' terms often prohibit scraping. Mention the legal/ethical risk explicitly; real services like Honey use partner data feeds where possible.</p>
+<p><strong>Graceful degradation.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Latency budget</th>
+<th>Fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Retailer 429 / block</td>
+<td>backoff</td>
+<td><code>Retry-After</code>, per-host bucket</td>
+<td>next allowed crawl</td>
+<td>stretch cadence and mark price stale</td>
+</tr>
+<tr>
+<td>Parser breaks</td>
+<td>stale price</td>
+<td>last good <code>price:{product_id}</code></td>
+<td>alert delayed</td>
+<td>route sample pages to parser-fix queue</td>
+</tr>
+<tr>
+<td>Dormant product</td>
+<td>cold crawl</td>
+<td>hourly/daily cadence</td>
+<td>best effort</td>
+<td>crawl on user page view to refresh</td>
+</tr>
+<tr>
+<td>Hot product drop</td>
+<td>async fan-out</td>
+<td><code>subs_by_product:{product_id}</code></td>
+<td>alert within 5 min</td>
+<td>batch notification jobs; per-user cap</td>
+</tr>
+<tr>
+<td>History range exhausted</td>
+<td>rollup read</td>
+<td>hourly/daily aggregates</td>
+<td>&lt; 500 ms chart</td>
+<td>show lower-resolution history</td>
+</tr>
+</tbody>
+</table>
+<p>"The interview punch line: users subscribe to products, but crawlers crawl canonical SKUs; that dedupe is what keeps 50M subscriptions from becoming 50M crawls."</p>
+<p><strong>What I'd defer.</strong> Affiliate-link monetization, browser extension architecture, "deal feed" curation, A/B testing alert templates.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

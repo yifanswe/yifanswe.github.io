@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design an API Gateway — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design an API Gateway</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>An API gateway is the single entry point in front of a service mesh. Every public request hits it before reaching any backend. The hard part is being fast (sub-millisecond overhead), safe (auth, abuse, rate limiting), and dynamically configurable (routes change without restarts).</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every request entering the system is authenticated, authorized, rate-limited, and routed to the correct backend with predictable latency overhead, and the gateway never becomes the single point of failure that takes the entire platform down.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can separate the data plane (per-request work) from the control plane (config, secrets, policies), handle config changes without dropping connections, integrate with observability and rate-limiting subsystems, and reason about which features live in the gateway vs in dedicated services.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design the API gateway as a horizontally scalable data plane plus a separate control plane. The data plane terminates TLS, authenticates requests, enforces rate limits, routes to backends, and emits observability data. The control plane owns route definitions, auth policies, and secrets, and pushes versioned configurations to data plane nodes. The interesting decisions are which features live in the gateway, how config updates propagate safely, and how to keep p99 overhead minimal.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>TLS termination; protocol support (HTTP/1.1, HTTP/2, gRPC, WebSocket).</li>
+<li>Authentication: API keys, OAuth, JWT, mTLS.</li>
+<li>Authorization: scope/role checks; per-route policies.</li>
+<li>Rate limiting and quota enforcement per identity and route.</li>
+<li>Request/response transformation: header rewrites, body remapping, schema validation.</li>
+<li>Routing: path-based, header-based, weight-based for canary/A-B.</li>
+<li>Service discovery integration; health checks.</li>
+<li>Caching responses where appropriate.</li>
+<li>Per-route logging and tracing context propagation.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Single-digit ms p99 overhead.</li>
+<li>Million+ QPS per gateway cluster.</li>
+<li>Zero-downtime config updates.</li>
+<li>Survive individual data plane node failures with no user-visible impact.</li>
+<li>Tenanted: different teams own different routes and policies.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>L4 load balancing (assume an L4 LB sits in front).</li>
+<li>WAF rule authoring (integrate, don't build).</li>
+<li>Service mesh sidecar (related but different problem).</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Traffic</td>
+<td>1M requests/sec peak per cluster.</td>
+</tr>
+<tr>
+<td>Routes</td>
+<td>10k-100k distinct routes.</td>
+</tr>
+<tr>
+<td>Tenants</td>
+<td>Hundreds of teams.</td>
+</tr>
+<tr>
+<td>Config churn</td>
+<td>Hundreds of changes/day.</td>
+</tr>
+<tr>
+<td>Latency overhead</td>
+<td>&lt; 5 ms p99 added by the gateway.</td>
+</tr>
+<tr>
+<td>Availability</td>
+<td>99.99% per region.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Per-region gateway clusters.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is per-request CPU work (TLS handshake amortization, JWT parse, route lookup) and the control-plane fan-out of config changes.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Data plane</td>
+<td>Per-request: terminate TLS, auth, rate limit, route, transform, observe.</td>
+<td>Stateless; horizontally scalable; sub-ms overhead per filter.</td>
+</tr>
+<tr>
+<td>Control plane</td>
+<td>Owns routes, policies, secrets; pushes config to data plane.</td>
+<td>Strongly consistent; versioned; rollbackable.</td>
+</tr>
+<tr>
+<td>Observability</td>
+<td>Logs, metrics, traces from every request.</td>
+<td>Async; never blocks the data path.</td>
+</tr>
+<tr>
+<td>Developer experience</td>
+<td>Self-service route registration, testing, deploy.</td>
+<td>Versioned configs, dry-run, staged rollout.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                   Internet
+                      |
+                      v
+              +---------------+
+              | L4 LB / Anycast|
+              +-------+-------+
+                      |
+                      v
+        +----------------------------------+
+        | API Gateway Data Plane (fleet)   |
+        |  - TLS, auth, rate limit, route  |
+        |  - filters (transform, cache)    |
+        +---+----------+----------+-------+
+            |          |          |
+   service  v   service v  service v
+       backend     backend     backend
+
+
+       Control Plane (separate fleet)
+       +---------------------------+
+       | Route Config Store        | &lt;-- developers via API/UI
+       | Auth Policy Store         |
+       | Secret Store              |
+       | Rate Limit Quota Store    |
+       +-----------+---------------+
+                   | versioned snapshots
+                   v
+        push/pull to all data plane nodes
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>L4 load balancer</td>
+<td>Spreads connections across data plane nodes; anycast for region steering.</td>
+<td>DSR, ECMP, or cloud LB.</td>
+</tr>
+<tr>
+<td>Data plane node (Envoy/NGINX-style)</td>
+<td>Per-request processing through a filter chain.</td>
+<td>Stateless; mostly CPU-bound; high concurrency via async I/O.</td>
+</tr>
+<tr>
+<td>Filter chain</td>
+<td>Ordered list of filters: TLS, auth, rate limit, route, transform.</td>
+<td>Pluggable; per-route configuration.</td>
+</tr>
+<tr>
+<td>Control plane API</td>
+<td>CRUD on routes, policies, secrets.</td>
+<td>Versioned, audited, role-restricted.</td>
+</tr>
+<tr>
+<td>Config distribution</td>
+<td>Pushes config snapshots to data plane nodes.</td>
+<td>xDS-style streaming, or polled with versioning.</td>
+</tr>
+<tr>
+<td>Secret store</td>
+<td>Holds private keys, JWT verification keys, API key hashes.</td>
+<td>Rotated; never logged.</td>
+</tr>
+<tr>
+<td>Rate limit subsystem</td>
+<td>Per-identity-per-route counters.</td>
+<td>See dedicated rate limiter design.</td>
+</tr>
+<tr>
+<td>Service discovery</td>
+<td>Maps logical service to backend endpoints.</td>
+<td>Health-checked; weighted.</td>
+</tr>
+<tr>
+<td>Observability sidecar</td>
+<td>Streams logs, metrics, traces.</td>
+<td>Decoupled; never blocks request path.</td>
+</tr>
+<tr>
+<td>WAF integration</td>
+<td>Optional, runs early in filter chain.</td>
+<td>Can be in-line or out-of-band.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="route">Route</h4>
+<pre><code class="language-text">Route(
+  route_id,
+  match,                  // path, host, headers, method
+  backend_ref,
+  filters,                // ordered list with config per filter
+  auth_policy_ref,
+  rate_limit_policy_ref,
+  timeout,
+  retry_policy,
+  canary,                 // weights to traffic-split
+  version,
+  owner_team,
+  updated_at
+)
+</code></pre>
+<h4 id="auth-policy">Auth Policy</h4>
+<pre><code class="language-text">AuthPolicy(
+  policy_id,
+  type,                   // api_key, jwt, oauth2, mtls
+  required_scopes,
+  issuer_whitelist,
+  jwks_url,
+  key_rotation_window,
+  version
+)
+</code></pre>
+<h4 id="backend-service">Backend / Service</h4>
+<pre><code class="language-text">Backend(
+  service_id,
+  endpoints,              // list of (host, port, weight, health)
+  protocol,               // http1, http2, grpc
+  health_check,
+  circuit_breaker,
+  tls_config
+)
+</code></pre>
+<h4 id="config-snapshot">Config Snapshot</h4>
+<pre><code class="language-text">ConfigSnapshot(
+  snapshot_id,
+  version,
+  routes[],
+  policies[],
+  backends[],
+  generated_at,
+  signature              // signed by control plane
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<p>External to platform users (developers managing routes):</p>
+<pre><code class="language-text">POST   /admin/routes
+PUT    /admin/routes/{route_id}
+DELETE /admin/routes/{route_id}
+POST   /admin/routes/{route_id}/canary  // start traffic shift
+POST   /admin/auth-policies
+POST   /admin/secrets/rotate
+</code></pre>
+<p>Public API (consumers):</p>
+<pre><code class="language-text">ANY  https://api.example.com/&lt;path&gt;      // matched against route table
+</code></pre>
+<p>Internal control plane → data plane:</p>
+<pre><code class="language-text">StreamConfig(node_id) -&gt; ConfigSnapshot, version    // xDS-like
+</code></pre>
+<h3 id="request-path-data-plane">Request Path (Data Plane)</h3>
+<p>For each incoming request:</p>
+<ol>
+<li><strong>Accept connection.</strong> L4 LB has steered TCP to a data plane node.</li>
+<li><strong>TLS termination.</strong> Use SNI to choose the right certificate; session resumption to amortize handshake cost.</li>
+<li><strong>Protocol parse.</strong> HTTP/1.1, HTTP/2, or gRPC.</li>
+<li><strong>Route match.</strong> Compiled trie or radix tree of route patterns; O(log n) or better.</li>
+<li><strong>Authentication filter.</strong> Verify JWT signature against cached JWKS, or look up API key hash, or validate mTLS cert chain. Reject on fail.</li>
+<li><strong>Authorization filter.</strong> Check scopes/roles against route's policy. Reject on fail.</li>
+<li><strong>Rate limit filter.</strong> Increment counters; deny if over quota. (See dedicated rate limiter design.)</li>
+<li><strong>Transform filter.</strong> Add/remove headers, rewrite path, validate request schema.</li>
+<li><strong>Caching filter.</strong> If response is cacheable and present, return immediately.</li>
+<li><strong>Backend selection.</strong> Choose backend instance from service discovery; weighted/least-loaded.</li>
+<li><strong>Forward request.</strong> Open or reuse upstream connection; send.</li>
+<li><strong>Response.</strong> Apply response transforms; possibly cache; emit log/metric/trace.</li>
+<li><strong>Return to client.</strong></li>
+</ol>
+<p>Per-filter latency budgets are sub-millisecond. The whole path should add under 5 ms p99.</p>
+<h3 id="config-update-path-control-plane">Config Update Path (Control Plane)</h3>
+<p>When a developer updates a route:</p>
+<ol>
+<li>Control plane API receives change; validates against schema and policy.</li>
+<li>Writes to versioned config store (e.g., etcd or a database with snapshots).</li>
+<li>Generates a new <code>ConfigSnapshot</code> containing the full state.</li>
+<li>Pushes via streaming RPC (xDS-style) to all data plane nodes.</li>
+<li>Each node atomically swaps its compiled config; in-flight requests continue on old config; new requests use the new one.</li>
+<li>Nodes ack with their applied version; control plane tracks fleet coverage.</li>
+</ol>
+<p>This is the standard control-plane/data-plane pattern from Envoy/Istio. The key guarantee: a config update never drops in-flight connections.</p>
+<p>For risky changes, use <strong>staged rollout:</strong></p>
+<ul>
+<li>Push to 1% of data plane nodes first.</li>
+<li>Monitor error rates.</li>
+<li>Continue to 10%, 50%, 100% if healthy.</li>
+<li>Auto-rollback on error spike.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Config distribution is the hardest correctness problem in the gateway. The data plane must never serve stale config during a critical update like a security policy change, but it also must not drop in-flight requests during config swaps.</p>
+</blockquote>
+<h3 id="authentication-approaches">Authentication Approaches</h3>
+<table>
+<thead>
+<tr>
+<th>Approach</th>
+<th>How it works</th>
+<th>Tradeoffs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>API key</td>
+<td>Pre-shared secret; gateway hashes and looks up in cache.</td>
+<td>Simple; key rotation is operational.</td>
+</tr>
+<tr>
+<td>JWT</td>
+<td>Client presents signed token; gateway verifies signature with public key.</td>
+<td>Stateless verification; revocation requires extra check.</td>
+</tr>
+<tr>
+<td>OAuth2 token introspection</td>
+<td>Gateway calls auth service per request.</td>
+<td>Authoritative but adds latency; cache short-lived.</td>
+</tr>
+<tr>
+<td>mTLS</td>
+<td>Mutual TLS at the connection; identity from cert.</td>
+<td>Strong identity; complex client setup.</td>
+</tr>
+</tbody>
+</table>
+<p>Caching:</p>
+<ul>
+<li>JWKS public keys cached per issuer with TTL.</li>
+<li>OAuth introspection results cached with short TTL.</li>
+<li>API key hash table refreshed via control plane push.</li>
+</ul>
+<h3 id="rate-limiting">Rate Limiting</h3>
+<p>Delegate to a dedicated rate limit service (see separate design) rather than implementing in the gateway:</p>
+<ul>
+<li>Gateway calls rate limiter via fast RPC (or local sidecar) per request.</li>
+<li>Gateway caches recent decisions locally to reduce calls for hot keys.</li>
+<li>Fallback mode: if rate limiter unreachable, fail open or closed per route policy.</li>
+</ul>
+<h3 id="observability">Observability</h3>
+<p>Every request produces:</p>
+<ul>
+<li><strong>Access log:</strong> sampled at 100% by default for low-traffic routes; sampled at adaptive rates for high-traffic.</li>
+<li><strong>Metric:</strong> request count, latency histogram, status code, route, identity, region.</li>
+<li><strong>Trace span:</strong> propagates trace context (<code>traceparent</code>); creates a span for the gateway hop.</li>
+</ul>
+<p>These are emitted asynchronously to a sidecar or local agent. The request path never blocks on observability writes.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Scaling</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Data plane</td>
+<td>Horizontal; stateless; L4 LB load-balances connections.</td>
+</tr>
+<tr>
+<td>Control plane</td>
+<td>Stateful (config store); replicated via consensus. Reads are heavy from data plane; writes are infrequent.</td>
+</tr>
+<tr>
+<td>Rate limit store</td>
+<td>Sharded by key; separate service.</td>
+</tr>
+<tr>
+<td>Secret store</td>
+<td>Replicated read-only to data plane after authentication.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Route configuration</td>
+<td>Eventually consistent across data plane; bounded by config push lag</td>
+<td>Acceptable for non-emergency changes.</td>
+</tr>
+<tr>
+<td>Emergency policy changes (e.g., block key)</td>
+<td>Bounded staleness target: under 10 seconds globally</td>
+<td>Security-critical; monitor propagation.</td>
+</tr>
+<tr>
+<td>Auth secrets</td>
+<td>Eventually consistent within rotation window</td>
+<td>Old keys remain valid during overlap.</td>
+</tr>
+<tr>
+<td>Rate limit counters</td>
+<td>Approximate (see rate limiter design)</td>
+<td>Tolerable.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Data plane node crashes mid-request.</td>
+<td>L4 LB removes node; client retries; idempotent ops safe.</td>
+<td>Per-node error rate.</td>
+</tr>
+<tr>
+<td>Control plane down.</td>
+<td>Data plane runs on last known config indefinitely.</td>
+<td>Config version skew; control plane availability.</td>
+</tr>
+<tr>
+<td>Bad config rolls out.</td>
+<td>Staged rollout; auto-rollback on error spike; manual revert via versioning.</td>
+<td>Error rate per version.</td>
+</tr>
+<tr>
+<td>Backend down.</td>
+<td>Health checks remove from pool; circuit breaker stops sending traffic; failover to backup if configured.</td>
+<td>Backend health.</td>
+</tr>
+<tr>
+<td>TLS cert expires.</td>
+<td>Auto-renewal pipeline; alerts well before expiry.</td>
+<td>Cert expiry time per route.</td>
+</tr>
+<tr>
+<td>Rate limiter down.</td>
+<td>Per-route fail mode; fall back to local counters.</td>
+<td>Rate limiter availability.</td>
+</tr>
+<tr>
+<td>Auth service down.</td>
+<td>Cached JWT verification continues; introspection fails to fail-open or fail-closed per route.</td>
+<td>Auth subsystem health.</td>
+</tr>
+<tr>
+<td>DDoS hits gateway.</td>
+<td>L4 LB or CDN absorbs; gateway has connection limits; WAF blocks signatures.</td>
+<td>Connection count, TLS handshake rate.</td>
+</tr>
+<tr>
+<td>Slow backend cascades.</td>
+<td>Per-route timeouts; circuit breakers; bulkheads.</td>
+<td>Backend p99; circuit open count.</td>
+</tr>
+<tr>
+<td>Tail latency from one slow filter.</td>
+<td>Per-filter latency monitoring; filter timeouts.</td>
+<td>Filter histograms.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Config version skew across data plane.</li>
+<li>Time from policy change to fleet-wide propagation.</li>
+<li>Reject reason distribution (auth fail, rate limit, 4xx, 5xx).</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>QPS per node; CPU utilization.</li>
+<li>Connection count; new connections/sec.</li>
+<li>TLS handshake rate.</li>
+<li>Backend connection pool utilization.</li>
+</ul>
+<p>Per-route metrics:</p>
+<ul>
+<li>Latency p50/p99 per route.</li>
+<li>Error rate per route.</li>
+<li>Cache hit ratio per route.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Run independent gateway clusters per region.</li>
+<li>L4 anycast or geo-DNS routes users to nearest region.</li>
+<li>Routes and policies are global; replicated to each region's control plane.</li>
+<li>Per-region failover via DNS or anycast withdrawal.</li>
+<li>For active-active backends, the gateway considers cross-region routing only when local backends are unhealthy.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Filter chain depth adds latency; minimize default filters and add per-route opt-ins.</li>
+<li>Centralized rate limit gives accuracy at the cost of round trip; local fallback is faster but inaccurate.</li>
+<li>Aggressive config push gives faster propagation but risks correlated rollout failures.</li>
+<li>TLS termination at gateway centralizes cert management but pushes CPU load to gateway nodes.</li>
+<li>Caching responses helps but invalidation across nodes is hard.</li>
+<li>Including auth in gateway simplifies backends but couples auth changes to gateway deployment.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One monolithic config file.</td>
+<td>Versioned snapshots with staged rollout.</td>
+</tr>
+<tr>
+<td>Synchronous logging on request path.</td>
+<td>Async to sidecar/local agent.</td>
+</tr>
+<tr>
+<td>Stateful gateway nodes (sessions).</td>
+<td>Stateless data plane; state in dedicated services.</td>
+</tr>
+<tr>
+<td>Per-request auth introspection.</td>
+<td>Cached JWT verification; introspection only when needed.</td>
+</tr>
+<tr>
+<td>One filter chain for all routes.</td>
+<td>Per-route filter list; lazily compiled.</td>
+</tr>
+<tr>
+<td>Single control plane node.</td>
+<td>Replicated control plane with consensus.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Config distribution</td>
+<td>xDS-style streaming; versioned snapshots; atomic swap; staged rollout.</td>
+</tr>
+<tr>
+<td>Auth pipelines</td>
+<td>JWT + JWKS cache; mTLS; OAuth introspection cache.</td>
+</tr>
+<tr>
+<td>Rate limiter integration</td>
+<td>RPC to dedicated service; local fallback; per-route fail mode.</td>
+</tr>
+<tr>
+<td>Observability</td>
+<td>Async metrics/traces; sampling; trace propagation.</td>
+</tr>
+<tr>
+<td>Hot route handling</td>
+<td>Connection pooling, per-route circuit breaker, autoscaler signal.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Geo-DNS or anycast; per-region clusters; replicated control plane.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Separate data plane from control plane.</li>
+<li>Versioned config snapshots with atomic swaps.</li>
+<li>Stateless data plane; horizontal scale.</li>
+<li>Auth, rate limit, observability as filters with per-route config.</li>
+<li>Staged rollout for risky changes.</li>
+<li>Per-route timeouts, retries, circuit breakers.</li>
+<li>Async observability.</li>
+<li>Multi-region as independent clusters.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>An API gateway is the classic data-plane / control-plane split. The data plane is stateless and stays fast by avoiding synchronous calls to anything that can fail; the control plane owns truth and propagates versioned snapshots. Every filter has a latency budget, and the gateway is never the bottleneck.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design an API gateway.</p>
+<p><strong>Candidate:</strong> I will design two pieces: a stateless data plane that handles per-request work (TLS, auth, rate limit, route, transform), and a control plane that owns routes, policies, and secrets and pushes versioned config to the data plane. The invariant is sub-millisecond filter overhead and never being the single point of failure.</p>
+<p><strong>Interviewer:</strong> How does config propagation work?</p>
+<p><strong>Candidate:</strong> Control plane API writes to a versioned store. It generates a <code>ConfigSnapshot</code> containing the full state, signs it, and pushes via streaming RPC (xDS-style) to every data plane node. Each node atomically swaps its compiled config; in-flight requests continue on the old config, new requests use the new one. Nodes ack with their applied version, and the control plane tracks fleet coverage.</p>
+<p><strong>Interviewer:</strong> A developer pushes a bad route. How do you not melt the platform?</p>
+<p><strong>Candidate:</strong> Staged rollout. The change deploys first to 1% of data plane nodes; we monitor error rates for a few minutes. If healthy, expand to 10%, 50%, 100%. If error spike detected, auto-rollback to the previous version. Developers can also manually revert via the versioned config store; every snapshot has an id.</p>
+<p><strong>Interviewer:</strong> How fast can you propagate an emergency security change like "block this API key right now"?</p>
+<p><strong>Candidate:</strong> Target under 10 seconds globally. The control plane pushes immediately via streaming RPC; each data plane node applies on receipt. We monitor a <code>config_propagation_latency</code> metric explicitly. For blocking known-bad credentials, we maintain a deny list that propagates separately from the route config and is consulted on every auth check.</p>
+<p><strong>Interviewer:</strong> How does authentication work?</p>
+<p><strong>Candidate:</strong> Multiple modes, per route. JWT is most common: client sends a token, the gateway verifies the signature against a cached JWKS public key. JWKS cache is refreshed periodically. For API keys, the gateway hashes and looks up in a cache backed by the control plane. For mTLS, the L4 LB or gateway terminates and extracts the client cert. OAuth introspection is the most expensive — we call the auth service and cache the result for short TTL.</p>
+<p><strong>Interviewer:</strong> Where does rate limiting live?</p>
+<p><strong>Candidate:</strong> I delegate to a dedicated rate limit service rather than build it into the gateway. The gateway makes an RPC to the limiter per request. For hot keys, the gateway has local approximation: a small in-process token bucket that absorbs the load and reconciles asynchronously with the central limiter. If the limiter is unreachable, the route's fail-mode (open or closed) decides.</p>
+<p><strong>Interviewer:</strong> What about TLS at this QPS?</p>
+<p><strong>Candidate:</strong> TLS handshake is the most expensive thing the gateway does. We use session resumption and TLS 1.3 zero-round-trip resumption where possible. Hardware acceleration where available. Per-route certificate selection via SNI. Cert rotation is automated; the secret store pushes new certs, the gateway loads them without restart.</p>
+<p><strong>Interviewer:</strong> A backend service is slow — how do you contain the damage?</p>
+<p><strong>Candidate:</strong> Per-route timeout: if the backend doesn't respond in N ms, the gateway returns 504 and frees the connection. Circuit breaker: after a threshold of failures or slow responses, the gateway stops sending traffic to the unhealthy backend instances. Bulkhead: connection pool per backend is bounded, so one slow backend can't consume all the gateway's concurrency.</p>
+<p><strong>Interviewer:</strong> How do you handle WebSockets and long-lived connections?</p>
+<p><strong>Candidate:</strong> Different filter chain. The auth filter runs on connect; rate limiting may run on the initial upgrade and possibly per message. The gateway holds a persistent upstream connection to the backend; client disconnects propagate. Connection draining: during deploy, the gateway stops accepting new WebSocket connections and lets existing ones complete or migrate.</p>
+<p><strong>Interviewer:</strong> How do you observe a billion requests per day?</p>
+<p><strong>Candidate:</strong> Async observability: each request emits a structured event to a sidecar or local agent that batches and ships to the observability backend. We sample access logs at adaptive rates based on traffic volume; metrics are always emitted but pre-aggregated; traces are sampled at low percentages with tail-based sampling on errors. The request path never waits on observability.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Independent gateway clusters per region. Geo-DNS or anycast steers users to the nearest region. Routes and policies are global state; the control plane replicates them per region. A region can fail over by withdrawing anycast advertisements or shifting DNS. Cross-region backend calls are avoided unless explicitly configured for failover.</p>
+<p><strong>Interviewer:</strong> What lives in the gateway vs in dedicated services?</p>
+<p><strong>Candidate:</strong> In the gateway: TLS, auth verification, routing, rate-limit enforcement (with cached decisions), request/response transformations. In dedicated services: identity provider, authoritative rate limit store, service discovery, WAF rule engine, observability backends. The principle: keep the gateway lean and fast, push heavy or specialized logic to specialized services.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Stateless data plane plus separate control plane. Versioned config snapshots distributed via streaming RPC; atomic config swap; staged rollouts for safety. Auth, rate limiting, transforms as filters with per-route configuration. Async observability. Per-route timeouts and circuit breakers contain backend failures. Multi-region as independent clusters with replicated control plane. The hardest correctness problem is config distribution; the hardest performance problem is keeping per-filter overhead sub-millisecond.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: TLS, auth, rate limit, route, observe; per-tenant config.</li>
+<li>Invariant: sub-ms overhead, never a SPOF.</li>
+<li>Architecture: stateless data plane + control plane.</li>
+<li>Filter chain: TLS, auth, rate limit, route, transform, observe.</li>
+<li>Config: versioned snapshots, atomic swap, staged rollout.</li>
+<li>Delegate rate limit and identity to dedicated services.</li>
+<li>Per-route timeouts, circuit breakers, bulkheads.</li>
+<li>Multi-region: independent clusters; geo-routing.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>An API gateway is the canonical data-plane / control-plane separation. The data plane is stateless, runs a per-route filter chain, and never blocks on anything that can fail. The control plane owns truth and propagates versioned snapshots with staged rollout. Auth and rate limiting integrate as filters that call dedicated subsystems. Per-route timeouts and circuit breakers contain backend failures. The hardest part is config distribution speed for security-critical changes.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Data plane stays fast by never synchronously calling anything that can fail; failures fall back to cached or local state."</li>
+<li>"Config distribution uses versioned snapshots with atomic swap so in-flight requests never see partial config."</li>
+<li>"Auth verification is cached; only introspection touches the auth service on the request path."</li>
+<li>"Rate limiting is delegated; the gateway calls a dedicated service with a local approximation fallback."</li>
+<li>"Per-route timeouts and circuit breakers stop one slow backend from cascading."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

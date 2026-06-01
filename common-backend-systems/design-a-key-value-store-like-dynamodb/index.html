@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design a Key-Value Store Like DynamoDB — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design a Key-Value Store Like DynamoDB</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A planet-scale KV store like DynamoDB sits at the foundation of many production systems. The hard part is offering predictable single-digit-millisecond latency and 99.999% availability across regions while letting the operator pick the consistency mode they need per request.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>For any key, a successful write is durable across at least a quorum of replicas, eventually visible to all consistent readers, and the system continues to accept writes during single-node, single-zone, and even partial-region failures, with conflict resolution rules that converge deterministically.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can choose between leaderless quorum-based replication (Dynamo paper style) and single-leader partition replication (modern DynamoDB style), explain consistent hashing and partition splits, handle vector clocks or last-write-wins, and design hot-partition mitigations.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design a managed KV store with three planes: a request router, a partition layer that owns ranges of the key space, and a replicated storage layer per partition. The interesting decisions are partitioning strategy (consistent hashing vs range partitioning with auto-split), replication (leaderless quorum vs leader-based), consistency tunability (strong vs eventual), and handling hot partitions. I will clarify requirements, pick a partition + replication scheme, walk write and read paths, then go deep on quorum semantics and hot keys.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Put, Get, Delete by primary key (single-key operations).</li>
+<li>Optional sort key for range scans within a partition.</li>
+<li>Conditional writes (CAS): write iff <code>version = X</code> or item does not exist.</li>
+<li>Batch get/put, paginated scans.</li>
+<li>Secondary indexes (global and local).</li>
+<li>Streams of changes for downstream consumers.</li>
+<li>Per-table TTL for automatic deletion.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Single-digit ms p99 reads and writes.</li>
+<li>99.99% to 99.999% availability per region.</li>
+<li>Tunable consistency per request: strong or eventual.</li>
+<li>Petabyte scale per table; tens of millions of QPS.</li>
+<li>Multi-region with active-active option.</li>
+<li>Per-tenant isolation and quotas.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Full SQL query planner.</li>
+<li>Multi-key ACID transactions across partitions (mention as a separate feature).</li>
+<li>Backup and PITR mechanics.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tables</td>
+<td>Hundreds of thousands across tenants.</td>
+</tr>
+<tr>
+<td>Items per table</td>
+<td>Billions to trillions.</td>
+</tr>
+<tr>
+<td>Item size</td>
+<td>KB-range typical; max 400 KB.</td>
+</tr>
+<tr>
+<td>Throughput</td>
+<td>Up to tens of millions of read/write units per second per table.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>p50 &lt; 5 ms, p99 &lt; 10 ms for in-region.</td>
+</tr>
+<tr>
+<td>Replication</td>
+<td>3 replicas per partition by default; cross-AZ within region.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Optional active-active with last-writer-wins or CRDT.</td>
+</tr>
+<tr>
+<td>Hot partition</td>
+<td>Single partition limited to ~3000 RCU / 1000 WCU; need to detect and split.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is hot partitions and tail latency under replica failure.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Operation</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single-key write</td>
+<td>Put/Update/Delete by primary key.</td>
+<td>Atomic per key; tunable durability.</td>
+</tr>
+<tr>
+<td>Single-key read</td>
+<td>Get by primary key.</td>
+<td>Tunable consistency; very low latency.</td>
+</tr>
+<tr>
+<td>Range query</td>
+<td>Items sharing partition key, sort key range.</td>
+<td>Bounded results; pagination via cursor.</td>
+</tr>
+<tr>
+<td>Conditional write</td>
+<td>Compare-and-swap.</td>
+<td>Atomic check-and-set within a partition.</td>
+</tr>
+<tr>
+<td>Streams</td>
+<td>Change log per partition.</td>
+<td>Ordered per partition; at-least-once delivery.</td>
+</tr>
+</tbody>
+</table>
+<p>The system is intentionally constrained to per-key (or per-partition for range) operations. Multi-partition transactions are the exception, not the rule.</p>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                +-------------------+
+Client    ---&gt;  | Request Router    |
+                | metadata cache    |
+                +---------+---------+
+                          |
+              (locate partition by key)
+                          |
+                          v
+                +-------------------+
+                | Partition Layer   |
+                | leader of range   |
+                +----+---------+----+
+                     |         |
+              replicate writes |
+                     v         v
+              +----------------+----------------+
+              | Replica 1 | Replica 2 | Replica 3 |
+              | + WAL     | + WAL     | + WAL     |
+              | + LSM/Btree storage engine        |
+              +----------------+----------------+
+                                |
+                                v
+                  +---------------------------+
+                  | Stream / CDC consumer     |
+                  +---------------------------+
+</code></pre>
+<p>Sidecar components: metadata service (partition map), auth, autoscaling, GSI maintainer, backup, hot-partition splitter.</p>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Request router</td>
+<td>Parses operation, finds owning partition by key, forwards to that partition's leader.</td>
+<td>Stateless; caches partition map; rebalances on changes.</td>
+</tr>
+<tr>
+<td>Metadata service</td>
+<td>Maps key range → partition → replica set.</td>
+<td>Strongly consistent; replicated via consensus.</td>
+</tr>
+<tr>
+<td>Partition (storage node)</td>
+<td>Owns a contiguous key range; runs LSM/Btree on local disk.</td>
+<td>Hundreds of partitions per host; pluggable engine.</td>
+</tr>
+<tr>
+<td>Replication group</td>
+<td>One leader + replicas per partition; Raft-like log shipping.</td>
+<td>Or leaderless quorum if you choose Dynamo-paper style.</td>
+</tr>
+<tr>
+<td>Autoscaler</td>
+<td>Splits hot partitions; merges cold; rebalances across hosts.</td>
+<td>Online; no downtime.</td>
+</tr>
+<tr>
+<td>GSI maintainer</td>
+<td>Writes secondary index entries asynchronously.</td>
+<td>Eventually consistent.</td>
+</tr>
+<tr>
+<td>Streams</td>
+<td>Per-partition change log exposed to consumers.</td>
+<td>Ordered per partition; sharded for parallel consumption.</td>
+</tr>
+<tr>
+<td>Cross-region replicator</td>
+<td>Replicates writes between regions for global tables.</td>
+<td>Last-writer-wins by default; CRDTs for counters.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="two-architectural-choices">Two Architectural Choices</h3>
+<p><strong>Choice A: Leaderless quorum (original Dynamo paper)</strong></p>
+<ul>
+<li>N replicas per key, no designated leader.</li>
+<li>Writes go to W of N replicas, reads from R of N. <code>R + W &gt; N</code> for strong consistency.</li>
+<li>Conflicts resolved via vector clocks and sibling reconciliation at read time.</li>
+<li>Hinted handoff: if a replica is down, a temporary stand-in stores the write.</li>
+<li>Anti-entropy via Merkle trees periodically reconciles divergent replicas.</li>
+</ul>
+<p>Pros: write-available even with replica failures; no leader bottleneck.
+Cons: sibling resolution is complex; clients must merge or system must apply LWW.</p>
+<p><strong>Choice B: Leader-based per partition (modern DynamoDB)</strong></p>
+<ul>
+<li>Each partition has one leader; replicas via consensus (Multi-Paxos / Raft style).</li>
+<li>Writes ack only after majority log replication.</li>
+<li>Strong consistency on reads from leader; eventual from replicas.</li>
+<li>Failover is a leader re-election; takes seconds.</li>
+</ul>
+<p>Pros: simpler client model; strong consistency natural; no sibling problem.
+Cons: leader is bottleneck per partition; failover causes brief write unavailability.</p>
+<p>Modern DynamoDB is closer to leader-based per partition with Multi-Paxos. The interview answer should pick one and justify; if asked, contrast both.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>I would default to leader-based partition replication because the operator experience is simpler — no siblings to merge, strong consistency on demand, and per-partition leaders give natural sharding. Leaderless quorum is more available under replica loss but pushes complexity to clients.</p>
+</blockquote>
+<h3 id="data-model">Data Model</h3>
+<h4 id="table-metadata">Table Metadata</h4>
+<pre><code class="language-text">TableMeta(
+  table_id,
+  primary_key_schema,         // partition key, sort key (optional)
+  attribute_schemas,
+  gsi_definitions,
+  ttl_attribute,
+  stream_enabled,
+  replication_mode,           // single_region, global_active_active
+  capacity_mode               // provisioned, on_demand
+)
+</code></pre>
+<h4 id="partition-map">Partition Map</h4>
+<pre><code class="language-text">Partition(
+  partition_id,
+  table_id,
+  key_range_start,
+  key_range_end,
+  leader_node,
+  replica_nodes,
+  capacity_units,
+  version
+)
+</code></pre>
+<h4 id="item">Item</h4>
+<pre><code class="language-text">Item(
+  primary_key,
+  sort_key?,
+  attributes,                 // schemaless map
+  version,                    // for CAS
+  ttl?,
+  updated_at,
+  tombstone_until?            // for soft delete
+)
+</code></pre>
+<h4 id="replication-log">Replication Log</h4>
+<pre><code class="language-text">LogEntry(
+  partition_id,
+  sequence_number,            // monotonic per partition
+  operation,                  // put, delete, ttl_expire
+  key,
+  payload,
+  timestamp,
+  origin_region
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">PutItem(table, item, condition?, return_values?)
+GetItem(table, key, consistent_read?)
+DeleteItem(table, key, condition?)
+UpdateItem(table, key, update_expression, condition?)
+Query(table, key_condition, filter?, cursor?, limit?)
+Scan(table, segment, filter?, cursor?)
+BatchGet, BatchWrite
+TransactWrite(items[], condition?)        // multi-item ACID
+DescribeStream(stream_id), GetRecords(shard_iterator)
+</code></pre>
+<h3 id="partitioning">Partitioning</h3>
+<p>DynamoDB uses <strong>hashed partition key</strong> as primary partition strategy:</p>
+<ul>
+<li>Apply hash function to partition key, mod into the key space.</li>
+<li>Each partition owns a contiguous range of the hashed space.</li>
+<li>Item with <code>(partition_key, sort_key)</code> goes to the partition whose range contains <code>hash(partition_key)</code>.</li>
+<li>Within a partition, items are sorted by sort_key (B-tree or LSM-organized).</li>
+</ul>
+<p><strong>Auto-split:</strong> When a partition's storage or throughput exceeds threshold, it splits at the median key. The split is online: the split table picks a midpoint, replication continues on both new partitions, and the metadata service flips the routing once the new partitions are caught up.</p>
+<p><strong>Hot keys:</strong> A single partition key (one user, one tenant) can saturate one partition. Mitigations:
+- Adaptive capacity: temporarily allow the partition more throughput by borrowing from idle siblings.
+- Write sharding: client appends a suffix to the partition key (<code>user_42#0</code>, <code>user_42#1</code>, ...) to spread across partitions, then queries all suffixes.
+- Burst capacity: short-term over-provisioning.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Auto-split handles uneven data volume, but the same hot partition key still routes everything to one partition. The fix has to be on the access pattern — write sharding or caching above the store.</p>
+</blockquote>
+<h3 id="replication">Replication</h3>
+<p>Per-partition replication (leader-based):</p>
+<ol>
+<li>Client write reaches router → partition leader.</li>
+<li>Leader appends to local WAL.</li>
+<li>Leader sends log entry to followers; followers persist to WAL.</li>
+<li>Once majority (e.g., 2 of 3) acked, leader applies to local state and responds.</li>
+<li>Followers apply asynchronously and confirm.</li>
+</ol>
+<p>Consensus details:</p>
+<ul>
+<li>Raft-style with terms and log indices, or Multi-Paxos with a stable leader.</li>
+<li>Leader election on failure within seconds; the metadata service may participate or it may be intrinsic to the consensus group.</li>
+</ul>
+<p>For leaderless (Dynamo paper):</p>
+<ol>
+<li>Client writes to coordinator; coordinator forwards to N replicas in parallel.</li>
+<li>Wait for W acks; respond.</li>
+<li>On read, coordinator queries R replicas; resolves conflicts.</li>
+<li>Vector clocks track causal history; on conflict, return all siblings to client or merge by LWW.</li>
+</ol>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Read mode</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Eventually consistent</td>
+<td>Read from any replica; may be stale by milliseconds to seconds.</td>
+</tr>
+<tr>
+<td>Strongly consistent (leader-based)</td>
+<td>Read from leader; reflects all committed writes.</td>
+</tr>
+<tr>
+<td>Linearizable read (leaderless)</td>
+<td>Quorum read of R replicas with R+W&gt;N.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Write mode</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Standard put</td>
+<td>Acked after majority replicas persist.</td>
+</tr>
+<tr>
+<td>Conditional put</td>
+<td>Same plus condition evaluated atomically on partition leader.</td>
+</tr>
+<tr>
+<td>Transactional write</td>
+<td>Two-phase commit across partitions involved.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="write-path">Write Path</h3>
+<ol>
+<li>Client → request router with partition key.</li>
+<li>Router resolves partition via cached map; forwards to leader.</li>
+<li>Leader checks conditional expression (if any) against current state.</li>
+<li>Append to WAL; replicate to followers.</li>
+<li>Wait for majority ack.</li>
+<li>Apply to local LSM/Btree.</li>
+<li>Emit to per-partition stream; update GSI asynchronously.</li>
+<li>Respond.</li>
+</ol>
+<p>Failure cases:</p>
+<ul>
+<li>Conditional fails: return ConditionalCheckFailed; nothing applied.</li>
+<li>Replica unreachable: leader uses remaining replicas if quorum still achievable; else fail with retryable error.</li>
+<li>Leader fails mid-write: client retries; new leader has the log up to last committed entry.</li>
+</ul>
+<h3 id="read-path">Read Path</h3>
+<ol>
+<li>Client → router → leader (strong) or any replica (eventual).</li>
+<li>Replica returns item from its local store.</li>
+<li>For eventual, no further coordination.</li>
+<li>For strong, the leader confirms it has applied all committed entries (it always has, by definition of being leader).</li>
+</ol>
+<p>For range queries, the leader scans the sort-key range, applies the filter, and returns up to the result limit plus a cursor.</p>
+<h3 id="secondary-indexes">Secondary Indexes</h3>
+<p><strong>Local secondary index (LSI):</strong> alternate sort key within the same partition. Updated synchronously with the base table; consistent with base.</p>
+<p><strong>Global secondary index (GSI):</strong> different partition key entirely. Maintained asynchronously by a GSI writer that consumes the partition's change log. Eventually consistent.</p>
+<p>GSI writes can fail or lag without affecting base writes. The application tolerates that by querying GSIs with eventual consistency.</p>
+<h3 id="streams-change-data-capture">Streams (Change Data Capture)</h3>
+<p>Per-partition append-only log of operations:</p>
+<ul>
+<li>Same sequence numbers as the replication log.</li>
+<li>Exposed as shards corresponding to partitions; consumers iterate cursors.</li>
+<li>Retention typically 24 hours.</li>
+<li>Order guaranteed per partition; not across partitions.</li>
+</ul>
+<p>Useful for triggers, materialized views, search indexes, replication to other systems.</p>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<p>Two main modes:</p>
+<p><strong>Global tables (active-active):</strong>
+- Each region accepts writes locally.
+- Cross-region replication is asynchronous.
+- Conflict resolution: last-writer-wins by timestamp + region tiebreaker, OR CRDT semantics for counters and sets.
+- Reads are eventually consistent across regions.
+- Required SLA: convergence within seconds.</p>
+<p><strong>Single-region with cross-region read replica:</strong>
+- One region accepts writes.
+- Other regions have read-only replicas.
+- Simpler; failover requires explicit promotion.</p>
+<p>For most workloads, single-region is sufficient. Active-active is for low-latency global writes (and the price is the conflict model).</p>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Replica down</td>
+<td>Continue with remaining quorum; rebuild on recovery.</td>
+<td>Replica health, quorum size.</td>
+</tr>
+<tr>
+<td>Leader down</td>
+<td>Re-elect within seconds; writes pause briefly.</td>
+<td>Leader election rate, write unavailability.</td>
+</tr>
+<tr>
+<td>Partition runs hot.</td>
+<td>Adaptive capacity; split partition; rate-limit client.</td>
+<td>Per-partition throughput, throttled requests.</td>
+</tr>
+<tr>
+<td>Storage volume fills.</td>
+<td>Auto-split + rebalance.</td>
+<td>Per-host storage utilization.</td>
+</tr>
+<tr>
+<td>Cross-region replication lag.</td>
+<td>Backpressure to writers; alert on lag.</td>
+<td>Replication lag p99.</td>
+</tr>
+<tr>
+<td>Conflicting concurrent writes (active-active).</td>
+<td>LWW with region tiebreaker; CRDT for counters.</td>
+<td>Conflict count per partition.</td>
+</tr>
+<tr>
+<td>GSI lag.</td>
+<td>Async backfill; bounded staleness alerts.</td>
+<td>GSI lag per index.</td>
+</tr>
+<tr>
+<td>Network partition isolates a region.</td>
+<td>Continue locally; converge on heal.</td>
+<td>Partition detection time, reconvergence.</td>
+</tr>
+<tr>
+<td>Tail latency from one slow replica.</td>
+<td>Hedged reads to a second replica with timeout.</td>
+<td>Read p99 vs p50 gap.</td>
+</tr>
+<tr>
+<td>Client retries amplify load.</td>
+<td>Server-side admission control; exponential backoff hints.</td>
+<td>Retry-after rate, throttled QPS.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Stale reads after strong-consistency request (must be zero).</li>
+<li>Conflict resolution events per region.</li>
+<li>GSI sync lag.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Per-partition read/write QPS and throughput consumption.</li>
+<li>Storage growth.</li>
+<li>Replication lag intra-region and cross-region.</li>
+<li>Throttled-request rate per table.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>p50/p99 latency per table.</li>
+<li>Cost per operation.</li>
+<li>Hot key detection events.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Leader-based replication gives strong consistency easily but loses brief availability on failover. Leaderless gives availability but pushes conflict resolution to the client.</li>
+<li>Hashed partitioning gives uniform distribution but breaks range scans across partition keys; that is by design.</li>
+<li>Auto-split rebalances data but cannot fix hot partition key access patterns.</li>
+<li>Strong reads cost an extra round trip (or leader hop). Eventual reads are cheaper and usually fine.</li>
+<li>Active-active multi-region helps latency but constrains the data model (LWW, CRDT).</li>
+<li>LSM provides high write throughput at cost of compaction overhead; B-tree gives predictable reads but writes are slower.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hash everything by user id without thinking.</td>
+<td>Identify hot users and apply write sharding above the store.</td>
+</tr>
+<tr>
+<td>Promise strong reads everywhere.</td>
+<td>Differentiate eventual vs strong per request; charge for strong.</td>
+</tr>
+<tr>
+<td>Forget secondary index consistency.</td>
+<td>State GSI is eventually consistent; LSI is consistent.</td>
+</tr>
+<tr>
+<td>Multi-key transactions everywhere.</td>
+<td>Limit transactions to small sets of partitions; design data model to colocate.</td>
+</tr>
+<tr>
+<td>Treat global tables as "free magic."</td>
+<td>Explain LWW / CRDT and the consequences.</td>
+</tr>
+<tr>
+<td>Ignore tail latency.</td>
+<td>Hedged reads, P99 alarms, replica health checks.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Partitioning + auto-split</td>
+<td>Hashed partition key; range per partition; online split at median.</td>
+</tr>
+<tr>
+<td>Leader vs leaderless</td>
+<td>Tradeoffs; conflict resolution; ops complexity.</td>
+</tr>
+<tr>
+<td>Hot partition</td>
+<td>Adaptive capacity; write sharding; caching upstream.</td>
+</tr>
+<tr>
+<td>GSI design</td>
+<td>Async via stream; eventual consistency; bounded staleness.</td>
+</tr>
+<tr>
+<td>Multi-region active-active</td>
+<td>LWW vs CRDT; convergence; partition healing.</td>
+</tr>
+<tr>
+<td>Conditional writes / TX</td>
+<td>Per-partition atomic; multi-partition via 2PC.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Pick a partitioning + replication scheme and justify.</li>
+<li>State per-key atomicity invariant and replication quorum.</li>
+<li>Walk write and read paths with consistency modes.</li>
+<li>Handle hot partitions explicitly.</li>
+<li>Cover GSIs as async derived state.</li>
+<li>Address multi-region active-active with conflict semantics.</li>
+<li>Streams as the change capture surface.</li>
+<li>Operational metrics and tail latency mitigations.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>A planet-scale KV store is fundamentally a partitioned, replicated log per partition with a key-range routing layer. The hard decisions are not the data structure; they are partitioning (hash with auto-split), replication (leader vs leaderless), and multi-region conflict semantics. Hot partitions and tail latency are the operational headaches that take the most engineering.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design a key-value store like DynamoDB.</p>
+<p><strong>Candidate:</strong> I will design a three-layer system: a request router, a partition layer that owns key ranges, and a replicated storage layer per partition. The core invariant is that successful writes are durable across a majority of replicas and reads can be tuned per request between strong and eventual.</p>
+<p><strong>Interviewer:</strong> How do you partition data?</p>
+<p><strong>Candidate:</strong> I hash the partition key and assign each partition a contiguous range of the hashed space. Each partition is replicated three ways across availability zones. When a partition's storage or throughput exceeds threshold, it auto-splits at the median key; the split happens online by spinning up the two new partition leaders, catching them up from the log, then flipping the metadata routing.</p>
+<p><strong>Interviewer:</strong> Leader-based or leaderless replication?</p>
+<p><strong>Candidate:</strong> Leader-based per partition. Each partition has a leader elected via Raft-style consensus, plus two followers. Writes go through the leader, replicate to a majority quorum (2 of 3), then ack. Strong reads come from the leader; eventual reads from any replica. The reason I prefer this over the original Dynamo paper's leaderless quorum is simpler client semantics — no sibling resolution to push to applications.</p>
+<p><strong>Interviewer:</strong> A single partition key becomes hot — one user generates 100,000 requests per second. What do you do?</p>
+<p><strong>Candidate:</strong> Three layers of defense. First, adaptive capacity: the partition borrows throughput budget from idle sibling partitions. Second, hot-partition splitting cannot help because all the load is on one key; auto-split splits by storage, not by traffic per key. Third, the application has to shard the key: append a small random suffix to the partition key on write (<code>user_42#0</code> through <code>user_42#9</code>), and fan out queries across all suffixes. That trades a small read amplification for spreading writes.</p>
+<p><strong>Interviewer:</strong> What if a leader dies?</p>
+<p><strong>Candidate:</strong> Raft election kicks in; a follower with the most up-to-date log becomes leader in a few seconds. Writes briefly pause for the affected partitions. Followers continue serving eventual reads throughout. The metadata service is informed of the new leader and updates the routing cache; clients with stale routes get a "not leader" error and retry against the metadata service.</p>
+<p><strong>Interviewer:</strong> How do conditional writes work?</p>
+<p><strong>Candidate:</strong> Single-key CAS is straightforward — the leader reads current value, evaluates the condition, and if it passes, writes the new value atomically by including the check in the replication log entry. For multi-item transactions across partitions, two-phase commit: a coordinator prepares each partition leader (which locks the items and writes a prepare entry), then commits once all prepare. Slower; only used when needed.</p>
+<p><strong>Interviewer:</strong> How do secondary indexes work?</p>
+<p><strong>Candidate:</strong> Two kinds. Local secondary index is within the same partition; updated synchronously with the base item, consistent. Global secondary index uses a different partition key, so updates must be cross-partition. The GSI maintainer consumes the change stream from the base partition, computes the GSI entry, writes it to the target partition. GSIs are eventually consistent; lag is usually under a second but spikes during reindex.</p>
+<p><strong>Interviewer:</strong> How do streams work?</p>
+<p><strong>Candidate:</strong> Every partition has an append-only change log with monotonic sequence numbers. Stream consumers iterate per partition shard with a cursor. We retain 24 hours. Order is guaranteed per partition, not across partitions. Consumers include GSI maintainers, cross-region replicators, and application triggers.</p>
+<p><strong>Interviewer:</strong> How do global tables work — active-active across regions?</p>
+<p><strong>Candidate:</strong> Each region accepts writes for the same table. Cross-region replication is asynchronous through the stream. Conflicts use last-writer-wins by timestamp, with region id as tiebreaker. For counter attributes, a CRDT counter would be more correct but most products live with LWW. Convergence target is a few seconds. The cost is that two simultaneous writes in different regions can lose one's data; users have to design around this (e.g., per-region partition keys for "owned" data).</p>
+<p><strong>Interviewer:</strong> What about tail latency?</p>
+<p><strong>Candidate:</strong> Several techniques. Hedged reads: send the request to the leader and a replica simultaneously, take the first response; the slow one is canceled or just ignored. Speculative retries. Capacity headroom: target 60-70% utilization so a slow node does not cascade. Per-replica health checks demote slow replicas from the read path. Compaction scheduling avoids spiking I/O during peak.</p>
+<p><strong>Interviewer:</strong> Storage engine choice?</p>
+<p><strong>Candidate:</strong> LSM tree underneath. Writes append to memtable then flush to sorted runs on disk; merge in background. Predictable write throughput, good compression, slightly worse read tail than B-tree due to merge passes. Bloom filters per SSTable speed up negative lookups.</p>
+<p><strong>Interviewer:</strong> Multi-key transaction across partitions — how often does it happen?</p>
+<p><strong>Candidate:</strong> Rarely, by design. The data model encourages single-partition operations because that is where ACID is cheap. Cross-partition transactions use 2PC and are charged at a higher cost. Application architects are encouraged to redesign rather than reach for transactions.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Hashed partition keys with auto-split; three-replica Raft-style leader per partition; tunable consistency per request; async GSIs via change stream; active-active multi-region via LWW or CRDT; hot partitions handled with adaptive capacity and client-side sharding; tail latency mitigated with hedged reads and capacity headroom. The architecture is intentionally simple at the operation level (single-key) so the system can deliver predictable performance at planet scale.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: single-key ops; tunable consistency; range scans within partition; GSIs.</li>
+<li>Invariant: durable write to quorum; tunable reads.</li>
+<li>Architecture: router + partition layer + replicated storage.</li>
+<li>Hashed partitioning with auto-split.</li>
+<li>Leader-based per partition; Raft-style consensus.</li>
+<li>Write path: WAL → quorum → apply → respond.</li>
+<li>Hot key handling: adaptive capacity + client write sharding.</li>
+<li>Multi-region: LWW or CRDT; GSI async; streams for CDC.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>A planet-scale KV store is a partitioned, replicated log per partition with a routing layer above it. I choose hashed partitioning with online auto-split, three-replica Raft-style leader per partition, and tunable read consistency. Hot partitions get adaptive capacity and client-side sharding; multi-region uses async replication with last-writer-wins; secondary indexes are eventually consistent via the per-partition change stream. The hardest production problems are hot keys and tail latency, addressed with adaptive capacity and hedged reads.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"I partition by hash and auto-split by storage; hot keys still need client-side sharding."</li>
+<li>"Leader-based replication is simpler than leaderless quorum; the operator never sees siblings."</li>
+<li>"GSIs are eventually consistent because they cross partitions; users design around it."</li>
+<li>"Multi-region active-active uses LWW with region tiebreaker, or a CRDT for counters."</li>
+<li>"Hedged reads and capacity headroom are how I keep p99 from blowing up."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

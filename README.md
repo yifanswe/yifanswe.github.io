@@ -62,9 +62,21 @@ For each source doc the generator:
 5. Writes `<section>/<slug>/index.html`, and a `<section>/index.html` landing
    page listing every doc as a card.
 
-Code blocks are rendered as plain `<pre><code>` and highlighted **client-side**
-by highlight.js (`hljs.initHighlightingOnLoad()`), so the generator does not run
-a server-side syntax highlighter.
+### Code blocks & syntax highlighting
+
+Code blocks are highlighted **client-side** by highlight.js; the generators do
+not run a server-side highlighter. Highlighting is **selective** — only blocks
+with an explicit language fence (` ```python `, ` ```sql `, ...) are themed.
+Bare ` ``` ` blocks are left as plain monospace, because these docs use them
+for ASCII architecture diagrams and highlight.js auto-detection mis-parses
+those as code (coloring words like "table"/"insert"). The logic lives in
+[`js/highlight-init.js`](js/highlight-init.js), loaded by every content page
+instead of the old `hljs.initHighlightingOnLoad()`.
+
+The theme is the dark **monokai-sublime** stylesheet (`/css/style/monokai-sublime.min.css`),
+chosen to match the dark `pre` background (`#1a1a1a`) set in `style.css`. To
+highlight a block, fence it with a language; to keep a diagram plain, leave the
+fence bare or use ` ```text `.
 
 ### Regenerating / adding a section
 
@@ -82,6 +94,18 @@ a server-side syntax highlighter.
    - Add a `<a href="/<section>/" …>` link in `.topbar-nav`.
    - Add one `.post-item` per page in `#posts` (the homepage search and year
      filter operate on these items' `data-title` / `data-year` attributes).
+
+### Bulk-importing a doc corpus (`tools/build_questions.py`)
+
+`build_site.py` takes a curated, hand-written list of docs. For a *large*
+corpus where hand-listing titles is impractical, [`tools/build_questions.py`](tools/build_questions.py)
+auto-discovers docs instead: it scans source directories, derives each page
+title from the first Markdown `# H1`, normalizes the filename into a slug, and
+merges everything into one flat list under `common-backend-systems/`. It then
+**injects** title-only cards into the existing section index and the homepage's
+Common Backend Systems group (between `<!-- QUESTIONS:START/END -->` markers, so
+re-runs are idempotent and the 5 hand-written component pages are preserved).
+Run it the same way: `python3 tools/build_questions.py`.
 
 ### Deploying
 

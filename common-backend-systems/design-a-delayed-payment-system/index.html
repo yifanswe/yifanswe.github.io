@@ -1,0 +1,938 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design a Delayed Payment System — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design a Delayed Payment System</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+<p><strong>Related docs:</strong> <a href="../design-a-payment-system/">Design a payment system</a> covers the generic authorize-and-capture pipeline. <a href="../design-a-distributed-job-scheduler-like-cron/">Design a distributed job scheduler like cron</a> covers the firing-at-a-future-time problem. This doc is the intersection: a payment that is intended to execute at a future time T, where T can be seconds or months from now.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A delayed payment system lets a user (or system) commit to a payment now but have it execute at a future time. Examples: "charge my card on the 15th of every month," "auto-pay this invoice on its due date," "send my friend money next Tuesday," buy-now-pay-later (BNPL) installments, scheduled merchant payouts, subscription billing.</p>
+<p>The hard part is not the scheduling. The hard part is everything that can change between "now" and "T":</p>
+<ul>
+<li>The card may expire or be cancelled.</li>
+<li>The user may not have funds at T.</li>
+<li>The user may cancel between now and T.</li>
+<li>The payment processor may be down at T.</li>
+<li>The authorization (auth hold) may expire before T.</li>
+<li>Your scheduler may fire twice or miss the firing entirely.</li>
+</ul>
+<p>The invariant is this:</p>
+<blockquote>
+<p>For every scheduled payment, exactly one of {captured, failed, cancelled} must terminally occur — never zero (silently dropped), never two (double charge), and the user must end up notified of the outcome.</p>
+</blockquote>
+<p>At Industry Career Track Level 5 (ICT5) or Senior Staff equivalent (L6+), the interviewer is testing whether you can compose a job scheduler with a payment state machine while preserving idempotency, surviving partial failures, and respecting card-network constraints like the seven-day auth window.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design this as a payment intent that gets scheduled into a durable timer system, fires through a payment execution worker, and walks a strict state machine with idempotency keys end-to-end. The interesting decisions are how to handle the gap between authorize-time and capture-time — auth holds expire, cards expire, funds may not be there. I will clarify requirements, design the state machine, walk authorize and execute paths, and dive into retries, cancellation races, and reconciliation with the payment processor.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>What "delayed" means: a fixed future timestamp, a recurring schedule (monthly), or a condition-triggered event (on delivery)?</li>
+<li>Maximum delay window: seconds, hours, days, months, years? This drives the auth strategy.</li>
+<li>Payment methods: card (debit/credit), Automated Clearing House (ACH), wallet, Buy Now Pay Later — each has different timing constraints.</li>
+<li>Can the user cancel between schedule and execution? What is the deadline?</li>
+<li>Can the amount or schedule be modified after scheduling?</li>
+<li>Recurring billing in scope (monthly subscription) or only one-shot delays?</li>
+<li>Who initiates: end user, merchant, or system?</li>
+<li>How is the outcome communicated: email, push, webhook to merchant?</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Exactly-once execution semantics from the user's perspective (zero double charges).</li>
+<li>Tolerable execution latency: must fire within a few seconds of scheduled time, or within minutes, or within a day?</li>
+<li>Throughput: peak scheduled payments per second.</li>
+<li>Durability: scheduled payments must survive any single component failure.</li>
+<li>Retention: how long do we keep historical payment records (regulatory minimum is years).</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Fraud detection (separate system feeding signals in).</li>
+<li>Currency conversion (separate FX system).</li>
+<li>Tax calculation (tax engine).</li>
+<li>Settlement and merchant payout (downstream of capture).</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scheduled payments outstanding</td>
+<td>100M at any given moment (subscriptions, invoices, BNPL installments).</td>
+</tr>
+<tr>
+<td>Daily executions at peak</td>
+<td>10M per day, with hourly hot spots (midnight, end of month).</td>
+</tr>
+<tr>
+<td>Per-second peak</td>
+<td>1k executions/sec during the midnight-on-the-1st-of-the-month spike.</td>
+</tr>
+<tr>
+<td>Max delay</td>
+<td>Up to 1 year ahead (annual subscription auto-renewals).</td>
+</tr>
+<tr>
+<td>Min delay</td>
+<td>1 second (delayed-confirm flows).</td>
+</tr>
+<tr>
+<td>Cancellation window</td>
+<td>Up to scheduled execution time, with a small cutoff.</td>
+</tr>
+<tr>
+<td>Auth window for cards</td>
+<td>7 days (Visa/Mastercard default) — drives re-auth strategy.</td>
+</tr>
+<tr>
+<td>Retry policy for soft declines</td>
+<td>Up to 3 attempts over 72 hours.</td>
+</tr>
+<tr>
+<td>Acceptable execution drift</td>
+<td>Within 60 seconds of scheduled time at p99.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is not throughput at execution time; it is the correctness of the state machine across long time spans where everything can fail or change.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>User experience</th>
+<th>System requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scheduling</td>
+<td>User picks a future date; gets confirmation that the payment is scheduled.</td>
+<td>Idempotent schedule API; immediate durable persistence.</td>
+</tr>
+<tr>
+<td>Cancellation</td>
+<td>User cancels before execution; sees status update.</td>
+<td>Cancellation race with executor must be resolved by the state machine, not by luck.</td>
+</tr>
+<tr>
+<td>Execution</td>
+<td>Money moves at the right moment, exactly once.</td>
+<td>Scheduler + executor + payment processor must compose without double-firing or silent drops.</td>
+</tr>
+<tr>
+<td>Failure</td>
+<td>Card declined; user notified; clear next-step UX.</td>
+<td>Retry policy; terminal failure state; user notification with reason.</td>
+</tr>
+<tr>
+<td>Merchant</td>
+<td>Knows the payment outcome through webhooks.</td>
+<td>At-least-once webhook delivery; merchant must idempotently consume.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="separating-infrastructure-from-business-logic">Separating Infrastructure From Business Logic</h3>
+<p>Before drawing the architecture, draw the line between <strong>what is provided by infrastructure</strong> and <strong>what the payment team actually builds</strong>. This is the single most important framing on the question — staff candidates who miss it end up reinventing a workflow engine inside the payment service.</p>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Belongs to</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"Run this function at time T, survive crashes, replay on restart, signal it for cancellation, persist its state between steps"</td>
+<td><strong>Infrastructure</strong> (durable execution platform: Temporal, AWS Step Functions, Cadence, Airflow, Netflix Conductor)</td>
+<td>This is a generic problem. Every team in the company that schedules future work needs it. Solve once, reuse.</td>
+</tr>
+<tr>
+<td>"When a card is declined with code 51 (insufficient funds), schedule a retry in 24 hours; when declined with code 14 (invalid card), do not retry"</td>
+<td><strong>Business logic</strong> (payment service)</td>
+<td>Card-network response codes, soft-vs-hard decline classification, retry budgets — this is payment-domain knowledge. No infrastructure platform knows or should know this.</td>
+</tr>
+<tr>
+<td>"Persist a workflow's intermediate state so it can resume after a worker crash"</td>
+<td><strong>Infrastructure</strong></td>
+<td>Generic durability.</td>
+</tr>
+<tr>
+<td>"Persist the Payment Intent state machine with a foreign key to a payment method and an idempotency key constraint"</td>
+<td><strong>Business logic</strong></td>
+<td>Domain schema.</td>
+</tr>
+<tr>
+<td>"Retry a failed step with exponential backoff"</td>
+<td><strong>Infrastructure</strong></td>
+<td>Generic retry primitive — works for any side-effecting step.</td>
+</tr>
+<tr>
+<td>"Decide whether <em>this particular processor response</em> should be retried at all"</td>
+<td><strong>Business logic</strong></td>
+<td>Only the payment service understands what a Stripe response code means.</td>
+</tr>
+<tr>
+<td>"Deliver a message at-least-once to a downstream consumer"</td>
+<td><strong>Infrastructure</strong> (queue, event bus)</td>
+<td>Generic.</td>
+</tr>
+<tr>
+<td>"Reconcile our local view of payment outcomes against the processor's view daily"</td>
+<td><strong>Business logic</strong></td>
+<td>Domain-specific reconciliation rules.</td>
+</tr>
+</tbody>
+</table>
+<p>The clean separation: <strong>the payment service owns the state machine and the semantics of every transition; the infrastructure platform owns "fire a function later, survive crashes, support cancellation signals."</strong> If you find yourself designing a database table named <code>scheduled_jobs</code> with a <code>next_run_at</code> column inside the payment service, you have crossed the line — that table belongs to the infrastructure layer (or you are choosing to build the infrastructure layer because you do not have one).</p>
+<p>This framing matters for two reasons. First, it changes the answer to "how do you handle retries / crashes / time-skew": the right answer is "the workflow engine handles it" plus the domain-specific decisions on top. Second, it changes the operational story: you are not on-call for a custom scheduler; the platform team is on-call for Temporal, and you are on-call for the state machine.</p>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Client ----schedule----&gt; +---------------+
+                         | Schedule API  |
+                         +-+-----------+-+
+                           |           |
+                  write    |           |  start workflow
+                  intent   v           v      (intent_id, schedule_at)
+              +------------------+   +-----------------------+
+              |   Intent DB      |   |   Workflow Engine     |  [infra:
+              |   (state machine,|   |   sleep_until(T),     |   Temporal /
+              |    source of     |   |   retry, cancel,      |   Step Functions /
+              |    truth)        |   |   replay              |   Cadence]
+              +--------^---------+   +-----------+-----------+
+                       |                         |
+              read /   |                         | invoke at T
+              CAS by   |                         |
+              activity |                         v
+                       |               +-------------------+
+                       +---------------+  Payment          |
+                                       |  Charge Workflow  |
+                                       +---------+---------+
+                                                 |  call (auth + capture
+                                                 |   with idempotency key)
+                                                 v
+                                       +-------------------+
+                                       | Payment Processor |  [external]
+                                       | (Stripe / Adyen)  |
+                                       +---------+---------+
+                                                 |
+                                       webhook   |  async result
+                                       (ACH etc.)|
+                                                 v
+                                       +-------------------+
+                                       | Webhook Receiver  |
+                                       +---------+---------+
+                                                 |
+                                                 |  signal workflow
+                                                 +-----&gt; Workflow Engine
+                                                         (advance state machine
+                                                          for async outcomes)
+
+              +-------------------+        +---------------------+
+              | Event Bus         |&lt;-------+ Activity emits      |
+              | (Notifier         |        | PaymentCaptured /   |
+              |  consumers send   |        | PaymentFailed /     |
+              |  email/push/      |        | PaymentCancelled    |
+              |  merchant webhook)|        | on terminal state   |
+              +-------------------+        +---------------------+
+
+              +-------------------+        Daily job that diffs Intent DB against
+              | Reconciliation    |        the processor's view and resolves drift.
+              | Job (batch)       |--------Reads from Intent DB, queries processor,
+              +-------------------+        emits alerts on disagreement.
+</code></pre>
+<p>The Workflow Engine is the one infrastructure component on the diagram; everything else is the payment service. The Schedule API is a thin entry point — it persists the intent and then hands off to the Workflow Engine, which owns "fire the activity at T, retry on transient failures, deliver cancellation signals." <code>ExecutePaymentActivity</code> is the only code in the system that talks to the payment processor; it CAS-transitions the Intent DB row, makes the processor call with the right idempotency key, and returns a domain-typed verdict that the Workflow Engine uses to decide the next step. Webhooks (for asynchronous rails like ACH) come back through the Webhook Receiver, which signals the running workflow rather than touching the Intent DB directly — so the Workflow Engine stays the single coordinator of state transitions. The Reconciliation Job sits off to the side because it does not participate in the live request path; it batches against the processor daily and writes corrections back to the Intent DB.</p>
+<p>The boundary worth defending out loud: <strong>the Workflow Engine is provided infrastructure, not something the payment service builds.</strong> "Sleep until T, survive a crash, retry on failure, deliver a cancel signal" is a generic problem; it belongs to a Temporal / Step Functions / Cadence cluster shared across the company. The payment service writes a <code>PaymentWorkflow</code> definition and a single activity; everything else inside that box is the platform team's problem. If your company does not have such a platform, the box has to be built — but that is a separate design exercise from this one (<a href="../design-a-distributed-job-scheduler-like-cron/">see the distributed job scheduler doc</a>).</p>
+<p>Three feedback paths back into the system are worth calling out:</p>
+<ul>
+<li><strong>(a) Initial schedule path</strong> — <code>Client → Schedule API → Intent DB + start workflow</code>. One intent row in <code>SCHEDULED</code>; one workflow instance running with <code>intent_id</code> as its key.</li>
+<li><strong>(b) Retry loop</strong> — a soft decline returned by the activity causes the workflow to <code>sleep_until(now + backoff)</code> and re-invoke the activity. The Intent DB row stays in <code>RETRY_PENDING</code> between attempts. The retry is workflow-managed; the domain decision (whether to retry at all, and for how long) was made by the activity and communicated through the activity's return value.</li>
+<li><strong>(c) Recurring loop</strong> — on <code>CAPTURED</code> for a recurring-plan intent, the workflow starts a <em>new</em> workflow instance for the next cycle (or, in Temporal's vocabulary, calls <code>continue_as_new</code>). A new intent row is inserted by the activity for the next cycle. The original workflow terminates.</li>
+</ul>
+<p>The webhook path on the right is the fourth feedback channel: for asynchronous-settling rails like ACH, the synchronous processor response only says "submitted." The Webhook Receiver later calls into the running workflow via a signal (or starts an outcome-update workflow) to drive the state machine to its terminal state.</p>
+<h3 id="core-components">Core Components</h3>
+<p>Grouped by plane to keep the boundary visible.</p>
+<p><strong>Business logic (payment team owns):</strong></p>
+<ul>
+<li><strong>Schedule API</strong> — accepts idempotency-keyed requests, writes the Payment Intent row in <code>SCHEDULED</code>, kicks off one workflow instance per intent.</li>
+<li><strong>Payment Intent Database</strong> — durable row per payment: state, amount, method, schedule time, attempts, idempotency key, last error. The source of truth for <em>the domain</em>; the workflow engine has its own source of truth for <em>workflow execution state</em>.</li>
+<li><strong>ExecutePaymentActivity</strong> — the atomic side-effecting unit: CAS the intent state, call the processor with the right idempotency key, classify the response, return a verdict (<code>captured</code>, <code>soft_decline_retryable</code>, <code>hard_decline_terminal</code>).</li>
+<li><strong>Webhook Receiver</strong> — receives async processor events, deduplicates by event id, signals the appropriate workflow to advance the state machine.</li>
+<li><strong>Outcome Updater</strong> — the state machine guardrails (legal-transition rules), invoked by both the activity and the webhook receiver. Pure business logic.</li>
+<li><strong>Reconciliation Job</strong> — daily pass that diffs Intent DB against the processor's view and resolves drift. Purely domain logic; no infrastructure equivalent because only the payment service knows what "agreement" means.</li>
+<li><strong>Notifier</strong> — emits domain events (<code>PaymentCaptured</code>, <code>PaymentFailed</code>) to the platform's event bus; consumers handle email/push/merchant webhooks.</li>
+</ul>
+<p><strong>Infrastructure (platform team owns; payment service uses):</strong></p>
+<ul>
+<li><strong>Durable Execution Platform</strong> (Temporal, AWS Step Functions, Cadence, Conductor) — runs <code>PaymentWorkflow</code> instances. Provides: <code>sleep_until(T)</code> that survives worker restarts, activity invocation with retries, cancellation via signals, exactly-once-effect activity execution via idempotency tokens, persistent workflow state.</li>
+<li><strong>Database</strong> — the Intent DB itself runs on a managed database (Postgres, Spanner, CockroachDB). The payment service owns the schema, not the database operation.</li>
+<li><strong>Event Bus / Queue</strong> — at-least-once delivery for domain events; consumed by Notifier downstream and webhook subscribers.</li>
+<li><strong>Idempotent Webhook Ingestion</strong> — generic webhook receiver infrastructure that accepts, retries, and persists incoming webhooks for any service. The payment service plugs in domain-specific event handlers.</li>
+</ul>
+<p>If your company does not have a durable execution platform, you have to build one — and that is its own design exercise (see <a href="../design-a-distributed-job-scheduler-like-cron/">Design a distributed job scheduler like cron</a>). The point is that this is a <em>separate</em> design exercise from "design a delayed payment system." Conflating them is the single most common mistake on this question.</p>
+<h3 id="concrete-stores-keys-and-sizing">Concrete Stores, Keys, And Sizing</h3>
+<p>The stores are intentionally split between <strong>domain truth</strong> and <strong>workflow execution state</strong>. They are related by <code>intent_id</code>, but they are not the same table.</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / shard</th>
+<th>Value</th>
+<th>TTL / retention</th>
+<th>Size math</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Payment Intent DB</td>
+<td>primary key <code>intent_id</code>; shard by <code>hash(intent_id)</code></td>
+<td>Intent row: amount, method token, schedule time, state, attempts, last error, processor charge id. About 1.2 KB/row.</td>
+<td>Active intents online; terminal rows hot for 90 days, then archived for years.</td>
+<td>100M active × 1.2 KB × 3 replicas × 2 regions ≈ 720 GB. Historical rows dominate; 10M/day × 365 × 5 years × 1.2 KB ≈ 22 TB primary before replicas, so archive aggressively.</td>
+</tr>
+<tr>
+<td>Intent secondary indexes</td>
+<td><code>(state, schedule_at)</code> for fallback sweeper, <code>(user_id, state)</code> for user history, unique <code>(user_id, idempotency_key)</code></td>
+<td>Index entries hold row pointers and small state fields, not hydrated intents. About 40-80 bytes/entry.</td>
+<td>Same as hot intent window.</td>
+<td>100M active × 3 indexes × 64 B × 3 replicas ≈ 58 GB. Indexes are small compared with historical audit.</td>
+</tr>
+<tr>
+<td>Workflow Engine state</td>
+<td><code>PaymentWorkflow:{intent_id}</code>; engine shards by workflow id and timer bucket</td>
+<td>Serialized workflow stack, next timer, retry policy, cancellation signal state. About 1-3 KB.</td>
+<td>Delete or compact 30 days after terminal state.</td>
+<td>100M active × 2 KB × 3 replicas ≈ 600 GB in the workflow platform. This is why the platform, not the payment service, should operate it.</td>
+</tr>
+<tr>
+<td>Payment Attempt / Audit Log</td>
+<td>append under <code>(intent_id, attempt_number)</code>; cold partition by <code>created_at</code></td>
+<td>Processor request/response summary, transition audit, actor, reason. About 800 B/attempt.</td>
+<td>Hot 90 days; cold 5-7 years for audit.</td>
+<td>10M executions/day × 1.1 attempts × 800 B ≈ 8.8 GB/day primary; with 3 replicas ≈ 26 GB/day. This dwarfs active intent storage over years.</td>
+</tr>
+<tr>
+<td>API idempotency table</td>
+<td><code>idem:{user_id}:{client_key}</code> → <code>{intent_id, request_hash, status}</code></td>
+<td>Small row, about 300 B.</td>
+<td>Keep until <code>max(schedule_at) + 30 days</code>; cap at 13 months here.</td>
+<td>If 100M active requests retained: 100M × 300 B × 3 replicas ≈ 90 GB.</td>
+</tr>
+<tr>
+<td>Webhook dedupe</td>
+<td><code>processor_event:{event_id}</code> → terminal outcome pointer</td>
+<td>Event id, charge id, received timestamp. About 150 B.</td>
+<td>90 days is enough for processor retry windows.</td>
+<td>10M/day × 90 × 150 B × 3 replicas ≈ 405 GB.</td>
+</tr>
+<tr>
+<td>Outbox</td>
+<td><code>outbox_id</code> ordered by commit timestamp</td>
+<td>Domain event payload pointer, not full email/webhook body. About 500 B.</td>
+<td>7-30 days after delivery.</td>
+<td>10M terminal events/day × 500 B × 30 × 3 ≈ 450 GB.</td>
+</tr>
+</tbody>
+</table>
+<p>Technology choice: <strong>Postgres works until the historical and multi-region requirements dominate</strong>; then use Spanner or CockroachDB for strongly consistent state transitions across regions. I would not pick Cassandra for the Payment Intent source of truth because I need compare-and-swap state transitions, uniqueness on idempotency, and transactional outbox semantics more than raw write throughput. Cassandra can store the audit log, but it should not own the money state machine.</p>
+<p>Be ready for "why not just Kafka?" Kafka is the event log and retry transport, not the source of truth for whether a payment is <code>CAPTURED</code> or <code>CANCELLED</code>. The legal transition must live in a transactional row.</p>
+<h3 id="payment-intent-state-machine">Payment Intent State Machine</h3>
+<pre><code class="language-text">                  +--------------+
+                  |  SCHEDULED   |
+                  +------+-------+
+                         |
+            user cancels |     scheduler fires
+                         v               |
+                   +-----+-----+         v
+                   | CANCELLED |   +-----+------+
+                   +-----------+   | EXECUTING  |
+                                   +-----+------+
+                                         |
+              processor: success         |    processor: hard decline
+              +--------------------------+--------------------------+
+              v                          |                          v
+        +-----+-----+               soft decline               +----+----+
+        | CAPTURED  |                    |                     |  FAILED |
+        +-----------+                    v                     +---------+
+                                  +------+-------+
+                                  | RETRY_PENDING|
+                                  +------+-------+
+                                         |  next retry due
+                                         v
+                                   (back to EXECUTING)
+</code></pre>
+<p>States:</p>
+<ul>
+<li><strong>SCHEDULED</strong> — committed, will fire at T. Cancellable.</li>
+<li><strong>EXECUTING</strong> — actively talking to the processor. Not cancellable; cancellation request is queued and applied after the processor call completes one way or another. (This is the key race-resolution rule.)</li>
+<li><strong>RETRY_PENDING</strong> — soft decline (insufficient funds, network blip); a retry is scheduled.</li>
+<li><strong>CAPTURED</strong> — terminal success.</li>
+<li><strong>FAILED</strong> — terminal failure (hard decline, retry budget exhausted, payment method expired). Notify user.</li>
+<li><strong>CANCELLED</strong> — terminal cancel.</li>
+</ul>
+<p>Terminal states never transition again. Every state change writes an audit row.</p>
+<h3 id="idempotency-end-to-end">Idempotency End-to-End</h3>
+<p>Three idempotency keys layer on top of each other; without all three, you will double-charge.</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Key</th>
+<th>What it guards</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Schedule API</td>
+<td>Client-provided idempotency key</td>
+<td>Two identical schedule requests do not create two intents.</td>
+</tr>
+<tr>
+<td>Executor → Processor</td>
+<td><code>intent_id:attempt_n</code></td>
+<td>The same execution attempt does not charge twice if the executor retries internally.</td>
+</tr>
+<tr>
+<td>Webhook handling</td>
+<td>Processor event ID</td>
+<td>Two deliveries of the same processor webhook do not double-update state.</td>
+</tr>
+</tbody>
+</table>
+<p>The state machine itself is the deepest idempotency guard: an attempt to transition <code>CAPTURED → CAPTURED</code> is a no-op, not an error; an attempt to transition <code>CANCELLED → EXECUTING</code> is rejected.</p>
+<h3 id="scheduling-strategy">Scheduling Strategy</h3>
+<p><strong>Default position: do not build the scheduler. Use a durable execution platform.</strong></p>
+<p>The "fire a function at time T, survive crashes, support cancellation" problem is generic infrastructure. Modern stacks expose it as a service:</p>
+<table>
+<thead>
+<tr>
+<th>Platform</th>
+<th>What it gives you</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Temporal / Cadence</td>
+<td>Workflows as code with persistent state, <code>sleep_until(T)</code> that survives restarts, signals for cancellation, automatic activity retries.</td>
+</tr>
+<tr>
+<td>AWS Step Functions</td>
+<td>Declarative state machines with <code>Wait</code> states, integrated retry/catch, signals via task tokens.</td>
+</tr>
+<tr>
+<td>Netflix Conductor</td>
+<td>Workflow definitions in JSON, similar primitives.</td>
+</tr>
+<tr>
+<td>Apache Airflow</td>
+<td>Built for batch; less ideal for one-off delays but works for cron-style recurring schedules.</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>PaymentWorkflow(intent_id)</code> written for any of these reduces to a few lines: sleep until <code>schedule_at</code>, invoke <code>ExecutePaymentActivity</code>, on soft decline sleep again and retry, on terminal state emit a domain event. The platform handles durability, replay, and worker affinity.</p>
+<p>State the default clearly: <strong>"I would not build a scheduler. The company has Temporal (or AWS Step Functions); I write a <code>PaymentWorkflow</code> and the platform owns timer firing, crash recovery, and signal delivery."</strong></p>
+<p><strong>Fallback: build a Time-Sorted Sweeper.</strong></p>
+<p>If the company has no durable execution platform — small company, greenfield, or the platform team explicitly punts this to you — then you are building infrastructure. Be honest about that scope expansion.</p>
+<p>In that case, the cheapest credible option is a Time-Sorted Sweeper over the Intent DB:</p>
+<ul>
+<li>A column <code>schedule_at</code> on the intent row.</li>
+<li>A periodic worker scans <code>WHERE state IN ('SCHEDULED','RETRY_PENDING') AND schedule_at &lt;= now() LIMIT N</code> and dispatches each row to the execution worker via a queue.</li>
+<li>Shard the sweeper by <code>hash(intent_id) % N</code>; each worker owns a partition under a lease (see <a href="../design-a-distributed-lock-manager-like-chubby/">Chubby doc</a>) so two sweepers do not double-fire.</li>
+<li>For sub-minute precision, add an in-memory timer wheel that loads near-term firings from the DB.</li>
+</ul>
+<p>The sweeper is OK as a stopgap, but recognize the tradeoff: you are now operating a workflow engine. You will eventually need cancellation signals, crash recovery for partial executions, exponential-backoff retries, observability into "where is workflow X stuck" — and you will end up reinventing Temporal poorly. State this in the interview: "I am building a minimal workflow engine here. If the system grows, I would migrate to a real platform."</p>
+<p><strong>Other options and when not to use them:</strong></p>
+<ul>
+<li><strong>Delay queues (Amazon SQS, RabbitMQ delayed exchange).</strong> Cap out at 15 minutes (SQS) or have ordering / cancellation gaps. Fine for short, fire-and-forget delays; wrong for scheduled payments where delays can be months and cancellation must be reliable.</li>
+<li><strong>Distributed cron (Quartz, Chronos).</strong> Designed for recurring schedules pinned to wall-clock times. Awkward for one-off delays with per-intent timestamps.</li>
+</ul>
+<h3 id="authorization-window-problem">Authorization Window Problem</h3>
+<p>Card networks (Visa, Mastercard) hold authorizations for around 7 days. If the user scheduled a payment 30 days from now and you authorized the card at scheduling time, the auth has expired by execution time. Three real strategies:</p>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>How it works</th>
+<th>Tradeoff</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Authorize at execution time only</strong></td>
+<td>Skip auth at scheduling; do an auth+capture at T.</td>
+<td>Simple. Risk: at T, card may decline; user is notified after the fact.</td>
+</tr>
+<tr>
+<td><strong>Authorize at scheduling, capture at execution</strong></td>
+<td>Auth hold the card immediately, capture at T.</td>
+<td>Only works if delay &lt; auth window (~7 days for cards).</td>
+</tr>
+<tr>
+<td><strong>Re-authorize before execution</strong></td>
+<td>At T - X minutes, the system re-auths the card to verify it still works; captures if good.</td>
+<td>Catches expired cards earlier; adds an extra processor call. Best for high-value scheduled payments.</td>
+</tr>
+</tbody>
+</table>
+<p>The cleanest answer: <strong>default to authorize-at-execution-time</strong> for delays beyond the auth window; layer in <strong>re-auth-at-T-minus-X</strong> for high-value payments where pre-flight verification matters. Be explicit about the tradeoff: simpler code path, but the failure surfaces only at execution time.</p>
+<p>For ACH (slower payment rail, no auth concept), there is no auth-vs-capture distinction; you initiate at T and learn the outcome days later via webhook.</p>
+<h3 id="retry-policy">Retry Policy</h3>
+<p>Split this cleanly along the same infra-vs-business-logic line.</p>
+<p><strong>The infrastructure layer provides retry mechanics</strong>: schedule the next attempt at <code>now + backoff</code> with jitter, survive worker crashes between attempts, persist attempt count, expose the in-progress state. In a workflow engine, this is a few lines of configuration on the activity.</p>
+<p><strong>The business logic decides whether to retry at all and on what schedule</strong>: which processor response codes are retryable, what the inter-attempt delay should be (24 hours, not seconds, because we are waiting for the user's bank balance to refresh), what the total retry budget is, when to give up.</p>
+<p>The activity returns a domain-typed result:</p>
+<pre><code class="language-text">activity result -&gt; workflow action
+  CAPTURED                  -&gt; terminal success, emit event
+  HARD_DECLINE (code 14)    -&gt; terminal failure, emit event
+  SOFT_DECLINE (code 51)    -&gt; if attempts &lt; 3: sleep 24h ±10% jitter, retry
+                               else: terminal failure
+  PROCESSOR_TIMEOUT         -&gt; query processor by idempotency key to learn outcome,
+                               then map to one of the above
+</code></pre>
+<p>Default schedule for soft declines: attempt 1 at T, attempt 2 at T+24h, attempt 3 at T+72h. Jitter ±10% so retries from many users do not bunch on the same second. The values are domain choices (banks repost overdrafts overnight, so 24h is meaningful); the <em>mechanism</em> of sleeping and re-invoking is the platform's job.</p>
+<p>The retry counter lives on the Payment Intent row (domain state) and is also tracked by the workflow engine (execution state). They agree because every attempt goes through the activity, which writes the counter back to the Intent row before calling the processor. The processor idempotency key is <code>intent_id:attempt_n</code> so the processor can distinguish attempts.</p>
+<p>Why not just use the platform's built-in retry policy? Because Temporal's default exponential backoff (seconds to minutes) is wrong for cards — you do not want to hammer a declined card 30 times in 10 minutes. You configure the platform's retry off for the activity, and let the workflow itself sleep for domain-meaningful durations between attempts. The retry policy is <em>expressed</em> in business code; the retry <em>machinery</em> is the platform.</p>
+<h3 id="cancellation-race">Cancellation Race</h3>
+<p>The hardest correctness problem in the design. User cancels at the same moment the scheduler fires. Possible outcomes the system must avoid:</p>
+<ul>
+<li>User cancels, payment still goes through (double-spend from user's view).</li>
+<li>Cancellation accepted, payment also processed; refund needed (operational mess).</li>
+<li>Payment processed, cancellation also recorded; state machine in invalid state.</li>
+</ul>
+<p>Resolution rule: <strong>cancellation is an asynchronous request that takes effect only at safe state transitions</strong>.</p>
+<pre><code class="language-text">Cancel request arrives:
+  if state == SCHEDULED:
+    atomic CAS (compare-and-swap): SCHEDULED -&gt; CANCELLED. Done.
+  if state == EXECUTING:
+    write cancel_requested = true. Do NOT abort the in-flight processor call.
+    When executor finishes:
+      if processor returned CAPTURED:
+        state -&gt; CAPTURED, then auto-issue a refund (separate operation)
+        notify user: &quot;payment processed but auto-refunded due to late cancel&quot;
+      if processor returned FAILED:
+        state -&gt; CANCELLED (the cancel won the race)
+  if state in {CAPTURED, FAILED, CANCELLED}:
+    cancellation no-op (already terminal)
+</code></pre>
+<p>The deeper point: <strong>never interrupt an in-flight call to the payment processor</strong>. The processor will either commit or fail; you find out and reconcile. Interrupting it (by, say, killing the executor process mid-call) creates orphan charges where the processor captured but the local state thinks otherwise. The reconciliation pass would then have to find these by polling.</p>
+<p>Product surface should have a "cancellation cutoff" T - X minutes so users do not encounter the race in the first place. Behind the cutoff, system handles it; before the cutoff, UI says "you can't cancel within the next 5 minutes."</p>
+<h3 id="reconciliation">Reconciliation</h3>
+<p>Reality is always worse than the design. A reconciliation pass runs daily (or hourly for high-volume systems):</p>
+<ol>
+<li>Pull all intents that the local state says are terminal but the processor says are in a different state, or vice versa.</li>
+<li>For each disagreement, classify: did we miss a webhook? Is the processor stale? Did we have a bug?</li>
+<li>Drive both sides to agreement; emit an alert if the resolution required a manual override.</li>
+</ol>
+<p>Typical sources of drift:</p>
+<ul>
+<li>Webhook lost in transit (processor sends three retries; if all fail, we are out of sync).</li>
+<li>Local executor crashed mid-call; processor captured; we never learned.</li>
+<li>Processor recorded a manual refund initiated through its dashboard; we never learned.</li>
+<li>Race between webhook arrival and our own processor response handling.</li>
+</ul>
+<p>The reconciliation job is what makes the system actually correct, not the state machine alone. Mention it explicitly; it is what separates a textbook design from a production design.</p>
+<h3 id="data-model">Data Model</h3>
+<pre><code class="language-text">PaymentIntent
+  intent_id                UUID primary key
+  user_id                  FK
+  idempotency_key          unique-per-user
+  amount_cents             int
+  currency                 ISO 4217 string
+  payment_method_id        FK to tokenized card / bank
+  schedule_at              timestamptz
+  state                    enum (SCHEDULED, EXECUTING, RETRY_PENDING, CAPTURED, FAILED, CANCELLED)
+  attempts                 int
+  last_error_code          string nullable
+  cancel_requested         bool default false
+  processor_charge_id      string nullable (filled at capture)
+  created_at               timestamptz
+  updated_at               timestamptz
+
+PaymentAttempt
+  attempt_id               UUID
+  intent_id                FK
+  attempt_number           int
+  started_at               timestamptz
+  completed_at             timestamptz nullable
+  processor_response_code  string
+  processor_response_body  jsonb
+
+AuditLog
+  intent_id                FK
+  from_state               enum
+  to_state                 enum
+  reason                   string
+  actor                    string (system, user, admin)
+  created_at               timestamptz
+</code></pre>
+<p>Indexes:
+- <code>(state, schedule_at)</code> — the sweeper query.
+- <code>(user_id, state)</code> — user views their scheduled payments.
+- <code>(idempotency_key, user_id)</code> unique — dedupe.</p>
+<p>Partitioning: by <code>hash(intent_id)</code> for the intent table. Audit log can partition by <code>created_at</code> (time-series).</p>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">POST /payments/schedule
+  Idempotency-Key: &lt;client-generated UUID&gt;
+  body: {
+    amount_cents, currency, payment_method_id, schedule_at, metadata
+  }
+  → 201 { intent_id, state: &quot;SCHEDULED&quot; }
+
+GET /payments/{intent_id}
+  → 200 { intent_id, state, attempts, last_error, ... }
+
+POST /payments/{intent_id}/cancel
+  → 200 { state: &quot;CANCELLED&quot; | &quot;EXECUTING with cancel_requested&quot; }
+  → 409 if terminal state already reached
+
+POST /webhooks/processor (internal endpoint)
+  body: { event_id, charge_id, status, ... }
+  → 200; deduplicated by event_id
+</code></pre>
+<h3 id="step-by-step-api-paths">Step-By-Step API Paths</h3>
+<p><strong>Schedule path — client commits to a future payment.</strong></p>
+<ol>
+<li>Client calls <code>POST /payments/schedule</code> with <code>Idempotency-Key</code> and an authenticated <code>user_id</code>.</li>
+<li>Schedule API validates amount, currency, method token, and that <code>schedule_at</code> is within the allowed future window.</li>
+<li>It starts a database transaction on shard <code>hash(intent_id)</code>: insert <code>PaymentIntent(state=SCHEDULED)</code>, insert the idempotency row, insert an outbox event <code>PaymentScheduled</code>.</li>
+<li>It starts <code>PaymentWorkflow:{intent_id}</code> in the durable execution platform with <code>{intent_id, schedule_at}</code>. If workflow start fails after DB commit, the outbox repair worker starts it from the durable row.</li>
+<li>It returns <code>{intent_id, state}</code>. Processor is not called on long delays; auth happens at execution unless the delay is inside the auth window and product explicitly wants a hold.</li>
+</ol>
+<p><strong>Execution path — workflow fires at T.</strong></p>
+<ol>
+<li>Workflow timer fires and invokes <code>ExecutePaymentActivity(intent_id)</code>.</li>
+<li>Activity reads <code>PaymentIntent</code> from shard <code>hash(intent_id)</code> and CASes <code>SCHEDULED -&gt; EXECUTING</code> or <code>RETRY_PENDING -&gt; EXECUTING</code>. If the CAS loses, the duplicate activity exits.</li>
+<li>In parallel, it loads the payment method token and risk flags; it does not call the processor until the state transition is durable.</li>
+<li>It calls the processor with idempotency key <code>intent_id:attempt_number</code>.</li>
+<li>Success transitions to <code>CAPTURED</code>, hard decline to <code>FAILED</code>, soft decline to <code>RETRY_PENDING</code> with <code>next_retry_at</code>, and timeout first queries the processor by idempotency key before choosing a transition.</li>
+<li>Terminal transitions insert an outbox event; Notifier and merchant-webhook consumers deliver at least once and dedupe by <code>(intent_id, event_type)</code>.</li>
+</ol>
+<p><strong>Cancel path — user races the executor.</strong></p>
+<ol>
+<li>Client calls <code>POST /payments/{intent_id}/cancel</code>.</li>
+<li>API routes to shard <code>hash(intent_id)</code> and reads the current state under CAS.</li>
+<li>If <code>SCHEDULED</code>, it transitions to <code>CANCELLED</code>, signals <code>PaymentWorkflow:{intent_id}</code> to stop, and emits <code>PaymentCancelled</code>.</li>
+<li>If <code>EXECUTING</code>, it sets <code>cancel_requested=true</code>; the workflow receives a signal but the processor call is not interrupted.</li>
+<li>If terminal, it returns the terminal state. Cursor or retry state is not client-owned; the server row is authoritative.</li>
+</ol>
+<p><strong>Webhook path — external processor catches up later.</strong></p>
+<ol>
+<li>Processor sends <code>event_id</code>, <code>charge_id</code>, status, and signature.</li>
+<li>Webhook Receiver verifies the signature, inserts <code>processor_event:{event_id}</code> with a 90-day TTL, and drops duplicates.</li>
+<li>It maps <code>charge_id</code> or processor idempotency key back to <code>intent_id</code> and signals the workflow.</li>
+<li>Workflow applies the same legal-transition table as the activity. Webhooks never bypass the state machine.</li>
+</ol>
+<p>Interview phrase:</p>
+<blockquote>
+<p>There are two durable sources of state: the payment intent row for domain truth, and the workflow state for timers and retries. The only safe bridge between them is <code>intent_id</code>, CAS transitions, and idempotency keys at every side-effect boundary.</p>
+</blockquote>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<ul>
+<li><strong>Schedule API</strong>: stateless; horizontal scale behind a load balancer.</li>
+<li><strong>Payment Intent Database</strong>: partition by <code>hash(intent_id)</code>. Hot user (someone scheduling thousands of payments) is rare; if it happens, sub-shard by user_id.</li>
+<li><strong>Workflow Engine / Scheduler</strong>: workflow id <code>PaymentWorkflow:{intent_id}</code> distributes timers by <code>hash(intent_id)</code> and by timer bucket. The payment team consumes this platform; it does not own the timer table.</li>
+<li><strong>Fallback Sweeper</strong>: only if no workflow platform exists. Partition by intent shard; each shard worker scans its own slice with leases.</li>
+<li><strong>Execution Worker</strong>: stateless; horizontal scale. Bottleneck is processor rate limits; coordinate with the processor on per-second caps and back off if hit.</li>
+<li><strong>Notifier</strong>: standard fan-out queue.</li>
+</ul>
+<p>The midnight-on-the-1st spike is real for subscription-billing workloads. Pre-warm executor capacity; smear scheduled times by adding a small per-user jitter at schedule time (e.g., 0-30 minute offset). The user agreed to "billed on the 1st," not "billed at 00:00:00 on the 1st."</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<ul>
+<li>Within the Payment Intent Database: strict serializable transactions for state transitions. Use row-level locks or optimistic CAS.</li>
+<li>Between Payment Intent Database and Payment Processor: eventually consistent, reconciled via webhooks plus the daily reconciliation pass.</li>
+<li>Between Payment Intent Database and Notifier: at-least-once via outbox pattern. The notifier consumer is idempotent (dedupes by <code>(intent_id, event_type)</code>).</li>
+</ul>
+<p>Strong consistency where it matters (your own state machine); eventual consistency where you have no choice (external processor).</p>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Effect</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scheduler down</td>
+<td>Payments not firing</td>
+<td>Multiple scheduler workers; lease-based ownership; alerts on <code>count(intents WHERE schedule_at &lt; now() AND state == SCHEDULED)</code>.</td>
+</tr>
+<tr>
+<td>Executor crashes mid-call</td>
+<td>Intent stuck in EXECUTING</td>
+<td>Idempotency key plus reconciliation; timeout on EXECUTING (say 5 min) flips it to RETRY_PENDING.</td>
+</tr>
+<tr>
+<td>Processor returns timeout</td>
+<td>Outcome unknown</td>
+<td>Treat as soft error; do NOT retry blindly. Query the processor (<code>GET /charges/{idempotency_key}</code>) to learn the actual outcome before deciding next action.</td>
+</tr>
+<tr>
+<td>Webhook lost</td>
+<td>Local state stale</td>
+<td>Reconciliation pass catches it; processor's own retry policy covers transient drops.</td>
+</tr>
+<tr>
+<td>Double webhook delivery</td>
+<td>Risk of double state update</td>
+<td>Webhook receiver dedupes on event_id.</td>
+</tr>
+<tr>
+<td>Card expired between schedule and execute</td>
+<td>Hard decline at T</td>
+<td>Notify user with actionable message ("Update payment method"); FAILED state; for recurring, pause the subscription.</td>
+</tr>
+<tr>
+<td>Clock skew on scheduler workers</td>
+<td>Payments fire early or late</td>
+<td>Use a Network Time Protocol (NTP)-disciplined clock; sweeper relies on database <code>now()</code>, not worker local time.</td>
+</tr>
+<tr>
+<td>Massive scheduled spike (everyone billed at 00:00)</td>
+<td>Executor overload, processor rate limit</td>
+<td>Smear scheduled times with per-intent jitter; rate-limit executor; queue overflow with backpressure.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="graceful-degradation-state-table">Graceful Degradation State Table</h3>
+<p>This system should degrade by moving to slower, more explicit states instead of guessing about money movement.</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source of truth</th>
+<th>User-visible latency budget</th>
+<th>Fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Normal scheduled</td>
+<td>Workflow timer owns wakeup</td>
+<td>Intent row + workflow state</td>
+<td>Fire within 60s p99 of <code>schedule_at</code></td>
+<td>None.</td>
+</tr>
+<tr>
+<td>Workflow timer late</td>
+<td>Overdue but not executing</td>
+<td>Intent row <code>state=SCHEDULED</code>, workflow metrics</td>
+<td>Up to 5 min before alerting</td>
+<td>Repair worker scans <code>(state, schedule_at)</code> index and starts / signals missing workflow.</td>
+</tr>
+<tr>
+<td>Processor timeout</td>
+<td>Outcome unknown</td>
+<td>Processor query by idempotency key</td>
+<td>User sees "processing" for minutes, not success/fail</td>
+<td>Do not retry blindly; reconcile processor outcome, then transition.</td>
+</tr>
+<tr>
+<td>Webhook missing</td>
+<td>Local state stale for async rails</td>
+<td>Processor API + reconciliation job</td>
+<td>Hours for ACH-like rails; seconds for card auth/capture</td>
+<td>Hourly reconciliation for recent intents; daily full diff.</td>
+</tr>
+<tr>
+<td>Retry budget active</td>
+<td>Soft-decline recovery</td>
+<td>Intent row <code>RETRY_PENDING(next_retry_at)</code></td>
+<td>24-72h depending on policy</td>
+<td>Notify user after first failure; stop after finite attempts.</td>
+</tr>
+<tr>
+<td>Database primary failover</td>
+<td>State machine unavailable</td>
+<td>Replicated DB quorum</td>
+<td>API returns retryable 503 for schedule/cancel under seconds-to-minutes failover</td>
+<td>No processor calls without a successful CAS.</td>
+</tr>
+</tbody>
+</table>
+<p>Interview phrase:</p>
+<blockquote>
+<p>When money outcome is unknown, the system must choose a visible pending state and reconcile; it should never invent success or retry a processor call just because our worker timed out.</p>
+</blockquote>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Alert on:</p>
+<ul>
+<li>Count of intents with <code>schedule_at &lt; now() - 60s AND state == SCHEDULED</code> (sweeper falling behind).</li>
+<li>Count of intents stuck in EXECUTING for &gt; 5 min (executor hung).</li>
+<li>Hard decline rate per processor per hour (processor degradation).</li>
+<li>Soft decline rate (signal of fraud or processor issues).</li>
+<li>Reconciliation discrepancies per day.</li>
+<li>Webhook delivery latency p99.</li>
+</ul>
+<p>Log without alerting:</p>
+<ul>
+<li>Cancellation race occurrences (rare, but each one is a UX education moment).</li>
+<li>Auto-refund count from late cancels.</li>
+<li>Per-payment-method success rates.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<p>Most payment systems are single-region (or active-passive) because:</p>
+<ul>
+<li>Payment processors are typically per-region or country-scoped.</li>
+<li>Regulatory rules (Payment Card Industry Data Security Standard — PCI-DSS, General Data Protection Regulation — GDPR) restrict cross-region replication of cardholder data.</li>
+<li>The throughput is well within a single region's capacity.</li>
+</ul>
+<p>Default: single-region primary with a hot standby in another region; failover requires synchronizing the Payment Intent Database. Use a globally distributed database (Spanner, CockroachDB) only if the product truly serves multiple regions with per-region payment processors.</p>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li><strong>Auth at scheduling vs auth at execution</strong>: auth at scheduling catches bad cards early, but the hold expires for any delay over 7 days. Auth at execution is simpler but surfaces failures only at T.</li>
+<li><strong>Strict scheduling cutoff vs late cancellation with auto-refund</strong>: cutoff is simpler UX, auto-refund preserves user trust at higher operational cost.</li>
+<li><strong>Single processor vs multiple processors</strong>: single is simpler; multiple gives fallback and price arbitrage but adds reconciliation complexity per processor.</li>
+<li><strong>Synchronous Schedule API vs Async</strong>: synchronous is simpler for the client; async lets the API absorb spike load via queue but complicates UX.</li>
+<li><strong>Retry generously vs retry cautiously</strong>: generous retries hide transient issues; cautious retries respect user (a card declined three times in a row is annoying). Per-processor-response-code policy is the right answer.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<ul>
+<li><strong>Forgetting the auth window</strong>. Strong candidates mention the 7-day card auth limit immediately.</li>
+<li><strong>No idempotency at every layer</strong>. Either the schedule call, the executor → processor call, or the webhook handling will be the duplicate source.</li>
+<li><strong>Killing in-flight processor calls on cancellation</strong>. Creates orphans.</li>
+<li><strong>Treating webhooks as authoritative</strong>. They are at-least-once and may be lost; reconciliation is what makes the system correct.</li>
+<li><strong>Ignoring the midnight spike</strong>. Scheduled payments cluster; smear them.</li>
+<li><strong>Skipping reconciliation</strong>. Every senior interviewer will probe for it; mention it before they ask.</li>
+<li><strong>Promising exact-time execution</strong>. Processors and networks have variance; commit to "within 60 seconds at p99," not "at the exact second."</li>
+</ul>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<ul>
+<li><strong>Buy Now Pay Later (BNPL)</strong>: how to model installments (multiple intents linked to one purchase), what happens when one installment fails, how to terminate the whole plan vs retry the failed installment.</li>
+<li><strong>Recurring subscriptions</strong>: how to model "every month on the 5th"; what to do when the 5th does not exist (February); proration on plan changes.</li>
+<li><strong>Soft-decline retry strategy</strong>: which processor codes are retryable, exponential backoff with jitter, when to mark FAILED.</li>
+<li><strong>Dunning</strong>: the email/notification campaign when a recurring payment fails — how to back off the customer relationship vs the actual charge attempts.</li>
+<li><strong>Multi-currency</strong>: lock in the exchange rate at scheduling, or at execution? Tradeoff: rate certainty vs Foreign Exchange (FX) risk on the merchant.</li>
+<li><strong>Compliance</strong>: how does PCI-DSS scoping change the architecture? Tokenized payment methods so card numbers never touch your servers.</li>
+<li><strong>Distributed scheduling at scale</strong>: how does a sweeper handle hundreds of millions of intents; sub-second granularity; cross-shard rebalancing.</li>
+</ul>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Stated the invariant: exactly one terminal outcome per scheduled payment.</li>
+<li>Designed the state machine and named the legal transitions.</li>
+<li>Identified the three idempotency layers (schedule, execute, webhook).</li>
+<li>Picked a scheduling strategy with justification (default: time-sorted sweeper).</li>
+<li>Picked a scheduling strategy with justification (default: durable workflow engine; fallback: time-sorted sweeper).</li>
+<li>Addressed the authorization window problem (7-day card auth) and picked an auth strategy.</li>
+<li>Designed the retry policy (soft vs hard decline, jittered backoff, retry budget).</li>
+<li>Resolved the cancellation race (never interrupt in-flight processor call).</li>
+<li>Included a reconciliation pass and explained why it is mandatory.</li>
+<li>Operational metrics with concrete alert thresholds.</li>
+<li>Multi-region position (usually single-region with hot standby).</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>"The state machine is the design. Everything else — scheduler, executor, webhooks, reconciliation — is plumbing that keeps the state machine honest. The hardest correctness problem is the cancellation race, which I solve by never interrupting in-flight processor calls and treating cancellation as an async request that takes effect at safe transitions. The hardest practical problem is the 7-day card auth window, which forces me to either auth at execution time or re-auth before capture."</p>
+</blockquote>
+<hr />
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design a delayed payment system.</p>
+<p><strong>Candidate:</strong> I will design it as a payment intent with a strict state machine, backed by a durable database, with a scheduler that fires at the intended execution time and an executor that calls the payment processor with idempotency. The interesting decisions are around the gap between scheduling time and execution time — auth holds expire, cards expire, the user may cancel, the processor may fail. I will clarify requirements, walk the state machine, and dive into retries and the cancellation race.</p>
+<p><strong>Interviewer:</strong> What's the maximum delay you'd support?</p>
+<p><strong>Candidate:</strong> Up to a year, for annual subscription renewals. The longer the delay, the more state can change between scheduling and execution. Specifically, card auth holds expire after about seven days on Visa and Mastercard, so for anything past a week I cannot rely on an upfront auth — I have to authorize at execution time. This is the single biggest constraint shaping the design.</p>
+<p><strong>Interviewer:</strong> How does the scheduler work?</p>
+<p><strong>Candidate:</strong> I default to a durable workflow engine such as Temporal or Step Functions, because "sleep until T, survive crashes, receive cancellation signals, and retry activities" is generic infrastructure. The payment service starts <code>PaymentWorkflow:{intent_id}</code> with <code>schedule_at</code>; the workflow sleeps until T and invokes <code>ExecutePaymentActivity</code>. The intent row still has <code>(state, schedule_at)</code> so a repair worker can find missing or overdue workflows. If the company has no workflow platform, then I fall back to a time-sorted sweeper over that same index, but I would call out that I'm now designing scheduler infrastructure, not just payments.</p>
+<p><strong>Interviewer:</strong> What's the state machine?</p>
+<p><strong>Candidate:</strong> SCHEDULED, EXECUTING, RETRY_PENDING, CAPTURED, FAILED, CANCELLED. SCHEDULED is the initial state, cancellable. EXECUTING is when the executor is actively calling the processor, not cancellable in the normal sense — cancellation becomes a request that is honored after the processor call completes. RETRY_PENDING is for soft declines that should retry later. CAPTURED, FAILED, CANCELLED are terminal. Illegal transitions are rejected at the database level with a row constraint, not just in application code.</p>
+<p><strong>Interviewer:</strong> Walk me through what happens at execution time.</p>
+<p><strong>Candidate:</strong> The sweeper picks up an intent whose <code>schedule_at</code> has passed and dispatches an executor task. The executor first transitions the row from SCHEDULED to EXECUTING using a compare-and-swap — if that fails, another executor already has it, so this one drops the task. Then it computes the processor idempotency key as <code>intent_id:attempt_number</code> and calls the processor's authorize-and-capture endpoint. The processor responds with success, soft decline, hard decline, or timeout. On success, transition to CAPTURED; on hard decline, transition to FAILED; on soft decline, transition to RETRY_PENDING with the next retry scheduled. On timeout, the executor must NOT retry blindly — it queries the processor by idempotency key to learn the actual outcome, then transitions accordingly. After the terminal transition, it emits a notification event.</p>
+<p><strong>Interviewer:</strong> What if the user cancels right when the scheduler fires?</p>
+<p><strong>Candidate:</strong> This is the cancellation race and it's the hardest correctness problem. The rule: cancellation is an async request that takes effect at safe state transitions. If the row is SCHEDULED, compare-and-swap to CANCELLED — done. If the row is EXECUTING, write <code>cancel_requested = true</code> on the row but DO NOT interrupt the in-flight processor call. When the executor finishes, it checks the flag: if the processor captured successfully, the state goes to CAPTURED and then we auto-issue a refund and notify the user that their late cancel was honored as a refund; if the processor failed, the state goes to CANCELLED, the cancel won the race. The reason for never interrupting the processor call is that interrupting it creates orphan charges — the processor captured but our local state has no record. Better to let it complete and reconcile.</p>
+<p><strong>Interviewer:</strong> How do you handle the card auth window?</p>
+<p><strong>Candidate:</strong> Default is to auth at execution time, not at scheduling time. Card auths only hold for about seven days, so for any longer delay I can't rely on a pre-auth. The cost is that bad cards surface only at execution, not at scheduling — the user doesn't know until T that their card is expired. For high-value payments I'd add a re-auth-at-T-minus-X-hours step that does a small auth to verify the card still works, with the actual capture at T. For ACH there's no auth concept at all; you initiate and learn the outcome days later through a webhook.</p>
+<p><strong>Interviewer:</strong> Retry policy?</p>
+<p><strong>Candidate:</strong> Three attempts over 72 hours by default — T, T+24h, T+72h — with jitter. Retry only on processor-classified soft declines like insufficient funds or network blips. Hard declines like a stolen card go straight to FAILED. The retry counter lives on the intent row, and each attempt uses <code>intent_id:attempt_n</code> as the processor idempotency key so the processor knows attempts are distinct. After the retry budget is exhausted, transition to FAILED and notify.</p>
+<p><strong>Interviewer:</strong> What if a webhook from the processor gets lost?</p>
+<p><strong>Candidate:</strong> The system can't rely solely on webhooks for correctness. A daily reconciliation job pulls intents in non-terminal states and intents that recently changed state, fetches the processor's view via its API, and resolves any disagreement. Webhooks are at-least-once and may be lost in transit; reconciliation is what makes the system actually correct. I'd flag the existence of this job up front — it's the thing that separates a textbook design from a production payment system.</p>
+<p><strong>Interviewer:</strong> What about the midnight-on-the-1st spike?</p>
+<p><strong>Candidate:</strong> Subscriptions cluster. The user's contract says "billed on the 1st of the month," not "billed at 00:00:00 on the 1st." So at scheduling time I add a per-user jitter of zero to thirty minutes. The spike smears across half an hour, executor capacity stays sane, the processor doesn't rate-limit me. Pre-warm executors before the predictable spike windows.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Default is single-region with a hot standby in another region. Payment processors are typically per-region, and cardholder data regulations like Payment Card Industry Data Security Standard restrict cross-region replication. Most products serve one region's payment rail anyway. If the product needs true multi-region — say, a global marketplace — I'd use a globally distributed database for the intent table and pick a processor in each region, but the operational complexity is high and most products don't need it.</p>
+<p><strong>Interviewer:</strong> Summarize the design.</p>
+<p><strong>Candidate:</strong> Payment intent with a six-state machine, persisted in a durable database that's the source of truth. A durable workflow engine owns timers, retries, and cancellation signals; the execution activity calls the processor with layered idempotency keys. Webhooks plus reconciliation keep local state in sync with processor reality. Cancellation never interrupts an in-flight processor call. Auth happens at execution time for long delays. Retries are jittered with a fixed budget. The whole design accepts that the source of truth for what happened to the money is the processor, and the intent database is our best understanding of it, reconciled continuously.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: max delay, payment methods, cancellation rules, recurring or one-shot, notification surface.</li>
+<li>State the invariant: exactly one terminal outcome per scheduled payment.</li>
+<li>Draw the state machine: SCHEDULED, EXECUTING, RETRY_PENDING, CAPTURED, FAILED, CANCELLED.</li>
+<li>Pick scheduling strategy (time-sorted sweeper) with justification.</li>
+<li>Address auth window: authorize at execution time for delays past 7 days.</li>
+<li>Walk execution: CAS to EXECUTING, processor call with idempotency key, transition to terminal state.</li>
+<li>Resolve cancellation race: cancel is async, never interrupt in-flight processor call.</li>
+<li>Retry policy: jittered, soft-decline-only, finite budget.</li>
+<li>Reconciliation: daily pass, source of truth is processor, intent DB is our model of it.</li>
+<li>Close with metrics (sweeper lag, stuck-in-EXECUTING, reconciliation discrepancies).</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>A delayed payment system is a state machine that has to survive everything that can happen between scheduling and execution. The state machine is the design; the rest — scheduler, executor, webhooks, reconciliation — is plumbing that keeps the state machine honest. The hard problems are the auth window, the cancellation race, and webhook loss. I solve them with auth-at-execution by default, never interrupting in-flight calls, and a daily reconciliation pass that treats the processor as the source of truth for money that actually moved.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"The state machine is the design."</li>
+<li>"Never interrupt an in-flight processor call to honor a cancellation — that creates orphans."</li>
+<li>"Auth holds expire in seven days; any longer delay forces auth-at-execution."</li>
+<li>"Webhooks are at-least-once and lossy; reconciliation is what makes the system correct."</li>
+<li>"The processor is the source of truth for money; the intent DB is our model of it."</li>
+<li>"Three idempotency layers: schedule, execute, webhook. Miss any one and you double-charge."</li>
+<li>"Smear the midnight spike with per-user scheduling jitter; the user agreed to 'on the 1st,' not 'at 00:00:00.'"</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

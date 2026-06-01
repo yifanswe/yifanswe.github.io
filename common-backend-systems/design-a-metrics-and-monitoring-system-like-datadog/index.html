@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design a Metrics and Monitoring System Like Datadog — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design a Metrics and Monitoring System Like Datadog</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A metrics platform ingests time-series data from millions of hosts and serves dashboards and alerts. The hard part is the cardinality explosion (metric × dimensions × hosts), efficient storage, low-latency queries over long ranges, and reliable alert evaluation.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every metric data point sent to the system is durably stored within bounded latency, retained according to retention policy, queryable by metric name and tag filters across configured time ranges, and used in alert evaluation that fires reliably within the alert's evaluation window.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design time-series ingestion at scale, downsampling and retention, query engine for aggregations across high-cardinality tag spaces, alert evaluation, and reason about cardinality control.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design the metrics system as three planes: ingestion that receives metric data points and writes them to time-series storage, storage that is column-oriented and downsampled over retention tiers, and query/alert that evaluates dashboards and alert rules. The interesting decisions are cardinality control, downsampling strategy, query latency over long ranges, and alert evaluation reliability.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Hosts and services emit metrics (counters, gauges, histograms, distributions).</li>
+<li>Metrics tagged with dimensions (host, service, region, etc.).</li>
+<li>Dashboards query metrics across time ranges.</li>
+<li>Alert rules: threshold, anomaly, rate-of-change.</li>
+<li>Notifications when alerts fire.</li>
+<li>Logs and traces (often integrated; we focus on metrics).</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Ingest millions of data points per second.</li>
+<li>Query latency: dashboards under a second; long-range queries seconds.</li>
+<li>Retention: high-resolution recent (1s/10s), downsampled long-term (5min, 1h).</li>
+<li>Alert evaluation: every minute typically.</li>
+<li>Multi-region.</li>
+<li>Auditability for alert state and silences.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Log management (similar but distinct).</li>
+<li>APM tracing.</li>
+<li>RUM and synthetic monitoring.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hosts</td>
+<td>100k+ per large customer; millions across customers.</td>
+</tr>
+<tr>
+<td>Metrics per host</td>
+<td>Hundreds to thousands.</td>
+</tr>
+<tr>
+<td>Data points/sec</td>
+<td>10M+ per cluster.</td>
+</tr>
+<tr>
+<td>Cardinality</td>
+<td>Hundreds of millions of unique time-series.</td>
+</tr>
+<tr>
+<td>Retention</td>
+<td>15 months typical, with downsampling.</td>
+</tr>
+<tr>
+<td>Query QPS</td>
+<td>Thousands.</td>
+</tr>
+<tr>
+<td>Alert rules</td>
+<td>Thousands per customer; tens of millions across customers.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is cardinality combined with long-range queries and reliable alert evaluation under churn.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Purpose</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ingestion</td>
+<td>Receive metric points; deduplicate; route.</td>
+<td>High throughput.</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Persistent time-series; downsampled tiers.</td>
+<td>Compressed; queryable.</td>
+</tr>
+<tr>
+<td>Query engine</td>
+<td>Aggregate, filter, range query.</td>
+<td>Sub-second for dashboards.</td>
+</tr>
+<tr>
+<td>Alert engine</td>
+<td>Evaluate alert rules; fire notifications.</td>
+<td>Reliable; bounded eval lag.</td>
+</tr>
+<tr>
+<td>Notification</td>
+<td>Page on-call.</td>
+<td>Reuse notification system.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Hosts/Agents --metrics--&gt; Ingestion Gateway
+                                 |
+                                 v
+                        +------------------+
+                        | Buffer / Kafka   |
+                        +--------+---------+
+                                 |
+                                 v
+                        +------------------+
+                        | Writer / Indexer |
+                        +--------+---------+
+                                 |
+              +------------------+------------------+
+              |                                     |
+              v                                     v
+     +-----------------+                  +-----------------+
+     | TSDB (recent)   |                  | Downsample tier |
+     | per-host shards |                  | aggregated      |
+     +--------+--------+                  +--------+--------+
+              |                                    |
+              v                                    v
+     +-----------------+                  +-----------------+
+     | Query Engine    |&lt;-----------------+ Cold storage    |
+     +--------+--------+                  +-----------------+
+              |
+              v
+     Dashboards + Alerts
+              |
+              v
+     +-----------------+
+     | Alert Engine    |
+     | + Notification  |
+     +-----------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Agent</td>
+<td>Runs on host; collects metrics; ships to ingestion.</td>
+<td>Lightweight; aggregates locally.</td>
+</tr>
+<tr>
+<td>Ingestion gateway</td>
+<td>Receives bursts; auth; rate-limit; route.</td>
+<td>Stateless; horizontal.</td>
+</tr>
+<tr>
+<td>Buffer</td>
+<td>Durable queue between ingestion and storage.</td>
+<td>Kafka-like.</td>
+</tr>
+<tr>
+<td>Writer</td>
+<td>Writes time-series to TSDB.</td>
+<td>Sharded by metric + tag hash.</td>
+</tr>
+<tr>
+<td>Index</td>
+<td>Tag-based search: tags → time-series IDs.</td>
+<td>Inverted index.</td>
+</tr>
+<tr>
+<td>TSDB</td>
+<td>Time-series database.</td>
+<td>Columnar; compressed.</td>
+</tr>
+<tr>
+<td>Downsampler</td>
+<td>Rolls up to longer time buckets.</td>
+<td>Lower resolution for older data.</td>
+</tr>
+<tr>
+<td>Query engine</td>
+<td>Parses query; fetches series; aggregates; returns.</td>
+<td>Distributed.</td>
+</tr>
+<tr>
+<td>Alert engine</td>
+<td>Evaluates alert rules on schedule.</td>
+<td>Reliable; replay-safe.</td>
+</tr>
+<tr>
+<td>Dashboard service</td>
+<td>UI for graphs and tables.</td>
+<td>Caches query results.</td>
+</tr>
+<tr>
+<td>Notification service</td>
+<td>Pages on-call.</td>
+<td>Reuse separate system.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="metric-time-series">Metric Time-Series</h4>
+<pre><code class="language-text">TimeSeries(
+  series_id,                // hash of (metric_name, tag_set)
+  metric_name,
+  tag_set: {key: value, ...},
+  type,                     // counter, gauge, histogram, distribution
+  data_points: [(ts, value, ...)]
+)
+</code></pre>
+<p>A data point is <code>(timestamp, value)</code>. Histograms and distributions have multiple values (buckets) per point.</p>
+<h4 id="tag-index">Tag Index</h4>
+<pre><code class="language-text">TagPosting(
+  tag_key,
+  tag_value,
+  series_ids: [series_id]
+)
+</code></pre>
+<p>For query "metric X where region=us-east": look up <code>region=us-east</code> posting, intersect with metric_name index.</p>
+<h4 id="alert-rule">Alert Rule</h4>
+<pre><code class="language-text">AlertRule(
+  rule_id,
+  name,
+  query,                    // metric query + threshold
+  evaluation_interval,
+  for_duration,             // alert fires only if condition true for X
+  thresholds,
+  notification_targets,
+  silence_windows,
+  state,                    // pending, alerting, ok, silenced
+  version
+)
+</code></pre>
+<h4 id="alert-event">Alert Event</h4>
+<pre><code class="language-text">AlertEvent(
+  event_id,
+  rule_id,
+  state_change,             // ok -&gt; alerting
+  evaluated_at,
+  trigger_value,
+  metadata
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text"># Ingestion
+POST /api/v1/metrics
+Body: [
+  { metric, points: [(ts, value)], tags },
+  ...
+]
+
+# Query
+GET /api/v1/query?expr=&amp;from=&amp;to=&amp;interval=
+GET /api/v1/series?match=&amp;from=&amp;to=        # discover series
+
+# Alerts
+POST /api/v1/alerts/rules
+GET  /api/v1/alerts/state
+POST /api/v1/alerts/silences
+</code></pre>
+<h3 id="ingestion-pipeline">Ingestion Pipeline</h3>
+<ol>
+<li>Agent on host batches metrics every 10s, sends to ingestion gateway over HTTP/2 or gRPC.</li>
+<li>Gateway authenticates customer, rate-limits, validates schema.</li>
+<li>Writes to Kafka-like buffer for durability.</li>
+<li>Writer consumes; for each data point:
+   - Compute <code>series_id = hash(metric_name, sorted_tag_set)</code>.
+   - Append point to series.
+   - Update tag index if series is new.</li>
+<li>Writer is sharded by <code>series_id</code> so each writer handles a subset.</li>
+</ol>
+<h3 id="storage">Storage</h3>
+<p>TSDB is columnar and compressed:</p>
+<ul>
+<li>Time-series data is highly compressible: delta encoding for timestamps, Gorilla-style float compression for values.</li>
+<li>Per-series compaction over time.</li>
+<li>Indexed by series_id + time block.</li>
+</ul>
+<p>Storage tiers:</p>
+<ul>
+<li><strong>Hot (recent days):</strong> high-resolution (1-10 second), in-memory or SSD.</li>
+<li><strong>Warm (recent months):</strong> lower resolution (1-5 minute), local disk.</li>
+<li><strong>Cold (long-term):</strong> hour-aggregated, object storage.</li>
+</ul>
+<p>Downsampler runs periodically to roll up older data to lower resolutions.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Time-series compression is the secret weapon. Gorilla-style encoding gives 10-50x compression on typical metrics. Downsampling extends retention without exploding storage.</p>
+</blockquote>
+<h3 id="cardinality-control">Cardinality Control</h3>
+<p>Cardinality = number of unique time-series. Adding a high-cardinality tag (like <code>user_id</code>) explodes cardinality and storage.</p>
+<p>Controls:</p>
+<ul>
+<li>Per-customer cardinality budget; alert and throttle when exceeded.</li>
+<li>Tag whitelist/blacklist.</li>
+<li>Allowlist for high-cardinality tags requiring approval.</li>
+<li>Automatic cardinality detection: alert on metrics with rising cardinality.</li>
+</ul>
+<p>The hardest production problem in metrics systems is cardinality explosion. A customer adding <code>user_id</code> to a counter can blow up the storage cost overnight.</p>
+<h3 id="query-engine">Query Engine</h3>
+<p>Query language like PromQL or Datadog's: <code>avg(rate(http_requests{service="api"}[5m]))</code>.</p>
+<p>Execution:</p>
+<ol>
+<li>Parse query AST.</li>
+<li>Resolve series matching tag filters: tag index lookup.</li>
+<li>For each matching series, fetch data points in the time range.</li>
+<li>Apply functions (rate, avg, sum, max).</li>
+<li>Group by specified dimensions.</li>
+<li>Return time-series result.</li>
+</ol>
+<p>Optimizations:</p>
+<ul>
+<li>Pre-aggregate common rollups.</li>
+<li>Cache query results.</li>
+<li>Parallelize across series shards.</li>
+<li>Distributed query plan for large ranges.</li>
+</ul>
+<p>For long-range queries (15 months), use downsampled tier; for recent ranges, use high-resolution.</p>
+<h3 id="alert-engine">Alert Engine</h3>
+<p>Each alert rule has an evaluation interval (e.g., every minute).</p>
+<ol>
+<li>Scheduler triggers rule evaluation.</li>
+<li>Query engine evaluates the rule's expression for the eval window.</li>
+<li>Compare result to threshold.</li>
+<li>Update rule state:
+   - <code>ok -&gt; pending</code> if threshold crossed.
+   - <code>pending -&gt; alerting</code> after <code>for_duration</code> of sustained alerting.
+   - <code>alerting -&gt; ok</code> when threshold no longer crossed.</li>
+<li>On state change, emit alert event.</li>
+<li>Notification service pages on-call.</li>
+</ol>
+<p>Reliability:</p>
+<ul>
+<li>Alert evaluation must not silently fail.</li>
+<li>Per-rule heartbeat; alert if rule hasn't evaluated in N intervals.</li>
+<li>Idempotent evaluation; replay-safe.</li>
+<li>Backfill on evaluator outage to catch missed firings.</li>
+</ul>
+<p>Silences:</p>
+<ul>
+<li>Per-rule silence windows.</li>
+<li>Maintenance mode.</li>
+<li>Suppress notifications without losing state.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>An alert that doesn't fire is a worse bug than a false alarm. Alert evaluation must heartbeat and self-monitor.</p>
+</blockquote>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Time-series data</td>
+<td><code>series_id</code> hash</td>
+<td>Spread writes; localize reads.</td>
+</tr>
+<tr>
+<td>Tag index</td>
+<td><code>(tag_key, tag_value)</code> hash</td>
+<td>Series lookup.</td>
+</tr>
+<tr>
+<td>Alert rules</td>
+<td><code>rule_id</code> hash</td>
+<td>Independent eval.</td>
+</tr>
+<tr>
+<td>Alert state</td>
+<td><code>rule_id</code> hash</td>
+<td>State transitions.</td>
+</tr>
+<tr>
+<td>Customer config</td>
+<td><code>customer_id</code> hash</td>
+<td>Tenancy.</td>
+</tr>
+</tbody>
+</table>
+<p>Hot metric (high write rate): single-series throughput is a bottleneck; partition by adding shard tag if needed.</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ingestion</td>
+<td>Durable to buffer; eventually written</td>
+<td>Bounded lag.</td>
+</tr>
+<tr>
+<td>Time-series storage</td>
+<td>Eventually consistent</td>
+<td>Acceptable for monitoring.</td>
+</tr>
+<tr>
+<td>Tag index</td>
+<td>Eventually consistent</td>
+<td>Series discovery.</td>
+</tr>
+<tr>
+<td>Alert state</td>
+<td>Strong (CAS on transitions)</td>
+<td>Avoid double-fire.</td>
+</tr>
+<tr>
+<td>Alert evaluation</td>
+<td>Strong per rule</td>
+<td>Reliable.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Per-region ingestion and storage; metrics generally consumed where generated.</li>
+<li>Cross-region query federation for global dashboards.</li>
+<li>Alert evaluation region-local; cross-region for global alerts.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ingestion overload.</td>
+<td>Rate-limit per customer; buffer absorbs.</td>
+<td>Buffer depth.</td>
+</tr>
+<tr>
+<td>Cardinality explosion.</td>
+<td>Per-customer budget; alert; throttle.</td>
+<td>Cardinality growth.</td>
+</tr>
+<tr>
+<td>Hot series.</td>
+<td>Add shard tag; pre-aggregate.</td>
+<td>Per-series write rate.</td>
+</tr>
+<tr>
+<td>Query timeout.</td>
+<td>Fall back to downsampled tier; partial result.</td>
+<td>Query p99.</td>
+</tr>
+<tr>
+<td>Alert evaluator outage.</td>
+<td>Heartbeat; backfill on recovery.</td>
+<td>Eval lag.</td>
+</tr>
+<tr>
+<td>Notification flap.</td>
+<td>Hysteresis (for_duration); silences.</td>
+<td>Flap count.</td>
+</tr>
+<tr>
+<td>Storage growth.</td>
+<td>Downsampling; retention enforcement.</td>
+<td>Storage per customer.</td>
+</tr>
+<tr>
+<td>Tag index hot key.</td>
+<td>Cache; partition further.</td>
+<td>Hot key QPS.</td>
+</tr>
+<tr>
+<td>Cross-region query lag.</td>
+<td>Federate with bounded staleness.</td>
+<td>Federation latency.</td>
+</tr>
+<tr>
+<td>Agent crash on host.</td>
+<td>Heartbeat detect; alert.</td>
+<td>Agent absence.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Lost data points (must be ~zero).</li>
+<li>Alert evaluation lag.</li>
+<li>Cardinality growth.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Ingest QPS by customer.</li>
+<li>Query p99.</li>
+<li>Storage growth.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Active metrics per customer.</li>
+<li>Alert firings.</li>
+<li>Dashboard usage.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Higher resolution costs more storage; downsampling extends retention but loses detail.</li>
+<li>Pre-aggregating rollups speeds queries but adds write work.</li>
+<li>Strict cardinality limits help cost but frustrate customers.</li>
+<li>Async ingestion improves throughput but adds query lag.</li>
+<li>Alert evaluation interval tunes responsiveness vs cost.</li>
+<li>Long for_duration reduces flap but delays notification.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Row-based time-series storage.</td>
+<td>Columnar with compression.</td>
+</tr>
+<tr>
+<td>Storing every data point forever.</td>
+<td>Downsampling tiers.</td>
+</tr>
+<tr>
+<td>Single eval thread for all alerts.</td>
+<td>Distributed eval; sharded.</td>
+</tr>
+<tr>
+<td>Ignore cardinality.</td>
+<td>Budget; alert; throttle.</td>
+</tr>
+<tr>
+<td>Synchronous ingest.</td>
+<td>Buffer + async writer.</td>
+</tr>
+<tr>
+<td>One global query engine.</td>
+<td>Sharded; federated.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Time-series storage</td>
+<td>Columnar + Gorilla compression + downsampling.</td>
+</tr>
+<tr>
+<td>Cardinality</td>
+<td>Per-tenant budgets; high-card tag detection.</td>
+</tr>
+<tr>
+<td>Query engine</td>
+<td>Distributed; parallel; partial results.</td>
+</tr>
+<tr>
+<td>Alert reliability</td>
+<td>Heartbeat; backfill; replay-safe.</td>
+</tr>
+<tr>
+<td>Tag index</td>
+<td>Inverted; sharded.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Per-region storage; federated query.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Ingestion → buffer → writer → TSDB.</li>
+<li>Columnar storage with Gorilla compression.</li>
+<li>Downsampling tiers for retention.</li>
+<li>Tag-based inverted index.</li>
+<li>Alert engine with heartbeat.</li>
+<li>Cardinality control.</li>
+<li>Multi-region with federation.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>A metrics platform is high-throughput time-series ingest plus a columnar compressed store plus an alert engine. The dominant scaling problem is cardinality — adding a high-cardinality tag can explode storage cost. Downsampling extends retention. Alert evaluation must heartbeat because a silent alert failure is worse than a false alarm.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Datadog metrics.</p>
+<p><strong>Candidate:</strong> Three planes: ingestion that receives metric data points from agents and writes durably; storage that is columnar with downsampling tiers; query/alert that evaluates dashboards and alert rules. Invariant: every data point durable; queryable; alerts reliable. The hardest problem is cardinality combined with long-range queries.</p>
+<p><strong>Interviewer:</strong> How is data stored?</p>
+<p><strong>Candidate:</strong> Per-series time-ordered points. Series_id is a hash of metric_name + sorted tag_set. Storage is columnar — timestamps and values stored separately, both compressed with Gorilla-style encoding for 10-50x reduction. Compaction merges segments over time. Tiered: hot (1-10s resolution, in-memory/SSD), warm (1-5 min, local disk), cold (1 hour, object storage). Downsampler rolls up periodically.</p>
+<p><strong>Interviewer:</strong> Cardinality explosion?</p>
+<p><strong>Candidate:</strong> The biggest production issue. Adding a <code>user_id</code> tag to a counter can blow up storage. Defenses: per-customer cardinality budget; alert when exceeded; throttle ingestion if needed. Tag allowlist/blocklist. Cardinality detection: a metric whose unique series count is rising fast triggers alarms. Customer-facing tools to show high-cardinality offenders.</p>
+<p><strong>Interviewer:</strong> Query — <code>avg(rate(http_requests{service="api"}[5m]))</code>.</p>
+<p><strong>Candidate:</strong> Parse the AST. Resolve <code>service="api"</code> from the tag index to get matching series. For each series, fetch data points for the requested window. Apply rate() per series (delta over time). Apply avg() across series. Return result series. Parallelized across series shards. For long ranges, use the downsampled tier automatically.</p>
+<p><strong>Interviewer:</strong> Alert evaluation?</p>
+<p><strong>Candidate:</strong> Scheduler runs each rule per its eval interval (typically every minute). For each rule, query engine evaluates the expression for the eval window. Compare to threshold. State machine: ok → pending (when crossed) → alerting (after for_duration sustained) → ok. On state change, emit event; notification service pages on-call. Each rule heartbeats; if a rule hasn't evaluated in N intervals, we alert about the evaluator. Replay-safe: re-running an interval doesn't double-fire.</p>
+<p><strong>Interviewer:</strong> Why heartbeat?</p>
+<p><strong>Candidate:</strong> A silent alert failure is the worst outcome. If the evaluator dies and we don't know, on-call has no signal about real production issues. Heartbeating ensures we detect evaluator death; backfill on recovery catches missed firings.</p>
+<p><strong>Interviewer:</strong> Hot metric — one metric receives 1M points/sec.</p>
+<p><strong>Candidate:</strong> Single series can't handle 1M points/sec — single writer is the bottleneck. Mitigation: add a shard tag (random suffix) that splits the metric into N sub-series. Customers re-aggregate at query time. Alternative: pre-aggregate at ingest with a stream processor.</p>
+<p><strong>Interviewer:</strong> Downsampling — explain.</p>
+<p><strong>Candidate:</strong> Old high-resolution data is rolled up. For example, after 7 days, 1-second points become 1-minute averages, mins, maxes, sums. Storage cost drops dramatically. Queries over long ranges use the downsampled tier automatically. Downsampler runs as a background job, idempotent.</p>
+<p><strong>Interviewer:</strong> Multi-tenant — how do you isolate noisy tenants?</p>
+<p><strong>Candidate:</strong> Per-tenant rate limits at ingestion. Cardinality budgets. Storage shards may be per-tenant for large customers; shared for small. Query engine bounds per-tenant resource usage. Alert engine per-tenant fairness.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Per-region ingestion and storage. Most metrics consumed locally. Global dashboards federate queries across regions. Cross-region alerts evaluate in a designated region. Cross-region latency tolerated for dashboards (seconds).</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Three planes: ingest, store, query/alert. Columnar Gorilla-compressed storage with downsampling tiers. Tag-based inverted index for series lookup. Alert engine with heartbeat and replay-safety. Cardinality control prevents the most common production headache. Multi-region with federation. The dominant scaling problem is cardinality; the dominant correctness problem is alert reliability.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: scale, retention, alerts.</li>
+<li>Invariant: durable points; reliable alerts.</li>
+<li>Ingest → buffer → writer → columnar TSDB.</li>
+<li>Gorilla compression + downsampling tiers.</li>
+<li>Tag inverted index.</li>
+<li>Query engine with parallel + downsample tier.</li>
+<li>Alert engine with heartbeat.</li>
+<li>Cardinality control as continuous process.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>A metrics platform is high-throughput time-series ingest plus columnar compressed storage plus query and alert engines. Gorilla compression keeps storage feasible; downsampling extends retention without exploding cost. Tag inverted index supports filtered queries. Alert engine evaluates per-rule with heartbeats so silent failures are detected. Cardinality is the dominant production concern; per-customer budgets and detection control it.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Gorilla compression makes time-series storage feasible."</li>
+<li>"Downsampling extends retention; recent data is high-resolution, older is rolled up."</li>
+<li>"Cardinality explosion is the biggest production headache; budget and detect."</li>
+<li>"Alert evaluation must heartbeat; silent failure is worse than false alarms."</li>
+<li>"Multi-region uses per-region storage with federated queries."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

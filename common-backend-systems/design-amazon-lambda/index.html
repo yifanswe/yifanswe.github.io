@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Amazon Lambda — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Amazon Lambda</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>AWS Lambda is serverless compute: deploy a function, get an endpoint, pay per invocation. The hard part is cold-start latency, secure multi-tenant isolation on shared hardware, fast scaling from zero to thousands of concurrent invocations, and reliable event-source integration.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every invocation request matched by a deployed function executes in an isolated environment with the configured code and runtime, completes within the function's timeout, and returns a result or error to the caller; concurrent invocations scale independently; resource limits (memory, CPU, network) are enforced; secrets and IAM identity are correct per invocation.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design micro-VM isolation (Firecracker), cold-start optimization, autoscaling from zero to N, event-source mapping (S3, SQS, Kinesis triggers), and reason about resource scheduling on shared fleet.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Lambda as four core systems: a function registry holding code and config, an isolated execution layer with micro-VMs (Firecracker), a request router that scales invocations across a worker fleet, and event sources that trigger functions. The interesting decisions are cold-start optimization, isolation model, fleet scheduling, and integration with synchronous (API Gateway) and asynchronous (S3, SQS, EventBridge) triggers.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Deploy a function: code, runtime, memory, timeout, env vars.</li>
+<li>Invoke synchronously (API call) or asynchronously (events).</li>
+<li>Auto-scale: zero idle cost; thousands concurrent.</li>
+<li>Logging and metrics per invocation.</li>
+<li>IAM identity per function.</li>
+<li>VPC connectivity.</li>
+<li>Multi-runtime support (Node, Python, Java, Go, custom).</li>
+<li>Layers and dependencies.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Cold start: under a second; warm under 50 ms.</li>
+<li>Concurrent: thousands per function.</li>
+<li>Isolation: strong (different tenants share hardware).</li>
+<li>Pay per millisecond billed.</li>
+<li>High availability per region.</li>
+<li>Limit enforcement.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>SnapStart pre-warming details.</li>
+<li>Container image deployment (touch on).</li>
+<li>Step Functions / orchestration.</li>
+<li>Lambda@Edge.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Functions</td>
+<td>Tens of millions across customers.</td>
+</tr>
+<tr>
+<td>Invocations</td>
+<td>Trillions/year.</td>
+</tr>
+<tr>
+<td>Concurrent</td>
+<td>Millions across customers.</td>
+</tr>
+<tr>
+<td>Average duration</td>
+<td>100ms-30s.</td>
+</tr>
+<tr>
+<td>Memory</td>
+<td>128 MB-10 GB per function.</td>
+</tr>
+<tr>
+<td>Worker fleet</td>
+<td>Hundreds of thousands of hosts.</td>
+</tr>
+</tbody>
+</table>
+<p>Bottleneck: cold-start latency and worker fleet scheduling under bursty load.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Function registry</td>
+<td>Code, config, versions.</td>
+<td>Strong on deploy.</td>
+</tr>
+<tr>
+<td>Invocation router</td>
+<td>Match request to worker.</td>
+<td>Sub-ms decision.</td>
+</tr>
+<tr>
+<td>Worker fleet</td>
+<td>Hosts micro-VMs.</td>
+<td>Multi-tenant.</td>
+</tr>
+<tr>
+<td>Micro-VM</td>
+<td>Isolated execution env.</td>
+<td>Firecracker.</td>
+</tr>
+<tr>
+<td>Scheduler</td>
+<td>Place invocations on workers.</td>
+<td>Bin-pack + cold-start aware.</td>
+</tr>
+<tr>
+<td>Event sources</td>
+<td>Trigger functions.</td>
+<td>Async with retry.</td>
+</tr>
+<tr>
+<td>Logging / metrics</td>
+<td>Capture per invocation.</td>
+<td>Async.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Caller --invoke--&gt; API Gateway / Direct
+                          |
+                          v
+                  +-----------------+
+                  | Invocation API  |
+                  +--------+--------+
+                          |
+                          v
+                  +-----------------+
+                  | Scheduler /     |
+                  | Router          |
+                  +--------+--------+
+                          |
+              +-----------+-----------+
+              |                       |
+              v                       v
+        Warm Worker            Cold Start
+        (existing micro-VM)    (provision micro-VM)
+              |                       |
+              +-----------+-----------+
+                          |
+                          v
+                  +-----------------+
+                  | Function Code   |
+                  | Executes        |
+                  +--------+--------+
+                          |
+                          v
+                  Return result
+                          |
+                          v
+                  Logs / Metrics → async pipeline
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Function registry</td>
+<td>Versioned function code + config.</td>
+<td>Code in S3-like store; metadata in KV.</td>
+</tr>
+<tr>
+<td>Code package store</td>
+<td>Function code zips or container images.</td>
+<td>Pulled to workers on cold start.</td>
+</tr>
+<tr>
+<td>Layer store</td>
+<td>Shared dependencies.</td>
+<td>Cached across functions.</td>
+</tr>
+<tr>
+<td>Invocation API</td>
+<td>Receive invocation; route.</td>
+<td>Stateless.</td>
+</tr>
+<tr>
+<td>Scheduler</td>
+<td>Pick worker + decide cold vs warm.</td>
+<td>Optimizes placement and reuse.</td>
+</tr>
+<tr>
+<td>Worker host</td>
+<td>Linux host running many micro-VMs.</td>
+<td>Multi-tenant.</td>
+</tr>
+<tr>
+<td>Firecracker</td>
+<td>Lightweight micro-VM.</td>
+<td>~125ms boot.</td>
+</tr>
+<tr>
+<td>Runtime API</td>
+<td>Function inside micro-VM polls for invocations.</td>
+<td>Reuse across invocations.</td>
+</tr>
+<tr>
+<td>Logging agent</td>
+<td>Captures stdout/stderr + structured logs.</td>
+<td>Ships to CloudWatch.</td>
+</tr>
+<tr>
+<td>Metrics emitter</td>
+<td>Per-invocation: duration, memory, errors.</td>
+<td>Async.</td>
+</tr>
+<tr>
+<td>Event source mapping</td>
+<td>Poll source (SQS, Kinesis, etc.) and invoke.</td>
+<td>One mapping per source.</td>
+</tr>
+<tr>
+<td>IAM integration</td>
+<td>Provide credentials per invocation.</td>
+<td>Inside execution role.</td>
+</tr>
+<tr>
+<td>VPC / networking</td>
+<td>Network plumbing for functions.</td>
+<td>ENIs in customer VPC.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="function">Function</h4>
+<pre><code class="language-text">Function(
+  function_arn,
+  function_name,
+  version,                  // $LATEST or numbered version
+  runtime,                  // nodejs18, python3.11, custom
+  handler,                  // entry point
+  code_ref,                 // S3 URI or container image
+  layers: [layer_arn],
+  memory_mb,
+  timeout_s,
+  env_vars,
+  vpc_config?,
+  execution_role,
+  reserved_concurrency?,
+  created_at,
+  updated_at,
+  version
+)
+</code></pre>
+<h4 id="invocation-request">Invocation Request</h4>
+<pre><code class="language-text">Invocation(
+  request_id,
+  function_arn,
+  version,
+  payload,
+  invocation_type,          // sync, async, event
+  client_context,
+  source,                   // direct, api_gateway, s3, sqs, ...
+  start_time,
+  end_time,
+  status_code,
+  duration_ms,
+  billed_ms,
+  memory_used_mb,
+  error?
+)
+</code></pre>
+<h4 id="execution-environment">Execution Environment</h4>
+<pre><code class="language-text">ExecutionEnvironment(
+  env_id,
+  function_arn,
+  version,
+  worker_host,
+  micro_vm_id,
+  state,                    // warm, cold, terminating
+  last_used,
+  invocations_handled
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text"># Management
+POST   /functions
+PUT    /functions/{name}
+DELETE /functions/{name}
+
+# Invocation
+POST   /functions/{name}/invocations
+       Body: payload
+       Returns: result (sync) or queued (async)
+
+# Event sources
+POST   /event-source-mappings
+</code></pre>
+<h3 id="function-deployment">Function Deployment</h3>
+<ol>
+<li>Developer packages code (zip or container image).</li>
+<li>Uploads to code store.</li>
+<li>Creates/updates function in registry.</li>
+<li>Function metadata published.</li>
+<li>Optional: pre-warm via SnapStart or provisioned concurrency.</li>
+</ol>
+<h3 id="invocation-path">Invocation Path</h3>
+<p>Synchronous invoke (caller waits for result):</p>
+<ol>
+<li>Caller invokes via API or SDK.</li>
+<li>Invocation API authenticates, validates payload size.</li>
+<li>Routes to scheduler.</li>
+<li>Scheduler decides:
+   - <strong>Warm:</strong> existing micro-VM for this function available → route invocation to it.
+   - <strong>Cold:</strong> no warm env → pick worker, provision micro-VM, fetch code, init runtime, then invoke.</li>
+<li>Function executes within micro-VM.</li>
+<li>Result returned to caller via Invocation API.</li>
+<li>Execution env retained for reuse (warm) or terminated based on idle policy.</li>
+</ol>
+<p>Async invoke (event-driven):</p>
+<ol>
+<li>Caller invokes; request queued.</li>
+<li>Async invocation queue.</li>
+<li>Worker picks from queue; same execution path.</li>
+<li>On failure: retries per policy; dead-letter on exhaustion.</li>
+</ol>
+<h3 id="cold-start-optimization">Cold Start Optimization</h3>
+<p>Cold start = time to provision micro-VM, fetch code, initialize runtime, run init code.</p>
+<p>Components:
+- Micro-VM provisioning: ~125ms (Firecracker).
+- Code download: depends on package size.
+- Runtime init: language-dependent (Java slowest).
+- User init code: depends on function.</p>
+<p>Optimizations:
+- <strong>Worker pre-warming:</strong> keep pool of pre-booted micro-VMs ready to load any code.
+- <strong>Code caching:</strong> workers cache recently-used function code.
+- <strong>Snapshots (SnapStart):</strong> persist warm state of init; restore from snapshot rather than re-init.
+- <strong>Provisioned concurrency:</strong> customer pays to keep N environments warm.
+- <strong>Container image layer caching:</strong> for image-based functions.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Cold start is the central performance challenge. The micro-VM itself boots in ~125ms; the rest is code fetch and init. SnapStart restores from a snapshot of post-init state, shrinking the variable portion.</p>
+</blockquote>
+<h3 id="isolation-firecracker-micro-vms">Isolation: Firecracker Micro-VMs</h3>
+<p>Multi-tenant on shared hardware requires strong isolation.</p>
+<ul>
+<li>Linux containers alone are insufficient — kernel boundary too permeable for cross-tenant.</li>
+<li>KVM-based micro-VMs give hardware-level isolation.</li>
+<li>Firecracker is a slim VMM (Virtual Machine Monitor) purpose-built for serverless: ~125 MB memory overhead per VM, ~125ms boot.</li>
+<li>Each invocation env is a separate VM with kernel, isolated network and filesystem.</li>
+<li>Workers can host hundreds of micro-VMs.</li>
+</ul>
+<h3 id="worker-fleet-scheduling">Worker Fleet Scheduling</h3>
+<p>Workers are general-purpose hosts running Firecracker.</p>
+<p>Scheduler decisions per invocation:
+- Find existing warm env for this function?
+- If yes, route there.
+- If no, pick a worker with capacity to provision new env.
+- Capacity = available memory, CPU, network.</p>
+<p>Bin-packing: workers should be utilized efficiently without overcommitting.</p>
+<p>Function isolation:
+- One worker can host many functions from many tenants.
+- Each tenant's micro-VMs are isolated.
+- No shared memory across tenants.</p>
+<h3 id="event-source-mappings">Event Source Mappings</h3>
+<p>For event triggers:</p>
+<ul>
+<li><strong>S3:</strong> S3 service invokes Lambda on object create/delete events.</li>
+<li><strong>SQS:</strong> Lambda polls SQS, batches messages, invokes function. Acks on success.</li>
+<li><strong>Kinesis:</strong> Lambda polls shards in order, processes batches.</li>
+<li><strong>DynamoDB Streams:</strong> similar to Kinesis.</li>
+<li><strong>EventBridge:</strong> rule-based event routing to Lambda.</li>
+<li><strong>API Gateway:</strong> synchronous HTTP-to-Lambda integration.</li>
+</ul>
+<p>Event source mappings translate source events into invocations with proper payload format, retries, batching, and ordering (where applicable).</p>
+<h3 id="concurrency-limits">Concurrency Limits</h3>
+<p>Per-function:
+- Reserved concurrency: dedicated quota (no scaling beyond, but guaranteed).
+- Unreserved: shares regional pool.
+- Burst limits: scale up to N per region per minute.</p>
+<p>Per-account: regional concurrency limit (default 1000, raisable).</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition strategy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Function registry</td>
+<td>Per-account, per-region</td>
+</tr>
+<tr>
+<td>Code store</td>
+<td>Object storage (S3-like)</td>
+</tr>
+<tr>
+<td>Worker fleet</td>
+<td>Pooled per region; AZ-distributed</td>
+</tr>
+<tr>
+<td>Event source mappings</td>
+<td>Per mapping</td>
+</tr>
+<tr>
+<td>Logs / metrics</td>
+<td>Per function; async pipeline</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Function deploy</td>
+<td>Strong (within region)</td>
+</tr>
+<tr>
+<td>Invocation routing</td>
+<td>Stateless; eventually consistent on function changes</td>
+</tr>
+<tr>
+<td>Logs / metrics</td>
+<td>Async, durable</td>
+</tr>
+<tr>
+<td>Concurrency tracking</td>
+<td>Approximate (token bucket-style)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Each region is independent.</li>
+<li>Function deployed per region.</li>
+<li>Cross-region invocation goes via the Internet / API.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cold start spike.</td>
+<td>Pre-warm; provisioned concurrency; SnapStart.</td>
+<td>Cold start rate.</td>
+</tr>
+<tr>
+<td>Worker host failure.</td>
+<td>Drain; reschedule micro-VMs.</td>
+<td>Worker health.</td>
+</tr>
+<tr>
+<td>Function code corruption.</td>
+<td>Versioning; rollback.</td>
+<td>Deploy failures.</td>
+</tr>
+<tr>
+<td>Tenant resource hog.</td>
+<td>Concurrency limits; CPU/memory caps.</td>
+<td>Per-tenant utilization.</td>
+</tr>
+<tr>
+<td>Event source backpressure.</td>
+<td>Throttle; dead-letter; retry.</td>
+<td>Source lag.</td>
+</tr>
+<tr>
+<td>Async retry storm.</td>
+<td>Bounded retry; dead-letter.</td>
+<td>Retry rate.</td>
+</tr>
+<tr>
+<td>Network partition to VPC.</td>
+<td>Direct ENI; retry.</td>
+<td>VPC connectivity.</td>
+</tr>
+<tr>
+<td>Hot function (sudden spike).</td>
+<td>Burst limits; auto-scale.</td>
+<td>Concurrency vs limit.</td>
+</tr>
+<tr>
+<td>Cross-tenant escape.</td>
+<td>Firecracker isolation; security review.</td>
+<td>Anomalous behavior.</td>
+</tr>
+<tr>
+<td>Log volume explosion.</td>
+<td>Throttle; sample; cost alerts.</td>
+<td>Log volume per function.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Invocation success rate.</li>
+<li>Cold start rate.</li>
+<li>Throttling rate.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Invocations per second per region.</li>
+<li>Worker fleet utilization.</li>
+<li>Cold start latency p99.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Functions per customer.</li>
+<li>Invocations per function.</li>
+<li>Cost per invocation.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Firecracker overhead vs container speed: better isolation, slower start.</li>
+<li>Pre-warming costs idle compute vs cold-start latency.</li>
+<li>Strict concurrency limits prevent runaway costs but block bursts.</li>
+<li>SnapStart saves cold start but limits flexibility.</li>
+<li>Per-function reserved concurrency guarantees but partitions capacity.</li>
+<li>More aggressive worker bin-packing improves utilization but risks noisy neighbors.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Container-based isolation across tenants.</td>
+<td>Micro-VMs (Firecracker) for hardware isolation.</td>
+</tr>
+<tr>
+<td>Spin VM per invocation.</td>
+<td>Warm env reuse + warm pool.</td>
+</tr>
+<tr>
+<td>Synchronous cold start.</td>
+<td>Pre-warm + SnapStart + provisioned concurrency.</td>
+</tr>
+<tr>
+<td>No per-tenant limits.</td>
+<td>Concurrency caps + token buckets.</td>
+</tr>
+<tr>
+<td>Sync VPC ENI provisioning.</td>
+<td>Pre-provisioned ENIs per function.</td>
+</tr>
+<tr>
+<td>Single global region.</td>
+<td>Per-region deployment.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cold start</td>
+<td>Firecracker boot, code fetch, runtime init, SnapStart.</td>
+</tr>
+<tr>
+<td>Isolation</td>
+<td>Micro-VM vs container; Firecracker design.</td>
+</tr>
+<tr>
+<td>Scheduling</td>
+<td>Bin-pack with warm env reuse; cold-start aware.</td>
+</tr>
+<tr>
+<td>Event sources</td>
+<td>Polling vs push; retry; dead-letter.</td>
+</tr>
+<tr>
+<td>Concurrency</td>
+<td>Reserved vs unreserved; burst limits.</td>
+</tr>
+<tr>
+<td>Multi-tenancy</td>
+<td>Resource caps; noisy neighbor mitigation.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Function registry + code store + worker fleet + scheduler.</li>
+<li>Firecracker micro-VM isolation.</li>
+<li>Warm-env reuse with idle policy.</li>
+<li>Cold-start optimization (pre-warm, SnapStart).</li>
+<li>Event source mappings for async triggers.</li>
+<li>Per-tenant concurrency limits.</li>
+<li>IAM per invocation.</li>
+<li>Async logs and metrics pipeline.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Lambda is request routing onto a Firecracker micro-VM fleet. The performance challenge is cold start; the safety challenge is multi-tenant isolation on shared hardware; the scaling challenge is reacting to bursts from zero. The architectural answers are warm pools and SnapStart for cold start, Firecracker for isolation, and per-tenant token buckets for fair sharing.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design AWS Lambda.</p>
+<p><strong>Candidate:</strong> Four core systems: function registry holding code and config, invocation API receiving requests, scheduler placing invocations on workers, worker fleet hosting Firecracker micro-VMs. The invariant is every matched invocation runs in an isolated environment with the configured code, within resource limits, returning result or error. The performance challenge is cold start; the safety challenge is tenant isolation.</p>
+<p><strong>Interviewer:</strong> Walk me through an invocation.</p>
+<p><strong>Candidate:</strong> Caller invokes function by name. Invocation API authenticates, validates payload, routes to scheduler. Scheduler checks if a warm execution environment exists for this function and version. If yes, routes the invocation there — sub-50ms latency. If no, cold start: pick a worker with capacity, provision a Firecracker micro-VM (~125ms), fetch function code from code store, initialize runtime, run user init code, then invoke. Result returned to caller; execution env retained for reuse.</p>
+<p><strong>Interviewer:</strong> Why Firecracker?</p>
+<p><strong>Candidate:</strong> Multi-tenant isolation on shared hardware. Linux containers alone share the kernel — too permeable for cross-tenant. KVM-based micro-VMs give hardware-level isolation. Firecracker is a slim VMM purpose-built for serverless: ~125 MB memory overhead, ~125ms boot. Each invocation env is its own VM with kernel, isolated network, isolated filesystem. Workers can host hundreds.</p>
+<p><strong>Interviewer:</strong> Cold start optimization?</p>
+<p><strong>Candidate:</strong> Several techniques. Worker pre-warming: pool of pre-booted micro-VMs ready to load any function code (saves boot time). Code caching on workers: recently used function code stays cached. SnapStart: take a snapshot of post-init state, restore from snapshot rather than re-running init — eliminates the variable init time. Provisioned concurrency: customer pays to keep N envs warm always. For container images, layer caching reduces image fetch.</p>
+<p><strong>Interviewer:</strong> A function suddenly gets 10,000 concurrent invocations.</p>
+<p><strong>Candidate:</strong> Burst limits handle this. Initial pool of warm envs serves the early ones. New invocations trigger cold starts on workers with capacity. The scheduler bin-packs across the fleet. There's a burst limit per region per minute; beyond that, throttle. Customer can request limit raises. If reserved concurrency is set, that's the guaranteed quota.</p>
+<p><strong>Interviewer:</strong> Scheduling decisions?</p>
+<p><strong>Candidate:</strong> Per invocation, scheduler checks (1) is there a warm env for this function and version? If yes, send there. (2) If no, pick a worker with available capacity (memory, CPU, network). (3) Avoid noisy neighbors — don't pack too many high-memory tenants on one host. (4) Affinity for repeated invocations to similar function families. Decision is sub-millisecond.</p>
+<p><strong>Interviewer:</strong> Event sources?</p>
+<p><strong>Candidate:</strong> Event source mappings translate source events into invocations. S3 directly invokes on object events. SQS: Lambda service polls queues, batches messages, invokes function. Kinesis/DynamoDB Streams: polls shards in order. EventBridge: rule-based routing. API Gateway: synchronous HTTP-to-Lambda. Each integration handles retries, batching, ordering, and dead-letter semantics appropriate to the source.</p>
+<p><strong>Interviewer:</strong> A function fails repeatedly.</p>
+<p><strong>Candidate:</strong> For async invocations: retries with exponential backoff up to configured limit (typically 2x). After exhaustion, message goes to dead-letter queue (SQS or SNS) configured per function. For sync: error returned to caller; they handle. Metrics surface error rate; alerts notify customer.</p>
+<p><strong>Interviewer:</strong> VPC connectivity?</p>
+<p><strong>Candidate:</strong> Functions can run in customer VPC. Each function-version needs Elastic Network Interfaces (ENIs) in the VPC subnets. Originally ENI provisioning per cold start added significant latency; modern Lambda pre-provisions ENIs per function to avoid the penalty.</p>
+<p><strong>Interviewer:</strong> IAM per invocation?</p>
+<p><strong>Candidate:</strong> Function has an execution role (IAM role). On invocation, Lambda provides temporary credentials for that role to the function via environment variables. Function uses these to call other AWS services. Tied to the execution env lifecycle; each warm env has credentials it can refresh.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Each region is independent. Function deployed per region. Cross-region invocation goes via internet/API. Multi-region deployment requires the customer to deploy in each region (or use Lambda@Edge for global edge functions).</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Function registry + code store + scheduler + worker fleet hosting Firecracker micro-VMs. Cold start is the performance challenge, mitigated by warm pools, code caching, and SnapStart. Firecracker provides hardware-level isolation for multi-tenancy. Event source mappings translate triggers into invocations with retry and dead-letter. Concurrency limits per function and per account prevent runaway costs. The scheduler bin-packs invocations across the worker fleet.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: deploy, invoke, scale, isolation.</li>
+<li>Invariant: each invocation isolated with configured code; resource-limited.</li>
+<li>Function registry + code store + scheduler + worker fleet.</li>
+<li>Firecracker micro-VMs for hardware isolation.</li>
+<li>Warm-env reuse; cold-start optimization (pre-warm, SnapStart).</li>
+<li>Event source mappings translate triggers.</li>
+<li>Concurrency limits per function and account.</li>
+<li>Per-region deployment; cross-region via API.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Lambda is request routing onto a Firecracker micro-VM fleet. Function registry holds code; scheduler picks warm env or provisions cold; Firecracker isolates tenants on shared hardware. Cold start is the central performance challenge, mitigated by pre-warming, SnapStart, and provisioned concurrency. Event source mappings handle async triggers with retries and dead-letter. Per-function and per-account concurrency limits prevent runaway costs. Multi-region by deployment.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Firecracker gives hardware isolation with container-like speed."</li>
+<li>"Cold start has many parts; SnapStart eliminates the variable init."</li>
+<li>"Scheduler bin-packs while preserving isolation and avoiding noisy neighbors."</li>
+<li>"Event sources translate triggers into invocations with proper retry semantics."</li>
+<li>"Multi-tenancy requires per-tenant resource caps and concurrency limits."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

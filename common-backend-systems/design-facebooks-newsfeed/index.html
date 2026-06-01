@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Facebook&#x27;s Newsfeed — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Facebook&#x27;s Newsfeed</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Facebook's newsfeed is the canonical personalized social feed: billions of users, complex relationships (friends, follows, groups, pages), heavy ranking with ML, and the requirement that opening the app shows fresh, relevant content in under a second.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every post is durably stored with attribution; the home feed of each user eventually includes every post from sources they are connected to (subject to ranking, visibility, blocks, and policy); the feed reads in sub-second p99 with ranked content; deletes, blocks, and policy decisions propagate within seconds and are enforced at read.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design hybrid fan-out for a more complex relationship graph than Twitter (friends are bidirectional, plus pages, groups, recommendations), heavy ML ranking with feature stores, integrate engagement signals, and reason about objectionable content moderation at scale.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Facebook's newsfeed as a feed generation pipeline: aggregate candidate posts from friends, pages, and groups the user is connected to, score them with an ML ranker, apply visibility filters, return. Authoritative storage for posts is separate from the feed projection. Fan-out is hybrid like Twitter but more nuanced because relationships include pages and groups. Heavy investment in ranking and the feature pipeline. The interesting decisions are candidate generation, ranking architecture, feature freshness, and content moderation.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>User has friends (bidirectional), follows pages, joins groups.</li>
+<li>Posts from friends, pages, groups appear in home feed.</li>
+<li>Posts can be text, photo, video, link, check-in.</li>
+<li>Like, comment, share, react.</li>
+<li>Ranked by relevance, not strict chronological.</li>
+<li>Visibility filters: blocks, mutes, hidden posts.</li>
+<li>Stories surface separately (like Instagram).</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>3B+ MAU; billions DAU.</li>
+<li>Feed read p99 &lt; 500 ms.</li>
+<li>Bounded freshness (seconds to minutes).</li>
+<li>Heavy ranking with sub-200 ms ML inference.</li>
+<li>Multi-region.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Marketplace.</li>
+<li>Watch (videos).</li>
+<li>Dating, gaming.</li>
+<li>Ads (treat as separate insertion).</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>3B MAU.</td>
+</tr>
+<tr>
+<td>Friends average</td>
+<td>300-500.</td>
+</tr>
+<tr>
+<td>Followed pages/groups</td>
+<td>50-200.</td>
+</tr>
+<tr>
+<td>Posts/day</td>
+<td>Billions.</td>
+</tr>
+<tr>
+<td>Feed reads</td>
+<td>Hundreds of billions/day.</td>
+</tr>
+<tr>
+<td>Latency budget</td>
+<td>500 ms p99 feed read.</td>
+</tr>
+<tr>
+<td>Candidate set per feed</td>
+<td>1000s of candidate posts.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is candidate generation across a complex graph, plus ML ranking under tight latency.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Post store</td>
+<td>Source of truth.</td>
+<td>Strongly consistent on write.</td>
+</tr>
+<tr>
+<td>Connection graph</td>
+<td>Friends + pages + groups.</td>
+<td>Fast lookup.</td>
+</tr>
+<tr>
+<td>Feed candidate generator</td>
+<td>Pulls candidate posts for a user.</td>
+<td>Sub-100ms.</td>
+</tr>
+<tr>
+<td>Ranker</td>
+<td>ML model scoring candidates.</td>
+<td>Sub-200ms.</td>
+</tr>
+<tr>
+<td>Feed renderer</td>
+<td>Hydrate, apply visibility, format.</td>
+<td>Sub-100ms.</td>
+</tr>
+<tr>
+<td>Engagement</td>
+<td>Likes, reactions, comments.</td>
+<td>Async aggregation.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Client --&gt; Newsfeed API
+              |
+              v
+       +-------------------+
+       | Candidate Generator|
+       | (friends, pages,   |
+       |  groups, recs)     |
+       +---------+----------+
+                 |
+                 v
+       +-------------------+
+       | Ranker (ML)       |
+       | feature store +   |
+       | model inference   |
+       +---------+----------+
+                 |
+                 v
+       +-------------------+
+       | Feed Renderer     |
+       | + visibility gate |
+       +---------+----------+
+                 |
+                 v
+       +-------------------+
+       | Engagement Counter|
+       +-------------------+
+
+Backends:
+   Post Store
+   Connection Graph
+   Feature Store
+   ML Models
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Post service</td>
+<td>Submit, edit, delete posts.</td>
+<td>Sharded by post_id.</td>
+</tr>
+<tr>
+<td>Post store</td>
+<td>Authoritative post records.</td>
+<td>Strong consistency.</td>
+</tr>
+<tr>
+<td>Connection graph</td>
+<td>Friends (bi), follows pages, joins groups.</td>
+<td>Sharded by user_id.</td>
+</tr>
+<tr>
+<td>Inbox / candidate cache</td>
+<td>Per-user precomputed candidate posts.</td>
+<td>Refreshed continuously.</td>
+</tr>
+<tr>
+<td>Candidate generator</td>
+<td>Selects which posts to consider.</td>
+<td>Mix of inbox and pull from sources.</td>
+</tr>
+<tr>
+<td>Feature store</td>
+<td>Per-user and per-post features for ranking.</td>
+<td>Online + offline.</td>
+</tr>
+<tr>
+<td>Ranker</td>
+<td>ML model scoring candidates.</td>
+<td>Multi-stage; tight latency.</td>
+</tr>
+<tr>
+<td>Renderer</td>
+<td>Hydrate, apply visibility filters, format.</td>
+<td>Stateless.</td>
+</tr>
+<tr>
+<td>Engagement service</td>
+<td>Likes, comments, reactions.</td>
+<td>Sub-counter sharded.</td>
+</tr>
+<tr>
+<td>Comment service</td>
+<td>Threaded comments under posts.</td>
+<td>Like Reddit.</td>
+</tr>
+<tr>
+<td>Moderation</td>
+<td>Policy enforcement; takedowns.</td>
+<td>Strong consistency.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="post">Post</h4>
+<pre><code class="language-text">Post(
+  post_id,                  // snowflake
+  author_id,
+  author_type,              // user, page
+  content,
+  media_refs,
+  visibility,               // public, friends, custom
+  audience,                 // computed audience for friend-of-friend etc.
+  posted_at,
+  edited_at?,
+  engagement_counters,
+  status,
+  version
+)
+</code></pre>
+<h4 id="connection">Connection</h4>
+<pre><code class="language-text">Connection(
+  source_id,                // user
+  target_id,                // user, page, group
+  type,                     // friend, follow, member
+  created_at,
+  strength_score?           // for ranking
+)
+</code></pre>
+<h4 id="feed-candidate">Feed Candidate</h4>
+<pre><code class="language-text">CandidateEntry(
+  user_id,
+  post_id,
+  source_type,              // friend, page, group, suggested
+  inserted_at,
+  predicted_score
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">GET    /home?cursor=
+POST   /posts
+DELETE /posts/{id}
+POST   /posts/{id}/reactions
+GET    /posts/{id}/comments
+POST   /friends/{id}
+POST   /pages/{id}/follow
+</code></pre>
+<h3 id="candidate-generation">Candidate Generation</h3>
+<p>For each user's feed request:</p>
+<ol>
+<li>Gather candidate post ids from multiple sources:
+   - <strong>Inbox-style fan-out:</strong> posts from friends pushed to user's inbox (Twitter-like, for normal friends).
+   - <strong>Pull from celebrities/pages:</strong> large-following pages pulled at request time.
+   - <strong>Group posts:</strong> from user's joined groups.
+   - <strong>Recommendations:</strong> posts from non-connected sources predicted relevant.</li>
+<li>Combine into candidate set (typically thousands).</li>
+<li>Hand off to ranker.</li>
+</ol>
+<p>For users with very dense graphs (1000+ friends + 200 pages + 100 groups), the candidate set is large; we prune by recency and source-level scoring before full ranking.</p>
+<h3 id="ranking">Ranking</h3>
+<p>Multi-stage ML pipeline:</p>
+<ol>
+<li><strong>Lightweight pre-ranker:</strong> Cheap features per candidate (age, source type, basic engagement). Prune to top hundreds.</li>
+<li><strong>Main ranker:</strong> Deep model (neural network) with extensive features:
+   - Viewer-author affinity (interaction history).
+   - Post engagement (likes, comments, shares).
+   - Post type performance for this viewer.
+   - Recency.
+   - Personalization vectors.</li>
+<li><strong>Post-processing:</strong>
+   - Diversity (don't show 5 posts from same author).
+   - Visibility filters.
+   - Sponsored insertion (ads interleaved per policy).
+   - Final ordering.</li>
+</ol>
+<p>Latency:
+- Pre-rank: &lt;50ms.
+- Main rank: &lt;200ms.
+- Total feed gen: &lt;500ms p99.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Ranking is two-stage: a cheap pre-ranker prunes candidates to a manageable set; an expensive deep model ranks the survivors. The feature store provides pre-computed features so inference doesn't compute from scratch.</p>
+</blockquote>
+<h3 id="feature-store">Feature Store</h3>
+<p>Online + offline.</p>
+<ul>
+<li><strong>Offline:</strong> Daily/hourly batch jobs compute user embeddings, content embeddings, affinity scores.</li>
+<li><strong>Online:</strong> Real-time signals (just liked, just commented) update online feature store.</li>
+<li>Ranker reads features for each (user, candidate) pair at request time.</li>
+<li>Pre-computed where possible; computed inline if necessary.</li>
+</ul>
+<h3 id="visibility-gate">Visibility Gate</h3>
+<p>Always applied AFTER candidate generation and ranking, BEFORE returning to client:</p>
+<ul>
+<li>Blocks: filter posts from blocked users.</li>
+<li>Mutes: filter posts from muted sources.</li>
+<li>Hidden: posts the user hid.</li>
+<li>Privacy: ensure viewer matches post's audience.</li>
+<li>Moderation: removed/policy-blocked posts excluded.</li>
+</ul>
+<p>Read-time enforcement; not baked into inbox.</p>
+<h3 id="write-path-post">Write Path: Post</h3>
+<ol>
+<li>Client submits post.</li>
+<li>Post service authenticates, validates, runs auto-moderation.</li>
+<li>Assign snowflake post_id.</li>
+<li>Persist to post store.</li>
+<li>Compute audience: who can see this post (friends, public, custom).</li>
+<li>Emit <code>PostCreated</code> event.</li>
+<li>Fan-out workers:
+   - For normal author: push post_id to friends' inbox candidate cache.
+   - For high-follower author / page: skip; pull at read time.</li>
+<li>Update feature store: new content available.</li>
+</ol>
+<h3 id="read-path-newsfeed">Read Path: Newsfeed</h3>
+<ol>
+<li>Client requests <code>/home</code>.</li>
+<li>Feed service fetches user's inbox candidates + pulls from large pages/groups.</li>
+<li>Combine candidate set (~1000s).</li>
+<li>Pre-ranker prunes to ~200.</li>
+<li>Main ranker scores and orders top ~50.</li>
+<li>Visibility gate filters.</li>
+<li>Hydrate post content from post store.</li>
+<li>Render with media URLs.</li>
+<li>Return page.</li>
+</ol>
+<h3 id="engagement-reactions-comments">Engagement: Reactions, Comments</h3>
+<p>Same patterns as YouTube likes and Reddit comments:</p>
+<ul>
+<li>Per-user per-post reaction (one active).</li>
+<li>Sub-counter sharded reaction counters.</li>
+<li>Comments flat with parent_id.</li>
+<li>Engagement feeds back into feature store for future ranking.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Posts</td>
+<td><code>post_id</code> hash</td>
+<td>Direct lookup.</td>
+</tr>
+<tr>
+<td>Connections</td>
+<td><code>source_id</code> for outgoing; <code>target_id</code> for incoming</td>
+<td>Both.</td>
+</tr>
+<tr>
+<td>Inbox cache</td>
+<td><code>user_id</code> hash</td>
+<td>Per-user.</td>
+</tr>
+<tr>
+<td>Feature store</td>
+<td><code>user_id</code> and <code>post_id</code> hash</td>
+<td>Lookups.</td>
+</tr>
+<tr>
+<td>Engagement counters</td>
+<td><code>post_id</code> hash + sub-counters</td>
+<td>Hot post.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Post writes</td>
+<td>Strong</td>
+<td>Source of truth.</td>
+</tr>
+<tr>
+<td>Inbox</td>
+<td>Eventually consistent</td>
+<td>Bounded staleness.</td>
+</tr>
+<tr>
+<td>Feature store</td>
+<td>Eventually consistent</td>
+<td>Refreshed online + batch.</td>
+</tr>
+<tr>
+<td>Engagement counters</td>
+<td>Eventually consistent</td>
+<td>UX.</td>
+</tr>
+<tr>
+<td>Visibility decisions</td>
+<td>Strong at hydration</td>
+<td>Privacy.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Per-user home region.</li>
+<li>Posts replicated globally.</li>
+<li>Inbox caches per region.</li>
+<li>Feature store regional with cross-region rollup for global features.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Celebrity post fan-out storm.</td>
+<td>Hybrid push/pull threshold; backpressure.</td>
+<td>Fan-out lag.</td>
+</tr>
+<tr>
+<td>Ranker model down.</td>
+<td>Fallback to pre-ranker or reverse-chronological.</td>
+<td>Ranker error rate.</td>
+</tr>
+<tr>
+<td>Feature store stale.</td>
+<td>Use cached features; mark with timestamp.</td>
+<td>Feature freshness.</td>
+</tr>
+<tr>
+<td>Stale deletion in inbox.</td>
+<td>Read-time visibility gate.</td>
+<td>Stale-display count.</td>
+</tr>
+<tr>
+<td>Block bypass.</td>
+<td>Final visibility filter.</td>
+<td>Block escape count.</td>
+</tr>
+<tr>
+<td>Inbox cache eviction.</td>
+<td>Reconstruct from post store + connections.</td>
+<td>Cache miss rate.</td>
+</tr>
+<tr>
+<td>Cross-region replication.</td>
+<td>Async; bounded.</td>
+<td>Replication lag.</td>
+</tr>
+<tr>
+<td>Moderation lag.</td>
+<td>Async + strong on action propagation.</td>
+<td>Time-to-block.</td>
+</tr>
+<tr>
+<td>Cold start user.</td>
+<td>Recommendation fallback; popular content.</td>
+<td>Cold-start request rate.</td>
+</tr>
+<tr>
+<td>Sponsored content failure.</td>
+<td>Skip ad if rendering fails; don't block feed.</td>
+<td>Ad error rate.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Visibility violations.</li>
+<li>Stale post display.</li>
+<li>Feature freshness.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Feed read QPS.</li>
+<li>Ranker p99.</li>
+<li>Inbox write rate.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Time spent in feed.</li>
+<li>Engagement rate.</li>
+<li>Sessions per DAU.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Hybrid fan-out balances write/read cost.</li>
+<li>Deeper ML model gives better ranking but adds latency.</li>
+<li>Larger candidate set finds more relevant content but costs ranking compute.</li>
+<li>Pre-computed features speed inference but add storage.</li>
+<li>Aggressive personalization may create filter bubbles.</li>
+<li>Strict moderation may suppress legitimate speech; lenient lets bad content through.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reverse-chronological.</td>
+<td>ML-ranked with diversification.</td>
+</tr>
+<tr>
+<td>Single ranking pass.</td>
+<td>Multi-stage: pre-ranker + main ranker.</td>
+</tr>
+<tr>
+<td>Filter blocks at write.</td>
+<td>Read-time visibility gate.</td>
+</tr>
+<tr>
+<td>Synchronous feature computation.</td>
+<td>Feature store with online + offline.</td>
+</tr>
+<tr>
+<td>Pure fan-out on write.</td>
+<td>Hybrid for celebrities/pages.</td>
+</tr>
+<tr>
+<td>Synchronous moderation.</td>
+<td>Auto-mod at write + async deeper scan.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ranking</td>
+<td>Multi-stage; feature store; latency budget.</td>
+</tr>
+<tr>
+<td>Candidate generation</td>
+<td>Hybrid push/pull; multi-source.</td>
+</tr>
+<tr>
+<td>Visibility</td>
+<td>Read-time gate; blocks, mutes, privacy.</td>
+</tr>
+<tr>
+<td>Hot post engagement</td>
+<td>Sub-counter sharding.</td>
+</tr>
+<tr>
+<td>Feature store</td>
+<td>Online + offline; freshness vs latency.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Per-user home; global replication.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Hybrid fan-out with multi-source candidate generation.</li>
+<li>Multi-stage ML ranking with feature store.</li>
+<li>Read-time visibility gate.</li>
+<li>Engagement aggregation separate from feed.</li>
+<li>Multi-region with per-user home.</li>
+<li>Moderation as continuous pipeline.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Facebook's newsfeed is hybrid fan-out plus heavy ML ranking. The feed isn't reverse-chronological — it's an ML-ranked composition of candidate posts from friends, pages, groups, and recommendations. Multi-stage ranking prunes candidates and then scores them with a deep model. Visibility filtering happens at read, never baked into the inbox.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Facebook's newsfeed.</p>
+<p><strong>Candidate:</strong> Pipeline: candidate generation, multi-stage ranking, visibility gate, render. Candidates come from multiple sources — friends' posts, pages followed, groups joined, recommended content from non-connected sources. Pre-ranker prunes; main ML ranker scores; visibility gate filters; render hydrates. The invariant is bounded-staleness display of ranked content from sources the user is connected to, with policy and privacy correctly enforced.</p>
+<p><strong>Interviewer:</strong> Candidate generation — how does it work?</p>
+<p><strong>Candidate:</strong> Multi-source. Friends' posts arrive via hybrid fan-out (normal friends push to inbox; very-active friends with thousands of friends-of-friends pull at read). Pages and groups: push for small followings, pull for large. Recommendations: a separate service surfaces predicted-relevant posts from non-connected sources. Combined candidate set is thousands of posts; pruned to manageable size before full ranking.</p>
+<p><strong>Interviewer:</strong> Ranking?</p>
+<p><strong>Candidate:</strong> Two stages plus post-processing. Pre-ranker is cheap: features per candidate (age, source type, basic engagement). Prunes to top ~200. Main ranker is a deep neural network with extensive features from the feature store: viewer-author affinity, post engagement, recency, post type performance for this viewer, personalization vectors. Scores top ~50. Post-processing: diversity (don't repeat same author), visibility filters, ad insertion, final ordering.</p>
+<p><strong>Interviewer:</strong> Feature store?</p>
+<p><strong>Candidate:</strong> Online + offline. Offline: daily batch builds user embeddings, content embeddings, affinity scores. Online: real-time signals (just liked, just commented) update features within seconds. Ranker reads features for each (user, candidate) pair at request time. Pre-computed where possible; computed inline if necessary. Feature freshness directly affects ranking quality.</p>
+<p><strong>Interviewer:</strong> Visibility — how do blocks work?</p>
+<p><strong>Candidate:</strong> Read-time gate. After ranking but before returning to the client, the visibility service filters: blocked users' posts, muted sources, posts the user hid, audience-mismatched posts (e.g., friends-only post from a non-friend due to a graph inconsistency), policy-removed posts. Never bake blocks into the inbox; the inbox is just candidate ids, and visibility is final-authority.</p>
+<p><strong>Interviewer:</strong> Posts arrive while you're scrolling. How do you keep the feed fresh?</p>
+<p><strong>Candidate:</strong> Inbox cache continuously updated as friends post. The next feed pull picks up fresh candidates. For active sessions, the client can poll for "new content" indicator that triggers a re-fetch. For real-time feels, push notifications can announce significant posts.</p>
+<p><strong>Interviewer:</strong> Celebrity page with 100M followers posts.</p>
+<p><strong>Candidate:</strong> Pulled at read time, not pushed. The page's recent posts are cached centrally; followers' inboxes are not written for celebrity content. When a follower opens the feed, candidate generator queries the celebrity's recent posts cache. Saves 100M inbox writes per post.</p>
+<p><strong>Interviewer:</strong> Posts that violate policy?</p>
+<p><strong>Candidate:</strong> Auto-moderation runs at write — basic checks (banned content, hate speech classifiers). Higher-confidence detections suppress immediately. Async deeper scan + human review for subtle cases. On takedown, post status transitions to <code>removed</code>; cache invalidates; read-time visibility gate filters. Time-to-takedown is a critical operational metric.</p>
+<p><strong>Interviewer:</strong> Engagement counters at this scale?</p>
+<p><strong>Candidate:</strong> Same pattern as YouTube likes. Per-user per-post reaction state is authoritative; per-post counter is derived. Sub-counter sharding for hot posts. Streaming aggregation. Periodic recount for correctness.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Per-user home region for primary writes. Posts replicated globally. Inbox caches per region. Feature store regional with cross-region rollup for global features (e.g., global trending). Reads come from local region.</p>
+<p><strong>Interviewer:</strong> Cold start user — just joined, no friends, no engagement history.</p>
+<p><strong>Candidate:</strong> Default to popular content within their region and stated interests. Recommendation engine surfaces "people you may know" and pages to follow. Heavy emphasis on bootstrapping affinity through early interactions. The feature store has cold-start fallbacks.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Hybrid fan-out into per-user inbox candidate cache, plus pull from large sources. Multi-stage ML ranking — cheap pre-rank then deep model — with feature store providing pre-computed features. Read-time visibility gate enforces blocks, privacy, moderation. Engagement counters sub-sharded. Multi-region with per-user home. The hardest scaling problem is candidate generation across a dense graph; the hardest correctness problem is visibility enforcement at read.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: friends, pages, groups, ranking, visibility.</li>
+<li>Invariant: ranked feed from connected sources; visibility enforced.</li>
+<li>Hybrid fan-out for candidate generation.</li>
+<li>Multi-stage ML ranker with feature store.</li>
+<li>Read-time visibility gate.</li>
+<li>Engagement sub-counter sharded.</li>
+<li>Multi-region per-user home.</li>
+<li>Continuous moderation pipeline.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Facebook's newsfeed is hybrid fan-out plus heavy ML ranking. Candidate generation pulls from friends, pages, groups, and recommendations. Multi-stage ranking — cheap pre-rank then deep model — scores top candidates. Feature store provides pre-computed features. Visibility gate filters at read for blocks, privacy, moderation. Engagement counters sub-sharded. Multi-region with per-user home. The hardest scaling problem is candidate generation across a dense graph.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Hybrid fan-out: push for normal sources, pull for celebrities and pages."</li>
+<li>"Multi-stage ranking: cheap pre-rank prunes; deep model ranks."</li>
+<li>"Feature store decouples feature computation from inference."</li>
+<li>"Visibility filtering at read; never bake blocks into inbox."</li>
+<li>"Engagement counters sub-shard for hot posts."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

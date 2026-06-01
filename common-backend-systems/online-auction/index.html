@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Online Auction — eBay-Style Bidding (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Online Auction — eBay-Style Bidding (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Medium · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build an online auction system. Sellers list items with a start price, duration, and reserve. Buyers place bids; the highest bid at close wins. Right before close, "sniping" creates a write-heavy spike. Assume 100M auctions/year, 10M concurrent active auctions, ~1M bids/sec at peak across the platform during major events.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Seller creates an auction with start time, end time, start bid, reserve.
+- Buyers place bids; the system enforces minimum increment and rejects late/low bids.
+- All viewers see live current price; on close, the highest bidder wins.</p>
+<p>I'd defer payments deep dive, dispute resolution, and seller storefronts.</p>
+<p><strong>Non-functional</strong>
+- <strong>Strong correctness</strong>: highest valid bid at close wins, deterministically.
+- <strong>Per-auction total ordering</strong> on bids — the "current high bid" is unambiguous.
+- Bid placement p99 &lt; 500 ms even during the last-minute spike.
+- Live price updates broadcast to all watchers within ~1 s.
+- Highly available — every dropped bid is a real complaint.</p>
+<p><strong>Capacity</strong>
+- 10M concurrent auctions; ~1M bids/sec at peak.
+- Read fan-out: a hot auction may have 100k viewers watching live.
+- Bid records are not the dominant cost unless a major event sustains peak: 1M bids/sec × 10 min × ~180 B × 3 replicas ≈ 324 GB for that spike. Over a normal year, 1B bids × 180 B × 3 ≈ 540 GB before indexes.
+- The hotter constraint is per-auction serialization and live fan-out: a 100k-viewer auction needs ~1.6 MB of watcher IDs, but the broadcast path must push every accepted high-bid update within ~1 s.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Auction</strong> — <code>auction_id</code>, seller_id, item, start_bid, reserve, start_at, end_at, status, current_high_bid_id.</li>
+<li><strong>Bid</strong> — <code>bid_id</code>, auction_id, bidder_id, amount, ts.</li>
+<li><strong>Watcher</strong> — <code>user_id, auction_id</code>. Drives live updates and notifications.</li>
+<li><strong>User</strong> — buyer or seller.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST  /v1/auctions                          { item, start_bid, end_at, reserve }  → { auction_id }
+GET   /v1/auctions/{id}                     → Auction + recent bids
+POST  /v1/auctions/{id}/bids                { amount }   (idempotency-key required)  → { bid_id, accepted, new_high }
+WS    /v1/auctions/{id}/stream              → live high-bid + countdown
+</code></pre>
+<p>User from token. Idempotency key on bids is mandatory.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Auction service.</strong> Owns auction metadata. Reads served from a write-through cache.</li>
+<li><strong>Bid service.</strong> The heart of the system. Receives bid → validates (auction active, amount &gt; current + min increment, bidder not seller) → atomically promotes if higher → writes the bid row → broadcasts.</li>
+<li><strong>Per-auction sharding.</strong> All writes for one auction go to the same shard so we can enforce ordering with a single in-memory queue or a row lock. Hot auctions still hit a single shard.</li>
+<li><strong>In-memory current-high state.</strong> Each auction's <code>current_high_bid_id, amount</code> lives in Redis (or in-process state) for the bid service to compare against without a DB round-trip. Source of truth backed by the bid row in MySQL with a unique constraint per auction on <code>(auction_id, bid_id)</code>.</li>
+<li><strong>Bid persistence.</strong> Append-only Cassandra or sharded MySQL keyed by <code>auction_id</code> — all bids for one auction co-locate. Bids are immutable.</li>
+<li><strong>Closer service.</strong> A timing wheel or scheduled jobs keyed by <code>end_at</code> per auction. At close, the service marks the auction <code>closed</code>, freezes the high bid, fires the <code>auction.closed</code> event.</li>
+<li><strong>Live updates.</strong> Each bid emits an event to a per-auction channel. WS gateway holds connections and fans out. For mega-auctions with 100k watchers, fan-out goes through a hierarchical bus.</li>
+<li><strong>Sniping defense.</strong> "Soft close": if a bid lands in the last 30 s, extend <code>end_at</code> by 30 s. Atomic update on the auction row.</li>
+</ol>
+<p>End-to-end narration: Auction A1 closes at 10:00:00. At 09:59:58 Alice bids $120 (current high $115). Request hits the partition for A1 → in-memory state shows current = $115 → atomic CAS to ($120, Alice's bid_id) → write bid row → publish event → all watchers get the update within 1 s → soft-close extends end to 10:00:28. Bob bids $130 at 10:00:25 → similar flow. No more bids → at 10:00:28 closer service marks A1 closed, Bob wins.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">                    +--------------------------------+
+                    | BUYERS / SELLERS / WATCHERS   |
+                    +--------+-----------+-----------+
+                            |           |
+       POST /auctions, GET /id   |           | WS /auctions/{id}/stream
+       POST /auctions/{id}/bids  |           v
+                            v    +------+-------+
+                    +--------+--+ | WS Gateways  |
+                    | Auction   | +------+-------+
+                    | Service   |        ^
+                    +----+------+        | bid.accepted
+                        |               |
+                        v               |
+                    +----+------+   +----+-------------+
+                    | Bid Router|--&gt;| Single Bid Owner |
+                    | hash(id)  |   | queue per auction|
+                    +----+------+   +----+------+------+ 
+                        |               |      |
+                        |               |      | auction.closed
+                        v               v      v
+       +----------------------------------------------------------+
+       | STORE / CACHE                                            |
+       | auction:{auction_id} metadata/status/current_high ptr    |
+       | auction_high:{auction_id} Redis hash amount,bid,version  |
+       | bids:{auction_id} append-only ordered bid log            |
+       | bid_idem:{user_id}:{key} idempotent bid response         |
+       | close:{epoch_second} set/list of auction_ids             |
+       | watch:{auction_id} ephemeral connection IDs              |
+       +-----------+---------------------------+------------------+
+                | current-high miss         ^ close slots
+                v                           |
+        +-------------------+         +-------+-------+
+        | Replay bids:{id}  |         | Closer        |
+        | to rebuild high   |         | Service       |
+        +-------------------+         +---------------+
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete stores and shard keys.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key pattern</th>
+<th>Data structure / entry</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Auction metadata</td>
+<td><code>auction:{auction_id}</code></td>
+<td>MySQL/Dynamo row, item/end/status/current_high pointer, ~1 KB</td>
+<td>active + 90 d hot, archive years</td>
+<td><code>auction_id</code></td>
+</tr>
+<tr>
+<td>Current high</td>
+<td><code>auction_high:{auction_id}</code></td>
+<td>Redis hash <code>{amount,bid_id,bidder,version}</code>, ~120 B</td>
+<td>until <code>end_at + 7 d</code></td>
+<td><code>auction_id</code></td>
+</tr>
+<tr>
+<td>Bid log</td>
+<td><code>bids:{auction_id}</code></td>
+<td>append-only partition ordered by server sequence, ~150–180 B/bid</td>
+<td>years</td>
+<td><code>auction_id</code></td>
+</tr>
+<tr>
+<td>Idempotency</td>
+<td><code>bid_idem:{user_id}:{key}</code></td>
+<td>accepted/rejected response, ~300 B</td>
+<td>24 h</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Close wheel</td>
+<td><code>close:{epoch_second}</code></td>
+<td>set/list of <code>auction_id</code>s, ~16 B/id</td>
+<td>until slot processed + 2 h</td>
+<td><code>epoch_second</code></td>
+</tr>
+<tr>
+<td>Watcher channel</td>
+<td><code>watch:{auction_id}</code></td>
+<td>ephemeral connection IDs, ~16 B/watcher</td>
+<td>while connected</td>
+<td><code>auction_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>The bid log is content; Redis is only the current-high index. If Redis loses a key, the owner replays the last bids for that auction from <code>bids:{auction_id}</code> and reconstructs the high bid.</p>
+<p><strong>Capacity by store.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store / index</th>
+<th>Math</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Auction metadata</td>
+<td>10M active × 1 KB × 3 ≈ 30 GB hot; 100M/year ≈ 300 GB/year</td>
+<td>archive closed auctions cheaply</td>
+</tr>
+<tr>
+<td>Current high</td>
+<td>10M active × 120 B × Redis overhead/replicas ≈ 5–10 GB real memory</td>
+<td>index only; rebuildable</td>
+</tr>
+<tr>
+<td>Bid log</td>
+<td>1B bids/year × 180 B × 3 ≈ 540 GB/year; 10-min 1M/sec spike ≈ 324 GB</td>
+<td>durable content store</td>
+</tr>
+<tr>
+<td>Idempotency</td>
+<td>100M bid attempts/day × 300 B × 3 ≈ 90 GB if kept 24 h</td>
+<td>TTL keeps it bounded</td>
+</tr>
+<tr>
+<td>Close wheel</td>
+<td>10M IDs × 16 B × 3 ≈ 480 MB</td>
+<td>time index, not content</td>
+</tr>
+<tr>
+<td>Watcher channel</td>
+<td>hot auction 100k watchers × 16 B ≈ 1.6 MB per region</td>
+<td>ephemeral connection index</td>
+</tr>
+</tbody>
+</table>
+<p>Why sharded MySQL/Dynamo for auction metadata but append storage for bids: the auction row needs conditional state transitions (<code>active → closed</code>, soft-close extension), while the bid log is immutable content keyed by <code>auction_id</code>. A single relational table for all bids can work at lower scale, but the hot path should not make live fan-out or bid append compete with metadata row locks.</p>
+<p><strong>Place-bid path.</strong>
+1. Client sends <code>POST /v1/auctions/{id}/bids</code> with an idempotency key; API gateway authenticates and forwards to the bid router.
+2. Router hashes <code>auction_id</code> to the current single owner; all bid requests for that auction hit the same in-memory queue.
+3. Owner checks <code>bid_idem:{user_id}:{key}</code>; if absent, it reads auction status/end time and current high from memory or <code>auction_high:{auction_id}</code>.
+4. Owner validates active auction, bidder != seller, <code>amount &gt;= current + increment</code>, and soft-close condition.
+5. In one serialized step, it assigns a sequence, appends to <code>bids:{auction_id}</code>, updates <code>auction_high:{auction_id}</code>, and updates <code>auction:{auction_id}.current_high_bid_id</code>.
+6. Broadcast is async: publish <code>bid.accepted</code> to the auction channel; slow WS clients get the newest high bid and may miss intermediate bids.</p>
+<p><strong>Auction read path, hot and cold.</strong>
+1. <code>GET /v1/auctions/{id}</code> reads <code>auction:{auction_id}</code> and <code>auction_high:{auction_id}</code> in parallel; recent bids come from the tail of <code>bids:{auction_id}</code> with cursor <code>{auction_id, last_sequence}</code>.
+2. Hot live clients should stay on <code>WS /stream</code>; the WS gateway keeps only connection IDs in <code>watch:{auction_id}</code> and receives accepted-high events from regional pub/sub.
+3. If <code>auction_high:{auction_id}</code> is missing, the service reads the auction row, replays the last bid-log page for <code>auction_id</code>, reconstructs the high bid, and repopulates Redis before returning.
+4. If the cursor asks for bids older than the hot partition, the API switches to the archived bid log; latency can be seconds because bid acceptance is already over.</p>
+<p><strong>Two-index framing.</strong> The same bid dataset has three views: append-only <code>bids:{auction_id}</code> as content, <code>auction_high:{auction_id}</code> as the current-high index, and <code>close:{epoch_second}</code> as a time index for closure. Keeping that distinction clear prevents the common mistake of treating Redis current-high as the legal audit trail.</p>
+<p><strong>Per-auction ordering under spike.</strong> The whole interview hinges here. Two viable approaches:
+- <strong>Single writer per auction.</strong> Route all bids for <code>auction_id = X</code> to one Bid service instance (consistent hashing). That instance serializes via an in-memory mutex/queue. Easy ordering. Fault: instance death loses in-flight state — back it with a Kafka topic so on failover the new owner can replay.
+- <strong>Optimistic CAS in Redis.</strong> <code>WATCH/MULTI/EXEC</code> or a Lua script: read current high; if new bid &gt; current, replace; else reject. Naturally scales but loses fairness when multiple bids arrive in the same RTT (one wins arbitrarily).</p>
+<p>I'd lead with single-writer-per-auction for clarity, mention Redis CAS as the alternative.</p>
+<p>Why not just lock a database row for every bid: it is correct, but the hottest auction pins one DB primary and makes fan-out retries compete with bid acceptance. The single-owner design keeps the critical comparison in memory, uses the DB as durable append-only history, and can replay after failover.</p>
+<p><strong>Sniping spike.</strong> Last 30 s of a popular auction: thousands of bids, all for the same key. The hot-key is unavoidable since bids must be ordered against the current high. Mitigations: scale the single-owner's bid service for that auction; use a tightly-coupled in-memory queue; ensure WS fan-out doesn't bottleneck the bid path (separate concern).</p>
+<p><strong>Multi-region and clocks.</strong> Active bidding for an auction is pinned to one home region selected by <code>auction_id</code>; other regions serve read replicas and route bids back to the owner. The owner stamps bids with server receive time, and the close service rejects any bid whose receive time is after the final <code>end_at</code>, even if a remote client sent it earlier. The tradeoff is a little extra cross-region latency for some bidders in exchange for deterministic close semantics.</p>
+<p><strong>Soft close.</strong> Prevents true snipe-at-zero: any bid in the last 30 s extends the auction by 30 s. Encoded as <code>end_at = max(end_at, now + 30s)</code> in the same transaction as the bid acceptance.</p>
+<p><strong>Auction closing.</strong> Don't scan all auctions every second. Timing wheel keyed by <code>end_at</code> resolution = 1 s, slot holds <code>auction_ids</code>. The closer service walks the current slot, fires close events. For 10M concurrent auctions this is manageable.</p>
+<p><strong>Bid latency.</strong> End-to-end &lt; 500 ms. Steps: API gateway (10 ms), routing to owner (10 ms), in-memory accept (1 ms), Cassandra write (~10 ms), publish (1 ms). Lots of headroom; the heavy cost is the WS fan-out to all watchers, which is decoupled.</p>
+<p><strong>Live updates at fan-out.</strong> 100k watchers on one auction. Hierarchical pub/sub: bid event → regional brokers → WS gateways → clients. Drop intermediate updates if a client is slow (only need the latest current high).</p>
+<p><strong>Graceful degradation.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Latency budget</th>
+<th>Fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cold auction</td>
+<td>DB + cache</td>
+<td><code>auction:{id}</code>, <code>auction_high:{id}</code></td>
+<td>&lt; 500 ms bid</td>
+<td>lazy-load owner state on first bid</td>
+</tr>
+<tr>
+<td>Hot auction</td>
+<td>single owner queue</td>
+<td>in-memory high + bid log append</td>
+<td>&lt; 500 ms bid</td>
+<td>shed live-update work, never shed accepted bid persistence</td>
+</tr>
+<tr>
+<td>Owner failure</td>
+<td>replay</td>
+<td><code>bids:{auction_id}</code> + last sequence</td>
+<td>seconds</td>
+<td>freeze accepts briefly, elect new owner, replay tail</td>
+</tr>
+<tr>
+<td>Close wheel delayed</td>
+<td>deterministic close</td>
+<td><code>auction.end_at</code> + owner sequence</td>
+<td>close within 1–2 s</td>
+<td>reject bids with server receive time &gt; final <code>end_at</code></td>
+</tr>
+<tr>
+<td>Watcher exhausted</td>
+<td>latest-only stream</td>
+<td>pub/sub + WS gateway</td>
+<td>&lt; 1 s latest</td>
+<td>drop intermediate updates for slow clients</td>
+</tr>
+</tbody>
+</table>
+<p>"My punch line: every auction is intentionally a single hot key; the design is about isolating that hot key, not pretending we can shard one auction's bid ordering."</p>
+<p><strong>Idempotency.</strong> Bids retried during slow networks must not double-charge or double-rank. Server stores <code>(idempotency_key, response)</code> for 24 h.</p>
+<p><strong>Fraud and shill bidding.</strong> Detect bidders with very high cancel rates, IP overlap with seller, sudden spike just before close. Hide flagged bids from leaderboard; resolve manually.</p>
+<p><strong>What I'd defer.</strong> Buy-it-now, second-chance offers, multi-item auctions (Dutch), bid retraction, payment capture deep dive, dispute resolution.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

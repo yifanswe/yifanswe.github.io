@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design a Stock Exchange — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design a Stock Exchange</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A stock exchange matches buyers and sellers of securities under strict latency, fairness, and audit requirements. The hard part is the <strong>matching engine</strong>: a single-threaded deterministic system that must execute trades in microseconds with perfect order preservation, while disseminating market data to thousands of subscribers and surviving the entire trading day without bugs.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Orders are accepted, validated, and matched in strict time priority within each price level using the canonical matching algorithm (typically price-time priority); every executed trade has a deterministic counterparty pair, price, and quantity derivable from the order stream; market data feeds reflect the same state across all subscribers; the order book and trade history are auditable to the microsecond.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design a deterministic single-threaded matching engine, design high-throughput order ingress and market data dissemination, handle pre-trade risk checks, and reason about disaster recovery and audit.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design the exchange as three core systems: order ingress with pre-trade risk, a deterministic matching engine per instrument (single-threaded for correctness), and a market data dissemination layer broadcasting order book updates and trades. The interesting decisions are matching algorithm, single-threaded determinism, sequencing, audit log, and how to scale across thousands of instruments without breaking determinism within each.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Accept limit and market orders.</li>
+<li>Match orders by price-time priority.</li>
+<li>Cancel and modify orders.</li>
+<li>Disseminate Level 1 (best bid/ask) and Level 2 (depth) market data.</li>
+<li>Trade reporting to regulators.</li>
+<li>Auction phases (open, continuous, close).</li>
+<li>Halts and circuit breakers.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Order entry to execution: microseconds (10-100 μs typical).</li>
+<li>Throughput: millions of orders/sec at peak.</li>
+<li>Determinism: same input order produces same trades, byte-for-byte.</li>
+<li>High availability: zero downtime during trading hours.</li>
+<li>Disaster recovery: failover with no message loss.</li>
+<li>Regulator-grade audit trail.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Settlement and clearing (separate system).</li>
+<li>KYC and account onboarding.</li>
+<li>Tax / compliance reporting beyond required.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Instruments</td>
+<td>10k+ traded symbols.</td>
+</tr>
+<tr>
+<td>Orders/sec</td>
+<td>1M+ peak across exchange.</td>
+</tr>
+<tr>
+<td>Per-symbol</td>
+<td>A few hundred orders/sec on active names.</td>
+</tr>
+<tr>
+<td>Trades/sec</td>
+<td>Tens of thousands.</td>
+</tr>
+<tr>
+<td>Market data subscribers</td>
+<td>Thousands of firms.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>10-100 μs order-to-ack.</td>
+</tr>
+<tr>
+<td>Audit retention</td>
+<td>Years.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is the per-symbol matching engine plus market data broadcast latency.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Purpose</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Order entry</td>
+<td>Accept orders, validate, route.</td>
+<td>Low latency.</td>
+</tr>
+<tr>
+<td>Pre-trade risk</td>
+<td>Check limits, credit, fat-finger.</td>
+<td>Inline; microseconds.</td>
+</tr>
+<tr>
+<td>Matching engine</td>
+<td>Order book + match.</td>
+<td>Deterministic; single-threaded per symbol.</td>
+</tr>
+<tr>
+<td>Market data</td>
+<td>Broadcast book updates and trades.</td>
+<td>Low latency; reliable.</td>
+</tr>
+<tr>
+<td>Audit</td>
+<td>Record every input event.</td>
+<td>Replayable.</td>
+</tr>
+<tr>
+<td>Trade reporting</td>
+<td>Send to regulators.</td>
+<td>Strong.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Member Firms --orders--&gt; Order Gateway (with auth)
+                              |
+                              v
+                       +-------------+
+                       | Sequencer   |
+                       | (global order|
+                       |  in time)   |
+                       +------+------+
+                              |
+                              v
+                       +-------------+
+                       | Pre-Trade   |
+                       | Risk Check  |
+                       +------+------+
+                              |
+                              v
+                       +-------------+
+                       | Matching    |
+                       | Engine      |
+                       | (per symbol)|
+                       +------+------+
+                              |
+              +---------------+----------------+
+              |               |                |
+              v               v                v
+        Trade Capture   Market Data       Audit Log
+         (clearing)     (subscribers)     (regulator-grade)
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Order gateway</td>
+<td>TCP / FIX / proprietary protocol; auth member.</td>
+<td>Low-latency network.</td>
+</tr>
+<tr>
+<td>Sequencer</td>
+<td>Assigns monotonic exchange-wide sequence to events.</td>
+<td>Often hardware-accelerated.</td>
+</tr>
+<tr>
+<td>Pre-trade risk</td>
+<td>Position limits, kill switches, fat-finger.</td>
+<td>Inline; very fast.</td>
+</tr>
+<tr>
+<td>Matching engine</td>
+<td>Per-symbol order book + matching algorithm.</td>
+<td>Single-threaded for determinism.</td>
+</tr>
+<tr>
+<td>Order book</td>
+<td>Sorted bids and asks; per-price queues.</td>
+<td>Hot path data structure.</td>
+</tr>
+<tr>
+<td>Trade capture</td>
+<td>Persist executed trades.</td>
+<td>Append-only; reliable.</td>
+</tr>
+<tr>
+<td>Market data publisher</td>
+<td>Multicast UDP for low-latency dissemination.</td>
+<td>Reliable via retransmit channel.</td>
+</tr>
+<tr>
+<td>Audit log</td>
+<td>Every input and output event.</td>
+<td>Replayable; regulator-grade.</td>
+</tr>
+<tr>
+<td>Failover service</td>
+<td>Hot standby matching engines.</td>
+<td>Continuous state replication.</td>
+</tr>
+<tr>
+<td>Drop copy</td>
+<td>Order/trade record back to member.</td>
+<td>Real-time confirmation.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="order">Order</h4>
+<pre><code class="language-text">Order(
+  order_id,                 // exchange-assigned
+  client_order_id,          // member's id
+  member_id,
+  symbol,
+  side,                     // buy, sell
+  quantity,
+  price?,                   // null for market
+  type,                     // limit, market, stop, ...
+  time_in_force,            // day, gtc, ioc, fok
+  received_at,              // microsecond timestamp
+  sequence,                 // global sequence
+  status                    // accepted, partially_filled, filled, cancelled, rejected
+)
+</code></pre>
+<h4 id="order-book-in-memory">Order Book (in-memory)</h4>
+<pre><code class="language-text">OrderBook(
+  symbol,
+  bids: SortedMap[price -&gt; Queue[Order]],
+  asks: SortedMap[price -&gt; Queue[Order]],
+  best_bid,
+  best_ask,
+  last_trade_price,
+  state                    // auction, continuous, halted
+)
+</code></pre>
+<h4 id="trade">Trade</h4>
+<pre><code class="language-text">Trade(
+  trade_id,
+  symbol,
+  buy_order_id,
+  sell_order_id,
+  buy_member,
+  sell_member,
+  price,
+  quantity,
+  executed_at,
+  sequence
+)
+</code></pre>
+<h4 id="audit-event">Audit Event</h4>
+<pre><code class="language-text">AuditEvent(
+  sequence,                 // global, monotonic
+  type,                     // order_new, order_cancel, trade, halt, ...
+  payload,
+  timestamp_ns
+)
+</code></pre>
+<h3 id="order-entry-apis">Order Entry APIs</h3>
+<p>Typically FIX protocol or proprietary binary:</p>
+<pre><code class="language-text">NewOrderSingle(client_order_id, symbol, side, quantity, price, ...)
+CancelRequest(client_order_id, order_id)
+ModifyRequest(...)
+</code></pre>
+<p>Response (Execution Reports):</p>
+<pre><code class="language-text">Ack            -- order accepted
+Reject         -- with reason
+Fill           -- partial or full
+Cancel ack
+</code></pre>
+<h3 id="matching-algorithm-price-time-priority">Matching Algorithm: Price-Time Priority</h3>
+<p>For each symbol's order book:</p>
+<ul>
+<li>Bids sorted by price descending, then by time ascending (FIFO at each price level).</li>
+<li>Asks sorted by price ascending, then by time ascending.</li>
+</ul>
+<p>When a new order arrives:</p>
+<ul>
+<li><strong>Aggressive (crosses the book):</strong> match against opposite side starting at best price; consume FIFO at each level until the order is filled or no more contra orders cross.</li>
+<li><strong>Passive (rests):</strong> place into the book at its price level, time-stamped.</li>
+</ul>
+<p>For each match: produce a Trade record with <code>price = price of the resting order</code> (which was first; passive side gets price improvement to the aggressor).</p>
+<p>This is the canonical algorithm; alternatives include pro-rata (allocate proportionally), price-size, etc.</p>
+<h3 id="single-threaded-determinism">Single-Threaded Determinism</h3>
+<p>The matching engine for one symbol is single-threaded.</p>
+<ul>
+<li>All inputs (new orders, cancels, modifies, time ticks) flow through one queue.</li>
+<li>Engine processes one at a time, in sequence.</li>
+<li>Output is deterministic given input.</li>
+</ul>
+<p>Why single-threaded?</p>
+<ul>
+<li>Concurrency is the enemy of determinism. Two threads racing on the order book may produce different results based on timing.</li>
+<li>Multi-threading adds locks, slowing things down anyway.</li>
+<li>A single CPU core can process millions of simple ops per second; that's plenty for an instrument.</li>
+</ul>
+<p>Scaling: one matching engine per symbol (or per group of symbols). Different symbols are independent — they can run on different cores / hosts.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Single-threaded matching is not a limitation; it's a feature. Determinism is paramount, and a single thread on one core handles the throughput of any individual instrument.</p>
+</blockquote>
+<h3 id="sequencer">Sequencer</h3>
+<p>A global sequencer assigns a monotonic sequence number to every order event in arrival order. This:</p>
+<ul>
+<li>Provides total order across the exchange.</li>
+<li>Enables deterministic replay.</li>
+<li>Is the basis of fairness — earlier sequence = better priority.</li>
+</ul>
+<p>Implementation often involves hardware (FPGA) or specialized low-latency network appliances.</p>
+<h3 id="pre-trade-risk">Pre-Trade Risk</h3>
+<p>Inline check before sending to matching:</p>
+<ul>
+<li>Member's position limits.</li>
+<li>Credit / collateral.</li>
+<li>Fat-finger detection (order qty or price way out of normal range).</li>
+<li>Kill switch (member-initiated emergency stop).</li>
+<li>Throttling (per-member rate limits).</li>
+</ul>
+<p>Must be very fast — microseconds.</p>
+<h3 id="market-data-dissemination">Market Data Dissemination</h3>
+<p>Two feed types:</p>
+<ul>
+<li><strong>Level 1:</strong> best bid, best ask, last trade.</li>
+<li><strong>Level 2:</strong> depth — multiple price levels with quantities.</li>
+<li><strong>Full depth / Level 3:</strong> every order.</li>
+</ul>
+<p>Dissemination:</p>
+<ul>
+<li>UDP multicast for low latency and broadcast efficiency.</li>
+<li>Sequence numbers on every packet; subscribers detect gaps and request retransmits via a separate TCP/UDP channel.</li>
+<li>"Snapshot + delta" model: subscribers get a periodic full snapshot, then incremental updates.</li>
+</ul>
+<h3 id="audit-log">Audit Log</h3>
+<p>Every input event and every output event is logged with sequence number and microsecond timestamp.</p>
+<ul>
+<li>Replayable: feed the input stream to a fresh matching engine and produce identical outputs.</li>
+<li>Persisted to disk and replicated to multiple sites.</li>
+<li>Regulator can request retrospective analysis.</li>
+</ul>
+<h3 id="failover">Failover</h3>
+<p>The matching engine is the heart; it must not go down during trading.</p>
+<ul>
+<li>Hot standby running in lockstep: same input stream, same state.</li>
+<li>Replication via sequenced event log.</li>
+<li>On primary failure, standby takes over with no message loss.</li>
+<li>Failover is transparent to members (typically within milliseconds).</li>
+</ul>
+<p>Aeron, LMAX Disruptor, and similar technologies enable this pattern.</p>
+<h3 id="auction-phases">Auction Phases</h3>
+<ul>
+<li><strong>Pre-open:</strong> orders queued; book imbalance published; opening price computed at open.</li>
+<li><strong>Continuous:</strong> standard price-time matching.</li>
+<li><strong>Pre-close / close:</strong> closing auction algorithm to determine end-of-day price.</li>
+<li><strong>Halt:</strong> all matching paused; orders rejected or queued per policy.</li>
+</ul>
+<p>Circuit breakers: automatic halts on extreme price movement.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition strategy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Matching engines</td>
+<td>Per-symbol (or per group)</td>
+</tr>
+<tr>
+<td>Order gateways</td>
+<td>Stateless; horizontal</td>
+</tr>
+<tr>
+<td>Pre-trade risk</td>
+<td>Per-member; replicated state</td>
+</tr>
+<tr>
+<td>Market data</td>
+<td>Symbol-based multicast groups</td>
+</tr>
+<tr>
+<td>Audit log</td>
+<td>Append-only; replicated</td>
+</tr>
+</tbody>
+</table>
+<p>Independent symbols scale horizontally. Within a symbol, single-threaded.</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Order book within a symbol</td>
+<td>Strong, single-threaded</td>
+</tr>
+<tr>
+<td>Cross-symbol</td>
+<td>Independent</td>
+</tr>
+<tr>
+<td>Market data</td>
+<td>Total order per symbol</td>
+</tr>
+<tr>
+<td>Audit log</td>
+<td>Total order, replicated</td>
+</tr>
+<tr>
+<td>Member confirmations</td>
+<td>Strong via drop-copy</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Matching engine crash.</td>
+<td>Hot standby; replay from log.</td>
+<td>Failover time.</td>
+</tr>
+<tr>
+<td>Bad order corrupts state.</td>
+<td>Validation before processing; canary engine compares output.</td>
+<td>State divergence.</td>
+</tr>
+<tr>
+<td>Sequencer fails.</td>
+<td>Redundant sequencers; backup.</td>
+<td>Sequence gaps.</td>
+</tr>
+<tr>
+<td>Member sends order storm.</td>
+<td>Per-member rate limit; kill switch.</td>
+<td>Per-member rate.</td>
+</tr>
+<tr>
+<td>Market data feed gap.</td>
+<td>Retransmit channel; periodic snapshot.</td>
+<td>Subscriber gap count.</td>
+</tr>
+<tr>
+<td>Pre-trade risk slow.</td>
+<td>Optimize; preemptive caches; deny on timeout.</td>
+<td>Risk check latency.</td>
+</tr>
+<tr>
+<td>Network partition between gateway and matching.</td>
+<td>Drop session; orders rejected with clear reason.</td>
+<td>Disconnection rate.</td>
+</tr>
+<tr>
+<td>Extreme market move (circuit breaker).</td>
+<td>Auto-halt; manual resume.</td>
+<td>Trigger frequency.</td>
+</tr>
+<tr>
+<td>Fat-finger order.</td>
+<td>Pre-trade risk catches; member can request cancel.</td>
+<td>Fat-finger rejects.</td>
+</tr>
+<tr>
+<td>Clock skew between sites.</td>
+<td>GPS-synced clocks; PTP.</td>
+<td>Clock drift.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Order rejected for invalid reasons (should be near zero).</li>
+<li>Trade mismatch between sites (must be zero).</li>
+<li>Audit log gaps.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Order entry latency p99 / p999.</li>
+<li>Match throughput per symbol.</li>
+<li>Market data publish latency.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Volume by symbol; market share.</li>
+<li>Member latencies.</li>
+<li>Failed orders.</li>
+</ul>
+<h3 id="multi-region-disaster-recovery">Multi-Region / Disaster Recovery</h3>
+<ul>
+<li>Primary data center for matching.</li>
+<li>Hot standby in nearby data center.</li>
+<li>Tertiary disaster recovery site.</li>
+<li>Strict latency: standby must keep up with primary.</li>
+<li>Failover drills regularly.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Single-threaded is fast and correct but caps per-symbol throughput; usually not a problem.</li>
+<li>Pre-trade risk adds latency; tradeoff vs catching bad orders.</li>
+<li>Multicast UDP is fast but unreliable; retransmit channels add complexity.</li>
+<li>Strict determinism requires every detail (including time) to be deterministic input.</li>
+<li>Tighter circuit breakers protect markets but anger high-frequency traders.</li>
+<li>Audit retention forever costs storage but is legally required.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Multi-threaded matching.</td>
+<td>Single-threaded per symbol; scale by symbol.</td>
+</tr>
+<tr>
+<td>Wall-clock-based ordering.</td>
+<td>Sequencer-based monotonic order.</td>
+</tr>
+<tr>
+<td>TCP for market data.</td>
+<td>UDP multicast + retransmit channel.</td>
+</tr>
+<tr>
+<td>In-memory only state.</td>
+<td>Replicated event log; replayable.</td>
+</tr>
+<tr>
+<td>No pre-trade risk.</td>
+<td>Inline checks per order.</td>
+</tr>
+<tr>
+<td>Synchronous regulator reporting.</td>
+<td>Async with strong audit log.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Matching algorithm</td>
+<td>Price-time priority; FIFO at each level.</td>
+</tr>
+<tr>
+<td>Single-threaded determinism</td>
+<td>One thread per symbol; no concurrency.</td>
+</tr>
+<tr>
+<td>Failover</td>
+<td>Hot standby with replayable log.</td>
+</tr>
+<tr>
+<td>Market data</td>
+<td>Multicast UDP + retransmit + snapshot.</td>
+</tr>
+<tr>
+<td>Pre-trade risk</td>
+<td>Inline checks; very low latency.</td>
+</tr>
+<tr>
+<td>Auction phases</td>
+<td>Opening/closing auction algorithms.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Sequencer-based total order.</li>
+<li>Single-threaded per-symbol matching.</li>
+<li>Price-time priority.</li>
+<li>Pre-trade risk inline.</li>
+<li>Multicast market data with retransmit.</li>
+<li>Replayable audit log.</li>
+<li>Hot-standby failover.</li>
+<li>Auction phases and circuit breakers.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>A stock exchange is a deterministic state machine over a global sequence of order events. The matching engine for each symbol is single-threaded for correctness; concurrency is the enemy of determinism. Market data is multicast UDP with retransmit channels. The audit log is replayable to the microsecond. Failover is hot standby in lockstep with the primary.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design a stock exchange.</p>
+<p><strong>Candidate:</strong> Three core systems: order entry with pre-trade risk, single-threaded matching engines per symbol with price-time priority, and multicast market data dissemination. Everything sequenced through a global sequencer for total order. The invariant is deterministic execution: same input stream produces same trades to the microsecond. Audit log is regulator-grade.</p>
+<p><strong>Interviewer:</strong> Walk me through an order.</p>
+<p><strong>Candidate:</strong> Member sends order via FIX to gateway. Gateway authenticates, parses, forwards to sequencer. Sequencer assigns the next sequence number and timestamps with nanosecond resolution. Order flows to pre-trade risk: check member's position limits, credit, fat-finger rules. If pass, route to matching engine for the symbol. Matching engine attempts to cross against the opposite side at the current best price; produces trades for each match; remaining quantity rests in the book. Execution reports flow back to the member via drop-copy.</p>
+<p><strong>Interviewer:</strong> Why single-threaded?</p>
+<p><strong>Candidate:</strong> Determinism. A multi-threaded engine processing the same input stream might produce different output depending on thread scheduling — which is incompatible with exchange fairness rules. Single thread = deterministic output = replayable audit = recoverable state. And a single CPU core handles plenty of throughput: even 100k orders/sec per symbol fits comfortably in a single thread.</p>
+<p><strong>Interviewer:</strong> How does failover work?</p>
+<p><strong>Candidate:</strong> Hot standby running in lockstep. The sequencer's output is replicated to both primary and standby; both apply events to their matching engines and should produce identical state. On primary failure, the standby is already at the same state and takes over within milliseconds. Members are typically routed via a session manager that fails over seamlessly. The audit log is the recovery substrate: replaying the log produces identical state.</p>
+<p><strong>Interviewer:</strong> Market data?</p>
+<p><strong>Candidate:</strong> UDP multicast feeds — Level 1 (BBO + last trade), Level 2 (depth), full depth. Each packet has a sequence number; subscribers detect gaps and request retransmits via a TCP gap channel. Periodic snapshots so subscribers can recover from major gaps. Multicast is the right choice for fan-out to thousands of subscribers because the same packet reaches everyone via routers.</p>
+<p><strong>Interviewer:</strong> Pre-trade risk?</p>
+<p><strong>Candidate:</strong> Inline before matching. Per-member position limits, credit checks, fat-finger thresholds (order quantity or price outside reasonable bands), kill switches. Must be very fast — microseconds. Risk data is replicated to all gateway/risk pods; updates flow continuously. Members can self-throttle via kill switch.</p>
+<p><strong>Interviewer:</strong> A bad order has a price 1000x reasonable. What happens?</p>
+<p><strong>Candidate:</strong> Fat-finger detection in pre-trade risk catches it. The order is rejected with a clear reason. If the rule's threshold doesn't catch it (e.g., a sophisticated manipulation), the order enters the book; the resulting trade might trigger a circuit breaker on extreme price move. After-the-fact, exchanges can cancel erroneous trades within a defined window (Erroneous Trade Cancellation rules).</p>
+<p><strong>Interviewer:</strong> Auction phases?</p>
+<p><strong>Candidate:</strong> Pre-open: orders queue; book imbalance published; opening price determined by an algorithm that maximizes matched volume at a single price. Continuous: standard price-time matching. Pre-close: similar to pre-open for closing auction. Halts: all matching paused; orders may be rejected or queued. Circuit breakers auto-halt on extreme price moves.</p>
+<p><strong>Interviewer:</strong> Audit log?</p>
+<p><strong>Candidate:</strong> Every input event (order, cancel, modify) and every output event (trade, reject, ack) is logged with sequence and nanosecond timestamp. Append-only; replicated across data centers. Regulators can request historical data; replaying the log reproduces the entire trading day's state byte-for-byte. The log is the source of truth — even the matching engine's in-memory state can be discarded and rebuilt.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Most exchanges colocate within one data center for latency; multi-region is for DR. Hot standby in a nearby site, tertiary DR farther. Standby keeps up with primary via the sequenced event stream. Failover drills are regular. Cross-region active-active matching is generally not done because latency penalty would defeat the purpose.</p>
+<p><strong>Interviewer:</strong> How do you handle a sudden 100x order rate?</p>
+<p><strong>Candidate:</strong> Per-member rate limits cap individual abuse. Aggregate flow control with backpressure to gateways. Pre-trade risk has fast-path rejects for over-limit cases. If the matching engine is saturated, orders queue at the sequencer with bounded latency increase. Worst case: temporary halt declared, all-cancel issued, resume.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Order entry with pre-trade risk, sequencer for global total order, single-threaded matching per symbol with price-time priority, multicast UDP market data with retransmit, regulator-grade audit log. Hot-standby failover with replayable log. Auction phases and circuit breakers handle market stress. Determinism is the central invariant; single-threaded matching delivers it. Scale by adding more symbols, not more threads per symbol.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: latency, fairness, determinism, audit.</li>
+<li>Invariant: deterministic; price-time priority; replayable.</li>
+<li>Sequencer for global total order.</li>
+<li>Single-threaded matching per symbol.</li>
+<li>Pre-trade risk inline.</li>
+<li>Multicast UDP market data + retransmit channel.</li>
+<li>Hot-standby failover; replayable audit log.</li>
+<li>Auction phases and circuit breakers.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>A stock exchange is a deterministic state machine. Sequencer gives global total order; single-threaded matching per symbol gives byte-deterministic output; price-time priority is the canonical algorithm. Pre-trade risk runs inline. Market data is multicast UDP with retransmit channels. Audit log is replayable. Failover is hot-standby in lockstep. Determinism is paramount; concurrency is the enemy. Scale across symbols, not within them.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Single-threaded matching is a feature, not a limitation."</li>
+<li>"Sequencer gives global total order; everything downstream is deterministic."</li>
+<li>"Price-time priority is the canonical algorithm: best price first, FIFO within."</li>
+<li>"Audit log is the source of truth; in-memory state can be rebuilt by replay."</li>
+<li>"Multicast UDP for fast fan-out; retransmit channel for gap recovery."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

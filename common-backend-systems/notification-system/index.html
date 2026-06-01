@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Notification System — Multi-Channel Delivery (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Notification System — Multi-Channel Delivery (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Medium · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build the notification fan-out service. Backend services trigger notifications; we deliver via push (iOS/Android), email, SMS, and in-app. 1B users, ~100M notifications/day average, big bursts (e.g., 50M push pings in 30 s for a breaking news alert). Respect user preferences and rate limits.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Backend services submit notification events (recipient, template, payload, channels).
+- System renders messages per channel, applies user preferences, and dispatches.
+- Track delivery status (sent / delivered / failed) for retries and reporting.</p>
+<p>I'd defer in-depth marketing analytics and segmentation/audience-building tools.</p>
+<p><strong>Non-functional</strong>
+- High availability — undelivered transactional notifications are real failures.
+- Throughput: sustain 100M/day = ~1200/sec average; absorb 50M-in-30s = ~1.6M/sec bursts.
+- Latency targets per channel: push p95 &lt; 5 s, email p95 &lt; 30 s, SMS p95 &lt; 30 s.
+- Retry transient failures; never silently drop.
+- Respect user preferences (channel opt-outs, quiet hours).</p>
+<p><strong>Capacity</strong>
+- 1B users; ~3B device tokens (Android/iOS/Web).
+- Burst notification: 50M sends in 30 s ≈ 1.6M/sec.
+- If the average event fans out to 1.4 channels, 100M events/day creates ~140M delivery rows/day. At ~700 B/row × 90 d × 3 replicas, delivery status is ~26 TB and is the dominant hot store.
+- Device tokens are large but stable: 3B × ~200 B × 3 replicas ≈ 1.8 TB before indexes.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>NotificationEvent</strong> — <code>event_id, user_id, template_id, payload, channels[], priority</code>.</li>
+<li><strong>Delivery</strong> — <code>delivery_id, event_id, channel, recipient_address, status, attempts</code>.</li>
+<li><strong>UserPreferences</strong> — <code>user_id, channel_opt_ins, quiet_hours, device_tokens[]</code>.</li>
+<li><strong>Template</strong> — <code>template_id, channel-specific bodies, locales</code>.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST  /v1/notifications              { user_id, template_id, payload, channels[] }   → { event_id }
+POST  /v1/notifications/bulk         { events[] }                                    → { batch_id }
+GET   /v1/deliveries/{id}            → status
+
+// Outgoing webhooks from providers (Apple, FCM, SES, Twilio):
+POST  /v1/webhooks/provider/{name}   → delivery status update
+</code></pre>
+<p>Internal callers; idempotent on <code>event_id</code>.</p>
+<hr />
+<h2 id="4-data-flow-5-min">4. Data Flow (~5 min)</h2>
+<p>Event submitted → enriched with user preferences → fanned out per channel → per-channel queue → per-channel worker pool → provider API call → status recorded → retry on failure.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Ingestion service.</strong> Accepts events. Validates, writes the event row (<code>NotificationEvent</code> in Cassandra, sharded by event_id), publishes to a router topic.</li>
+<li><strong>Router service.</strong> Stream consumer that:
+   - Looks up user preferences (cached).
+   - Filters out opted-out channels.
+   - Applies quiet-hours (defer or drop based on policy).
+   - Splits the event into one <code>Delivery</code> per surviving channel.
+   - Publishes each delivery to that channel's queue.</li>
+<li><strong>Per-channel queues.</strong> Kafka topics: <code>dispatch.push</code>, <code>dispatch.email</code>, <code>dispatch.sms</code>, <code>dispatch.in_app</code>. Sized differently — push the largest.</li>
+<li><strong>Per-channel worker pools.</strong>
+   - <strong>Push workers:</strong> Group by token type, batch APNs/FCM calls (both support bulk), respect per-provider rate limits.
+   - <strong>Email workers:</strong> Use email provider (SES, Sendgrid), respect per-domain throttling.
+   - <strong>SMS workers:</strong> Per-carrier and per-country rate limits.
+   - <strong>In-app workers:</strong> Write to user's in-app notification feed (Cassandra row), push via WS if connected.</li>
+<li><strong>Provider callbacks.</strong> Each provider returns status (sent/delivered/bounced/etc.). Webhook handlers update <code>Delivery</code> rows.</li>
+<li><strong>Retry policy.</strong> Per channel: exponential backoff with cap. Push transient: retry 3 times over 1 hour. Email: retry 3 days. After give-up, dead-letter for ops review.</li>
+<li><strong>Rate limit per user.</strong> "Don't email someone 10× a day." Token bucket per <code>(user_id, channel)</code> in Redis. Drops or coalesces if exceeded.</li>
+<li><strong>Templates &amp; rendering.</strong> Templates with locale variants + payload variables. Rendered at dispatch time (per locale, per channel).</li>
+</ol>
+<p>End-to-end narration: a friend-request service emits a notification event for user U. Router pulls U's prefs — opted in to push + in_app, opted out of email; quiet hours not active. Two deliveries written: push and in_app. Push delivery routes to APNs worker, which batches with other deliveries to the same push gateway, calls APNs. Status <code>sent</code>; later APNs webhook says <code>delivered</code>. In-app delivery writes to U's feed; if U has an open WS, immediate broadcast.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">          +----------------------------------+
+          | PRODUCERS + PROVIDER CALLBACKS  |
+          +-----------+----------------------+
+                 |
+     POST /v1/notifications     |     POST /webhooks/provider/{name}
+     POST /v1/notifications/bulk|                 |
+                 v                 v
+          +-----------+----+    +-------+--------+
+          | Ingestion/API  |    | Webhook        |
+          | + idempotency  |    | Handlers       |
+          +-------+--------+    +-------+--------+
+             |                     |
+          router.normal/high           | update status
+          key=user_id                  v
+             v
+          +-------+--------+
+          | Router / Pref |
+          | Filter        |
+          +-------+--------+
+             |
+          dispatch.push/email/sms/in_app
+             v
+   +----------------+-------+--------+---------------------+
+   |                | Channel Workers |                     |
+   |                +-------+---------+                     |
+   |                        | batch / rate-limit            |
+   |                        v                               |
+   |             APNs / FCM / SES / Twilio                  |
+   +--------------------------------------------------------+
+             |
+             v
+   +--------------------------------------------------------+
+   | STORE / CACHE                                          |
+   | notif_idem:{producer}:{event_id} response pointer      |
+   | notif_event:{event_id} durable event row               |
+   | pref:{user_id} Redis hash; tokens:{user_id} set/list   |
+   | notif_cap:{user_id}:{channel}:{yyyy_mm_dd} token bucket|
+   | delivery:{delivery_id} status/attempts/provider_ref    |
+   | inapp:{user_id}:{yyyy_mm} notification ID list         |
+   | delay:{deliver_at_minute} queue/ZSET for quiet hours   |
+   +-----------+-------------------------------+------------+
+          | pref/token cache miss         ^ retry / DLQ
+          v                               |
+     +-------------------+             +-------+-------+
+     | Preference /      |             | Delayed       |
+     | Token DB          |             | Retry Workers |
+     +-------------------+             +---------------+
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete stores and shard keys.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key pattern</th>
+<th>Data structure / entry</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Event record</td>
+<td><code>notif_event:{event_id}</code></td>
+<td>Cassandra/Dynamo row, payload pointer + template + priority, ~0.5–1 KB</td>
+<td>30 d, transactional 1 y</td>
+<td><code>event_id</code></td>
+</tr>
+<tr>
+<td>Delivery status</td>
+<td><code>delivery:{delivery_id}</code></td>
+<td>row with channel/status/attempts/provider_ref, ~700 B</td>
+<td>30–90 d by channel</td>
+<td><code>delivery_id</code> or <code>(user_id, day)</code> for user lookup</td>
+</tr>
+<tr>
+<td>User prefs cache</td>
+<td><code>pref:{user_id}</code></td>
+<td>Redis hash, opt-ins/quiet hours/time zone, ~300 B</td>
+<td>TTL 1 h; invalidate on write</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Device tokens</td>
+<td><code>tokens:{user_id}</code></td>
+<td>set/list of token records, ~200 B/token</td>
+<td>until provider invalidates</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>In-app feed</td>
+<td><code>inapp:{user_id}:{yyyy_mm}</code></td>
+<td>wide row/list of notification IDs + snippet, ~150 B/item</td>
+<td>90 d hot, archive older</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Idempotency</td>
+<td><code>notif_idem:{producer}:{event_id}</code></td>
+<td>response pointer/status, ~200 B</td>
+<td>24–72 h</td>
+<td><code>(producer, event_id)</code></td>
+</tr>
+<tr>
+<td>Delayed delivery</td>
+<td><code>delay:{deliver_at_minute}</code></td>
+<td>queue/ZSET of <code>delivery_id</code>s</td>
+<td>until fired</td>
+<td><code>deliver_at_minute</code></td>
+</tr>
+<tr>
+<td>User/channel cap</td>
+<td><code>notif_cap:{user_id}:{channel}:{yyyy_mm_dd}</code></td>
+<td>Redis token bucket, ~40 B</td>
+<td>2 d</td>
+<td><code>user_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>Kafka queues are transport and buffering; Cassandra/Dynamo rows are the durable queryable state. I would call that out because interviewers often probe whether the queue is accidentally becoming the source of truth.</p>
+<p><strong>Capacity by store.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store / index</th>
+<th>Math</th>
+<th>What dominates</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Event records</td>
+<td>100M/day × 0.8 KB × 30 d × 3 replicas ≈ 7.2 TB</td>
+<td>payload pointers, not the rendered body</td>
+</tr>
+<tr>
+<td>Delivery status</td>
+<td>140M/day × 700 B × 90 d × 3 ≈ 26 TB</td>
+<td>dominant hot durable store</td>
+</tr>
+<tr>
+<td>Preference cache</td>
+<td>100M hot users × 300 B × Redis overhead/replica ≈ 100–200 GB real memory</td>
+<td>active users only; cold falls through</td>
+</tr>
+<tr>
+<td>Device token DB</td>
+<td>3B tokens × 200 B × 3 ≈ 1.8 TB</td>
+<td>stable but write-light</td>
+</tr>
+<tr>
+<td>In-app feed</td>
+<td>40M/day × 150 B × 90 d × 3 ≈ 1.6 TB</td>
+<td>user-keyed index, not full content</td>
+</tr>
+<tr>
+<td>Burst queue</td>
+<td>50M delivery pointers × 200 B × 3 ≈ 30 GB raw broker data</td>
+<td>short-lived buffer, not long-term state</td>
+</tr>
+</tbody>
+</table>
+<p>Why Cassandra/Dynamo-style rows instead of a single relational cluster: delivery writes are append-heavy, TTL-friendly, and naturally partition by <code>delivery_id</code> or <code>(user_id, day)</code>. MySQL can work at smaller scale, but the 26 TB hot-status footprint and burst write rate push me toward a wide-row or Dynamo-style store. Elasticsearch is a reporting index only; it should not be the source of truth for delivery status.</p>
+<p><strong>Submit notification path, hot and cold.</strong>
+1. Producer calls <code>POST /v1/notifications</code> with <code>event_id</code>; ingestion checks <code>notif_idem:{producer}:{event_id}</code> on shard <code>(producer, event_id)</code> and returns the old response on duplicate submit.
+2. Ingestion writes <code>notif_event:{event_id}</code> on shard <code>event_id</code>, then publishes a small pointer to <code>router.normal</code> or <code>router.high</code> with Kafka partition key <code>user_id</code> so per-user coalescing and rate caps stay ordered.
+3. Router fetches <code>pref:{user_id}</code>, <code>tokens:{user_id}</code>, and <code>notif_cap:{user_id}:{channel}:{day}</code> in parallel. On a preference/token cache miss, it falls through to the preference/token DB by <code>user_id</code>, repopulates Redis, and marks missing tokens as explicit <code>failed_no_token</code> deliveries rather than silently dropping push.
+4. Router filters opt-outs, quiet hours, and per-user caps; each surviving channel gets a <code>delivery:{delivery_id}</code> row before enqueue, with secondary lookup fields <code>(user_id, day)</code> for support/debug views.
+5. Channel workers consume <code>dispatch.{channel}.{priority}</code>. They batch by provider/token type, call APNs/FCM/SES/Twilio, and update <code>delivery:{delivery_id}</code> with attempt/status/provider_ref.
+6. Provider webhooks update the same delivery row idempotently using <code>(provider_ref, provider_event_id)</code>; retries use the durable attempt counter, not worker memory.
+7. Cold-start path: if the router cache is empty after deploy, it degrades to DB-backed preference/token reads and protects the DB with a small per-user local cache plus queue backpressure.</p>
+<p><strong>Two-index framing.</strong> Notification content is written once as <code>notif_event:{event_id}</code>. Delivery status is indexed by <code>delivery_id</code> for provider callbacks and by <code>(user_id, day)</code> for support/user-history reads. In-app feed is another user-keyed view over the same event/delivery IDs; it should store snippets and pointers, not a second copy of every rendered message.</p>
+<p><strong>Burst handling (50M in 30 s).</strong> Three pressure points:
+- <strong>Ingest:</strong> stateless; scale horizontally. Bounded by network.
+- <strong>Router:</strong> stateless; reads prefs from a cache; scale on demand. Pre-warm before known events.
+- <strong>Provider rate limits:</strong> can't be exceeded. APNs and FCM accept hundreds of thousands/sec per app; you still queue and drain.</p>
+<p>For mega-bursts (50M in seconds), the queue absorbs and the worker pools drain over a longer window. Acceptable as long as priority traffic isn't blocked.</p>
+<p>Why Kafka instead of a simple Redis queue or SQS-only design: Kafka gives ordered partitions, replay for router bugs, and consumer-group scaling across the 1.6M/sec burst. SQS/Pub/Sub can work for simpler systems, but replay and per-priority partition control are weaker. Redis queues are too memory-fragile for a burst that must survive worker downtime.</p>
+<p><strong>Edge stress tests.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Edge</th>
+<th>Failure mode</th>
+<th>Fallback / budget</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dormant user</td>
+<td>prefs/tokens not cached</td>
+<td>DB read by <code>user_id</code>, populate Redis; keep submit p95 under a few hundred ms</td>
+</tr>
+<tr>
+<td>Hot celebrity / broadcast</td>
+<td>one campaign creates 50M rows</td>
+<td>segment fan-out into jobs; preserve transactional priority queues</td>
+</tr>
+<tr>
+<td>In-app feed past 90 d</td>
+<td>hot row window exhausted</td>
+<td>cursor switches from <code>inapp:{user_id}:{yyyy_mm}</code> to archive store; chart/history can be slower</td>
+</tr>
+<tr>
+<td>Provider cap</td>
+<td>APNs/SMS throttles</td>
+<td>defer in <code>delay:{deliver_at_minute}</code> and drain by priority</td>
+</tr>
+<tr>
+<td>Multi-region drift</td>
+<td>duplicate webhook or retry in another region</td>
+<td>idempotent <code>delivery_id</code> update; provider reference is globally unique</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Priority queues.</strong> Critical transactional (password reset, auth code) vs marketing (weekly digest). Separate queues + workers prevent marketing surge from delaying transactional. Each channel has at least two priorities.</p>
+<p><strong>De-duplication.</strong> Idempotency on <code>event_id</code> end-to-end. Router stores <code>(event_id, channel) -&gt; delivery_id</code> so re-submit doesn't double-send.</p>
+<p><strong>User preference cache.</strong> 1B users × small pref row = a few hundred GB. Cache hot users in a Redis cluster; cold users hit MySQL/Cassandra. Updates propagate via cache invalidation on pref change.</p>
+<p><strong>Quiet hours and time zones.</strong> User's time zone in preferences. Router computes "is now within user's quiet hours?" If yes, defer the event (write to a delayed queue with <code>deliver_at</code> set to end-of-quiet-hours). Mark transactional events as quiet-hour-overriding.</p>
+<p><strong>Coalescing.</strong> Friend likes 5 photos in 1 minute → one notification "5 likes" rather than 5 separate. Implemented at the router: collapse same-template events within a window into one. Bumps engagement, lowers user fatigue.</p>
+<p><strong>Per-provider failover.</strong> Multiple providers for SMS (Twilio + alternates) and email (SES + Sendgrid). Per-provider success-rate monitoring; auto-shift traffic if one degrades. Routing config hot-reloads.</p>
+<p><strong>Status tracking.</strong> Each delivery row updates on provider callback. Status enables sender-side analytics ("Was my password reset delivered?"). Per-channel retention varies — push status often only kept short-term; transactional kept 90 days.</p>
+<p><strong>Graceful degradation state machine.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Latency / retention</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Accepted</td>
+<td>durable event</td>
+<td><code>notif_event:{event_id}</code></td>
+<td>immediate</td>
+<td>event is safe before routing</td>
+</tr>
+<tr>
+<td>Deferred</td>
+<td>quiet hours / provider cap</td>
+<td><code>delay:{deliver_at_minute}</code></td>
+<td>minutes–hours</td>
+<td>wake later with same delivery ID</td>
+</tr>
+<tr>
+<td>Provider degraded</td>
+<td>queued drain</td>
+<td>Kafka + delivery attempts</td>
+<td>channel SLA may stretch</td>
+<td>preserve priority queues; do not block transactional</td>
+</tr>
+<tr>
+<td>Duplicate submit</td>
+<td>idempotent return</td>
+<td><code>notif_idem:{producer}:{event_id}</code></td>
+<td>&lt; 10 ms</td>
+<td>return original <code>event_id</code> / status</td>
+</tr>
+<tr>
+<td>Permanent failure</td>
+<td>dead letter</td>
+<td><code>delivery:{id}</code> + DLQ</td>
+<td>retained 30–90 d</td>
+<td>expose failure, no silent drop</td>
+</tr>
+</tbody>
+</table>
+<p>"The line I want the interviewer to remember: providers are best-effort, but my internal state is not; every notification is either delivered, deferred, or explicitly failed."</p>
+<p><strong>Token rot.</strong> Mobile tokens expire on app uninstall. Provider returns <code>Unregistered</code> → invalidate the token in our DB. Periodic sweeper removes very old tokens never refreshed.</p>
+<p><strong>Multi-region.</strong> Each region routes to its local providers; cross-region failover if a region's providers all degrade. Provider rate limits often global, so coordinate via shared counters.</p>
+<p><strong>What I'd defer.</strong> Marketing segmentation, A/B testing of templates, machine-learning send-time optimization, content moderation, internationalization tooling beyond locale templates.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

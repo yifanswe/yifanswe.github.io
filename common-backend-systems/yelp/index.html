@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Yelp — Local Business Search &amp; Reviews (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Yelp — Local Business Search &amp; Reviews (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Medium · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build Yelp. A user opens the app, searches "ramen near me," and gets a ranked list of nearby restaurants with photos, ratings, and reviews. 100M monthly active users, ~10M businesses, ~200M reviews lifetime. Read-heavy; reviews trickle in.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Search for businesses by keyword + location, optionally filtered (category, rating, price, open now).
+- View a business page: photos, hours, address, aggregate rating, reviews.
+- Write and read reviews.</p>
+<p>I'd defer reservations, business owner tooling, and ad placement.</p>
+<p><strong>Non-functional</strong>
+- Search results p99 &lt; 300 ms.
+- Read-heavy: ~10k searches/sec average.
+- Strong consistency on the business profile (hours, address); eventual is fine on aggregate ratings (cached).
+- Review fraud is real; flagging pipeline matters even if we don't implement it.</p>
+<p><strong>Capacity</strong>
+- 10M businesses × 5 KB profile = 50 GB. Fits one shard easily; sharded for read fan-out.
+- 200M reviews × 2 KB = 400 GB.
+- Photos: ~1B images, ~500 KB each → ~500 TB in object storage.
+- Search index is still modest: 10M businesses × ~2–5 KB indexed fields/terms ≈ 20–50 GB primary, maybe 3–5× with replicas and inverted-index overhead. The dominant cost is photos/CDN, not metadata.
+- Review writes are low compared with reads: even 5M reviews/day is only ~60 writes/sec average; the review store is designed for business-page locality and moderation, not write scale.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Business</strong> — <code>business_id</code>, name, geo, hours, categories, phone.</li>
+<li><strong>Review</strong> — <code>review_id</code>, business_id, user_id, rating, text, photos, created_at.</li>
+<li><strong>User</strong> — <code>user_id</code>, profile.</li>
+<li><strong>Photo</strong> — <code>photo_id</code>, business_id, url, uploader.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>GET   /v1/search?q=ramen&amp;lat=&amp;lng=&amp;filters=...&amp;cursor=...   → Business[]
+GET   /v1/businesses/{id}                                    → Business + recent_reviews
+GET   /v1/businesses/{id}/reviews?cursor=...                 → Review[]
+POST  /v1/businesses/{id}/reviews     { rating, text, photos[] }   → { review_id }
+</code></pre>
+<p>User from token.</p>
+<p>Search uses cursor-based pagination; the cursor encodes <code>query_hash</code>, <code>geo_cell</code>, <code>last_score</code>, and <code>last_business_id</code> so page 2 is stable even while ratings drift slightly.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Business catalog service.</strong> Authoritative store (MySQL or DynamoDB, sharded by <code>business_id</code>). Read-through cache for hot businesses.</li>
+<li><strong>Search service.</strong> Elasticsearch (or OpenSearch) cluster indexing businesses with full-text on name + categories + tags + city, plus geospatial indexing on the location field.</li>
+<li><strong>Geo + keyword query.</strong> ES query combines geo-distance filter + keyword + filters + a custom score (rating, review count, distance, recency).</li>
+<li><strong>Review service.</strong> Writes reviews (sharded by <code>business_id</code> so all reviews for one business co-locate). Publishes <code>review.created</code> to Kafka.</li>
+<li><strong>Aggregator pipeline.</strong> Stream processor consumes review events, recomputes per-business rating + count, writes back to the catalog. Also enqueues fraud scoring.</li>
+<li><strong>Photo service.</strong> Upload through API, store in S3, generate thumbnails async, CDN-front everything.</li>
+<li><strong>CDN + edge cache.</strong> Search results cacheable for short TTL by (query, geo cell, filters); business pages cacheable by <code>business_id</code>.</li>
+</ol>
+<p>End-to-end narration: Alice searches "ramen near me" → API gateway → search service queries ES with geo-distance &lt; 5 km, full-text "ramen," filter <code>open_now=true</code> → ES returns top 50 → service hydrates with cached business profiles → returns top 20 with photos. Alice taps a business → catalog lookup (likely cached) → 20 most recent reviews from review service.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">Mobile app
+    |-- search(q, lat/lng, filters) -&gt; Search API -&gt; OpenSearch business index
+    |                                      |-- Catalog cache/KV: business profiles
+    |                                      '-- Photo CDN URLs
+    '-- business page -&gt; Business API -&gt; Catalog cache/KV
+                                                                    |-- recent_reviews:{business_id}
+                                                                    '-- reviews_by_business shard on miss
+
+Review write -&gt; Review service -&gt; reviews_by_business DB
+                                                     |-&gt; Kafka review.created -&gt; rating aggregate -&gt; catalog + search index
+                                                     '-- moderation queue
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete store contracts.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / data structure</th>
+<th style="text-align: right;">Entry size + TTL</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Business catalog</td>
+<td><code>business:{business_id}</code> document</td>
+<td style="text-align: right;">~5 KB, retained</td>
+<td><code>business_id</code></td>
+</tr>
+<tr>
+<td>Search index</td>
+<td>OpenSearch/ES doc with text fields + <code>geo_point</code> + filter fields</td>
+<td style="text-align: right;">~2–5 KB indexed, rebuilt/replicated</td>
+<td><code>geo_cell/business_id</code> routing if needed</td>
+</tr>
+<tr>
+<td>Reviews</td>
+<td><code>reviews_by_business:{business_id}</code> sorted by <code>created_at</code></td>
+<td style="text-align: right;">~2 KB/review, retained</td>
+<td><code>business_id</code></td>
+</tr>
+<tr>
+<td>User review index</td>
+<td><code>reviews_by_user:{user_id}</code> pointers</td>
+<td style="text-align: right;">~32 B/review pointer</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Rating aggregate</td>
+<td><code>rating:{business_id}</code> → <code>{sum,count,bayes_avg}</code></td>
+<td style="text-align: right;">~32 B, retained</td>
+<td><code>business_id</code></td>
+</tr>
+<tr>
+<td>Recent-review cache</td>
+<td><code>recent_reviews:{business_id}</code> Redis list</td>
+<td style="text-align: right;">~40 KB for top 20, TTL 5 min</td>
+<td><code>business_id</code></td>
+</tr>
+<tr>
+<td>Photos</td>
+<td><code>s3://photos/{business_id}/{photo_id}_{size}</code></td>
+<td style="text-align: right;">~500 KB original, thumbnails retained</td>
+<td><code>business_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>Store math: catalog + reviews are hundreds of GB, while photos are hundreds of TB. Search is a read index: <code>10M × 5 KB × 3 replicas</code> is roughly 150 GB before inverted-index overhead; still small compared with photo storage. The cost levers are thumbnail sizing, CDN cache hit rate, and photo lifecycle tiering, not shaving bytes from business rows.</p>
+<p><strong>Search path trace.</strong> Client → search API normalizes query and geo → OpenSearch executes geo-distance filter, keyword match, structured filters, and top-100 scoring → search service hydrates business documents and rating aggregates from cache/KV in parallel → fetches thumbnail URLs → returns top 20 with cursor. Page 2 reuses the same query hash and <code>last_score</code> so pagination is by score/cursor, not offset.</p>
+<p>Cold search path: if the query cache misses and OpenSearch is slow, the API can fall back to <code>popular:{geo_cell}:{category}</code> from Redis, then hydrate those businesses. That result is less personalized but still useful within 500 ms. The cursor carries <code>{mode=popular_fallback, geo_cell, category, offset}</code> so pagination stays in the same degraded mode.</p>
+<p><strong>Geo + keyword in one query.</strong> Elasticsearch with a <code>geo_point</code> field handles this well — geo-distance filter applied first (cheap), then full-text BM25 scoring, then a script_score for custom ranking. Alternative: separate geo index (S2 cells → business_ids) intersected with a keyword index — more boxes, more failure modes, mention as an option.</p>
+<p>Why ES/OpenSearch instead of a relational database with geo extensions: the workload combines full-text relevance, filters, geo radius, and top-K ranking in one low-latency path. PostGIS is excellent for spatial truth, but BM25/rescoring and inverted-index pagination are the core search problem here.</p>
+<p>Be ready for "why not only S2 cells?" S2 is great for nearby candidate generation, but it cannot rank typo-tolerant text queries like "ramen," "ramn," and category synonyms without rebuilding a search engine around it.</p>
+<p><strong>Ranking.</strong> Inputs: text relevance, distance, rating (Bayesian-averaged with global prior so a single 5-star doesn't beat a 4.5-with-200-reviews), recency, review count, business open right now. Learn-to-rank model trained offline; serve as ES rescore script for the top 100.</p>
+<p><strong>Reviews — write path.</strong> Reviews are sharded by <code>business_id</code> so the business page query is a single shard read. Reviewer can amend their review; row keyed by <code>(business_id, user_id)</code> so each user has at most one review per business.</p>
+<p>Write path: client → review service validates one-review-per-business with unique <code>(business_id,user_id)</code> → writes review row → writes pointer to <code>reviews_by_user</code> → emits <code>review.created</code> → stream aggregator updates <code>rating:{business_id}</code> and search index asynchronously → cache invalidation for <code>recent_reviews:{business_id}</code> is best-effort.</p>
+<p>Two indexes, one review: <code>reviews_by_business:{business_id}</code> is optimized for the business page, while <code>reviews_by_user:{user_id}</code> is optimized for profile/history and moderation. Both point to the same review content; neither should duplicate photo blobs or large text beyond what the query needs.</p>
+<p><strong>Aggregate ratings without recomputation cost.</strong> Stream processor maintains <code>sum(rating), count(review)</code> per business; aggregate = sum/count. Update is a single key-value put. Avoid scanning all reviews to compute average.</p>
+<p><strong>Hot business pages.</strong> Trending restaurant has 1000 concurrent viewers. Cache the business profile in CDN (60s TTL) and recent reviews in Redis (5 min TTL). Cache invalidation on write is best-effort — eventual consistency is acceptable for reviews.</p>
+<p>Interview punch line: "The business profile needs correctness; the rating and recent reviews need freshness, and those are different contracts."</p>
+<p><strong>Photo serving.</strong> Upload → S3 → image worker resizes to 4 sizes → publishes to CDN. Originals kept for super-zoom; CDN serves the right size by URL convention.</p>
+<p><strong>Fraud detection.</strong> Heuristics: same IP across multiple reviews, account age, review velocity, content similarity to known templates. Flagged reviews are hidden but stored; humans review the queue.</p>
+<p><strong>Filter on "open now."</strong> Per business, store weekly hours. Index <code>open_hours_minute_of_week</code> as a sparse bitmap in ES, query against current minute. Refresh per minute.</p>
+<p><strong>Graceful degradation state machine.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th style="text-align: right;">Latency budget</th>
+<th>Fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot search query</td>
+<td>Cached result page</td>
+<td>query+geo+filter cache</td>
+<td style="text-align: right;">&lt;100 ms</td>
+<td>Short TTL 30–60s; hydrate fresh profile on tap</td>
+</tr>
+<tr>
+<td>OpenSearch slow</td>
+<td>Degraded search</td>
+<td>cached query or geo-only index</td>
+<td style="text-align: right;">&lt;500 ms</td>
+<td>Return popular nearby businesses with a stale badge internally</td>
+</tr>
+<tr>
+<td>Hot business page</td>
+<td>CDN/Redis</td>
+<td>catalog cache + recent reviews cache</td>
+<td style="text-align: right;">&lt;200 ms</td>
+<td>Serve stale profile for 60s; reviews eventually catch up</td>
+</tr>
+<tr>
+<td>Review write burst</td>
+<td>Async aggregates</td>
+<td>review row truth + Kafka</td>
+<td style="text-align: right;">Write ack &lt;200 ms</td>
+<td>Rating count lags; never drop review row</td>
+</tr>
+<tr>
+<td>Photo CDN miss</td>
+<td>Origin fetch</td>
+<td>object store</td>
+<td style="text-align: right;">Seconds okay</td>
+<td>Serve placeholder thumbnail; page still useful</td>
+</tr>
+</tbody>
+</table>
+<p>Interview punch line: "Yelp search is a search-index problem, but Yelp correctness is a catalog-and-review problem; the index can lag, the user's review cannot disappear."</p>
+<p><strong>What I'd defer.</strong> Reservations system (OpenTable integration), business owner verification, structured ad placement, recommendations / "you might also like," local sponsored slots.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

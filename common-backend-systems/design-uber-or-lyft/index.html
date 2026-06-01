@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Uber or Lyft — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Uber or Lyft</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A ride-hailing platform matches riders with drivers in real time. The hard part is the geospatial dispatch problem: find the right driver among millions of moving locations, hand off the trip atomically so no two riders get the same driver, then track the trip to completion.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>A driver is assigned to at most one in-progress trip at a time; each rider request is matched to at most one driver who accepts; once matched, both sides agree on the trip state through its lifecycle (en route, in trip, completed); location and ETA updates are timely; fares are computed deterministically from the trip's recorded events.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can model geospatial indexing, design real-time matching under contention, handle driver state transitions atomically, manage trip lifecycle as a state machine, and reason about surge pricing and ETA prediction.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Uber as three core systems: a real-time location index of available drivers (geospatial), a matching service that finds and reserves the right driver for each request, and a trip lifecycle service that owns the state machine from request to completion. The interesting decisions are geospatial sharding, atomic driver assignment (no double-booking), trip state transitions, surge pricing, and ETA prediction.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Rider requests a ride from A to B.</li>
+<li>System matches a driver; rider sees ETA, driver info.</li>
+<li>Driver receives, accepts or declines; on decline, system tries next.</li>
+<li>Real-time location updates from rider and driver during trip.</li>
+<li>Trip lifecycle: requested → matched → en_route → in_trip → completed.</li>
+<li>Fare calculation based on distance, time, surge.</li>
+<li>Cancel by rider or driver.</li>
+<li>Payments after trip.</li>
+<li>Ratings and review.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Matching latency under a few seconds.</li>
+<li>Location updates at high frequency (every 4-10 seconds per driver).</li>
+<li>Survive sudden surges (event end, weather, airport).</li>
+<li>No double-booking of drivers.</li>
+<li>Accurate trip records for billing.</li>
+<li>Multi-region (each city is essentially independent).</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Pool / shared rides matching algorithm.</li>
+<li>Long-haul logistics (Uber Freight).</li>
+<li>Food delivery (Uber Eats; similar but distinct).</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Drivers</td>
+<td>10M global; 1-2M online at peak.</td>
+</tr>
+<tr>
+<td>Riders</td>
+<td>Hundreds of millions; tens of millions DAU.</td>
+</tr>
+<tr>
+<td>Active trips</td>
+<td>Hundreds of thousands at peak.</td>
+</tr>
+<tr>
+<td>Location updates</td>
+<td>10M+ per second peak.</td>
+</tr>
+<tr>
+<td>Match latency</td>
+<td>&lt; 5 s.</td>
+</tr>
+<tr>
+<td>Trips/day</td>
+<td>Tens of millions.</td>
+</tr>
+<tr>
+<td>City</td>
+<td>Each city operates relatively independently.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is the spatial query under contention plus the atomic match handoff.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Experience</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Rider</td>
+<td>Request, watch driver approach, ride, pay.</td>
+<td>Real-time updates; sub-5-s match.</td>
+</tr>
+<tr>
+<td>Driver</td>
+<td>See requests, accept, navigate, complete.</td>
+<td>Reliable assignment; clear next action.</td>
+</tr>
+<tr>
+<td>Matching</td>
+<td>Find nearest acceptable driver for request.</td>
+<td>Spatial query; tie-breaking; reservation.</td>
+</tr>
+<tr>
+<td>Trip lifecycle</td>
+<td>State transitions from request to completion.</td>
+<td>Strongly consistent.</td>
+</tr>
+<tr>
+<td>Pricing</td>
+<td>Fare calculation; surge.</td>
+<td>Deterministic from recorded events.</td>
+</tr>
+<tr>
+<td>Payments</td>
+<td>Charge rider; pay driver.</td>
+<td>Reuse payment-system design.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Rider App  --&gt;  Mobile Gateway  --&gt;  Dispatch Service
+                                          |
+                                          v
+                                  +----------------+
+                                  | Matching       |
+                                  | Algorithm      |
+                                  +-------+--------+
+                                          |
+                                          v
+                                  +----------------+
+                                  | Driver Geo    |
+                                  | Index (cells) |
+                                  +-------+--------+
+                                          |
+                                          v
+                                  +----------------+
+                                  | Trip State    |
+                                  | Machine       |
+                                  +-------+--------+
+                                          |
+                       +------------------+------------------+
+                       |                  |                  |
+                       v                  v                  v
+                +-----------+    +-------------+   +------------+
+                | Pricing   |    | Payment     |   | Notifications|
+                +-----------+    +-------------+   +------------+
+
+   Driver App  --location updates--&gt;  Location Ingest --&gt; Geo Index
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mobile gateway</td>
+<td>Auth, request routing.</td>
+<td>Persistent connection for trip updates.</td>
+</tr>
+<tr>
+<td>Location ingest</td>
+<td>Receives high-frequency location updates from drivers.</td>
+<td>Sharded by driver_id; writes to geo index.</td>
+</tr>
+<tr>
+<td>Geo index</td>
+<td>Spatial structure: available drivers by location.</td>
+<td>S2/H3/geohash cells; in-memory; per-region.</td>
+</tr>
+<tr>
+<td>Dispatch / matching</td>
+<td>Finds candidate drivers for a request.</td>
+<td>Cell scan; ranking; offer to top candidate.</td>
+</tr>
+<tr>
+<td>Trip service</td>
+<td>State machine for trip lifecycle.</td>
+<td>Strongly consistent; per-trip CAS.</td>
+</tr>
+<tr>
+<td>Driver state service</td>
+<td>Tracks driver online/offline/on_trip.</td>
+<td>Atomic state transition.</td>
+</tr>
+<tr>
+<td>Surge / pricing</td>
+<td>Computes price multiplier and trip fare.</td>
+<td>Heatmap by cell; updated frequently.</td>
+</tr>
+<tr>
+<td>ETA service</td>
+<td>Predicts travel times.</td>
+<td>ML model; uses road network + traffic.</td>
+</tr>
+<tr>
+<td>Notifications</td>
+<td>Push to rider/driver.</td>
+<td>Reuse notification system.</td>
+</tr>
+<tr>
+<td>Payments</td>
+<td>Charge rider, pay driver.</td>
+<td>Reuse payment system.</td>
+</tr>
+<tr>
+<td>Trip history / analytics</td>
+<td>Trip records, audit.</td>
+<td>OLAP.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="driver-state">Driver State</h4>
+<pre><code class="language-text">Driver(
+  driver_id,
+  status,                // offline, online_available, online_on_trip
+  current_location,
+  current_cell,
+  last_seen,
+  current_trip_id?,
+  vehicle_type,
+  rating,
+  version
+)
+</code></pre>
+<h4 id="trip">Trip</h4>
+<pre><code class="language-text">Trip(
+  trip_id,
+  rider_id,
+  driver_id?,
+  origin,
+  destination,
+  state,                  // requested, matched, en_route, arrived, in_trip, completed, canceled
+  requested_at,
+  matched_at,
+  pickup_at,
+  dropoff_at,
+  route_polyline,
+  fare,
+  surge_multiplier,
+  payment_intent_id?,
+  cancellation_reason?,
+  version
+)
+</code></pre>
+<h4 id="location-update-event">Location Update Event</h4>
+<pre><code class="language-text">LocationUpdate(
+  driver_id,
+  lat,
+  lng,
+  heading,
+  speed,
+  accuracy,
+  ts
+)
+</code></pre>
+<h4 id="geo-cell">Geo Cell</h4>
+<pre><code class="language-text">GeoCell(
+  cell_id,                 // e.g., H3 cell at resolution 9 (~100m radius)
+  available_drivers: Set[driver_id]
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">Rider:
+POST   /trips                    # request
+GET    /trips/{id}
+POST   /trips/{id}/cancel
+
+Driver:
+POST   /driver/online
+POST   /driver/offline
+POST   /driver/location          # streaming
+POST   /trips/{id}/accept
+POST   /trips/{id}/decline
+POST   /trips/{id}/arrive
+POST   /trips/{id}/start
+POST   /trips/{id}/complete
+</code></pre>
+<h3 id="geospatial-index">Geospatial Index</h3>
+<p>Drivers move; the index must update fast.</p>
+<p>Approach: divide the world into cells (S2, H3, or geohash) at appropriate resolution.</p>
+<ul>
+<li>H3 resolution 9: ~100m hex cells.</li>
+<li>Each cell stores a set of available driver_ids.</li>
+<li>On location update, if the driver's cell changes, remove from old cell, add to new.</li>
+<li>Each cell lives in memory in a service; shard by cell_id across nodes.</li>
+</ul>
+<p>For "find drivers within R of point P":</p>
+<ul>
+<li>Compute the cells covering the disc of radius R around P.</li>
+<li>Query each cell's available-driver set in parallel.</li>
+<li>Filter by exact distance and vehicle compatibility.</li>
+<li>Rank by score (distance, ETA, driver rating).</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The geo index is fundamentally "for each cell, who is available." Location updates are cell-membership changes. Spatial queries are cell scans plus exact-distance filtering.</p>
+</blockquote>
+<h3 id="matching-algorithm">Matching Algorithm</h3>
+<p>When a rider requests:</p>
+<ol>
+<li>Compute candidate cells around origin (e.g., 1-2 km radius).</li>
+<li>Query geo index for available drivers.</li>
+<li>Score candidates: ETA, driver rating, vehicle match, recent decline rate.</li>
+<li>Pick top candidate.</li>
+<li>Atomically attempt to reserve the driver — conditional update on <code>Driver.status = online_available, current_trip_id = null</code>.</li>
+<li>If reserved successfully, offer the trip to the driver.</li>
+<li>If driver accepts, transition trip to <code>matched</code>.</li>
+<li>If driver declines or times out, release reservation and pick next candidate.</li>
+</ol>
+<p>Atomic reservation is the key:</p>
+<ul>
+<li>Use CAS on <code>Driver.status</code> and <code>Driver.current_trip_id</code>.</li>
+<li>Only one trip can hold a driver at a time.</li>
+<li>The driver's "offer pending" is a short-lived hold (~15-30 seconds).</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The match is an atomic conditional state transition on the driver. No two trips can race-acquire the same driver because only one CAS wins.</p>
+</blockquote>
+<h3 id="trip-state-machine">Trip State Machine</h3>
+<pre><code class="language-text">requested -&gt; matched -&gt; en_route -&gt; arrived -&gt; in_trip -&gt; completed
+     |             |          |          |          |
+     +-&gt; canceled  +-&gt; driver_canceled   +-&gt; canceled
+</code></pre>
+<p>Transitions:</p>
+<table>
+<thead>
+<tr>
+<th>Transition</th>
+<th>Trigger</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>requested -&gt; matched</code></td>
+<td>Driver accepts.</td>
+<td>Set driver_id; lock driver.</td>
+</tr>
+<tr>
+<td><code>matched -&gt; en_route</code></td>
+<td>Driver starts driving toward rider.</td>
+<td>Update display.</td>
+</tr>
+<tr>
+<td><code>en_route -&gt; arrived</code></td>
+<td>Driver arrives at pickup.</td>
+<td>Start wait timer.</td>
+</tr>
+<tr>
+<td><code>arrived -&gt; in_trip</code></td>
+<td>Driver begins trip.</td>
+<td>Start meter.</td>
+</tr>
+<tr>
+<td><code>in_trip -&gt; completed</code></td>
+<td>Driver ends trip.</td>
+<td>Compute fare; charge.</td>
+</tr>
+<tr>
+<td>Any -&gt; <code>canceled</code></td>
+<td>Cancel action.</td>
+<td>Release driver; possibly fee.</td>
+</tr>
+</tbody>
+</table>
+<p>Each transition is CAS on <code>(trip_id, from_state)</code>.</p>
+<h3 id="surge-pricing">Surge Pricing</h3>
+<p>A heatmap by cell of supply vs demand.</p>
+<ul>
+<li>Demand = open requests per cell per minute.</li>
+<li>Supply = available drivers per cell.</li>
+<li>Multiplier = function of supply/demand ratio.</li>
+<li>Updated every 30 seconds to a few minutes.</li>
+<li>Cached client-side for display.</li>
+</ul>
+<p>The surge value at the time of request is recorded in the trip and used for fare calculation.</p>
+<h3 id="eta-prediction">ETA Prediction</h3>
+<p>Two-level:</p>
+<ul>
+<li><strong>Routing ETA:</strong> based on road network and current traffic.</li>
+<li><strong>ML ETA:</strong> correction based on historical patterns, driver behavior, time of day.</li>
+</ul>
+<p>Pre-computed for common O-D pairs; on-demand for arbitrary.</p>
+<p>Used at:</p>
+<ul>
+<li>Match time: ETA to pickup for driver scoring.</li>
+<li>Trip preview: ETA for rider.</li>
+<li>En route: live ETA updates.</li>
+</ul>
+<h3 id="location-update-pipeline">Location Update Pipeline</h3>
+<p>Drivers send location every 4-10 seconds. At 1M drivers online, that's 100k-250k updates per second.</p>
+<ul>
+<li>Each driver's location updates partition by driver_id.</li>
+<li>A streaming pipeline updates the geo index in near-real time.</li>
+<li>Updates are tolerant of slight lag (a few seconds).</li>
+<li>We do not store every location update forever; only the route polyline for completed trips.</li>
+</ul>
+<p>For real-time display:</p>
+<ul>
+<li>Rider's app subscribes to driver location during en_route and in_trip.</li>
+<li>Server pushes location at lower frequency than driver reports (e.g., every 2-5 seconds).</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Driver state</td>
+<td><code>driver_id</code> hash</td>
+<td>Per-driver CAS.</td>
+</tr>
+<tr>
+<td>Geo index</td>
+<td><code>cell_id</code> hash</td>
+<td>Co-locate cell membership.</td>
+</tr>
+<tr>
+<td>Trips</td>
+<td><code>trip_id</code> hash, indexed by rider/driver</td>
+<td>Per-trip writes; lookup by ID.</td>
+</tr>
+<tr>
+<td>Location updates</td>
+<td><code>driver_id</code> hash</td>
+<td>Stream partitioning.</td>
+</tr>
+<tr>
+<td>Surge heatmap</td>
+<td><code>cell_id</code> hash</td>
+<td>Per-cell calculation.</td>
+</tr>
+</tbody>
+</table>
+<p>Per-city sharding:</p>
+<ul>
+<li>Cities are largely independent operationally.</li>
+<li>A driver in San Francisco does not match with a rider in New York.</li>
+<li>Each city has its own geo index, dispatch service, and (often) data center.</li>
+</ul>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Driver state</td>
+<td>Strong (CAS)</td>
+<td>No double-booking.</td>
+</tr>
+<tr>
+<td>Trip state</td>
+<td>Strong (CAS)</td>
+<td>Single authoritative state.</td>
+</tr>
+<tr>
+<td>Geo index</td>
+<td>Eventually consistent (seconds lag)</td>
+<td>Acceptable for matching.</td>
+</tr>
+<tr>
+<td>Surge heatmap</td>
+<td>Eventually consistent</td>
+<td>Updated periodically.</td>
+</tr>
+<tr>
+<td>Trip history</td>
+<td>Eventually consistent</td>
+<td>Reporting.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Cities are the natural sharding unit.</li>
+<li>Each city's geo index and dispatch run in the nearest region.</li>
+<li>Driver state and trip state in same region.</li>
+<li>Cross-city handoffs (long airport trip) are rare and handled with specific logic.</li>
+<li>Global services (payments, user accounts) replicated globally.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Two riders request same driver simultaneously.</td>
+<td>CAS on driver state; only one wins.</td>
+<td>Conditional-write conflict rate.</td>
+</tr>
+<tr>
+<td>Driver app goes offline during trip.</td>
+<td>Trip continues based on rider's reports; reconciliation when reconnect.</td>
+<td>Driver-offline-mid-trip count.</td>
+</tr>
+<tr>
+<td>Location update lost.</td>
+<td>Smooth client-side; resume on next update.</td>
+<td>Update gap distribution.</td>
+</tr>
+<tr>
+<td>Surge spike at venue end.</td>
+<td>Pre-allocate dispatch capacity; surge pricing adjusts demand.</td>
+<td>Per-cell demand vs supply ratio.</td>
+</tr>
+<tr>
+<td>Match offer not responded (driver away from phone).</td>
+<td>Offer expires in 15s; reassign.</td>
+<td>Offer expiry rate.</td>
+</tr>
+<tr>
+<td>Driver accepts but doesn't move.</td>
+<td>Time-bounded; rider can cancel without penalty after threshold.</td>
+<td>Match-but-no-move count.</td>
+</tr>
+<tr>
+<td>Fraudulent location spoofing.</td>
+<td>GPS plausibility checks; behavior analytics.</td>
+<td>Anomaly score per driver.</td>
+</tr>
+<tr>
+<td>Geo index hot cell.</td>
+<td>Sub-shard the cell; or accept and scale node.</td>
+<td>Per-cell QPS.</td>
+</tr>
+<tr>
+<td>Trip stuck in <code>in_trip</code>.</td>
+<td>Reconciliation worker; max trip duration.</td>
+<td>Trips &gt; N hours.</td>
+</tr>
+<tr>
+<td>Payment fails post-trip.</td>
+<td>Trip already recorded; payment retried; reuse payment system.</td>
+<td>Failed payment rate.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Double-booking attempts (must equal zero conflicts that succeed).</li>
+<li>Trip state inconsistency events.</li>
+<li>Cancellations within first N seconds (UX problem signal).</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Location updates per second per region.</li>
+<li>Match latency p99.</li>
+<li>Geo index node CPU and memory.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Active trips, active drivers, requests per minute by city.</li>
+<li>Match success rate.</li>
+<li>Surge multiplier distribution.</li>
+<li>Average wait time.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Larger geo cells make spatial queries cheaper but reduce match precision.</li>
+<li>More frequent location updates give live ETA but cost battery and bandwidth.</li>
+<li>Shorter offer timeout matches faster but causes more reassignment.</li>
+<li>Strict driver state CAS prevents double-booking but limits throughput per driver.</li>
+<li>Per-city sharding is natural but cross-city trips become awkward.</li>
+<li>Aggressive surge dampens demand but generates user complaints.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Global location index.</td>
+<td>Per-city geo index sharded by cell.</td>
+</tr>
+<tr>
+<td>Linear scan of all drivers.</td>
+<td>H3/S2 cell-based spatial index.</td>
+</tr>
+<tr>
+<td>First-come-first-serve dispatch.</td>
+<td>Score-based matching; CAS reservation.</td>
+</tr>
+<tr>
+<td>No offer timeout.</td>
+<td>Short-bounded offer with fallback to next candidate.</td>
+</tr>
+<tr>
+<td>Persistent storage for every location update.</td>
+<td>Stream-only with bounded retention; persist polylines on trip end.</td>
+</tr>
+<tr>
+<td>Surge as a simple slider.</td>
+<td>Per-cell heatmap updated frequently.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Geo indexing</td>
+<td>H3 cells; cell-level driver sets; spatial scan.</td>
+</tr>
+<tr>
+<td>Atomic match</td>
+<td>CAS on driver state; offer-and-accept handshake.</td>
+</tr>
+<tr>
+<td>Trip state machine</td>
+<td>Explicit states + CAS transitions.</td>
+</tr>
+<tr>
+<td>Surge</td>
+<td>Heatmap by cell; supply/demand ratio.</td>
+</tr>
+<tr>
+<td>ETA</td>
+<td>Routing + ML; live updates.</td>
+</tr>
+<tr>
+<td>Multi-city</td>
+<td>Per-city geo index; minimal cross-city.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Geospatial index with cells; per-city sharding.</li>
+<li>Atomic driver reservation via CAS.</li>
+<li>Trip state machine with explicit transitions.</li>
+<li>Surge as per-cell heatmap.</li>
+<li>ETA from routing + ML.</li>
+<li>Location update pipeline streaming.</li>
+<li>Multi-region as per-city.</li>
+<li>Reconciliation for stuck trips.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Uber is a geospatial dispatch problem layered over a trip state machine. The geo index makes "find nearby drivers" cheap; atomic CAS on driver state guarantees no double-booking; the trip is a state machine from request to completion. Surge and ETA ride alongside as supporting services.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Uber.</p>
+<p><strong>Candidate:</strong> I will design three core systems. First, a real-time geospatial index of available drivers organized into H3 cells. Second, a matching service that queries the index and atomically reserves the chosen driver. Third, a trip state machine that owns the lifecycle from request to completion. The invariant is that a driver is assigned to at most one in-progress trip at a time. Surge pricing, ETA, and payments are supporting services.</p>
+<p><strong>Interviewer:</strong> How do you find the nearest available driver?</p>
+<p><strong>Candidate:</strong> Divide the world into H3 cells at resolution 9 — about 100m hex cells. Each cell maintains a set of available driver_ids. On a request, I compute the cells covering a small disc around the origin (1-2 km), query each cell in parallel, get the candidate driver_ids, filter by exact distance and vehicle compatibility, and score them by ETA and other factors. The geo index is sharded by cell_id and held in memory.</p>
+<p><strong>Interviewer:</strong> Two riders request a ride simultaneously and both get the same nearest driver. How do you prevent double-booking?</p>
+<p><strong>Candidate:</strong> Atomic conditional update on the driver's state. After scoring, the matching service does <code>UPDATE Driver SET status=on_trip_pending, current_trip_id=? WHERE driver_id=? AND status=online_available AND current_trip_id IS NULL</code>. Only one of the two requests' CAS succeeds. The losing request picks the next best candidate. This is the canonical "use database atomicity instead of a distributed lock" approach.</p>
+<p><strong>Interviewer:</strong> The driver accepts. What happens?</p>
+<p><strong>Candidate:</strong> Trip transitions to <code>matched</code>. We notify both apps. The driver's state is now <code>on_trip_pending</code>. The driver starts navigation; the rider sees the driver approaching. As the driver moves, location updates flow through the geo index and the per-trip subscription. Trip state advances: <code>matched</code> → <code>en_route</code> → <code>arrived</code> → <code>in_trip</code> → <code>completed</code>. Each transition is a CAS on (trip_id, from_state).</p>
+<p><strong>Interviewer:</strong> The driver doesn't accept after 15 seconds.</p>
+<p><strong>Candidate:</strong> Offer expires. We release the driver's <code>on_trip_pending</code> back to <code>online_available</code>. The matching service picks the next candidate and offers. We track the driver's decline rate as a signal for future matching scoring.</p>
+<p><strong>Interviewer:</strong> Driver app goes offline mid-trip.</p>
+<p><strong>Candidate:</strong> Two scenarios. If the trip is <code>in_trip</code>, the rider can still report progress (the rider's app sends location). The trip continues based on rider's reports; on driver app reconnect, we reconcile. The driver's location updates pick back up. If the driver disconnect is long, support can intervene. For trip completion, either side can trigger; we have safeguards against unilateral premature completion.</p>
+<p><strong>Interviewer:</strong> How does surge pricing work?</p>
+<p><strong>Candidate:</strong> Per-cell heatmap. Demand per cell (recent open requests) divided by supply (available drivers). When ratio exceeds threshold, multiplier kicks in. Updated every 30 seconds or so. The surge multiplier at request time is captured in the trip record and used for fare calculation. It's deterministic given the recorded surge value.</p>
+<p><strong>Interviewer:</strong> Location updates — 10M drivers reporting every 5 seconds is 2M updates per second.</p>
+<p><strong>Candidate:</strong> Sharded by driver_id. A streaming pipeline (Kafka + stateful consumer) receives updates and applies them to the geo index. If the driver crossed a cell boundary, we remove from old cell and add to new. The geo index is in-memory; each node owns some cells. Update latency is sub-second. We don't persist every location update; only the route polyline for completed trips.</p>
+<p><strong>Interviewer:</strong> ETA?</p>
+<p><strong>Candidate:</strong> Routing engine computes ETA from current location to destination based on road network and traffic data. ML model adjusts for historical patterns, time of day, driver behavior. For match scoring, we use ETA to pickup. For rider display during en_route and in_trip, we use ETA to destination, updated periodically.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Cities are the natural sharding unit. Each city has its own geo index, matching service, and trip state — usually in the nearest data center. Cross-city handoffs (long airport trip) are rare and handled with explicit support. Global services like payments and user accounts replicate globally.</p>
+<p><strong>Interviewer:</strong> What about a venue letting out — 50,000 people requesting rides simultaneously.</p>
+<p><strong>Candidate:</strong> That cell becomes hot. Geo index node for that cell may saturate; we pre-shard the hot cell into sub-shards. Surge pricing kicks in, dampening demand. Drivers are notified of high demand and migrate. We also pre-allocate dispatch capacity for known events. Trip backlog is handled with explicit "you'll be matched soon" UX rather than failing.</p>
+<p><strong>Interviewer:</strong> Trip stuck in <code>in_trip</code> for 12 hours.</p>
+<p><strong>Candidate:</strong> Reconciliation worker scans for trips in non-terminal states older than threshold. Likely scenarios: driver finished trip but didn't tap complete, or driver app crashed. We auto-complete based on detected motion patterns or driver outreach. Fare is computed from recorded events.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Geo index with H3 cells, sharded per city. Atomic CAS on driver state prevents double-booking. Trip state machine with explicit transitions. Surge pricing as per-cell heatmap. ETA from routing + ML. Location updates streamed; geo index updated in-memory. Reconciliation for stuck trips. The hardest correctness problem is the atomic match; the hardest scale problem is the location update firehose.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: matching, real-time location, trip lifecycle, surge.</li>
+<li>Invariant: at most one trip per driver.</li>
+<li>Geo index with H3 cells; per-city sharding.</li>
+<li>Matching: score candidates; atomic CAS reservation.</li>
+<li>Trip state machine with explicit transitions.</li>
+<li>Surge as per-cell heatmap; ETA from routing + ML.</li>
+<li>Location update streaming; bounded retention.</li>
+<li>Reconciliation for stuck trips.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Uber is a geospatial dispatch problem layered over a trip state machine. H3-cell geo index makes nearby-driver queries cheap; atomic CAS on driver state prevents double-booking; the trip lifecycle is a state machine of CAS transitions. Surge pricing and ETA ride alongside. Cities are the natural sharding unit. The hardest scale problem is the location update firehose; the hardest correctness problem is the atomic match.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"The match is an atomic conditional state transition on the driver; only one CAS wins."</li>
+<li>"The geo index is per-cell membership; spatial queries are cell scans."</li>
+<li>"Trip lifecycle is explicit state transitions, each a CAS."</li>
+<li>"Surge is a per-cell heatmap, not a global slider."</li>
+<li>"Cities are the natural sharding unit; cross-city is the exception."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

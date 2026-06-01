@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Amazon Dynamo — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Amazon Dynamo</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Dynamo (the 2007 paper, not modern DynamoDB) is the canonical eventually-consistent distributed KV store. It is the proof-of-existence for "always writable" systems built from consistent hashing, sloppy quorums, vector clocks, hinted handoff, anti-entropy via Merkle trees, and gossip. Modern systems (Cassandra, Riak, Voldemort, modern DynamoDB) inherit pieces from it.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every write succeeds on at least W replicas; every read examines at least R replicas; concurrent writes produce siblings reconciled deterministically; the system stays writable even during partitions and node failures, accepting eventual consistency as the tradeoff.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can articulate consistent hashing, the (N, R, W) quorum tunable, vector clocks for causality, hinted handoff and Merkle-tree anti-entropy, and the architectural philosophy of "always writable."</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would describe Dynamo as a leaderless KV store built on consistent hashing for partitioning and replication. Writes go to W of N preference list replicas; reads gather from R. (N, R, W) is tunable per request. Conflicts produce vector-clock siblings that the client merges. Hinted handoff handles short failures; Merkle-tree anti-entropy fixes longer divergence. The architectural choice is availability over strict consistency — always writable.</p>
+</blockquote>
+<h3 id="requirements-the-paper-sets">Requirements The Paper Sets</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Simple Put / Get API by key.</li>
+<li>Highly available writes during failures and partitions.</li>
+<li>Multi-data-center.</li>
+<li>Configurable durability and latency tradeoffs.</li>
+<li>Used at Amazon for shopping cart, session, customer preferences, etc.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>99.9th-percentile latency under hundreds of ms.</li>
+<li>High availability — write must succeed even when some replicas are unreachable.</li>
+<li>Eventually consistent (within seconds typically).</li>
+<li>Conflict resolution at read time.</li>
+</ul>
+<p>Out of scope of the original paper:</p>
+<ul>
+<li>Strong consistency.</li>
+<li>Multi-key transactions.</li>
+<li>Range queries.</li>
+<li>Secondary indexes.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cluster size</td>
+<td>10s to 100s of nodes per cluster.</td>
+</tr>
+<tr>
+<td>Replication factor N</td>
+<td>Typically 3.</td>
+</tr>
+<tr>
+<td>Quorum W, R</td>
+<td>Tunable per request; common: W=R=2.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>p99 in tens of ms.</td>
+</tr>
+<tr>
+<td>Throughput</td>
+<td>Thousands of ops/sec.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="core-concepts">Core Concepts</h3>
+<h4 id="consistent-hashing">Consistent Hashing</h4>
+<p>Nodes and keys live on a ring (hash space).</p>
+<ul>
+<li>Each node placed at one or more positions (virtual nodes / vnodes) for load balance.</li>
+<li>A key's coordinator is the first node clockwise from the key's hash.</li>
+<li>Replicas are the next N-1 nodes on the ring after the coordinator.</li>
+</ul>
+<p>Adding/removing nodes shifts only adjacent ranges.</p>
+<p>Why vnodes:
+- Per-node load smoother.
+- Heterogeneous nodes can be assigned more vnodes.
+- Bootstrapping a new node is parallel.</p>
+<h4 id="preference-list">Preference List</h4>
+<p>For each key, the preference list is the ordered list of N+ nodes that should hold replicas. The first N reachable form the actual quorum.</p>
+<h4 id="n-r-w-tunable">(N, R, W) Tunable</h4>
+<ul>
+<li>N: total replicas.</li>
+<li>W: minimum replicas that must ack a write.</li>
+<li>R: minimum replicas that must respond to a read.</li>
+</ul>
+<p>If R + W &gt; N: at least one replica overlap between any read and any write — strong consistency (subject to failures).</p>
+<p>If R + W ≤ N: higher availability, weaker guarantees.</p>
+<p>Common tuning:
+- N=3, W=2, R=2: read-your-own-write under normal conditions.
+- N=3, W=3, R=1: strong consistency on read; writes slow.
+- N=3, W=1, R=1: maximum availability; very eventual.</p>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Client -&gt; Coordinator (any node, often via load balancer)
+              |
+              v
+       Consistent Hashing Ring
+              |
+              v
+       Preference List (N nodes for key)
+              |
+              v
+    +---------+---------+
+    |         |         |
+    v         v         v
+  Node A    Node B    Node C   (replicas)
+
+    Hinted Handoff (temp store if replica down)
+    Merkle-Tree Anti-Entropy (background reconciliation)
+    Gossip (membership state)
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ring membership</td>
+<td>Track active nodes via gossip.</td>
+<td>Eventually consistent membership.</td>
+</tr>
+<tr>
+<td>Consistent hashing</td>
+<td>Map keys → preference list.</td>
+<td>Vnodes for load balance.</td>
+</tr>
+<tr>
+<td>Coordinator</td>
+<td>Per-request node coordinating writes/reads.</td>
+<td>Any node can coordinate.</td>
+</tr>
+<tr>
+<td>Replica node</td>
+<td>Stores key → value + vector clock.</td>
+<td>Local store (e.g., BerkeleyDB).</td>
+</tr>
+<tr>
+<td>Hinted handoff</td>
+<td>Temp store for hint when target down.</td>
+<td>Replay on recovery.</td>
+</tr>
+<tr>
+<td>Anti-entropy</td>
+<td>Merkle-tree diff to repair divergence.</td>
+<td>Background.</td>
+</tr>
+<tr>
+<td>Vector clock</td>
+<td>Causality tracking on writes.</td>
+<td>Per-key.</td>
+</tr>
+<tr>
+<td>Sibling resolution</td>
+<td>Client-side merge on read of divergent versions.</td>
+<td>Application logic.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="stored-object">Stored Object</h4>
+<pre><code class="language-text">StoredObject(
+  key,
+  value,
+  version_vector,           // vector clock of writes
+  context                   // opaque token passed back on next write
+)
+</code></pre>
+<h4 id="vector-clock">Vector Clock</h4>
+<p>A list of (node_id, counter) pairs. Each write by node N increments N's counter.</p>
+<p>Comparison:
+- If vc_A's counters are all ≤ vc_B's, vc_A &lt; vc_B (causally before).
+- If neither is ≤ the other, they're concurrent (siblings).</p>
+<p>Example:
+- Write 1 by A: vc = [(A, 1)]
+- Write 2 by A (after read of write 1): vc = [(A, 2)]
+- Write 3 by B (after read of write 1): vc = [(A, 1), (B, 1)]
+- Write 2 and Write 3 are concurrent.</p>
+<h3 id="write-path">Write Path</h3>
+<ol>
+<li>Client sends PUT(key, value, context) to a coordinator.</li>
+<li>Coordinator looks up preference list.</li>
+<li>Updates vector clock: take input context's vc, increment coordinator's counter.</li>
+<li>Sends Put to N nodes in preference list.</li>
+<li>Waits for W acks.</li>
+<li>Returns success.</li>
+</ol>
+<p>If a replica is down:
+- Send to next node on ring as a temporary hint.
+- Hint includes original target.
+- When original recovers, replay hint to original.</p>
+<h3 id="read-path">Read Path</h3>
+<ol>
+<li>Client sends GET(key) to coordinator.</li>
+<li>Coordinator queries N nodes in preference list.</li>
+<li>Waits for R responses.</li>
+<li>If responses have divergent vector clocks, return all siblings + merged context.</li>
+<li>Client (or coordinator-side resolver) merges.</li>
+<li>Optional read repair: write merged value back.</li>
+</ol>
+<p>For sibling merge:
+- For cart: union of items with max quantity per item.
+- For session: most recent fields (LWW per field).
+- For generic: application-defined.</p>
+<h3 id="hinted-handoff">Hinted Handoff</h3>
+<p>When a write target is unreachable:</p>
+<ol>
+<li>Coordinator picks the next reachable node on the ring as a hint holder.</li>
+<li>Hint includes original target as metadata.</li>
+<li>Hint holder stores the data with a "this is for X" tag.</li>
+<li>Periodically tries to replay hints to original.</li>
+<li>On success, hint deleted.</li>
+</ol>
+<p>If hint holder dies before replay: data lost (unless N&gt;3 and other replicas have it). For high durability, use larger N.</p>
+<h3 id="anti-entropy-merkle-trees">Anti-Entropy: Merkle Trees</h3>
+<p>For longer-lived divergence (hint holder lost data, partition lasted hours):</p>
+<ol>
+<li>Each node maintains a Merkle tree per partition's key range.</li>
+<li>Leaves are hashes of (key, value) tuples.</li>
+<li>Internal nodes are hashes of children.</li>
+<li>Periodically, replicas exchange tree summaries.</li>
+<li>Tree-diff: walk down the tree comparing hashes; mismatches identify divergent keys.</li>
+<li>For each divergent key, exchange and reconcile.</li>
+</ol>
+<p>Cost: tree build is expensive; usually done periodically and incrementally.</p>
+<h3 id="membership-gossip">Membership: Gossip</h3>
+<p>Membership changes (node add, remove, fail) propagate via gossip:</p>
+<ol>
+<li>Each node periodically picks a peer at random.</li>
+<li>Exchanges membership state.</li>
+<li>Reconciles differences.</li>
+<li>Membership info eventually converges.</li>
+</ol>
+<p>Failure detection: gossip heartbeats; a node not seen in T seconds is suspected dead, marked unreachable.</p>
+<h3 id="sloppy-quorum">Sloppy Quorum</h3>
+<p>A strict quorum (W out of N preference list) might block writes if some preference list members are down. Sloppy quorum allows the next N reachable nodes to take the write.</p>
+<ul>
+<li>Preserves write availability during failures.</li>
+<li>The "real" replicas catch up via hinted handoff later.</li>
+</ul>
+<h3 id="multi-data-center">Multi-Data-Center</h3>
+<p>The paper covers replication across data centers:</p>
+<ul>
+<li>Replication factor includes nodes in different DCs.</li>
+<li>Writes typically wait for local DC quorum; replication to other DCs is async.</li>
+<li>DR via second-region replicas.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Strategy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Adding a node</td>
+<td>Pre-assigned vnode positions; bootstrap from neighbors.</td>
+</tr>
+<tr>
+<td>Removing a node</td>
+<td>Drain to neighbors.</td>
+</tr>
+<tr>
+<td>Heterogeneous nodes</td>
+<td>Different vnode counts.</td>
+</tr>
+<tr>
+<td>Skew</td>
+<td>Vnodes distribute load.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Consistency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Write (W reached)</td>
+<td>Durable on W replicas.</td>
+</tr>
+<tr>
+<td>Read (R reached)</td>
+<td>Possibly stale; sibling-aware.</td>
+</tr>
+<tr>
+<td>R + W &gt; N</td>
+<td>Strong (modulo failures).</td>
+</tr>
+<tr>
+<td>Conflict</td>
+<td>Sibling presented to client; merge per app.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Replica down.</td>
+<td>Hinted handoff.</td>
+<td>Hint queue depth.</td>
+</tr>
+<tr>
+<td>Network partition.</td>
+<td>Sloppy quorum; reconciliation on heal.</td>
+<td>Partition detection.</td>
+</tr>
+<tr>
+<td>Permanent loss.</td>
+<td>Replica replacement; anti-entropy.</td>
+<td>Tree diff size.</td>
+</tr>
+<tr>
+<td>Concurrent writes.</td>
+<td>Vector clock siblings.</td>
+<td>Sibling rate.</td>
+</tr>
+<tr>
+<td>Bad merge.</td>
+<td>Application-level fix.</td>
+<td>Merge errors.</td>
+</tr>
+<tr>
+<td>Gossip lag.</td>
+<td>Bounded; eventual.</td>
+<td>Membership skew.</td>
+</tr>
+<tr>
+<td>Hot key.</td>
+<td>Vnode distribution; cache.</td>
+<td>Per-key QPS.</td>
+</tr>
+<tr>
+<td>Read inconsistency.</td>
+<td>Read repair; tune R/W.</td>
+<td>Stale reads.</td>
+</tr>
+<tr>
+<td>Multi-DC.</td>
+<td>Async cross-DC replication; bounded.</td>
+<td>Cross-DC lag.</td>
+</tr>
+<tr>
+<td>Bootstrap slow.</td>
+<td>Parallel; throttled.</td>
+<td>Bootstrap time.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Sibling rate.</li>
+<li>Hinted handoff backlog.</li>
+<li>Anti-entropy convergence time.</li>
+<li>Lost-write count.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Per-node QPS.</li>
+<li>Replication latency.</li>
+<li>Ring rebalance time.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Availability over consistency: writes always succeed; reads may diverge.</li>
+<li>Vector clocks expressive but grow without pruning.</li>
+<li>Sloppy quorum maintains availability but allows temporary divergence.</li>
+<li>Application-level merge is flexible but error-prone.</li>
+<li>Hinted handoff trades simplicity for durability concerns.</li>
+<li>Anti-entropy is heavy but catches all divergence eventually.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Last-writer-wins always.</td>
+<td>Vector clock siblings; let app merge.</td>
+</tr>
+<tr>
+<td>Strict quorum.</td>
+<td>Sloppy quorum + hinted handoff.</td>
+</tr>
+<tr>
+<td>Wait for all replicas.</td>
+<td>W of N quorum; tunable.</td>
+</tr>
+<tr>
+<td>Static node placement.</td>
+<td>Vnodes; bootstrap parallelism.</td>
+</tr>
+<tr>
+<td>Ignore divergence.</td>
+<td>Anti-entropy via Merkle trees.</td>
+</tr>
+<tr>
+<td>Centralized coordinator.</td>
+<td>Any node can coordinate.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Consistent hashing</td>
+<td>Ring, vnodes, replication.</td>
+</tr>
+<tr>
+<td>(N, R, W)</td>
+<td>Tunability; tradeoffs.</td>
+</tr>
+<tr>
+<td>Vector clocks</td>
+<td>Causality; siblings; pruning.</td>
+</tr>
+<tr>
+<td>Hinted handoff</td>
+<td>Temp store; replay; durability concerns.</td>
+</tr>
+<tr>
+<td>Anti-entropy</td>
+<td>Merkle tree; tree diff.</td>
+</tr>
+<tr>
+<td>Gossip</td>
+<td>Membership propagation; failure detection.</td>
+</tr>
+<tr>
+<td>Sloppy quorum</td>
+<td>Availability tradeoff.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Consistent hashing with vnodes.</li>
+<li>(N, R, W) tunable quorum.</li>
+<li>Vector clocks + sibling resolution.</li>
+<li>Hinted handoff for short failures.</li>
+<li>Anti-entropy with Merkle trees.</li>
+<li>Gossip-based membership.</li>
+<li>Sloppy quorum for write availability.</li>
+<li>Multi-DC replication.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Dynamo is the canonical leaderless eventually-consistent KV store. Consistent hashing partitions and replicates; (N, R, W) tunes the durability-latency tradeoff; vector clocks track causality with sibling resolution at read; hinted handoff and Merkle-tree anti-entropy reconcile after failures; gossip propagates membership. The architectural choice is availability over strict consistency — always writable.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Walk me through Dynamo's design.</p>
+<p><strong>Candidate:</strong> Leaderless KV store on a consistent hashing ring with vnodes. Each key's preference list is the N next nodes clockwise. Writes go to any coordinator, replicate to W of N; reads gather R. Conflicts produce vector-clock siblings reconciled by the client at read. Hinted handoff handles short failures; Merkle-tree anti-entropy handles longer divergence. Gossip propagates membership. The invariant is always writable, eventually consistent.</p>
+<p><strong>Interviewer:</strong> Walk me through a PUT.</p>
+<p><strong>Candidate:</strong> Client sends PUT(key, value, context) where context is the vector clock from the last read. Coordinator (any node) hashes the key, finds the preference list, increments its own counter in the vector clock, and forwards the write to N replicas. Waits for W acks. Returns success. If some replicas are unreachable, sends to the next reachable nodes (sloppy quorum) with hints noting the original target. Original target gets the hint replayed when it recovers.</p>
+<p><strong>Interviewer:</strong> What about a GET?</p>
+<p><strong>Candidate:</strong> Coordinator queries N replicas; waits for R responses. If all responses have causally comparable vector clocks (one dominates), return the winner. If they're concurrent (siblings), return all of them with a merged context. Client merges per application semantics — for cart, union with max quantity per item.</p>
+<p><strong>Interviewer:</strong> Vector clocks.</p>
+<p><strong>Candidate:</strong> List of (node_id, counter) pairs. Each write by node N increments N's counter. To compare: if all counters in A ≤ all in B, A is causally before B; if neither dominates, they're concurrent. Siblings result from concurrent writes. The client passes the context (vc) back on the next write so the system knows what version was last seen.</p>
+<p><strong>Interviewer:</strong> Vector clocks grow over time.</p>
+<p><strong>Candidate:</strong> Right. Prune by capping size and dropping oldest entries — but careful, dropping loses causal information. Alternative: prune older-than-N entries by timestamp. The original paper notes this is a real concern. CRDTs offer an alternative for merge-friendly types.</p>
+<p><strong>Interviewer:</strong> Hinted handoff.</p>
+<p><strong>Candidate:</strong> When a replica is down, coordinator sends the write to the next reachable node on the ring as a temporary hint. Hint is tagged with the original target. The hint holder periodically tries to replay to the original. On success, hint is deleted. If the hint holder dies before replay, the hint is lost — durability depends on having other replicas.</p>
+<p><strong>Interviewer:</strong> Anti-entropy via Merkle trees.</p>
+<p><strong>Candidate:</strong> Each node maintains a Merkle tree per key-range partition. Leaves hash (key, value); internal nodes hash children. Replicas exchange tree summaries; walking down the tree, mismatched hashes localize divergent keys. Exchange the differing keys, reconcile. Used for longer-lived divergence that hinted handoff didn't catch.</p>
+<p><strong>Interviewer:</strong> Sloppy quorum vs strict.</p>
+<p><strong>Candidate:</strong> Strict: writes go to exactly N preference list members; if some unreachable, fewer than W ack, write fails. Sloppy: when preference list members are unreachable, sub in the next reachable nodes. Write succeeds but on potentially temporary holders. Trade: write availability for temporary divergence (which anti-entropy eventually resolves).</p>
+<p><strong>Interviewer:</strong> (N, R, W) trade-offs.</p>
+<p><strong>Candidate:</strong> N=3 typical. W=2, R=2 gives R+W&gt;N — at least one overlap → strong consistency under no-failure. W=1: write fast, very eventually consistent. W=3: write slow but durable. R=1, W=N=3: read-fast strong consistency. Tuning per workload.</p>
+<p><strong>Interviewer:</strong> Multi-data-center?</p>
+<p><strong>Candidate:</strong> Preference list can span DCs. Common pattern: writes wait for local DC quorum (fast), async replicate to other DCs (eventual). DR fails over to another DC. Some strict-consistency configurations wait for cross-DC quorum, paying latency.</p>
+<p><strong>Interviewer:</strong> Adding a node.</p>
+<p><strong>Candidate:</strong> Pre-assigned vnode positions. New node joins ring at those positions. Bootstrap: stream key ranges from neighbors. Parallelism via vnodes — many neighbors stream simultaneously. Membership change propagates via gossip. Throttle bootstrap to not saturate.</p>
+<p><strong>Interviewer:</strong> Gossip.</p>
+<p><strong>Candidate:</strong> Each node periodically picks a peer at random, exchanges membership state, reconciles. Eventually consistent membership. Failure detection via heartbeats; a node not seen in T seconds is suspected dead. Suspected nodes can recover; the system errs toward continuing rather than declaring dead.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Consistent hashing partitions and replicates; (N, R, W) tunes durability and latency per request; vector clocks make causality explicit so conflicts surface as siblings for app-level merge; hinted handoff and Merkle-tree anti-entropy reconcile divergence; gossip propagates membership. Sloppy quorum maintains write availability under failures. The whole design favors availability over strict consistency — an explicit choice for use cases like the cart.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Always writable; eventually consistent.</li>
+<li>Consistent hashing with vnodes for partitioning + replication.</li>
+<li>(N, R, W) tunable quorum.</li>
+<li>Vector clocks + sibling resolution.</li>
+<li>Sloppy quorum + hinted handoff for availability.</li>
+<li>Merkle-tree anti-entropy for divergence repair.</li>
+<li>Gossip for membership.</li>
+<li>Multi-DC with async cross-DC.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Dynamo is the canonical eventually-consistent leaderless KV store. Consistent hashing with vnodes partitions and replicates. (N, R, W) tunes per-request durability and latency. Vector clocks surface concurrent writes as siblings for app-level merge. Hinted handoff handles short failures; Merkle-tree anti-entropy handles longer divergence. Sloppy quorum keeps writes available under partial failures. The architectural choice is availability over strict consistency.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Always writable; conflicts surface as siblings, merged by the application."</li>
+<li>"(N, R, W) is tunable per request; pick your tradeoff."</li>
+<li>"Vector clocks make causality explicit; concurrent writes are concurrent, not blindly merged."</li>
+<li>"Hinted handoff handles short failures; Merkle anti-entropy handles longer."</li>
+<li>"Sloppy quorum is the price of write availability under partial failures."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

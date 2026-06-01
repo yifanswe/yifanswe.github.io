@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design a Distributed Cache like Redis — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design a Distributed Cache like Redis</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A distributed cache sits between the application and its source of truth — typically a slower datastore (database, object store, downstream service) — and absorbs the read load. The hard part is not the in-memory hash table; it is keeping a large pool of memory across many machines coordinated, evicting the right things, surviving failures, and shielding the source of truth from correlated traffic spikes.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>For any cached key, a read returns either a value that was valid at some recent point in time (the freshness contract) or a clean miss that triggers exactly one origin fetch per stampede window, even when nodes fail, keys are hot, and clients retry aggressively.</p>
+</blockquote>
+<p>At Industry Career Track Level 5 (ICT5) or Senior Staff equivalent (L6+), the interviewer is testing whether you can pick a partitioning scheme, an eviction policy, a replication and failover story, and — most importantly — explain what happens to the origin when the cache misses, fails, or restarts.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design the cache as a sharded in-memory key-value (KV) cluster, sitting on the read path between application servers and the source of truth. The interesting decisions are how to partition keys, how to replicate for availability, how to evict when memory is full, and how to protect the origin from cache stampede on hot misses and cold restarts. I will clarify requirements, pick consistent hashing with hash slots, walk the read and write paths, then go deep on eviction, hot keys, and failure modes.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Operations supported: GET, SET, DEL, with Time To Live (TTL) on SET.</li>
+<li>Data types: just byte-string values, or richer types like lists, sets, sorted sets, hashes? Redis itself exposes structures; Memcached does not.</li>
+<li>Pub/Sub, atomic counters, distributed locks — are these in scope?</li>
+<li>Multi-key operations: pipelines, transactions, scripts that touch multiple keys.</li>
+<li>Consistency contract: read-your-writes? Eventual? Best-effort?</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Read latency budget — typically sub-millisecond at p99 inside a datacenter.</li>
+<li>Hit rate target — usually north of 90% for the design to be worth it.</li>
+<li>Memory size — terabytes across the fleet.</li>
+<li>Throughput — millions of operations per second per cluster.</li>
+<li>Durability — is the cache allowed to lose data on restart, or must it survive? If it must survive, you are in KV-store territory, not cache.</li>
+<li>Multi-region — replicated cluster per region, or one global cluster?</li>
+</ul>
+<p>Out of scope unless interviewer asks:</p>
+<ul>
+<li>Full disk persistence and point-in-time recovery (that is a database problem).</li>
+<li>Query languages, indexes, secondary indexes.</li>
+<li>Strong cross-shard transactions (caches do not do this well, and you should say so).</li>
+<li>Search and analytics workloads (use Elasticsearch or a column store).</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Read traffic</td>
+<td>10M operations/sec at peak across the cluster.</td>
+</tr>
+<tr>
+<td>Write traffic</td>
+<td>1M operations/sec — typically 10:1 read:write.</td>
+</tr>
+<tr>
+<td>Working set</td>
+<td>1 TB hot data across 100+ shards.</td>
+</tr>
+<tr>
+<td>Value sizes</td>
+<td>Median 1 KB, p99 50 KB, hard cap 1 MB (large values blow up the event loop).</td>
+</tr>
+<tr>
+<td>TTL distribution</td>
+<td>Most keys 5 min to 1 hour; some sticky session keys 24 hours.</td>
+</tr>
+<tr>
+<td>Hit rate</td>
+<td>Target 95%+; below 80% means the cache is not earning its keep.</td>
+</tr>
+<tr>
+<td>Latency budget</td>
+<td>p99 GET under 1 ms inside a region; p99 SET under 2 ms.</td>
+</tr>
+<tr>
+<td>Restart blast radius</td>
+<td>Full cluster restart must not knock over the origin database.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is rarely raw queries-per-second per node — a single Redis instance can do 100k+ operations per second on commodity hardware. The bottleneck is hot keys, hot shards, and origin protection during cache misses.</p>
+<p>Capacity math to say out loud:</p>
+<ul>
+<li>If the hot value set is 1 TB and the median value is 1 KB, the cluster stores roughly 1B keys.</li>
+<li>Per-key metadata is not free: key bytes, expiry timestamp, LRU/LFU metadata, allocator overhead, hash-table pointers. Budget 100-150 B/key for a simple string value.</li>
+<li>1B keys × 1 KB value ≈ 1 TB value bytes; 1B × 120 B metadata ≈ 120 GB overhead.</li>
+<li>Add 30% allocator fragmentation and free headroom: <code>(1.12 TB × 1.3) ≈ 1.46 TB</code> per full copy.</li>
+<li>With primary + one replica, the fleet needs about 3 TB RAM before growth margin. With 100 primary shards, each primary owns about 15 GB logical; in practice use 40-80 GB nodes so failover and resharding have breathing room.</li>
+</ul>
+<p>The dominant cost is RAM, not CPU. The knobs to cut cost are TTL, smaller value caps, compact encodings, dropping cold namespaces, and moving large blobs out of cache into object storage with only metadata cached.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>User experience</th>
+<th>System requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Application read</td>
+<td>Sub-millisecond GET with high hit rate.</td>
+<td>Cache must be near the application, partitioned to spread load, and warm.</td>
+</tr>
+<tr>
+<td>Application write</td>
+<td>Predictable SET semantics with TTL.</td>
+<td>Writes must propagate to replicas fast enough that a follower read after a write is consistent in most cases.</td>
+</tr>
+<tr>
+<td>Origin database</td>
+<td>Bounded read load even when cache is degraded.</td>
+<td>Cache must coalesce stampedes, jitter TTLs, and fail soft.</td>
+</tr>
+<tr>
+<td>Operator</td>
+<td>Can resize the cluster, drain a node, and rebalance without an outage.</td>
+<td>Resharding must be online and incremental.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                                 +-----------------------+
+                                 |    Configuration /    |
+                                 |    Topology Service   |
+                                 |  (etcd / Sentinel /   |
+                                 |   Cluster Manager)    |
+                                 +-----------+-----------+
+                                             |
+                                             v
++----------+   +-------------+    +----------------------+
+|  Client  +--&gt;+ Smart Client|---&gt;+   Cache Cluster      |
+|   App    |   | (or proxy)  |    |  +----+ +----+ +----+|
++----------+   +------+------+    |  |Sh1 | |Sh2 | |Sh3 ||
+                      |           |  | M  | | M  | | M  ||
+              (cache miss)        |  | +R | | +R | | +R ||
+                      v           |  +----+ +----+ +----+|
+              +---------------+   +----------------------+
+              |   Origin DB   |
+              | (Postgres,    |
+              |  MySQL, S3,   |
+              |  service API) |
+              +---------------+
+</code></pre>
+<p>The client (or a proxy in front of the client) is responsible for hashing the key to a shard. Each shard is a primary plus one or more replicas. A topology service tracks who owns which key range and coordinates failover.</p>
+<h3 id="core-components">Core Components</h3>
+<ul>
+<li><strong>Smart client or proxy</strong>: hashes keys to shards, handles redirects when slots move, retries on failure. Smart-client examples: Jedis, Lettuce, redis-py-cluster. Proxy examples: Twemproxy, Envoy, Redis Cluster Proxy. Smart client is faster (one less network hop) but couples the client to topology; proxy is easier to operate.</li>
+<li><strong>Shard primary</strong>: owns a slice of the keyspace, serves reads and writes, replicates to followers.</li>
+<li><strong>Shard replica</strong>: takes async replication from the primary, can serve reads in some configurations, becomes the new primary on failover.</li>
+<li><strong>Topology service</strong>: maintains the slot-to-shard map and orchestrates failover. Can be Redis Sentinel, Redis Cluster gossip, ZooKeeper, etcd, or a custom controller.</li>
+<li><strong>Origin database</strong>: the source of truth. Cache misses fall through here.</li>
+</ul>
+<h3 id="concrete-data-model-and-client-api">Concrete Data Model And Client API</h3>
+<p>Even though the cache is "just keys," interviewers expect you to name the metadata that makes eviction, expiry, and failover work.</p>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Key pattern / shard</th>
+<th>Value</th>
+<th>TTL</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cached value</td>
+<td><code>{namespace}:{logical_id}</code>; slot = <code>crc16(key) % 16384</code></td>
+<td>Byte string up to 1 MB, plus metadata <code>{expire_at_ms, last_access_sample, lfu_counter, version?}</code></td>
+<td>Caller-specified, usually 5 min-1 hour. No TTL only for explicitly configured namespaces.</td>
+</tr>
+<tr>
+<td>Negative cache</td>
+<td><code>neg:{namespace}:{logical_id}</code></td>
+<td>Tiny marker: <code>NOT_FOUND</code>, source version, created_at</td>
+<td>30-120 seconds to avoid hiding newly-created objects too long.</td>
+</tr>
+<tr>
+<td>Single-flight lease</td>
+<td><code>sf:{hash(key)}</code></td>
+<td>Fetch owner request id + deadline</td>
+<td>5-30 seconds; must expire automatically if the owner dies.</td>
+</tr>
+<tr>
+<td>Slot map</td>
+<td><code>slot:{0..16383}</code> in topology service</td>
+<td>Primary node id, replica ids, config epoch, migrating/importing state</td>
+<td>No TTL; changes through quorum-managed config update.</td>
+</tr>
+<tr>
+<td>Hot-key sketch</td>
+<td>per-shard Count-Min Sketch + top-N heap</td>
+<td>Key fingerprints and approximate counts</td>
+<td>1-minute rolling windows, exported to metrics.</td>
+</tr>
+<tr>
+<td>Persistence snapshot</td>
+<td>per-shard RDB/AOF segment if enabled</td>
+<td>Serialized key/value data or append log</td>
+<td>Operational, not application TTL.</td>
+</tr>
+</tbody>
+</table>
+<p>Minimal client API:</p>
+<pre><code class="language-text">GET key                         -&gt; value | MISS | ERROR
+MGET [key...]                   -&gt; [{key, value|MISS}]
+SET key value ttl_ms [NX|XX]     -&gt; OK | NOT_STORED | ERROR
+DEL key                         -&gt; deleted_count
+INCR key delta ttl_ms?           -&gt; integer
+TOPOLOGY                         -&gt; slot map + epoch
+</code></pre>
+<p><code>MGET</code> is only efficient when keys map to a small number of shards; otherwise the smart client fans out in parallel and merges responses. Multi-key atomic operations should require a hash tag, like <code>user:{42}:profile</code> and <code>user:{42}:cart</code>, so all touched keys live in one slot.</p>
+<p>Technology choice framing: Redis Cluster is the default if the product wants rich data structures, Lua/functions, streams, and mature operations. Memcached is better for pure string GET/SET at huge CPU scale because it is simpler and multi-threaded. Aerospike or DynamoDB DAX becomes relevant if the "cache" needs durable KV behavior. Be ready for "why not Memcached?" — answer: use it when the workload is simple; pick Redis when the data-structure and replication features are worth the operational cost.</p>
+<h3 id="partitioning-strategy">Partitioning Strategy</h3>
+<p>Two real options:</p>
+<table>
+<thead>
+<tr>
+<th>Scheme</th>
+<th>How it works</th>
+<th>Tradeoff</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Consistent hashing with virtual nodes</td>
+<td>Each physical node owns many points on the hash ring. Add or remove a node, only its neighbors are affected.</td>
+<td>Smooth resize, no central authority needed. Hot keys still pin one node.</td>
+</tr>
+<tr>
+<td>Hash slots (Redis Cluster style)</td>
+<td>Fixed 16,384 slots, each slot maps to a shard. Moving a slot moves all its keys.</td>
+<td>Simpler operational model; reshard is explicit and observable. The choice Redis Cluster actually made.</td>
+</tr>
+</tbody>
+</table>
+<p>Pick <strong>hash slots</strong> as the default — they make reshards explicit, support multi-key operations via hash tags (<code>user:{42}:profile</code> and <code>user:{42}:cart</code> go to the same slot), and integrate cleanly with online migration. Be ready to defend why over consistent hashing: predictable slot movement, MOVED and ASK redirections give the client a clear protocol, and hash tags solve the multi-key problem cleanly.</p>
+<p>Modulo-N hashing (<code>hash(key) % N</code>) is the trap answer — every resize remaps every key.</p>
+<h3 id="eviction-policy">Eviction Policy</h3>
+<p>When memory is full, you must evict. The policy choices and when each is right:</p>
+<table>
+<thead>
+<tr>
+<th>Policy</th>
+<th>When to use</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Least Recently Used (LRU)</td>
+<td>General-purpose default; recent access predicts future access.</td>
+<td>Approximate LRU is cheap; exact LRU costs a doubly-linked list per key.</td>
+</tr>
+<tr>
+<td>Least Frequently Used (LFU)</td>
+<td>Scan-resistant workloads where a one-time large scan would evict the hot set under LRU.</td>
+<td>Needs a counter per key; access patterns shift slowly.</td>
+</tr>
+<tr>
+<td>TTL only</td>
+<td>When every key has a meaningful expiry and you do not want to evict early.</td>
+<td>Memory may fill if TTLs are long; then SETs start failing.</td>
+</tr>
+<tr>
+<td>First In First Out (FIFO)</td>
+<td>Almost never; LRU is strictly better at similar cost.</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Adaptive Replacement Cache (ARC) / Window TinyLFU (W-TinyLFU)</td>
+<td>When hit rate matters more than implementation simplicity.</td>
+<td>More complex; great for benchmark wins, harder to operate.</td>
+</tr>
+</tbody>
+</table>
+<p>Redis defaults to <code>allkeys-lru</code> or <code>volatile-lru</code>. The deeper point: <strong>approximate LRU is fine</strong>. Redis samples a few random keys and evicts the oldest among them. With sample size 10, you get within a percent of true LRU at a fraction of the cost.</p>
+<p>The harder design question is <strong>what to do when a SET fails because of memory pressure</strong>: return an error to the application, evict eagerly, or accept the miss on the next read? Most caches return an error and let the application decide. Some pre-evict on a background thread when memory crosses a high-water mark.</p>
+<h3 id="replication-and-consistency">Replication And Consistency</h3>
+<p>Default model: asynchronous replication from primary to one or more replicas.</p>
+<ul>
+<li><strong>Writes</strong> go to the primary, which acknowledges before the replica has the data. The replication stream is a logical operation log (in Redis terms, it is the same protocol the primary would speak to a client).</li>
+<li><strong>Replica lag</strong> is typically sub-millisecond inside a datacenter, low tens of milliseconds across regions.</li>
+<li><strong>Reads</strong> can go to the primary (read-your-writes) or to replicas (cheaper, can be stale).</li>
+<li><strong>Failover</strong> promotes a replica when the primary is unreachable. Whoever runs the topology service decides this; in Redis Sentinel a quorum of sentinels agrees; in Redis Cluster the other primaries vote.</li>
+</ul>
+<p>The consistency contract for caches is <strong>eventual with read-from-primary for read-your-writes</strong>. Cache invalidation is a hint, not a guarantee — applications must treat cache misses as the failure mode that drives correctness, with the origin database as the authoritative store.</p>
+<p>If the interviewer asks about stronger consistency: caches with strong consistency exist (Aerospike, FoundationDB) but pay for it with extra round trips. Most caching use cases do not need strong consistency; the application using the cache is already comfortable with stale reads up to a TTL.</p>
+<h3 id="read-and-write-path">Read And Write Path</h3>
+<p><strong>Read (cache-aside, the most common pattern):</strong></p>
+<pre><code class="language-text">1. App constructs `{namespace}:{logical_id}` and asks the smart client for `GET`.
+2. Smart client hashes the key to a slot and reads the current slot owner from its local topology cache.
+3. It dispatches to the shard primary for read-your-writes namespaces, or to a replica for stale-tolerant namespaces.
+4. Cache hit: shard checks `expire_at_ms`, updates approximate LRU/LFU metadata, returns the byte string.
+5. Clean miss: app tries to acquire `sf:{hash(key)}` single-flight lease for 5-30s.
+6. Lease winner reads the origin, writes `SET key value ttl+jitter`, and releases by expiry. Concurrent missers wait briefly or return stale-if-available.
+7. If origin returns not found, app writes `neg:{namespace}:{logical_id}` for 30-120s, not a long-lived empty value.
+</code></pre>
+<p><strong>Write (cache-aside, write-around):</strong></p>
+<pre><code class="language-text">1. App writes to origin database and commits the durable version.
+2. App invalidates cache with `DEL key` or writes `SET key new_value ttl` if the new value is already available.
+3. Invalidation is best effort; correctness still comes from TTL and origin truth.
+4. For high-value namespaces, origin write publishes an invalidation event so every region deletes the key.
+</code></pre>
+<p><strong>Topology-move path:</strong></p>
+<pre><code class="language-text">1. Cluster manager marks slot S as MIGRATING from shard A to shard B with config epoch E+1.
+2. Smart clients seeing MOVED update the slot map; clients seeing ASK send the next request to B for that one key.
+3. A streams keys in slot S to B while both shards continue serving under migration rules.
+4. Cluster manager flips ownership when copied keys and replication catch up.
+</code></pre>
+<p>Interview phrase:</p>
+<blockquote>
+<p>A cache miss is not just a miss; it is a controlled origin fetch with a lease, jittered refill, and negative-cache option. That is the difference between a cache and a database amplifier.</p>
+</blockquote>
+<p><strong>Other patterns to mention:</strong></p>
+<ul>
+<li><strong>Write-through</strong>: cache and database written together; cache always consistent with database but writes pay for both. Use when read-your-writes matters and origin writes are cheap.</li>
+<li><strong>Write-back (write-behind)</strong>: write to cache, flush to database asynchronously. Great for write-heavy workloads, but the cache becomes a durability single point of failure. Almost never the right call unless you have invested in cache durability.</li>
+<li><strong>Refresh-ahead</strong>: proactively refresh hot keys before TTL expires. Good for predictable hot keys; wasted work for cold ones.</li>
+</ul>
+<p>Default to cache-aside with write-around. State this clearly to the interviewer and only deviate if requirements force it.</p>
+<h3 id="cache-stampede-protection">Cache Stampede Protection</h3>
+<p>The single most important topic. A cache stampede happens when a hot key expires (or the cache restarts) and thousands of clients all miss simultaneously, all call the origin, and the origin falls over.</p>
+<p>Mitigations, from cheap to expensive:</p>
+<table>
+<thead>
+<tr>
+<th>Technique</th>
+<th>How it works</th>
+<th>When to use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TTL jitter</td>
+<td>Add ±10% random jitter to TTLs so they do not all expire together.</td>
+<td>Always. Free.</td>
+</tr>
+<tr>
+<td>Request coalescing (single-flight)</td>
+<td>First miss takes a per-key lock, fetches from origin, populates cache; concurrent misses wait.</td>
+<td>When the origin call is expensive. Implement at the application layer or in a sidecar.</td>
+</tr>
+<tr>
+<td>Probabilistic early expiration (XFetch)</td>
+<td>Each reader rolls a die; as TTL approaches, probability of "refresh now" rises. One reader hits origin a few seconds early, repopulating before the cliff.</td>
+<td>Hot keys where downtime at expiration is unacceptable.</td>
+</tr>
+<tr>
+<td>Background refresh</td>
+<td>A worker refreshes hot keys before they expire; readers always see fresh data.</td>
+<td>Top-N hot keys, where you can identify them.</td>
+</tr>
+<tr>
+<td>Negative caching</td>
+<td>Cache misses themselves with a short TTL ("this key has no value").</td>
+<td>When clients repeatedly request keys that do not exist (think 404 floods).</td>
+</tr>
+<tr>
+<td>Bloom filter in front of cache</td>
+<td>Reject impossible lookups before they hit the cache or origin.</td>
+<td>Cache penetration attacks where attackers query random nonexistent keys.</td>
+</tr>
+</tbody>
+</table>
+<p>The deepest answer: <strong>distinguish stampede on hot key expiration from stampede on cache cold start</strong>. The first is per-key; coalescing handles it. The second is fleet-wide; only origin protection (origin-side rate limiting, gradual cluster warm-up, sticky pre-warming from a snapshot) handles it.</p>
+<h3 id="hot-key-and-hot-shard-strategy">Hot Key And Hot Shard Strategy</h3>
+<p>A hot key is one that a single shard cannot serve. Strategies:</p>
+<ul>
+<li><strong>Read replicas</strong>: spread reads across replicas. Works for read-hot keys, not for write-hot keys.</li>
+<li><strong>Client-side caching</strong>: clients hold a short-TTL in-process cache for the very hottest keys. Redis 6 supports server-assisted client-side caching with invalidation notifications.</li>
+<li><strong>Key splitting</strong>: split <code>leaderboard:global</code> into <code>leaderboard:global:{0..15}</code> and have clients merge results. Trades extra reads for distributed load.</li>
+<li><strong>Dedicated hot-key tier</strong>: route known hot keys to a separate replica fleet sized for the traffic.</li>
+<li><strong>Application-level dedupe</strong>: if many requests need the same data, batch them at the application layer before they reach the cache.</li>
+</ul>
+<p>A hot shard is one whose key range concentrates traffic regardless of any single key. Symptoms: shard CPU pegged, neighbor shards idle. Strategies: pre-sharding (allocate more slots to the hot range from day one), online slot migration, or restructuring keys to spread better (avoid <code>tenant_id:{...}</code> if one tenant dominates).</p>
+<h3 id="failure-modes">Failure Modes</h3>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>What happens</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single replica down</td>
+<td>Reads to that replica fail; clients retry or fall back to primary.</td>
+<td>Health checks, fast topology refresh.</td>
+</tr>
+<tr>
+<td>Primary down</td>
+<td>Failover promotes a replica. Some uncommitted writes lost (async replication).</td>
+<td>Quorum-based promotion, fence the old primary.</td>
+</tr>
+<tr>
+<td>Network partition</td>
+<td>Split brain risk: two primaries serving the same slot.</td>
+<td>Quorum prevents promotion when majority is unreachable; fencing tokens on writes.</td>
+</tr>
+<tr>
+<td>Cluster cold start</td>
+<td>Cache is empty; every read misses; origin overwhelmed.</td>
+<td>Restore from a snapshot, gradual traffic ramp, origin-side rate limit.</td>
+</tr>
+<tr>
+<td>Slow operation blocks event loop</td>
+<td>A <code>KEYS *</code> or large <code>SUNION</code> pegs the single thread; everything else times out.</td>
+<td>Forbid slow operations in code review; use <code>SCAN</code>; cap value sizes.</td>
+</tr>
+<tr>
+<td>Out of memory (OOM)</td>
+<td>Cache evicts faster, hit rate drops, origin load rises.</td>
+<td>Alert on memory pressure well before hard limit; eviction policy that prefers cold data.</td>
+</tr>
+<tr>
+<td>Replica lag spikes</td>
+<td>Replica reads return very stale data.</td>
+<td>Bound the lag; drop replica from rotation if lag exceeds threshold.</td>
+</tr>
+<tr>
+<td>Hot key kills one shard</td>
+<td>One shard at 100% CPU, others idle.</td>
+<td>Detect via per-key sampling; apply key splitting or client-side cache for the offender.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="graceful-degradation-state-table">Graceful Degradation State Table</h3>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Latency budget</th>
+<th>Fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot hit</td>
+<td>Normal cache read</td>
+<td>Shard primary / replica</td>
+<td>&lt;1 ms p99 in-region</td>
+<td>None.</td>
+</tr>
+<tr>
+<td>Local topology stale</td>
+<td>Client routed to old owner</td>
+<td>MOVED / ASK redirect</td>
+<td>One extra network round trip</td>
+<td>Refresh slot map by epoch.</td>
+</tr>
+<tr>
+<td>Clean miss</td>
+<td>Origin fetch controlled by lease</td>
+<td>Origin DB + single-flight</td>
+<td>Origin p99 plus waiters capped at a few hundred ms</td>
+<td>Serve stale value if namespace allows; otherwise bounded miss.</td>
+</tr>
+<tr>
+<td>Lease owner dies</td>
+<td>Single-flight lease expires</td>
+<td><code>sf:{hash(key)}</code> TTL</td>
+<td>5-30s worst-case wait if clients choose to wait</td>
+<td>Next waiter becomes owner; origin rate limit still applies.</td>
+</tr>
+<tr>
+<td>Shard primary down</td>
+<td>Failover</td>
+<td>Replica + topology quorum</td>
+<td>Seconds; client retries with backoff</td>
+<td>Promote replica, fence old primary, serve stale from local app cache if allowed.</td>
+</tr>
+<tr>
+<td>Cluster cold</td>
+<td>Low hit rate after restart</td>
+<td>Snapshot + origin</td>
+<td>Minutes to warm</td>
+<td>Traffic ramp, origin circuit breaker, pre-warm top keys.</td>
+</tr>
+<tr>
+<td>Origin overloaded</td>
+<td>Cache miss path unsafe</td>
+<td>Origin rate limiter</td>
+<td>Serve degraded response quickly</td>
+<td>Stale-if-error, negative admission, shed low-priority requests.</td>
+</tr>
+</tbody>
+</table>
+<p>The cursor-like state that persists across requests is the topology epoch in the client and, for paged bulk operations such as <code>SCAN</code>, the server-issued scan cursor. A <code>SCAN</code> cursor encodes shard, bucket position, and topology epoch; if the epoch changes during resharding, the client should tolerate duplicates and dedupe by key.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The graceful state machine is hit → controlled miss → stale-if-allowed → shed. I never let a cache outage turn into an unbounded origin stampede.</p>
+</blockquote>
+<p>State the fail-mode policy out loud: <strong>cache failures must not become origin failures</strong>. The application must treat cache errors as cache misses and have origin-side protection (rate limit, circuit breaker) to absorb the resulting spike.</p>
+<h3 id="persistence-cache-vs-kv-store">Persistence (Cache vs. KV Store)</h3>
+<p>Pure caches do not persist. If the interviewer says "we cannot afford a cold start," you have two options:</p>
+<ul>
+<li><strong>Snapshot to disk</strong>: periodic point-in-time dumps (Redis <code>RDB</code>). Cheap, but you lose anything since the last dump.</li>
+<li><strong>Append-only log</strong>: every write also appends to a log on disk (Redis <code>AOF</code>). More durable, slower writes, log compaction needed.</li>
+</ul>
+<p>Be honest with the interviewer: enabling persistence on a cache makes it a slower KV store. If the application cannot tolerate cold-start latency, the better answer is usually:</p>
+<ol>
+<li>Replica in another availability zone, promoted on full primary failure.</li>
+<li>Origin protection so cold start is bearable, not invisible.</li>
+<li>Snapshot on shutdown and reload on startup (best-effort warm cache).</li>
+</ol>
+<p>Do not promise zero-loss durability from a cache layer. That is a database.</p>
+<h3 id="memory-management">Memory Management</h3>
+<p>The implementation detail that distinguishes a serious answer:</p>
+<ul>
+<li><strong>Memory allocator</strong>: jemalloc is the default in Redis; it dramatically reduces fragmentation versus glibc malloc. Mention it.</li>
+<li><strong>Fragmentation ratio</strong>: <code>used_memory_rss / used_memory</code>. Above 1.5 means you are wasting memory; consider <code>ACTIVEDEFRAG</code> or a restart.</li>
+<li><strong>Object sharing</strong>: small integers are shared across keys in Redis. Useful for high-cardinality counter caches.</li>
+<li><strong>Encoding optimization</strong>: short hashes, lists, sorted sets use compact encodings (<code>ziplist</code>, <code>listpack</code>); they cross over to full hash table at configurable thresholds. Tuning these saves memory at the cost of operation latency for large values.</li>
+<li><strong>Eviction granularity</strong>: per-key, not per-bucket. Big values evict fewer items per memory reclaimed.</li>
+<li><strong>maxmemory and maxmemory-policy</strong>: the two configs that decide eviction behavior at memory cap. Get them wrong and the cache starts returning errors instead of evicting.</li>
+</ul>
+<h3 id="threading-model">Threading Model</h3>
+<p>Redis is famously single-threaded for command execution. The implications:</p>
+<ul>
+<li><strong>No locks needed inside the engine</strong> — operations are atomic by virtue of serial execution.</li>
+<li><strong>One slow command stalls everything</strong>. <code>KEYS *</code> over a million keys is a multi-second stall.</li>
+<li><strong>Use the event loop for I/O, single thread for command logic</strong>. Redis 6 added I/O threads for parsing and writing replies, keeping command execution single-threaded.</li>
+<li><strong>Pipelines</strong> batch commands so the round-trip cost amortizes. Always use pipelines for bulk operations.</li>
+<li><strong>Lua and Function</strong> scripts run atomically on the single thread; the same "do not do slow things" rule applies.</li>
+</ul>
+<p>The frequent interview question: "Why is Redis single-threaded and still fast?" Answer: the bottleneck is network and memory bandwidth, not CPU; serialized execution avoids locking overhead; the event loop handles many connections concurrently. The threading model is a fit for the workload, not a workaround.</p>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<p>Three options, in order of operational simplicity:</p>
+<ol>
+<li><strong>Independent regional clusters</strong>. Each region has its own cache, populated lazily from its own origin replicas. No cross-region cache coordination. Cache may temporarily disagree across regions; eventual consistency from the origin replication brings them together.</li>
+<li><strong>Active-passive global cluster</strong>. One region writes, others read. Reads in the passive region pay cross-region latency on miss only. Failover promotes another region.</li>
+<li><strong>Active-active with Conflict-free Replicated Data Types (CRDTs)</strong>. Redis Enterprise supports this. Writes in any region converge. Expensive operationally; only use if the product demands it.</li>
+</ol>
+<p>Default to option 1. Push the consistency problem down to the origin database, where it belongs.</p>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>What you alert on:</p>
+<ul>
+<li><strong>Hit rate</strong> (per route, per shard, global). Drop indicates origin pressure incoming.</li>
+<li><strong>p99 GET / SET latency</strong>.</li>
+<li><strong>Connections per shard</strong>. Connection pool exhaustion is a common failure mode.</li>
+<li><strong>Memory usage and fragmentation ratio</strong> per shard.</li>
+<li><strong>Evictions per second</strong>. Spike means working set just exceeded memory.</li>
+<li><strong>Replication lag</strong> per replica.</li>
+<li><strong>Commands per second per shard</strong>. Hot shard detection.</li>
+<li><strong>Slowlog entries</strong>. Anything over 10ms gets a human eyeball.</li>
+</ul>
+<p>What you sample (not alert on, but log):</p>
+<ul>
+<li>Top N hot keys per shard.</li>
+<li>Top N largest values.</li>
+<li>Origin call rate from cache-miss path.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li><strong>Cache freshness vs origin load</strong>: shorter TTL means fresher data and more origin traffic. Pick TTL per data type, not globally.</li>
+<li><strong>Consistency vs availability</strong>: stronger consistency means cross-shard coordination, which kills latency. Caches choose availability and pay with staleness.</li>
+<li><strong>Memory vs compute</strong>: bigger cache, higher hit rate, lower origin cost — until you cannot afford the cache. Find the sweet spot via hit-rate / cost-per-GB analysis, not gut feeling.</li>
+<li><strong>Smart client vs proxy</strong>: smart client is one hop faster; proxy is easier to operate and lets you change topology without redeploying clients.</li>
+<li><strong>Persistence on or off</strong>: on costs latency and disk; off costs cold-start pain. Default off, mitigate cold-start with replicas and origin protection.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<ul>
+<li><strong>Saying "just use Redis" without picking partitioning, replication, or failover</strong>. The interviewer wants to see the components, not the product name.</li>
+<li><strong>Forgetting cache stampede entirely</strong>. The biggest "miss" in answering this question.</li>
+<li><strong>Promising strong consistency from an async-replicated cache</strong>. The contract is eventual; own it.</li>
+<li><strong>Modulo-N hashing for partitioning</strong>. Reshard is a full data movement.</li>
+<li><strong>Ignoring hot keys and hot shards</strong>. Senior interviewers will deliberately steer here.</li>
+<li><strong>Treating the origin as infinitely scalable</strong>. The cache exists to protect the origin; if you forget the origin in your design, you have not solved the actual problem.</li>
+<li><strong>Promising sub-millisecond cross-region cache reads</strong>. Speed of light says no.</li>
+</ul>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<ul>
+<li><strong>Distributed locking with Redis</strong>: the Redlock algorithm, Martin Kleppmann's critique, when redlock is OK (best-effort coordination) versus when you need a real consensus system (correctness).</li>
+<li><strong>Pub/Sub vs Streams</strong>: Redis Pub/Sub is fire-and-forget, no delivery guarantee. Redis Streams are an append log with consumer groups, persistence, and at-least-once semantics. Pick the right one.</li>
+<li><strong>Geo, HyperLogLog, sorted sets</strong>: when these earn their keep. Sorted sets for leaderboards, HyperLogLog for unique-count estimation under tight memory.</li>
+<li><strong>Sharded counter</strong> vs Redis <code>INCR</code>: when do you need sharded counters to avoid hot-key pinning?</li>
+<li><strong>Cluster resharding mechanics</strong>: how a slot migrates while still serving traffic (the <code>MIGRATING</code> and <code>IMPORTING</code> states, MOVED versus ASK redirects).</li>
+<li><strong>Memcached vs Redis</strong>: Memcached is multi-threaded, simpler data model, no persistence; Redis has data structures, persistence, replication. Memcached is still right for the simplest workload.</li>
+</ul>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Stated the invariant: cache returns fresh-enough or clean miss, origin is protected from stampede.</li>
+<li>Picked partitioning (hash slots) with justification.</li>
+<li>Picked eviction (approximate LRU) with justification.</li>
+<li>Walked the cache-aside read and write paths.</li>
+<li>Addressed cache stampede (jitter, coalescing, probabilistic refresh).</li>
+<li>Addressed hot keys and hot shards (splitting, client-side cache, replicas).</li>
+<li>Discussed failure modes and stated that cache failures must not become origin failures.</li>
+<li>Picked replication model (async primary-replica with quorum failover) and named the consistency contract.</li>
+<li>Multi-region strategy (independent regional clusters by default).</li>
+<li>Operational metrics and what to alert on.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>"The cache exists to protect the origin and to serve fast reads. Every design decision — partitioning, eviction, replication, stampede protection — flows from those two goals. I default to hash-slot partitioning, approximate LRU, async replication with quorum failover, and cache-aside with TTL jitter and request coalescing. The most common failure I design against is correlated cache miss, not a single node crash."</p>
+</blockquote>
+<hr />
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design a distributed cache like Redis.</p>
+<p><strong>Candidate:</strong> I will design a sharded in-memory KV cluster on the read path between application servers and an origin database. The two goals are sub-millisecond reads with high hit rate, and protecting the origin from correlated cache misses. I will clarify requirements, pick partitioning, walk the data path, and dive into eviction and stampede protection.</p>
+<p><strong>Interviewer:</strong> How do you partition keys?</p>
+<p><strong>Candidate:</strong> Hash slots, like Redis Cluster. A fixed number of logical slots — say 16,384 — each mapped to a shard. Clients hash the key, look up the slot in a small map, and route directly. Resharding moves slots between shards, which is explicit and observable. Hash tags like <code>user:{42}:profile</code> let me put related keys on the same shard for multi-key operations. I avoid modulo-N hashing because resize remaps everything, and I avoid pure consistent hashing because hash slots have a cleaner operational story.</p>
+<p><strong>Interviewer:</strong> How do you handle replication and failover?</p>
+<p><strong>Candidate:</strong> Each shard is a primary plus one or more async replicas. Writes go to the primary, replication is sub-millisecond inside a region. A topology service — Redis Cluster gossip, Sentinel, or etcd-backed controller — watches health and promotes a replica on primary failure. Quorum is required for promotion, which prevents split brain during a partition. The consistency contract is eventual; reads from replicas can be slightly stale.</p>
+<p><strong>Interviewer:</strong> What eviction policy do you use?</p>
+<p><strong>Candidate:</strong> Approximate Least Recently Used as the default. Redis samples a handful of random keys on each eviction and removes the oldest among them; with a sample size around 10 it is within a percent of true LRU at much lower cost. For scan-heavy workloads where LRU evicts the hot set, I switch to Least Frequently Used. The deeper choice is what happens on memory pressure: by default, SETs return an error; I would also alert at 80% memory so an operator can resize before it hurts.</p>
+<p><strong>Interviewer:</strong> What about cache stampede?</p>
+<p><strong>Candidate:</strong> The biggest topic on this question. Three layers. First, TTL jitter — add ten percent random noise so keys do not all expire at the same instant. Free win. Second, request coalescing per key — the first miss takes an in-process lock or short Redis lock, calls the origin, populates the cache; concurrent misses wait. Third, probabilistic early refresh for the hottest keys — readers stochastically refresh slightly before expiration, so the cliff never happens. Separately, I plan for cold-start stampede where the whole cache is empty: snapshot-on-shutdown plus restore-on-startup, plus origin-side rate limiting that absorbs the inevitable spike.</p>
+<p><strong>Interviewer:</strong> What if a single key is so hot it pins one shard?</p>
+<p><strong>Candidate:</strong> That is the hot-key problem. A few moves: enable server-assisted client-side caching so each client keeps a short-TTL local copy; spread reads across replicas; split the key — <code>leaderboard:global</code> becomes <code>leaderboard:global:{0..15}</code> and clients union the slices. For write-hot keys, key splitting is the only real answer; client caching does not help.</p>
+<p><strong>Interviewer:</strong> Cache-aside or write-through?</p>
+<p><strong>Candidate:</strong> Cache-aside with write-around as the default. Application reads check cache, miss falls through to origin, populates cache. Application writes go to origin then invalidate the cache key. Write-through is tempting because it keeps cache and origin consistent, but it doubles the write path latency and the failure modes get nasty when the cache write succeeds and the origin write fails. Write-back is almost never right unless you have built real durability into the cache, at which point it is a database.</p>
+<p><strong>Interviewer:</strong> What happens when the cache cluster is unavailable?</p>
+<p><strong>Candidate:</strong> Cache failures must not become origin failures. The application treats cache errors as cache misses, falls through to origin. Without protection that is the worst case for the origin — every read goes through. So the application also has a circuit breaker that opens on sustained cache errors, with origin-side rate limiting and request shedding behind it. Better to serve a fraction of users a clean error than to take the origin down for everyone.</p>
+<p><strong>Interviewer:</strong> How does the cache restart without taking down the origin?</p>
+<p><strong>Candidate:</strong> Two strategies. First, replicas are in a separate availability zone so a single-zone outage does not take the whole cluster cold. Second, snapshot to disk on shutdown, load on startup; the cluster comes back warm-ish. Third, if both fail and we are doing a real cold start, the application's circuit breaker and origin-side rate limit absorb the spike. The cache being slow to warm is acceptable; the database falling over is not.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Default is independent regional clusters, each populated from its regional origin replicas. No cross-region cache coordination, lower complexity, eventual consistency from the database replication. If the product genuinely needs a single global cache, Redis Enterprise active-active with CRDTs exists, but the operational cost is real and most products do not need it. I would push hard on whether the requirement is actually a global cache or just per-region consistency with the global database.</p>
+<p><strong>Interviewer:</strong> Tell me about persistence.</p>
+<p><strong>Candidate:</strong> A pure cache does not persist. The moment you turn on persistence, the cache is slower and the failure modes are more complex; you are paying KV-store costs for cache benefits. Redis offers RDB snapshots and AOF append logs. I use RDB snapshots on shutdown as a best-effort warm reload, not as durability. If the product cannot tolerate the cold-start period, the right answer is usually a multi-AZ replica setup plus origin protection, not full persistence.</p>
+<p><strong>Interviewer:</strong> What metrics do you alert on?</p>
+<p><strong>Candidate:</strong> Hit rate per route — a drop means origin load is rising. P99 latency for GET and SET. Memory pressure and fragmentation ratio per shard — eviction rate spikes when working set crosses memory cap. Replication lag — old replicas should not serve reads. Slowlog entries — anything over ten milliseconds in a single-threaded engine is a real problem. Connections per shard — pool exhaustion is a quiet failure mode that does not look like a cache outage until everything times out.</p>
+<p><strong>Interviewer:</strong> Summarize the design.</p>
+<p><strong>Candidate:</strong> Hash-slot partitioning with smart clients, async primary-replica replication per shard, quorum-based failover. Approximate LRU eviction. Cache-aside with TTL jitter, request coalescing, and probabilistic early refresh for stampede protection. Hot keys handled with client-side caching, replica reads, and key splitting. Multi-region uses independent regional clusters. Failures are designed so the cache going down does not take the origin with it — circuit breakers, origin-side rate limits, and the application treating cache errors as cache misses. The whole design optimizes for fast reads and protected origin, not for exact consistency.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: data types, TTL behavior, consistency contract, persistence required or not.</li>
+<li>State the invariant: cache returns fresh-enough or clean miss, origin protected from stampede.</li>
+<li>Pick hash-slot partitioning; explain why over modulo and consistent hashing.</li>
+<li>Pick async primary-replica with quorum failover; name the consistency contract.</li>
+<li>Pick approximate LRU; cover eviction at memory pressure.</li>
+<li>Walk cache-aside read and write paths.</li>
+<li>Stampede protection: jitter, coalescing, probabilistic refresh.</li>
+<li>Hot keys: client-side cache, replica reads, key splitting.</li>
+<li>Failure: cache errors become cache misses, not origin failures.</li>
+<li>Close with metrics and multi-region as independent regional clusters.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>A cache is an approximation system whose first job is to protect the origin and whose second job is to be fast. Hash slots for partitioning, async replication for availability, approximate LRU for eviction, and cache-aside with stampede protection on top. The interesting questions are not the data structures; they are what happens when keys are hot, when the cache is cold, and when a shard fails. I design those paths first and let the steady-state design fall out.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"The cache exists to protect the origin, not just to be fast."</li>
+<li>"Cache failures must not become origin failures."</li>
+<li>"Stampede is the failure mode I design against first; node death is easy."</li>
+<li>"Async replication, eventual consistency, read-from-primary for read-your-writes — that is the contract."</li>
+<li>"Approximate LRU is good enough; do not pay for exact."</li>
+<li>"Hot keys break naive designs; client-side caching, replica reads, and key splitting are the three moves."</li>
+<li>"A cache with persistence turned on is a slower KV store. Be explicit about which one you are building."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

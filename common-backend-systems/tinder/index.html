@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tinder — Dating App (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Tinder — Dating App (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Medium · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build Tinder. A user opens the app, gets a stack of nearby candidate profiles, swipes left/right, and when two users mutually swipe right they "match" and can chat. 100M daily active users (DAU), median ~50 swipes/day, ~10M new matches/day.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Browse a stack of candidate profiles filtered by location, age range, gender preference.
+- Swipe left (pass) or right (like).
+- When both users have swiped right, create a match and open a chat thread.</p>
+<p>I'd defer chat/messaging implementation depth, premium features (Super Like, Boost), profile photo moderation.</p>
+<p><strong>Non-functional</strong>
+- Card-stack open p99 &lt; 300 ms; nothing kills the experience like a slow next-card.
+- Strong consistency on match detection — both users must see the match exactly once.
+- A user must never see the same candidate twice (no re-shows).
+- Read-heavy: 100M × 50 = 5B swipes/day → ~60k swipes/sec average; candidate fetches roughly 1:5 with that.</p>
+<p><strong>Capacity</strong>
+- 100M DAU × 50 swipes = 5B swipes/day.
+- Match table: ~3.6B matches lifetime.
+- Profile store: 200M profiles total at 5 KB each ≈ 1 TB.
+- Swipe write volume: 5B/day × ~40 B compact row (<code>from,to,dir,ts</code>) ≈ 200 GB/day before replication; with 3 replicas and 1-year retention, this is ~220 TB. The dominant hot cost is write throughput and per-user exclusion state, not profile storage.
+- Active geo index: if 30M users are active in the last 30 min and each entry is ~24 B, the live location index is &lt;1 GB primary; it is small but extremely latency-sensitive.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>User / Profile</strong> — <code>user_id</code>, location, age, photos, preferences.</li>
+<li><strong>Swipe</strong> — <code>from, to, direction (like/pass), ts</code>. Append-only.</li>
+<li><strong>Match</strong> — <code>user_a, user_b, created_at, chat_id</code>. Symmetric pair.</li>
+<li><strong>Chat thread</strong> — out of scope to design fully; just touch the entry point.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>GET   /v1/cards?lat=&amp;lng=&amp;n=10               → Profile[]    // candidate stack
+POST  /v1/swipes                              { target_id, direction }  → { matched?: bool, match_id?: ... }
+GET   /v1/matches                             → Match[]
+POST  /v1/location                            { lat, lng }
+</code></pre>
+<p>User from token. Swipes are idempotent by <code>(swiper, target)</code>.</p>
+<p>The cards cursor is server-issued and encodes <code>user_id</code>, <code>geo_cell</code>, <code>candidate_batch_id</code>, and <code>rank_offset</code>; it prevents duplicate cards across retries without exposing ranking internals.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Profile service.</strong> Sharded by <code>user_id</code>. Read-heavy; fronted by a per-profile cache.</li>
+<li><strong>Location service.</strong> User reports location → write to a geo-index (S2 cells; Redis or a geo-aware store like ElasticSearch).</li>
+<li><strong>Candidate generation.</strong> For a card request, query nearby users in the user's S2 cell (and adjacent cells) with matching age/gender preferences. Subtract already-swiped users. Cap at ~50 candidates, rank by a lightweight quality model.</li>
+<li><strong>Swipe service.</strong> Write the swipe row (sharded by <code>swiper_id</code>). If direction = like, check whether <code>(target, swiper, like)</code> exists — if so, create a match.</li>
+<li><strong>Match detection.</strong> Two paths: (a) synchronous on swipe — single read of the reciprocal swipe; if found, write match row; (b) async via Kafka if we don't want to add a read on the swipe path. I'd default to sync for the snappy "It's a Match!" UX.</li>
+<li><strong>Match store.</strong> Symmetric — store one row keyed by sorted <code>(min_id, max_id)</code> to avoid duplicate matches; unique constraint enforces "match at most once."</li>
+<li><strong>Chat service.</strong> When a match is created, provision a chat thread (just a <code>chat_id</code>); messages are out of scope.</li>
+</ol>
+<p>End-to-end narration: Alice opens the app → cards request → candidate gen finds 50 nearby singles, subtracts Alice's 1000 prior swipes, returns top 10. She swipes right on Bob → swipe service writes the row, looks up <code>(Bob, Alice, like)</code> → not found, just write swipe. Later Bob swipes right on Alice → swipe service writes, looks up <code>(Alice, Bob, like)</code> → found. Insert match row (unique constraint), return <code>matched=true</code>. Both phones get a push.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">+-------------------------------+
+| iOS / Android Client          |
++------+---------------+--------+
+    |               |
+GET /v1/cards       POST /v1/swipes
+POST /v1/location   GET /v1/matches
+    v               v
++--------------------------------------------------------------+
+| API Gateway / Auth                                           |
++-----------+--------------------+-----------------------------+
+         |                    |
+         v                    v
++-----------------------+  +-----------------------+  +----------------+
+| Candidate Generation  |  | Swipe Service         |  | Location Svc   |
+| cards cursor + rank   |  | idempotent write      |  | S2 cell update |
++-----------+-----------+  +-----------+-----------+  +-------+--------+
+         |                          |                      |
+         | profile hydrate          | reciprocal lookup    | geo refresh
+         v                          v                      v
++-----------------------------------------------------------------------+
+| Stores / Caches                                                       |
+| profile:{user_id} KV doc + CDN photo URLs                            |
+| geo:{s2_cell} sorted set member=user_id score=last_seen TTL 30m       |
+| shown:{user_id} bloom/cuckoo filter rolling 6-12m                    |
+| swipes_from:{swiper_id}:{month} append rows                          |
+| likes_to:{target_id} set of swiper_id for reciprocal checks          |
+| match:{min_user}:{max_user} unique row; chat_id pointer              |
++--------------------------+--------------------------------------------+
+                  |
+                  | profile/shown miss
+                  v
+            +---------------------------+
+            | Profile KV + Swipe Log    |
+            | rebuild shown:{user_id}   |
+            +---------------------------+
+
++----------------------------- async -----------------------------------+
+| swipe events -&gt; ranking features / safety review -&gt; chat thread + push|
++-----------------------------------------------------------------------+
+
+Primary read: cards -&gt; geo cells + shown filter -&gt; profile cache -&gt; rank.
+Primary write: swipe -&gt; swipes_from + likes_to -&gt; match unique row -&gt; push.
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete store contracts.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / data structure</th>
+<th style="text-align: right;">Entry size + TTL</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Profile</td>
+<td><code>profile:{user_id}</code> document in KV store + CDN photo URLs</td>
+<td style="text-align: right;">~5 KB, retained until delete</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Active geo index</td>
+<td><code>geo:{s2_cell}</code> sorted set of <code>user_id</code>, score=<code>last_seen</code></td>
+<td style="text-align: right;">~24 B/member, TTL 30 min</td>
+<td><code>s2_cell</code></td>
+</tr>
+<tr>
+<td>Swipe log</td>
+<td><code>swipes_from:{swiper_id}:{month}</code> append rows</td>
+<td style="text-align: right;">~40 B/row, 1–2 years hot/warm</td>
+<td><code>swiper_id</code></td>
+</tr>
+<tr>
+<td>Reciprocal-like index</td>
+<td><code>likes_to:{target_id}</code> set of <code>swiper_id</code></td>
+<td style="text-align: right;">~8–16 B/id, same retention as swipes</td>
+<td><code>target_id</code></td>
+</tr>
+<tr>
+<td>Already-shown filter</td>
+<td><code>shown:{user_id}</code> bloom/cuckoo filter</td>
+<td style="text-align: right;">16–64 KB/user, rolling 6–12 months</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Match</td>
+<td><code>match:{min_user}:{max_user}</code> unique row</td>
+<td style="text-align: right;">~80 B, retained forever</td>
+<td>sorted pair hash</td>
+</tr>
+</tbody>
+</table>
+<p>This is the two-index pattern: the same swipe event is stored once as the user's history and once as a reciprocal lookup. The first supports "what have I done?"; the second supports "did they already like me?"</p>
+<p>Store math: swipe history at 5B/day is the heavyweight write path, roughly 200 GB/day compact and ~600 GB/day at RF=3 before indexes. Per-user <code>shown</code> filters are the sneaky RAM cost: only active users should be loaded, e.g., 30M active × 32 KB is ~1 TB if kept hot, so keep it in a tiered cache and rebuild from swipe logs for dormant users.</p>
+<p><strong>Cards path trace.</strong> Client → cards API → read user preferences/profile → query <code>geo:{cell}</code> plus adjacent cells in parallel → remove users from <code>shown:{user_id}</code> and block lists → hydrate top ~50 profiles from profile cache in parallel → rank → return top 10 with a cursor → mark returned candidates in <code>shown:{user_id}</code>. If profile hydration misses cache, fetch from profile KV; if too many misses, return fewer cards rather than exceeding 300 ms.</p>
+<pre><code class="language-text">Cards request
+    |-- profile/preferences MGET
+    |-- geo:{cell + neighbors} reads in parallel
+    |-- shown:{user_id} + block lists
+    '-- profile hydrate for candidates
+                -&gt; rank -&gt; return 10 -&gt; update shown:{user_id}
+</code></pre>
+<p><strong>Swipe path trace.</strong> Client sends <code>(target_id, direction, client_uuid)</code> → idempotency check on <code>(swiper,target)</code> → append to <code>swipes_from:{swiper}</code> → update <code>shown:{swiper}</code> → if <code>like</code>, check <code>likes_to:{swiper}</code> for <code>target_id</code> in parallel with writing <code>likes_to:{target}</code> → if reciprocal exists, insert <code>match:{min,max}</code> unique row and provision chat id. Duplicate concurrent matches lose the unique insert and read back the winning match row.</p>
+<p>Named tech choice: DynamoDB/Cassandra-style wide rows fit <code>swipes_from:{swiper}</code> because the write volume is high and access is append-by-user. A relational store can still own <code>match:{min,max}</code> because uniqueness and exactly-once match creation matter more there. Redis/S2 active sets are for candidates; they are not the source of truth for swipes.</p>
+<p><strong>Never showing the same profile twice.</strong> Naive: subtract a list of swipes from candidates — expensive at 50 swipes/day × users. Better: maintain a bloom filter per user of "already shown," small enough to keep in-memory in the candidate service. Bloom false positives just mean a profile occasionally doesn't show; never the reverse.</p>
+<p>Interview punch line: "For candidate generation, a false positive is acceptable because skipping one possible profile is cheap; showing the same profile twice is the product bug."</p>
+<p><strong>Geo-search at scale.</strong> S2 cells at appropriate level (e.g., level 12, ~1 km²). Index <code>cell_id → set of recently-active user_ids</code>. Query: nearby cells (1 + 8 ring) for users matching preference filters. Refresh user-to-cell mapping every location ping (debounced to once per 5 min unless user moves &gt;1 km).</p>
+<p>Why S2 + Redis-style active sets instead of Elasticsearch geo search: the dating stack asks for fresh, nearby, active users, not arbitrary text + geo ranking. Elasticsearch works for richer profile search, but S2 active sets make freshness, TTL, and adjacent-cell expansion explicit and cheap.</p>
+<p><strong>The match race.</strong> Both users swipe right on each other within the same second. Two concurrent inserts. The match table must use a deterministic primary key like <code>LEAST(a,b)||GREATEST(a,b)</code> and <code>INSERT IGNORE</code> so only one row wins. The losing writer reads back the existing row and returns the same match_id.</p>
+<p><strong>Hot-key on prolific swipers.</strong> A user swiping 500/day creates a hot shard. Sharding by <code>swiper_id</code> is generally fine; for the heaviest tail, batch swipes client-side and submit in a single call.</p>
+<p><strong>Candidate ranking quality.</strong> Pure recency in cell ignores attractiveness/compatibility signals. Add a small ranking model (LightGBM, ~50 features) at the candidate service. Mention online learning from swipe outcomes as the production lever.</p>
+<p><strong>Photo storage.</strong> Profile photos in object store (S3) behind a CDN with signed URLs. Thumbnails (3 sizes) generated async on upload.</p>
+<p><strong>Privacy / safety.</strong> Profile visibility is bidirectional: if Alice blocks Bob, neither appears in the other's stack. Block list lives in the user profile; candidate gen filters against it.</p>
+<p><strong>ELO / matchmaking score (optional).</strong> Some products use a desirability score derived from swipe-right rates. Compute offline; bucket users by score to keep matches balanced. Be ready to discuss the ethical tradeoff.</p>
+<p><strong>Graceful degradation state machine.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th style="text-align: right;">Latency budget</th>
+<th>Fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dense city</td>
+<td>Normal ranked stack</td>
+<td>S2 active cells + profile cache</td>
+<td style="text-align: right;">&lt;300 ms</td>
+<td>Expand 1 ring, rank top 50</td>
+</tr>
+<tr>
+<td>Sparse/cold area</td>
+<td>Exhaustion mode</td>
+<td>Wider S2 rings + older active users</td>
+<td style="text-align: right;">&lt;500 ms</td>
+<td>Show fewer cards, widen distance, relax recency</td>
+</tr>
+<tr>
+<td>Dormant user returns</td>
+<td>Lazy filter load</td>
+<td>Persisted swipe log rebuilds <code>shown</code> filter</td>
+<td style="text-align: right;">First request &lt;1s</td>
+<td>Return small batch while async rebuild completes</td>
+</tr>
+<tr>
+<td>Hot swiper</td>
+<td>Batched writes</td>
+<td>Swipe log + reciprocal index</td>
+<td style="text-align: right;">Swipe ack &lt;100 ms</td>
+<td>Buffer client swipes and flush in small batches</td>
+</tr>
+<tr>
+<td>Geo index degraded</td>
+<td>Conservative candidates</td>
+<td>Last-known profile location</td>
+<td style="text-align: right;">&lt;500 ms</td>
+<td>Disable distance-sensitive ranking; never break no-repeat</td>
+</tr>
+<tr>
+<td>Match insert race</td>
+<td>Unique-row winner</td>
+<td><code>match:{min,max}</code></td>
+<td style="text-align: right;">&lt;100 ms</td>
+<td>Losing writer reads existing match and returns same id</td>
+</tr>
+</tbody>
+</table>
+<p>Server-side state that must persist across requests: the opaque card cursor <code>{user_id, geo_cell, candidate_batch_id, rank_offset}</code>, the <code>shown:{user_id}</code> filter, idempotency for <code>(swiper,target)</code>, and the sorted-pair match key. Losing the cursor is tolerable; losing <code>shown</code> risks repeats, so rebuild it before returning a full stack.</p>
+<p><strong>What I'd defer.</strong> Chat infrastructure (presence, typing indicators), Super Like and rewinds, abuse moderation, machine-learning ranking deep-dive, premium subscription logic.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design a Flash Sale for an E-Commerce Site — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design a Flash Sale for an E-Commerce Site</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A flash sale is a deliberate stampede: ten thousand units, ten million users, ten seconds. The hard part is preserving inventory correctness under a traffic profile that would melt a normal e-commerce site, while still letting checkout, payment, and fraud checks complete reliably.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>The system sells each unit of scarce inventory at most once, holds inventory only for users actively progressing through checkout, releases holds on abandonment or timeout, and converts holds to sales only after payment succeeds — even when millions of users arrive at the sale instant, bots attack, and downstream services degrade.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can separate stampede absorption (waiting room, queue) from inventory correctness (atomic decrement, holds), design idempotent checkout, isolate the hot product from the rest of the site, and handle bots and payment timeouts.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design a flash sale as a separate hot path layered over the existing e-commerce backend. The hot path consists of a waiting room that controls admission, an inventory reservation service with atomic decrement, a short-lived hold table, and a payment-completion flow that converts holds to orders. The rest of the site — catalog, search, recommendations — stays on the normal path, bulkheaded from the burst. I will clarify requirements, walk through admission control, inventory state transitions, and payment timeout handling.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>A specific SKU (or set of SKUs) becomes available at a fixed time.</li>
+<li>Inventory is small (thousands to tens of thousands of units).</li>
+<li>Users place items in cart, check out, and pay.</li>
+<li>Per-user purchase limits (e.g., one per account).</li>
+<li>Bot protection and fraud checks.</li>
+<li>Sale window can end early (sold out) or at a deadline.</li>
+<li>Order confirmation, fulfillment, refunds.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Sustain 1M-10M concurrent users at sale start.</li>
+<li>No overselling: ever.</li>
+<li>Avoid melting the rest of the e-commerce site.</li>
+<li>Acceptable user latency for those admitted; backoff for those waiting.</li>
+<li>Fairness across users (rough, not strict).</li>
+<li>Auditability for inventory, payments, fraud disputes.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Recommendation engine for related items.</li>
+<li>Long-tail inventory.</li>
+<li>Resale market / scalping enforcement.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inventory</td>
+<td>10,000 units of a single hot SKU.</td>
+</tr>
+<tr>
+<td>Users</td>
+<td>1-10 million arrive at sale start.</td>
+</tr>
+<tr>
+<td>Sale duration</td>
+<td>Often seconds to minutes; could be hours for less scarce items.</td>
+</tr>
+<tr>
+<td>Latency target</td>
+<td>Admitted users see sub-second response; waiting users see queue position.</td>
+</tr>
+<tr>
+<td>Bot fraction</td>
+<td>30-70% of incoming requests.</td>
+</tr>
+<tr>
+<td>Payment success rate</td>
+<td>80-95% under normal conditions; lower during burst.</td>
+</tr>
+<tr>
+<td>Checkout duration</td>
+<td>30 seconds to 2 minutes per user.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is inventory correctness at the moment of decrement, combined with the asymmetric ratio of users to inventory.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Experience</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pre-sale</td>
+<td>Product page, countdown, "join queue" CTA.</td>
+<td>Cacheable, eventually consistent, CDN-served.</td>
+</tr>
+<tr>
+<td>Sale start</td>
+<td>Waiting room or immediate access.</td>
+<td>Admission control; signed tokens.</td>
+</tr>
+<tr>
+<td>Reservation</td>
+<td>Inventory decrement; cart holds for N minutes.</td>
+<td>Atomic; per-user limited; expiring.</td>
+</tr>
+<tr>
+<td>Checkout</td>
+<td>Address, payment, confirmation.</td>
+<td>Idempotent; payment provider integration.</td>
+</tr>
+<tr>
+<td>Post-sale</td>
+<td>Order tracking, fulfillment, support.</td>
+<td>Standard e-commerce.</td>
+</tr>
+</tbody>
+</table>
+<p>The flash sale is the few minutes between pre-sale and checkout. Designing it as a hot path with its own isolation is the staff-level move.</p>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                +-------------------+
+User clients -&gt; | CDN / Edge / WAF  |
+                +---------+---------+
+                          |
+                          v
+                +-------------------+
+                | API Gateway       |
+                | auth, rate limit  |
+                +----+---------+----+
+                     |         |
+   normal browsing   |         |  sale-start traffic
+                     v         v
+       +----------------+   +-------------------+
+       | Catalog/Search |   | Waiting Room       |
+       | (CDN/cache)    |   | signed tokens      |
+       +----------------+   +---------+---------+
+                                      |
+                                      v
+                            +-------------------+
+                            | Inventory Service |
+                            | atomic decrement  |
+                            +---------+---------+
+                                      |
+                                      v
+                            +-------------------+
+                            | Hold Table        |
+                            | TTL per user      |
+                            +---------+---------+
+                                      |
+                                      v
+                            +-------------------+
+                            | Checkout / Payment|
+                            | idempotent        |
+                            +---------+---------+
+                                      |
+                                      v
+                            +-------------------+
+                            | Order / Fulfillment|
+                            +-------------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CDN / Edge</td>
+<td>Cache product page, countdown, static assets.</td>
+<td>Absorbs view traffic; no origin hit for browsing.</td>
+</tr>
+<tr>
+<td>API gateway</td>
+<td>Auth, rate limit, route.</td>
+<td>Per-IP and per-user limits; coarse bot block.</td>
+</tr>
+<tr>
+<td>Waiting room</td>
+<td>Admission control.</td>
+<td>Signed tokens; bounded admission rate.</td>
+</tr>
+<tr>
+<td>Inventory service</td>
+<td>Authoritative remaining count and atomic decrement.</td>
+<td>Single source of truth; sharded for SKUs.</td>
+</tr>
+<tr>
+<td>Hold table</td>
+<td>Per-user reservation with expiry.</td>
+<td>TTL-driven; released on payment fail or timeout.</td>
+</tr>
+<tr>
+<td>Checkout service</td>
+<td>Address, payment, conversion.</td>
+<td>Idempotent on hold_id; payment provider integration.</td>
+</tr>
+<tr>
+<td>Payment service</td>
+<td>Charges card; subject to provider timeouts.</td>
+<td>Idempotency end-to-end.</td>
+</tr>
+<tr>
+<td>Order service</td>
+<td>Records confirmed orders post-payment.</td>
+<td>Source of truth for fulfillment.</td>
+</tr>
+<tr>
+<td>Bot/fraud service</td>
+<td>Scores requests; can pre-block.</td>
+<td>Runs before inventory decrement.</td>
+</tr>
+<tr>
+<td>Event stream</td>
+<td>Inventory and order events.</td>
+<td>Drives projections, analytics, fulfillment.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="sku-inventory">SKU Inventory</h4>
+<pre><code class="language-text">Inventory(
+  sku_id,
+  total,
+  reserved_count,
+  sold_count,
+  status,                // pre_sale, on_sale, sold_out, closed
+  sale_start,
+  sale_end,
+  per_user_limit,
+  version
+)
+</code></pre>
+<h4 id="hold">Hold</h4>
+<pre><code class="language-text">Hold(
+  hold_id,
+  user_id,
+  sku_id,
+  quantity,
+  status,                // active, expired, converted, canceled
+  created_at,
+  expires_at,
+  idempotency_key,
+  version
+)
+</code></pre>
+<h4 id="admission-token">Admission Token</h4>
+<pre><code class="language-text">AdmissionToken(
+  token_id,
+  user_id,
+  sku_id,
+  issued_at,
+  expires_at,
+  max_attempts,
+  signature
+)
+</code></pre>
+<h4 id="order">Order</h4>
+<pre><code class="language-text">Order(
+  order_id,
+  user_id,
+  sku_id,
+  quantity,
+  amount,
+  payment_intent_id,
+  status,                // pending_payment, paid, failed, canceled
+  hold_id,
+  created_at,
+  version
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">POST /sales/{sku_id}/queue           # join waiting room
+GET  /sales/{sku_id}/queue-status
+POST /sales/{sku_id}/reserve         # idempotent reservation
+POST /holds/{hold_id}/checkout
+GET  /orders/{order_id}
+</code></pre>
+<h3 id="waiting-room">Waiting Room</h3>
+<p>The waiting room shapes traffic before it reaches inventory.</p>
+<p>Flow:</p>
+<ol>
+<li>User clicks "join queue" before or at sale start.</li>
+<li>System issues a signed queue token: <code>(user_id, sku_id, issued_at, signature)</code>.</li>
+<li>Client polls status; server returns approximate position and ETA.</li>
+<li>At admission time, server issues a signed admission token: <code>(user_id, sku_id, expires_at, max_attempts)</code>.</li>
+<li>The reservation API requires a valid admission token.</li>
+</ol>
+<p>Admission rate control:</p>
+<ul>
+<li>Match the inventory service's safe throughput.</li>
+<li>Adjust based on observed conversion (if many holds expire unconverted, admit more; if checkout backs up, admit less).</li>
+<li>Operators can pause, slow, or stop admission.</li>
+</ul>
+<p>Fairness:</p>
+<ul>
+<li>Order by queue join time, with randomization within join windows to defeat bot races.</li>
+<li>Optional lottery model: random selection among queue members at sale start.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The waiting room is not a UX feature. It is admission control for the inventory write path. Without it, even a perfect inventory service melts under millions of concurrent decrement attempts.</p>
+</blockquote>
+<h3 id="inventory-state-machine-and-atomic-decrement">Inventory State Machine And Atomic Decrement</h3>
+<p>Inventory is a counter, not a per-unit record (unlike Ticketmaster's seats).</p>
+<p>State transitions per hold:</p>
+<pre><code class="language-text">available -&gt; reserved -&gt; sold
+                |
+                +-&gt; expired -&gt; available
+</code></pre>
+<p>Atomic decrement:</p>
+<pre><code class="language-text">UPDATE Inventory
+SET reserved_count = reserved_count + ?,
+    version = version + 1
+WHERE sku_id = ?
+  AND total - reserved_count - sold_count &gt;= ?
+  AND status = 'on_sale'
+  AND version = ?
+</code></pre>
+<p>If the conditional update succeeds, write a hold row with TTL. If it fails (insufficient inventory), return sold-out response.</p>
+<p>For very high throughput, use Redis <code>DECRBY</code> with a Lua script that checks the remaining count and atomically reserves. Periodically sync back to authoritative store.</p>
+<h3 id="hold-lifecycle">Hold Lifecycle</h3>
+<p>A hold is short-lived (2-5 minutes typically):</p>
+<ul>
+<li>On create: TTL set; hold row written.</li>
+<li>On checkout success: hold converted to order; status <code>converted</code>.</li>
+<li>On checkout failure or user abandonment: hold expires; inventory <code>reserved_count</code> decremented.</li>
+<li>On TTL expiry: background worker (or eviction policy) releases inventory.</li>
+</ul>
+<p>Critical: TTL handling must be reliable. Lost holds permanently reduce available inventory.</p>
+<p>Options:</p>
+<ul>
+<li>Redis with <code>EXPIRE</code> and a keyspace notification subscriber that releases on expiry.</li>
+<li>Sorted set keyed by expiry time, worker pops and processes.</li>
+<li>Time-bucketed queues.</li>
+</ul>
+<h3 id="checkout-and-payment">Checkout And Payment</h3>
+<p>When user submits checkout:</p>
+<ol>
+<li>Validate hold ownership and active status.</li>
+<li>Run fraud check.</li>
+<li>Create payment intent with provider, including idempotency key derived from hold_id.</li>
+<li>Wait for provider response.</li>
+<li>On success: convert hold → order; transition inventory <code>reserved</code> → <code>sold</code>.</li>
+<li>On failure: release hold; user can retry within session.</li>
+<li>On timeout: payment unknown; hold extended; reconciliation worker queries provider.</li>
+</ol>
+<p>Payment timeout case (critical for flash sales):</p>
+<ul>
+<li>Inventory is scarce; releasing prematurely allows another user to buy a unit that the first user may actually have purchased.</li>
+<li>The conservative play: keep the hold while resolving payment state; reconciliation queries provider for the final result.</li>
+<li>Tradeoff: a long-pending payment temporarily blocks the unit; we accept this rather than overselling.</li>
+</ul>
+<h3 id="bot-protection">Bot Protection</h3>
+<p>Bots are the primary threat. Mitigations:</p>
+<ul>
+<li>Pre-sale registration: account-based queue with KYC-lite checks.</li>
+<li>Per-account, per-IP, per-card limits.</li>
+<li>CAPTCHA before admission.</li>
+<li>Device fingerprinting.</li>
+<li>Account age and history requirements.</li>
+<li>Rate limit at edge: aggressive for new/anonymous IPs.</li>
+<li>Behavioral analysis: timing patterns, mouse movement, header anomalies.</li>
+</ul>
+<p>Sophisticated bots will get through. The fairness story is "best-effort"; perfect bot exclusion is not achievable.</p>
+<h3 id="bulkheading-from-normal-site">Bulkheading From Normal Site</h3>
+<p>A flash sale must not melt the rest of the e-commerce site.</p>
+<ul>
+<li>Product page for the sale SKU served from CDN, not origin.</li>
+<li>Sale-related APIs route to dedicated service tier.</li>
+<li>Inventory service runs in isolated capacity, separate from regular inventory.</li>
+<li>Search and recommendations exclude the sale SKU from regular indexes during the sale (or serve a "see sale page" link).</li>
+<li>Payment service has dedicated capacity allocation for sale traffic.</li>
+<li>Database connections bulkheaded per service.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The rest of the site should not even notice that a sale is happening. Isolate the hot SKU's traffic at every layer.</p>
+</blockquote>
+<h3 id="write-path-reserve">Write Path: Reserve</h3>
+<ol>
+<li>Client → API gateway with admission token.</li>
+<li>Gateway validates token, rate limit, bot score.</li>
+<li>Reservation API checks idempotency (per user × sale).</li>
+<li>Inventory service performs atomic decrement.</li>
+<li>If success, write hold with TTL.</li>
+<li>Return hold_id and expiry to client.</li>
+</ol>
+<h3 id="write-path-checkout">Write Path: Checkout</h3>
+<ol>
+<li>Client posts hold_id, payment method, shipping.</li>
+<li>Checkout service verifies hold belongs to user, active.</li>
+<li>Fraud check.</li>
+<li>Payment intent created.</li>
+<li>On success: convert hold; transition inventory; create order.</li>
+<li>Notify user.</li>
+</ol>
+<h3 id="read-path-browsing-and-status">Read Path: Browsing And Status</h3>
+<ul>
+<li>Pre-sale: product page from CDN.</li>
+<li>Sale-active: same plus countdown.</li>
+<li>Queue status: poll API returning approximate position and ETA.</li>
+<li>Post-purchase: order page from CDN-fronted profile service.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sale inventory</td>
+<td><code>sku_id</code> (typically one SKU per sale)</td>
+<td>One hot key; dedicated capacity.</td>
+</tr>
+<tr>
+<td>Holds</td>
+<td><code>hold_id</code> hash</td>
+<td>Even distribution; lookup by id.</td>
+</tr>
+<tr>
+<td>Per-user limit counter</td>
+<td><code>user_id</code> hash</td>
+<td>Atomic per-user check.</td>
+</tr>
+<tr>
+<td>Admission tokens</td>
+<td>Stateless (signed)</td>
+<td>No persistence needed.</td>
+</tr>
+<tr>
+<td>Orders</td>
+<td><code>user_id</code> hash for user lookups; <code>order_id</code> hash for direct lookups</td>
+<td>Standard order patterns.</td>
+</tr>
+</tbody>
+</table>
+<p>Hot-SKU strategy:</p>
+<ul>
+<li>The single SKU's inventory is on dedicated capacity.</li>
+<li>May shard the inventory counter into N sub-counters; rejoin via aggregation. Each sub-counter handles 1/N of admissions.</li>
+<li>Payment service scaled up specifically for the sale period.</li>
+</ul>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inventory decrement</td>
+<td>Strong (atomic conditional update)</td>
+<td>No overselling.</td>
+</tr>
+<tr>
+<td>Hold state</td>
+<td>Strong CAS</td>
+<td>Idempotent transitions.</td>
+</tr>
+<tr>
+<td>Order creation</td>
+<td>Strong</td>
+<td>Money + fulfillment.</td>
+</tr>
+<tr>
+<td>Queue position</td>
+<td>Approximate</td>
+<td>UX hint, not authoritative.</td>
+</tr>
+<tr>
+<td>Availability display</td>
+<td>Eventually consistent</td>
+<td>Final decision at reservation.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inventory oversold.</td>
+<td>Conditional decrement; idempotency keys.</td>
+<td>Sold count vs total; alert if exceeded.</td>
+</tr>
+<tr>
+<td>Hold leaks (TTL not enforced).</td>
+<td>Reliable expiry worker; alerts on expired-active holds.</td>
+<td>Expired-active hold count.</td>
+</tr>
+<tr>
+<td>Payment timeout.</td>
+<td>Hold preserved; reconciliation queries provider.</td>
+<td>Pending-payment hold age.</td>
+</tr>
+<tr>
+<td>Waiting room bypass.</td>
+<td>Admission token required at API.</td>
+<td>Reservation requests without valid token.</td>
+</tr>
+<tr>
+<td>Bot flood.</td>
+<td>Edge rate limits; CAPTCHA; per-account/IP limits.</td>
+<td>Bot score distribution; block rate.</td>
+</tr>
+<tr>
+<td>Hot DB shard.</td>
+<td>Sub-counter sharding; in-memory inventory in Redis.</td>
+<td>Per-shard QPS; p99 latency.</td>
+</tr>
+<tr>
+<td>Checkout cascade fails.</td>
+<td>Bulkhead checkout from rest of site.</td>
+<td>Checkout error rate during sale.</td>
+</tr>
+<tr>
+<td>Sold out faster than expected.</td>
+<td>Graceful sold-out UX; do not return empty 5xx.</td>
+<td>Sold-out admission attempts.</td>
+</tr>
+<tr>
+<td>Operator pauses sale.</td>
+<td>Admin API to halt admission; in-flight holds either honored or canceled with refund.</td>
+<td>Sale state changes.</td>
+</tr>
+<tr>
+<td>Burst hits non-sale traffic.</td>
+<td>Edge rate limit; isolation.</td>
+<td>Normal-path latency during sale.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Sold count vs total (must never exceed).</li>
+<li>Hold leaks (expired but still reserving inventory).</li>
+<li>Payment unknown-state age.</li>
+<li>Duplicate purchases per user (must equal limit).</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Admission rate vs inventory throughput.</li>
+<li>Hold creation success/fail by reason.</li>
+<li>Inventory decrement p99 latency.</li>
+<li>Checkout conversion rate.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Total sold; sell-through time.</li>
+<li>Bot block rate vs human admission rate.</li>
+<li>Per-user purchase distribution.</li>
+<li>Refund/dispute rate post-sale.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<p>Two approaches:</p>
+<p><strong>Single-region inventory:</strong>
+- One region owns the inventory counter for the SKU.
+- Other regions queue users and forward admissions.
+- Simpler; latency penalty for far regions.</p>
+<p><strong>Pre-allocated regional inventory:</strong>
+- Partition 10,000 units across regions: 4000 US, 3000 EU, 3000 APAC.
+- Each region operates independently.
+- Risk: one region sells out while another has stock; user from US sees sold out even though APAC has units.
+- Mitigation: cross-region rebalancing during the sale.</p>
+<p>Most flash sales use single-region inventory with regional waiting rooms feeding it.</p>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Waiting room reduces UX immediacy but is the only way to keep inventory correct under stampede.</li>
+<li>Pre-allocated regional inventory gives latency but can lead to regional sell-outs.</li>
+<li>Sharded counters scale but require aggregation logic.</li>
+<li>Short holds reduce inventory lockup; long holds give users time but block units.</li>
+<li>Aggressive bot blocking hurts legitimate users behind shared IPs.</li>
+<li>Lottery admission feels less competitive; FCFS rewards bots.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One global lock for the SKU.</td>
+<td>Sub-counter sharding with aggregation.</td>
+</tr>
+<tr>
+<td>Reserving on add-to-cart.</td>
+<td>Reserve only at checkout; show "in cart" as informational.</td>
+</tr>
+<tr>
+<td>FCFS at sale start.</td>
+<td>Waiting room with admission control.</td>
+</tr>
+<tr>
+<td>Payment-first inventory decrement.</td>
+<td>Reserve first, then payment; release on payment fail.</td>
+</tr>
+<tr>
+<td>No bot defense.</td>
+<td>Multiple layers; assume some will get through.</td>
+</tr>
+<tr>
+<td>Sharing infra with normal site.</td>
+<td>Bulkhead inventory, checkout, payment for the sale.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Waiting room</td>
+<td>Signed tokens; admission rate; fairness model.</td>
+</tr>
+<tr>
+<td>Inventory correctness</td>
+<td>Conditional decrement; idempotency; reconciliation.</td>
+</tr>
+<tr>
+<td>Payment timeout</td>
+<td>Unknown state; reconciliation; do not release scarce inventory prematurely.</td>
+</tr>
+<tr>
+<td>Bot defense</td>
+<td>Pre-registration; rate limits; CAPTCHA; behavioral analysis.</td>
+</tr>
+<tr>
+<td>Hot counter</td>
+<td>Redis with Lua; sub-counter sharding; periodic sync.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Single-owner or regional pre-allocation; tradeoffs.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Bulkhead the sale from the rest of the site.</li>
+<li>Waiting room as admission control for inventory writes.</li>
+<li>Atomic conditional decrement; idempotency end-to-end.</li>
+<li>Hold lifecycle with reliable TTL release.</li>
+<li>Payment timeout treated as unknown; reconciliation.</li>
+<li>Bot defenses at multiple layers; accept imperfection.</li>
+<li>Per-region strategy explained.</li>
+<li>Bots, fairness, and post-sale support included.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>A flash sale is a deliberate stampede over scarce inventory. The hard parts are admission control to keep the inventory write path from melting, atomic conditional decrement for correctness, and payment timeout handling that never releases scarce inventory prematurely. Bulkhead everything sale-related from the normal site so a hot SKU does not melt the catalog.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design a flash sale.</p>
+<p><strong>Candidate:</strong> I will design a hot path layered over the e-commerce backend. The hot path has a waiting room for admission control, an inventory service that performs atomic conditional decrement, a short-lived hold table, and a checkout flow that converts holds to orders after payment. The rest of the site stays on the normal path, bulkheaded from the burst. The invariant is no overselling.</p>
+<p><strong>Interviewer:</strong> Walk me through what happens at sale start.</p>
+<p><strong>Candidate:</strong> Millions of users land on the product page. The page is served from CDN. At the sale time, the "Buy" button enables and the user is sent to the waiting room. Each user gets a signed queue token. The server admits users at a rate the inventory service can handle, issuing signed admission tokens. Admitted users hit the reservation API which performs the atomic decrement. On success, a hold row is written with a 3-minute TTL. The user proceeds to checkout. After payment, the hold converts to an order; inventory reserved-count rises to sold-count.</p>
+<p><strong>Interviewer:</strong> How do you prevent overselling?</p>
+<p><strong>Candidate:</strong> Conditional update on the inventory row: decrement only if <code>total - reserved - sold &gt;= quantity</code>. This is an atomic CAS. If two users race, only one succeeds. For high throughput, the inventory state lives in Redis with a Lua script that atomically reads and decrements, with periodic sync back to the authoritative store.</p>
+<p><strong>Interviewer:</strong> Why a waiting room? Can't you just let everyone hit the inventory service?</p>
+<p><strong>Candidate:</strong> No. Even with atomic decrements, the inventory service has a throughput ceiling. A million concurrent users hitting it overwhelms the database or Redis cluster. The waiting room shapes the traffic, admitting users at the rate the inventory service can serve. It also creates a fairness story and lets us deploy bot defenses upstream of the scarce resource.</p>
+<p><strong>Interviewer:</strong> What about bots?</p>
+<p><strong>Candidate:</strong> Multiple layers. Pre-registration with account age and KYC-lite requirements. Per-account, per-IP, per-card purchase limits. CAPTCHA before admission. Device fingerprinting. Edge rate limiting. We assume some sophisticated bots will get through; the goal is reducing their share of inventory, not eliminating them. We monitor and tune in real time during the sale.</p>
+<p><strong>Interviewer:</strong> A user is admitted, gets a hold, but their payment times out at the provider. What do we do?</p>
+<p><strong>Candidate:</strong> This is the central correctness case. We don't release the hold immediately, because if the payment actually succeeded at the provider, we'd be giving someone else a unit the first user just bought. Instead, the hold stays. A reconciliation worker queries the provider with the payment's idempotency key. On confirmed success, we complete the order. On confirmed failure, we release the hold. On still-unknown after a longer timeout, escalate to manual review. The tradeoff is that one unit may be locked for minutes during reconciliation; we accept that to prevent overselling.</p>
+<p><strong>Interviewer:</strong> How do you handle bursts on the inventory service itself?</p>
+<p><strong>Candidate:</strong> Sharded counters. For a 10,000-unit sale, split into 10 sub-counters of 1,000 each. Admissions hash to a sub-counter. This spreads the load. The aggregated view (<code>sum of sub-counter remaining</code>) tells us total left. Risk: one sub-counter sells out while another has stock; users mapped to the empty sub-counter get sold-out responses even though units exist. Mitigation: pre-shuffle assignment or allow cross-sub-counter retry.</p>
+<p><strong>Interviewer:</strong> How do you make sure the hot SKU doesn't melt the regular site?</p>
+<p><strong>Candidate:</strong> Bulkhead at every layer. Product page from CDN. Sale-related APIs route to dedicated service tiers. The inventory service for the SKU is on isolated capacity. Search and recommendations exclude the sale SKU during the sale. Database connections for sale flow are separate. The normal site browsing user shouldn't even notice a sale is happening.</p>
+<p><strong>Interviewer:</strong> Fairness — FCFS or lottery?</p>
+<p><strong>Candidate:</strong> Tradeoff. Strict FCFS rewards bots and fastest networks. Lottery feels arbitrary but defeats some bot advantages. A common compromise: gather queue members during a window before sale start, then randomize within that window. After the window, late arrivals queue FCFS. Operators can adjust per sale.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Two options. Single-region inventory: one region owns the counter; other regions queue users and forward admissions. Cleaner correctness, higher latency for far regions. Or pre-allocated regional inventory: partition the 10,000 units across regions. Risk: one region sells out while another has stock. We can mitigate with cross-region rebalancing during the sale. Most flash sales go with single-region inventory and regional waiting rooms.</p>
+<p><strong>Interviewer:</strong> What metrics do you watch?</p>
+<p><strong>Candidate:</strong> Correctness: sold vs total (never exceed), hold leaks, payment unknown age, per-user limit violations. Capacity: admission rate vs inventory throughput, hold creation latency, checkout error rate. Business: total sold, sell-through time, bot block rate, refund rate post-sale.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> A flash sale is a stampede over scarce inventory. I bulkhead the sale from the rest of the site, use a waiting room for admission control, perform atomic conditional decrement on inventory with sharded counters for throughput, hold inventory for a short TTL with reliable expiry release, and treat payment timeouts as unknown state resolved by reconciliation. Bot defenses at multiple layers reduce but don't eliminate abuse. The hard parts are admission control and payment timeout handling under inventory scarcity.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: scarce inventory, stampede, bots, fairness, payment.</li>
+<li>Invariant: no overselling.</li>
+<li>Hot path bulkheaded from normal site.</li>
+<li>Waiting room: admission control with signed tokens.</li>
+<li>Atomic conditional decrement; possibly sharded sub-counters.</li>
+<li>Short-lived holds with reliable TTL release.</li>
+<li>Payment timeouts handled via unknown state + reconciliation.</li>
+<li>Multi-layer bot defenses; per-user limits.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>A flash sale is admission control plus atomic inventory decrement. The waiting room shapes a million-user burst into a stream the inventory service can handle; conditional CAS decrement guarantees no overselling. Holds with short TTL prevent inventory hoarding; payment timeouts hold inventory until reconciled rather than releasing prematurely. The whole sale path is bulkheaded so the hot SKU does not melt the rest of the site. Bots are mitigated in layers, not eliminated.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Bulkhead the sale from the rest of the site at every layer."</li>
+<li>"Waiting room is admission control for the inventory write path, not a UX feature."</li>
+<li>"Atomic conditional decrement is the only place where 'no overselling' is enforced."</li>
+<li>"Payment timeout is unknown state; never release scarce inventory on a guess."</li>
+<li>"Bots are reduced, not eliminated; fairness is best-effort."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

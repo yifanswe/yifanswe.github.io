@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bitly — URL Shortener (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Bitly — URL Shortener (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Easy · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build a Bitly-style URL shortener. Anyone pastes a long URL, gets back a short code, and anyone who visits that short code is 302-redirected to the original. Owners can see basic click counts. Assume 100M new links/month and a 100:1 read-to-write ratio.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional — "Users should be able to..."</strong>
+- Shorten a long URL into a short URL, optionally with a custom alias.
+- Visit a short URL and be redirected to the original.
+- See click count and recent referrers for links they own.</p>
+<p>I'd explicitly drop expiring links and full analytics dashboards to focus on the redirect path.</p>
+<p><strong>Non-functional — "The system should..."</strong>
+- Redirect with p99 &lt; 100 ms; every extra millisecond is felt on click.
+- Stay available for redirects even during write outages — once a link exists, it must work.
+- Be durable for the short-code-to-URL mapping; a lost mapping is unrecoverable from the user's side.
+- Make codes unique and non-guessable enough that random scanning is uneconomical.</p>
+<p><strong>Capacity (only because it shapes sharding):</strong>
+- 100M links/mo × 60 mo = ~6B links. Row ≈ 200 bytes. Total ~1.2 TB metadata — fits sharded MySQL.
+- 100:1 read ratio → ~4k redirects/sec average, ~40k/sec peak.
+- 7-char base62 = 62⁷ ≈ 3.5 trillion codes — plenty of room.
+- Click events dominate write volume: ~400k/sec peak if every redirect emits analytics. Keep them out of MySQL; Kafka + rollups absorb that path.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>User</strong> — owns links, authenticates writes.</li>
+<li><strong>Link</strong> — <code>short_code</code>, <code>long_url</code>, <code>owner_id</code>, <code>created_at</code>, <code>custom?</code>.</li>
+<li><strong>ClickEvent</strong> — <code>short_code</code>, <code>ts</code>, <code>ip</code>, <code>ua</code>, <code>referrer</code>. High volume, lives outside the main store.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST /v1/links              { long_url, custom_alias? }  → { short_url }
+GET  /{short_code}          → 302 Location: long_url
+GET  /v1/links/{short_code}/stats → { count_24h, count_total, recent[] }
+</code></pre>
+<p>Auth via Bearer token; <code>owner_id</code> derived from the token, never from the body. The redirect endpoint is the only unauthenticated path. Plural <code>links</code> resource for collection routes.</p>
+<p><code>POST /v1/links</code> accepts an <code>Idempotency-Key</code> so a retry after timeout returns the same <code>{short_url}</code> rather than burning a second code. Stats pagination uses a cursor like <code>{short_code, bucket_start, last_event_id}</code>.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<p>Boxes I'd draw, in order:</p>
+<ol>
+<li><strong>Client → API Gateway</strong> — TLS termination, auth, per-IP rate limit on writes.</li>
+<li><strong>Write service</strong> — validates URL, generates a short code, writes <code>(short_code, long_url, owner_id)</code> to the metadata store. Returns short URL.</li>
+<li><strong>Read service (redirect path)</strong> — <code>GET /{code}</code> → Redis lookup → fall through to metadata store on miss → cache → return <code>302</code>. Fires a click event to Kafka before responding (or as the response is written).</li>
+<li><strong>Metadata store</strong> — sharded MySQL keyed by <code>short_code</code> (consistent-hash on the code). Single-row lookups, no joins.</li>
+<li><strong>Cache</strong> — Redis cluster, write-through, LRU eviction. Hot codes stay in memory.</li>
+<li><strong>Click pipeline</strong> — Kafka → stream processor (Flink) → rollups in ClickHouse (per-minute, per-hour, per-day buckets keyed by short_code).</li>
+<li><strong>Stats service</strong> — reads ClickHouse rollups for the <code>/stats</code> endpoint.</li>
+</ol>
+<p>I'd walk the interviewer through one write and one read end-to-end so the data path is concrete.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code>                +------------------------------+
+                | CLIENTS                      |
+                | owner UI / browser / CDN     |
+                +-----+------------+-----------+
+                   |            |
+         POST /v1/links     |            | GET /{short_code}
+                   |            |
+                   v            v
+    +-------------+   +------------+   +------------------+
+    | API Gateway |--&gt;| Write      |   | Read / Redirect  |--302--&gt; long_url
+    | auth + RL   |   | Service    |   | Service          |
+    +------+------+   +-----+------+   +--------+---------+
+        |                |                   |
+        | GET /v1/links/{code}/stats         | async ClickEvent
+        v                |                   v
+    +-------------+         |          +---------------------+
+    | Stats       |         |          | Kafka clicks[hash   |
+    | Service     |         |          | (short_code)]       |
+    +------+------+         |          +----------+----------+
+        |                |                     v
+        |                |          +---------------------+
+        |                |          | Flink rollups       |
+        |                |          | -&gt; ClickHouse       |
+        |                |          +---------------------+
+        v                v
+    +--------------------------------------------------------+
+    | STORE / CACHE GROUP                                   |
+    | Redis code:{short_code} packed long_url + flags        |
+    | Redis alias:{alias}, idem:{owner_id}:{key}             |
+    | Redis live_clicks:{short_code}:{minute} open bucket    |
+    | MySQL links.short_code row + owner:{owner_id}:codes    |
+    | ClickHouse (short_code, minute) count/referrer sketch  |
+    +-------------------------+------------------------------+
+                     ^
+                     | Redis code miss
+                     | MySQL hash(short_code) lookup
+                     | then Redis fill
+                +-------+--------+
+                | ID Block       |
+                | Allocator      |
+                +----------------+
+</code></pre>
+<p>Write path:</p>
+<ol>
+<li>API gateway authenticates, rate-limits by <code>owner_id</code>, and validates <code>long_url</code>.</li>
+<li>Write service reserves a code from its local ID block, or reserves <code>alias:{custom}</code> with <code>SETNX</code> for custom aliases.</li>
+<li>It inserts one metadata row keyed by <code>short_code</code>; on duplicate custom alias, return 409.</li>
+<li>It writes <code>code:{short_code}</code> into Redis with the long URL and owner fields, then returns the short URL.</li>
+</ol>
+<p>Redirect path:</p>
+<ol>
+<li>Read service parses <code>/{short_code}</code> and checks the edge bloom filter for definitely-missing codes.</li>
+<li>It does <code>GET code:{short_code}</code> in Redis. Hit returns a 302 immediately.</li>
+<li>On miss, it does a single-row lookup in MySQL shard <code>hash(short_code)</code>, repopulates Redis, and returns 302.</li>
+<li>In parallel with the response write, it publishes <code>ClickEvent</code> to Kafka and increments <code>live_clicks:{short_code}:{minute}</code> in Redis. Analytics failure must not block the redirect.</li>
+</ol>
+<p>Stats path:</p>
+<ol>
+<li>Stats service authenticates owner and checks ownership via MySQL or a cached <code>owner:{owner_id}:codes</code> index.</li>
+<li>It queries ClickHouse rollups for closed buckets keyed by <code>(short_code, minute)</code>.</li>
+<li>In parallel, it reads Redis <code>live_clicks:{short_code}:{minute}</code> for the current minute.</li>
+<li>It returns an opaque cursor <code>{short_code, bucket_start, bucket_end, last_bucket, freshness_cutoff}</code>. The cutoff freezes the result set for pagination while new clicks arrive.</li>
+<li>If ClickHouse is behind, the response includes closed buckets through the last committed watermark plus a provisional live count from Redis.</li>
+</ol>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Short code generation.</strong> Three options:
+- Random base62 + collision check on insert. Simple but every write costs an existence check.
+- Hash(long_url) truncated. Deterministic dedupe but you still need collision probing.
+- <strong>Counter + base62, per-shard ID ranges.</strong> Each writer pulls a 10k-id block from a coordinator and converts to base62. No collision, no extra read on the write path. I'd default to this and accept that codes leak rough creation order.</p>
+<p><strong>Hot redirect path.</strong> Goal is to never touch MySQL for popular codes. Redis is the front line; a small bloom filter at the edge short-circuits known-bad codes. For codes going viral right now, I'd let the CDN cache the 302 for 30–60s — a stale redirect is fine, a stale destination is the worst case but I'd document the tradeoff.</p>
+<p>Concrete stores:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key pattern</th>
+<th>Value / data structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Metadata DB</td>
+<td><code>links.short_code</code></td>
+<td>row: long_url, owner_id, created_at, flags</td>
+<td style="text-align: right;">~200-500 B</td>
+<td>forever</td>
+<td><code>hash(short_code)</code></td>
+</tr>
+<tr>
+<td>Redis redirect cache</td>
+<td><code>code:{short_code}</code></td>
+<td>packed long_url + flags</td>
+<td style="text-align: right;">~300-600 B</td>
+<td>7-30 days LRU</td>
+<td><code>hash(short_code)</code></td>
+</tr>
+<tr>
+<td>Alias reservation</td>
+<td><code>alias:{alias}</code></td>
+<td>owner_id / request_id</td>
+<td style="text-align: right;">~64 B</td>
+<td>5 s while creating</td>
+<td><code>hash(alias)</code></td>
+</tr>
+<tr>
+<td>Create idempotency</td>
+<td><code>idem:{owner_id}:{key}</code></td>
+<td>short_code, status</td>
+<td style="text-align: right;">~100 B</td>
+<td>24 h</td>
+<td><code>owner_id</code></td>
+</tr>
+<tr>
+<td>Owner link index</td>
+<td><code>owner:{owner_id}:codes</code></td>
+<td>paged list of short_codes</td>
+<td style="text-align: right;">~12 B/code</td>
+<td>forever</td>
+<td><code>owner_id</code></td>
+</tr>
+<tr>
+<td>Bad-code bloom</td>
+<td>daily filter</td>
+<td>membership bits for known codes</td>
+<td style="text-align: right;">~10 bits/code</td>
+<td>24 h rebuild</td>
+<td>edge-local</td>
+</tr>
+<tr>
+<td>Click stream</td>
+<td><code>clicks[{partition}]</code></td>
+<td>append-only ClickEvent</td>
+<td style="text-align: right;">~150 B</td>
+<td>7 days hot</td>
+<td><code>hash(short_code)</code></td>
+</tr>
+<tr>
+<td>Rollups</td>
+<td><code>(short_code, minute)</code></td>
+<td>count, referrer sketch</td>
+<td style="text-align: right;">~80 B</td>
+<td>2 years</td>
+<td><code>hash(short_code)</code></td>
+</tr>
+</tbody>
+</table>
+<p>Metadata capacity is modest: 6B links x 500 B x 3 replicas ~= 9 TB, still ordinary sharded MySQL. The owner index is 6B codes x 12 B x 3 replicas ~= 216 GB before page overhead, small enough to keep beside metadata or in a separate index table. Redirect cache for the hottest 1B links at ~500 B is ~500 GB before Redis overhead, maybe 1-2 TB replicated. Click analytics is the larger moving stream: 40k/sec peak x 150 B ~= 6 MB/sec peak, with Kafka 7-day x3 retention under ~11 TB before compression. Rollups at 40k/sec collapsed into <code>(short_code, minute)</code> buckets are much smaller; the cost knob is how much referrer/user-agent detail we keep.</p>
+<p>The two-index pattern is simple but important: the canonical Link row is addressed by <code>short_code</code> for redirects, while the owner dashboard needs <code>owner_id -&gt; short_codes</code>. I would keep the redirect row as the source of truth and maintain the owner index transactionally on create, because listing owned links should never add a join to the redirect path.</p>
+<p>Redirect degradation state:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>User impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>hot</td>
+<td>CDN/Redis hit</td>
+<td>cached 302 / <code>code:{short_code}</code></td>
+<td>&lt;20 ms service time</td>
+</tr>
+<tr>
+<td>warm</td>
+<td>Redis miss</td>
+<td>MySQL lookup then cache fill</td>
+<td>&lt;100 ms p99 target</td>
+</tr>
+<tr>
+<td>DB degraded</td>
+<td>stale cache only</td>
+<td>Redis serves existing codes; misses 503/404 retryable</td>
+<td>existing hot links survive</td>
+</tr>
+<tr>
+<td>analytics down</td>
+<td>redirect-only</td>
+<td>skip Kafka after enqueue failure budget</td>
+<td>no redirect impact</td>
+</tr>
+</tbody>
+</table>
+<p>Edge stress tests:</p>
+<table>
+<thead>
+<tr>
+<th>Edge</th>
+<th>Design response</th>
+<th>Latency / correctness target</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dormant code after cache eviction</td>
+<td>Redis miss -&gt; single MySQL lookup by <code>hash(short_code)</code> -&gt; refill</td>
+<td>still &lt;100 ms p99 if DB healthy</td>
+</tr>
+<tr>
+<td>Viral code becomes a hot key</td>
+<td>CDN caches 302 for 30-60 s; Redis remains backup</td>
+<td>service load drops at edge</td>
+</tr>
+<tr>
+<td>Random scanners exhaust misses</td>
+<td>edge bloom filter rejects definitely-unknown codes before MySQL</td>
+<td>protect DB from miss storms</td>
+</tr>
+<tr>
+<td>Stats pagination past live window</td>
+<td>cursor switches from Redis overlay to ClickHouse closed buckets</td>
+<td>no duplicate/missing buckets</td>
+</tr>
+<tr>
+<td>Multi-region drift</td>
+<td>writes route to home region for custom alias uniqueness; redirects can read replicated metadata</td>
+<td>redirects available, creates may be region-pinned</td>
+</tr>
+<tr>
+<td>Cold cache after deploy</td>
+<td>pre-warm top N hot codes from ClickHouse/Kafka click rankings into Redis/CDN</td>
+<td>avoid DB thundering herd</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Interview punch line:</strong> the read path has two jobs with different guarantees: redirect must be fast and durable, while analytics can lag and be rebuilt from the click log.</p>
+<p><strong>Click analytics without writing per click to MySQL.</strong> Every redirect fires an event to Kafka and increments a Redis counter for the live UI. Flink rolls up to ClickHouse on a tumbling 1-min window. The <code>/stats</code> endpoint only ever reads ClickHouse. MySQL never sees click traffic.</p>
+<p><strong>Why MySQL + Redis.</strong> The metadata access pattern is a primary-key lookup and a rare insert; sharded MySQL gives durable rows, unique constraints for aliases, and simple backups. DynamoDB/Cassandra also work, but we do not need wide rows or multi-region active-active unless the interview pushes global writes. Redis beats an in-process cache because redirect traffic is shared across many stateless read-service nodes; CDN caching is an extra edge optimization for ultra-hot codes, not the source of truth.</p>
+<p><strong>Custom-alias contention.</strong> Two users racing for <code>bit.ly/launch</code>: use <code>SETNX</code> on <code>alias:launch</code> with a 5-second TTL to reserve before the MySQL insert. First writer wins; second gets a clean 409.</p>
+<p><strong>Abuse and safety.</strong> Token-bucket rate limit per <code>owner_id</code> on writes (Redis). After insert, push the URL through Google Safe Browsing asynchronously; if flagged, soft-delete and serve a warning interstitial instead of the 302.</p>
+<p><strong>What I'd defer if I had more time.</strong> Multi-region active-active for the redirect path, per-link TTLs, geo-aware analytics, and link previews. I'd mention them so the interviewer knows I see them.</p>
+<p><strong>Interview punch line:</strong> the redirect is a tiny primary-key read, so protect that path from everything else. Link metadata is durable and boring; analytics is high-volume and lossy enough to be streamed and reconciled separately.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

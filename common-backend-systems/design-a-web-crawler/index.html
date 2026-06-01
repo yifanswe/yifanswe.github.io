@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design a Web Crawler — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design a Web Crawler</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A web crawler is the canonical large-distributed-system problem: trillions of URLs, every host an independent rate-limited resource, the work never finishes. The hard part is being polite (not hammering hosts), efficient (not re-crawling unchanged pages), and respectful of robots.txt at the same time.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>The crawler must visit URLs at a rate that respects each host's politeness budget and robots.txt, must not fetch a URL more than necessary for freshness, and must produce a deterministic, deduplicated, indexable record for every successfully fetched page.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design per-host queueing, manage a frontier of trillions of URLs without re-fetching, handle traps (calendars, session ids), and prioritize freshness for important pages over completeness for everything.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design the crawler around a frontier of URLs to fetch, partitioned by host, with strict per-host politeness queues. A fleet of stateless fetchers pulls from the frontier, fetches HTML, extracts links, dedupes via content and URL fingerprints, and emits documents to downstream parsers and indexers. The interesting decisions are how to handle politeness, dedupe at trillion scale, prioritize the frontier, and detect spider traps.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Crawl the public web starting from seed URLs.</li>
+<li>Respect robots.txt and crawl-delay directives.</li>
+<li>Re-crawl pages on a schedule informed by their estimated freshness.</li>
+<li>Detect duplicate and near-duplicate pages.</li>
+<li>Extract links and follow them subject to filters (depth, domain whitelist, content-type).</li>
+<li>Produce content suitable for downstream indexing or analysis.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Scale to tens of billions of pages, trillions of known URLs.</li>
+<li>Throughput: hundreds of thousands of fetches per second.</li>
+<li>Politeness: never overload a small site.</li>
+<li>Resilience to traps and adversarial content.</li>
+<li>Resumable after crawler outages.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Index serving (covered in "Design Google Search").</li>
+<li>JavaScript rendering at full scale (mention as a heavy mode).</li>
+<li>Real-time content discovery (push from publishers).</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pages</td>
+<td>10B-100B documents in the corpus.</td>
+</tr>
+<tr>
+<td>Known URLs</td>
+<td>10x to 100x pages (most never fetched).</td>
+</tr>
+<tr>
+<td>Hosts</td>
+<td>200M+ active hosts.</td>
+</tr>
+<tr>
+<td>Fetch rate</td>
+<td>100k-1M URLs/sec across the fleet.</td>
+</tr>
+<tr>
+<td>Average page size</td>
+<td>50-200 KB raw, 10-30 KB extracted text.</td>
+</tr>
+<tr>
+<td>Politeness</td>
+<td>1 request/second/host typical; configurable.</td>
+</tr>
+<tr>
+<td>Re-crawl cadence</td>
+<td>Hours for news; weeks for static pages.</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Petabytes for raw HTML; tens of petabytes for historical versions.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is host concurrency: a single hot host cannot be hit faster than its politeness budget, and the frontier must keep workers busy without violating any host's budget.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Discovery</td>
+<td>Find new URLs from seeds, sitemaps, and link graph.</td>
+<td>High recall over time.</td>
+</tr>
+<tr>
+<td>Fetching</td>
+<td>Politely retrieve content.</td>
+<td>Strict per-host rate limits.</td>
+</tr>
+<tr>
+<td>Deduplication</td>
+<td>Avoid storing redundant content.</td>
+<td>URL canonicalization + content fingerprinting.</td>
+</tr>
+<tr>
+<td>Freshness scheduling</td>
+<td>Decide which URLs to re-crawl when.</td>
+<td>Score-driven; bounded by total fleet capacity.</td>
+</tr>
+<tr>
+<td>Output</td>
+<td>Hand off fetched content to indexer.</td>
+<td>Append-only document store with versions.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                +---------------+
+   Seeds  ---&gt;  | URL Frontier  |
+                | priority queue|
+                | per-host shards|
+                +-------+-------+
+                        |
+                        v
+                +---------------+
+                | Fetcher Pool  |
+                | stateless     |
+                +-------+-------+
+                        |
+        +---------------+---------------+
+        |               |               |
+        v               v               v
++--------------+ +--------------+ +--------------+
+| Robots Cache | | DNS Cache    | | Content Store|
++--------------+ +--------------+ +------+-------+
+                                         |
+                                         v
+                                  +---------------+
+                                  | Parser/Extract|
+                                  | links, text   |
+                                  +-------+-------+
+                                          |
+                +-------------------------+--------------------+
+                |                         |                    |
+                v                         v                    v
+        +---------------+        +---------------+   +-----------------+
+        | URL Dedupe    |        | Content Hash  |   | Indexer / Down  |
+        | bloom + hash  |        | shingles      |   | stream consumers|
+        +-------+-------+        +-------+-------+   +-----------------+
+                |                        |
+                v                        v
+        +-------------------------------------------+
+        | Re-queued URLs flow back to URL Frontier  |
+        +-------------------------------------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>URL frontier</td>
+<td>Priority queue of URLs to fetch, sharded by host.</td>
+<td>Per-host FIFO inside; cross-host priority across.</td>
+</tr>
+<tr>
+<td>Fetcher</td>
+<td>HTTP client; fetches URL; handles redirects, retries, robots.</td>
+<td>Stateless; horizontally scalable; pulls from frontier.</td>
+</tr>
+<tr>
+<td>Robots service</td>
+<td>Caches and serves robots.txt per host.</td>
+<td>TTL-based refresh; consulted before every fetch.</td>
+</tr>
+<tr>
+<td>DNS resolver</td>
+<td>High-throughput DNS with internal cache.</td>
+<td>Avoid hammering recursive resolvers.</td>
+</tr>
+<tr>
+<td>Content store</td>
+<td>Append-only blob store of raw responses by URL+version.</td>
+<td>Versioned; large objects in object storage.</td>
+</tr>
+<tr>
+<td>Parser</td>
+<td>Extracts links, text, metadata.</td>
+<td>Streaming; handles malformed HTML.</td>
+</tr>
+<tr>
+<td>URL dedupe</td>
+<td>Tracks "seen" URLs to avoid re-enqueueing.</td>
+<td>Bloom filter + persistent set.</td>
+</tr>
+<tr>
+<td>Content dedupe</td>
+<td>Tracks page content fingerprints.</td>
+<td>Simhash / minhash for near-duplicates.</td>
+</tr>
+<tr>
+<td>Scheduler</td>
+<td>Decides re-crawl cadence per URL.</td>
+<td>Score = freshness × importance × cost.</td>
+</tr>
+<tr>
+<td>Frontier prioritizer</td>
+<td>Reorders URLs in frontier by score.</td>
+<td>Hot pages get more attention.</td>
+</tr>
+<tr>
+<td>Trap detector</td>
+<td>Bounds crawl depth and ID parameter cardinality per host.</td>
+<td>Avoid infinite loops.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="url-record">URL Record</h4>
+<pre><code class="language-text">URLRecord(
+  url,                       // canonical form
+  url_hash,
+  host,
+  first_seen_at,
+  last_fetched_at,
+  last_status,
+  last_content_hash,
+  refetch_score,
+  in_frontier,
+  fetch_attempts,
+  fetch_failures,
+  forbidden,                 // by robots
+  noindex
+)
+</code></pre>
+<h4 id="document">Document</h4>
+<pre><code class="language-text">Document(
+  url,
+  fetched_at,
+  http_status,
+  content_type,
+  content_length,
+  raw_pointer,               // object storage key
+  text_pointer,
+  links_extracted,
+  content_hash,
+  shingles,
+  language,
+  charset
+)
+</code></pre>
+<h4 id="host-state">Host State</h4>
+<pre><code class="language-text">HostState(
+  host,
+  last_fetch_at,
+  politeness_interval_ms,
+  crawl_delay_from_robots,
+  active_in_flight,
+  recent_5xx_count,
+  reputation,                // throttle multiplier
+  robots_etag,
+  robots_fetched_at
+)
+</code></pre>
+<h4 id="robots-entry">Robots Entry</h4>
+<pre><code class="language-text">RobotsEntry(
+  host,
+  fetched_at,
+  expires_at,
+  rules,                     // parsed allow/disallow per user-agent
+  crawl_delay,
+  sitemap_urls
+)
+</code></pre>
+<h3 id="url-frontier-design">URL Frontier Design</h3>
+<p>This is the central deep dive.</p>
+<p><strong>Two-level structure:</strong></p>
+<ul>
+<li>A front queue per priority class (high, medium, low).</li>
+<li>A back queue per host, ensuring strict per-host FIFO and politeness gating.</li>
+</ul>
+<p>Workflow:</p>
+<ol>
+<li>New URL arrives from extractor.</li>
+<li>Look up host; route to host's back queue.</li>
+<li>A scheduler thread per priority class peeks at front queue; selects host whose politeness window has elapsed; pops next URL.</li>
+<li>Hands URL to fetcher.</li>
+</ol>
+<p>Storage:</p>
+<ul>
+<li>Front and back queues live in persistent durable storage (a sharded log or KV store) because trillions of URLs do not fit in memory.</li>
+<li>Hot working set is cached in memory for the active fetcher fleet.</li>
+</ul>
+<p>Partitioning:</p>
+<ul>
+<li>Frontier shards by <code>hash(host)</code>. All URLs for a host live on the same shard.</li>
+<li>Each shard manages its own per-host queues.</li>
+</ul>
+<p>This guarantees: per-host politeness is enforced locally; cross-host parallelism is achieved by having many shards each managing many hosts.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The frontier is the heart of the system. The two-level design — back queues per host for politeness, front queues across hosts for priority — is what lets a single shard fetch from many hosts without violating any host's budget.</p>
+</blockquote>
+<h3 id="politeness">Politeness</h3>
+<p>For each host:</p>
+<ul>
+<li>Track <code>last_fetch_at</code>. The next fetch starts after <code>last_fetch_at + politeness_interval</code>.</li>
+<li><code>politeness_interval</code> defaults to one second, can be overridden by robots.txt <code>crawl-delay</code>.</li>
+<li>Concurrent fetches per host: usually 1; can be relaxed for large hosts after consultation.</li>
+<li>On repeated 5xx or rate-limit responses, automatically increase the interval (multiplicative backoff).</li>
+</ul>
+<h3 id="robotstxt-handling">Robots.txt Handling</h3>
+<p>Before fetching a URL:</p>
+<ol>
+<li>Check robots cache for the host. If missing or expired (TTL 24h typical), fetch <code>host/robots.txt</code>.</li>
+<li>If robots.txt is missing/200, parse and store.</li>
+<li>Match URL against rules. If disallowed for our user-agent, drop and emit a <code>forbidden</code> URLRecord update.</li>
+<li>Respect <code>Crawl-delay</code> if set.</li>
+<li>Cache sitemaps; enqueue them as discovery sources.</li>
+</ol>
+<p>Many parsers exist; the rules are not formal but conventions matter (longest-match per user-agent, etc.). Treat robots.txt as authoritative.</p>
+<h3 id="deduplication-urls-and-content">Deduplication: URLs And Content</h3>
+<p><strong>URL dedup:</strong></p>
+<ul>
+<li>Canonicalize URL: lowercase host, sort query parameters, strip session ids, remove fragments.</li>
+<li>Hash to a 64-bit fingerprint.</li>
+<li>Maintain a global bloom filter for membership probe; a persistent KV-backed exact set as the truth.</li>
+<li>Bloom misses → query KV. Set membership informs whether to enqueue.</li>
+</ul>
+<p><strong>Content dedup:</strong></p>
+<ul>
+<li>Compute SHA-256 of normalized text.</li>
+<li>Compare against a "seen content" index. Exact match → known duplicate.</li>
+<li>For near-duplicates (boilerplate or templated pages), compute simhash or minhash signatures; cluster pages whose signatures are within a Hamming distance threshold.</li>
+<li>One canonical URL per content cluster.</li>
+</ul>
+<h3 id="refetch-scheduling">Refetch Scheduling</h3>
+<p>Not all URLs deserve the same attention.</p>
+<p>Score factors:</p>
+<ul>
+<li>Importance: domain authority, inbound link count, traffic estimates.</li>
+<li>Estimated change rate: from prior fetch differences (news sites change hourly; static manuals weekly).</li>
+<li>Last fetch age.</li>
+<li>Capacity budget per host and per priority class.</li>
+</ul>
+<p>Algorithm:</p>
+<ul>
+<li>Each URL has a <code>refetch_score</code>. Higher score → fetched sooner.</li>
+<li>Score recomputed after each fetch from observed change frequency.</li>
+<li>Scheduler keeps a per-host priority heap of URLs awaiting re-crawl.</li>
+</ul>
+<h3 id="spider-traps">Spider Traps</h3>
+<p>Common traps:</p>
+<ul>
+<li>Infinite calendar pages: <code>/cal/2024/01/01</code>, <code>/cal/2024/01/02</code>, ...</li>
+<li>Faceted commerce URLs: query parameter combinations grow exponentially.</li>
+<li>Session ids in URLs.</li>
+<li>Broken pagination that loops.</li>
+</ul>
+<p>Mitigations:</p>
+<ul>
+<li>Cap crawl depth per host.</li>
+<li>Limit URLs per host per day.</li>
+<li>Detect parameter-cardinality explosions and quarantine the pattern.</li>
+<li>Strip well-known session id parameters during canonicalization.</li>
+<li>Reputation system: hosts with high duplicate ratios are throttled.</li>
+</ul>
+<h3 id="adversarial-content">Adversarial Content</h3>
+<ul>
+<li>Pages that detect crawler user-agent and serve different content (cloaking).</li>
+<li>Pages that respond with malware payloads.</li>
+<li>Pages that try to exhaust the crawler's resources (decompression bombs).</li>
+</ul>
+<p>Defenses:</p>
+<ul>
+<li>Limit per-page bytes; abort if exceeded.</li>
+<li>Sandbox parsers and renderers.</li>
+<li>Random sampling: occasionally crawl as a normal user agent to detect cloaking.</li>
+<li>Resource limits per fetch.</li>
+</ul>
+<h3 id="write-and-read-path">Write And Read Path</h3>
+<p><strong>Write (fetch) path:</strong></p>
+<ol>
+<li>Fetcher pulls URL from frontier.</li>
+<li>Check robots cache; if disallowed, drop and update URLRecord.</li>
+<li>Resolve host via DNS cache.</li>
+<li>HTTP GET with conditional headers (<code>If-Modified-Since</code>, <code>ETag</code>).</li>
+<li>On 304, update <code>last_fetched_at</code>; skip storage.</li>
+<li>On 200, stream response to content store; record metadata.</li>
+<li>Parse: extract links, text, canonical tags.</li>
+<li>For each link: canonicalize, dedup check, enqueue if new.</li>
+<li>Update content dedup index.</li>
+<li>Push document to downstream indexer.</li>
+</ol>
+<p><strong>Read path:</strong> Indexers and downstream consumers consume from the document stream or read from content store. Not part of the crawler proper.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>URL frontier</td>
+<td>Hash on host</td>
+<td>Co-locate all URLs for a host.</td>
+</tr>
+<tr>
+<td>URL dedup set</td>
+<td>Hash on url_hash</td>
+<td>Even distribution.</td>
+</tr>
+<tr>
+<td>Content dedup</td>
+<td>Hash on content_hash</td>
+<td>Even distribution.</td>
+</tr>
+<tr>
+<td>Content store</td>
+<td>URL or document_id</td>
+<td>Massive blob storage.</td>
+</tr>
+<tr>
+<td>Host state</td>
+<td>Hash on host</td>
+<td>Co-located with frontier.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>URL dedup</td>
+<td>Eventually consistent (bloom + exact)</td>
+<td>Bloom false positives reduce work; rare misses tolerable.</td>
+</tr>
+<tr>
+<td>Frontier scheduling</td>
+<td>Per-host strict order</td>
+<td>Politeness is a hard constraint.</td>
+</tr>
+<tr>
+<td>Content store</td>
+<td>Strong write of new versions</td>
+<td>Audit and time-series analysis.</td>
+</tr>
+<tr>
+<td>Robots cache</td>
+<td>Eventually consistent within TTL</td>
+<td>Tolerable lag.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hammering a small site (politeness bug).</td>
+<td>Per-host single-flight gate; backoff on 429/5xx.</td>
+<td>Per-host QPS; complaint volume.</td>
+</tr>
+<tr>
+<td>Spider trap eats fleet capacity.</td>
+<td>Depth caps, host caps, parameter cardinality detection.</td>
+<td>Per-host duplicate ratio; URL growth rate per host.</td>
+</tr>
+<tr>
+<td>Robots.txt fetch fails.</td>
+<td>Default to disallow if recently unreachable; or default to allow with reduced rate.</td>
+<td>Robots fetch error rate.</td>
+</tr>
+<tr>
+<td>Frontier shard imbalance.</td>
+<td>Re-shard hot hosts to dedicated shards.</td>
+<td>Per-shard backlog size.</td>
+</tr>
+<tr>
+<td>Content store growth explosion.</td>
+<td>Dedup before storage; sample storage for unchanging pages.</td>
+<td>Storage growth rate vs new-content rate.</td>
+</tr>
+<tr>
+<td>Fetcher crashes mid-stream.</td>
+<td>Idempotent re-fetch; URL stays in <code>dispatched</code> state with timeout.</td>
+<td>In-flight URL stale count.</td>
+</tr>
+<tr>
+<td>DNS resolver overload.</td>
+<td>Local DNS cache; rate-limit by domain authority.</td>
+<td>DNS QPS, error rate.</td>
+</tr>
+<tr>
+<td>Adversarial cloaking.</td>
+<td>Mixed user-agent sampling; reputation tracking.</td>
+<td>Per-host content-hash variance under different agents.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Politeness violations per host (must be ~zero).</li>
+<li>robots.txt rule violations.</li>
+<li>Duplicate fetches per URL within freshness window.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Fetch QPS by priority.</li>
+<li>Frontier size and growth rate.</li>
+<li>Bloom false-positive rate.</li>
+<li>Per-host backlog distribution.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Coverage: fraction of important pages re-crawled within target SLA.</li>
+<li>Index freshness for news domains.</li>
+<li>Discovered URLs per day.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Run regional fetcher fleets close to publishers (US, EU, Asia).</li>
+<li>Frontier sharding is partitioned by host; each host is owned by one region (often picked by host's hosting location).</li>
+<li>Content store is regional with cross-region replication for indexing.</li>
+<li>Avoid double-crawling from two regions on the same host.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Tight politeness limits cap throughput; lax limits anger webmasters.</li>
+<li>Aggressive dedup reduces storage but risks missing legitimate updates.</li>
+<li>Strict robots respect costs coverage; loose interpretation invites legal trouble.</li>
+<li>Centralized priority is hard at trillion-URL scale; approximate per-shard priority is usually accepted.</li>
+<li>Deep crawling discovers more but consumes budget; shallow crawling misses long-tail.</li>
+<li>Re-crawl frequency should adapt to observed change rate; static schedules waste fetches.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One big global queue.</td>
+<td>Two-level frontier: back queue per host, front queue by priority.</td>
+</tr>
+<tr>
+<td>Ignoring robots.txt.</td>
+<td>First-class robots cache, consulted before every fetch.</td>
+</tr>
+<tr>
+<td>URL dedup only at insert.</td>
+<td>Bloom filter + exact set; re-canonicalize before checking.</td>
+</tr>
+<tr>
+<td>Treating all URLs as equal.</td>
+<td>Importance + change-rate scoring for re-crawl.</td>
+</tr>
+<tr>
+<td>Ignoring spider traps.</td>
+<td>Depth and parameter caps per host; cardinality detection.</td>
+</tr>
+<tr>
+<td>Synchronous indexing.</td>
+<td>Append-only document stream; indexer is downstream.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Frontier design</td>
+<td>Two-level queues; per-host politeness; priority across hosts.</td>
+</tr>
+<tr>
+<td>Dedup at scale</td>
+<td>Bloom + exact KV; simhash for near-duplicates.</td>
+</tr>
+<tr>
+<td>Re-crawl scheduling</td>
+<td>Score from importance + change rate; capacity-bounded.</td>
+</tr>
+<tr>
+<td>Spider trap defense</td>
+<td>Depth caps; cardinality detection; reputation.</td>
+</tr>
+<tr>
+<td>Robots.txt handling</td>
+<td>Caching, parsing, sitemap discovery.</td>
+</tr>
+<tr>
+<td>JS rendering</td>
+<td>Separate slow lane; only for sites that need it.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Politeness as a hard invariant, enforced per-host.</li>
+<li>Two-level frontier: priority across hosts, FIFO per host.</li>
+<li>URL canonicalization and dedup with bloom + exact set.</li>
+<li>Content dedup with simhash / shingles.</li>
+<li>Refetch scheduling driven by importance and change rate.</li>
+<li>Spider trap detection and host reputation.</li>
+<li>Robots.txt cache as a first-class service.</li>
+<li>Append-only document store; indexer is downstream.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>A web crawler's hardest constraint is politeness, not throughput. Two-level queues — back queue per host, front queue across hosts — let me parallelize without ever hammering a single host. Dedup with bloom filters plus content fingerprints prevents wasted work; importance and change-rate scoring focuses capacity on what matters.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design a web crawler.</p>
+<p><strong>Candidate:</strong> I will design it around a URL frontier that enforces per-host politeness as a hard invariant, a stateless fetcher fleet, and dedup layers for both URLs and content. The hard parts are politeness, scale of the dedup set, spider traps, and choosing what to re-crawl.</p>
+<p><strong>Interviewer:</strong> How does the URL frontier work?</p>
+<p><strong>Candidate:</strong> Two levels. Each host gets a back queue in strict FIFO order; politeness is enforced as "next fetch from this back queue at least T ms after last fetch." A small set of front queues across priority classes selects which host to pop next. A scheduler thread checks "which host's politeness window has elapsed" and picks the highest-priority one. The whole frontier is sharded by <code>hash(host)</code>, so all URLs for one host live on one shard.</p>
+<p><strong>Interviewer:</strong> How big is the frontier?</p>
+<p><strong>Candidate:</strong> Trillions of URLs. It cannot fit in memory. The frontier lives in persistent storage — a log-structured KV or sharded RocksDB — with hot working set cached. Workers stream URLs into and out of disk-resident queues.</p>
+<p><strong>Interviewer:</strong> How do you dedupe URLs at that scale?</p>
+<p><strong>Candidate:</strong> First canonicalize: lowercase host, sort query parameters, strip known session ids, drop fragments, normalize trailing slash. Hash to a 64-bit fingerprint. Check a sharded bloom filter for fast membership. On bloom hit, check the persistent exact set. On miss, insert into bloom and exact set, and enqueue the URL.</p>
+<p><strong>Interviewer:</strong> Bloom false positives — how do you handle them?</p>
+<p><strong>Candidate:</strong> They mean we occasionally skip a URL that we have not actually seen. With a properly sized bloom filter, the false-positive rate is well under 1%. Acceptable because the URL will appear again from another inbound link and be checked against the exact set then. The cost of missing a re-discovery is much lower than the cost of looking up the exact set on every URL.</p>
+<p><strong>Interviewer:</strong> What about content dedup?</p>
+<p><strong>Candidate:</strong> Compute SHA-256 over normalized text. Exact match → known duplicate, skip storage but update URL → content_hash mapping. For near-duplicates, compute simhash or minhash. Pages with simhash within a small Hamming distance are clustered; we keep one canonical URL per cluster.</p>
+<p><strong>Interviewer:</strong> How do you respect robots.txt?</p>
+<p><strong>Candidate:</strong> First-class robots service. Before fetching a URL, check the host's robots entry. If missing or expired (TTL 24h), fetch <code>/robots.txt</code> (which itself respects politeness for that host). Parse rules, store. Match URL against the rules for our user-agent. Disallowed URLs are marked <code>forbidden</code> and skipped. We also pull sitemap URLs from robots.txt as discovery seeds and respect <code>Crawl-delay</code>.</p>
+<p><strong>Interviewer:</strong> Spider trap: a calendar that links infinitely forward.</p>
+<p><strong>Candidate:</strong> Three defenses. First, per-host crawl depth cap (say 20). Second, per-host URL budget per day; once exceeded, lower-priority URLs from that host are dropped. Third, parameter-cardinality detection: if a query parameter takes thousands of distinct values within a host, we flag the pattern and quarantine new URLs that match. The host's reputation degrades, and future fetches are throttled.</p>
+<p><strong>Interviewer:</strong> What gets re-crawled and when?</p>
+<p><strong>Candidate:</strong> A refetch score per URL combining importance (PageRank-style), observed change frequency, and time since last fetch. News domains may have a one-hour refetch interval; static manuals may be monthly. The scheduler maintains a priority heap per host; capacity is allocated across priority classes with quotas. We also respect <code>Last-Modified</code> and <code>ETag</code> via conditional GETs; a 304 response is cheap and confirms freshness.</p>
+<p><strong>Interviewer:</strong> How do you handle a host that returns lots of 5xx errors?</p>
+<p><strong>Candidate:</strong> Multiplicative backoff on the host's politeness interval. After repeated errors, the host enters a degraded state — fewer fetches per hour. After a longer cooldown, we probe to see if it has recovered. If a host is consistently down, we deprioritize but don't permanently drop; outages happen.</p>
+<p><strong>Interviewer:</strong> How do you parallelize within a host for big sites?</p>
+<p><strong>Candidate:</strong> Carefully. By default, one fetch per host at a time. For very large hosts (major news sites, large e-commerce) we may negotiate higher rates or detect that they obviously can handle more. We can run multiple concurrent fetches to such hosts via separate IP addresses if we have a reciprocal agreement.</p>
+<p><strong>Interviewer:</strong> What about JS-rendered pages?</p>
+<p><strong>Candidate:</strong> Two lanes. The default lane fetches raw HTML and parses it. For sites known to require JS, a slower, more expensive lane uses a headless browser. The headless fleet is much smaller; we route only a small fraction of URLs to it, prioritized by importance.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Run fetcher fleets in each region close to publishers. Each host is owned by one region — usually the closest geographically — so we never double-fetch the same host from two regions. The content store replicates cross-region for downstream indexing.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> A two-level frontier sharded by host enforces strict politeness; stateless fetchers pull URLs and respect robots.txt. URL dedup uses bloom + exact set; content dedup uses simhash. Re-crawl scheduling uses an importance + change-rate score. Spider traps are bounded by depth and cardinality caps. The output is an append-only document stream consumed by downstream indexers. Politeness is the hard invariant, not throughput; everything else scales by sharding.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: scale, politeness, robots, dedup, freshness.</li>
+<li>Invariant: respect per-host politeness; deterministic dedup.</li>
+<li>Two-level frontier: back queues per host, front queues by priority.</li>
+<li>Stateless fetchers; robots cache; DNS cache.</li>
+<li>URL dedup with bloom + exact set; canonicalize first.</li>
+<li>Content dedup with hash + simhash.</li>
+<li>Refetch scheduling by importance × change rate.</li>
+<li>Spider trap defenses; reputation; multi-region.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>A web crawler is bounded by politeness, not throughput. The two-level frontier — back queue per host, front queue by priority — guarantees we never hammer a host while staying fully utilized. Trillion-URL dedup uses bloom filters with a persistent exact-set fallback. Content dedup uses simhash for near-duplicates. Refetch is score-driven, focusing capacity on important and frequently changing pages. Spider traps are bounded by depth, cardinality, and reputation. Output is an append-only document stream consumed by downstream indexers.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Politeness is a hard invariant, enforced per host."</li>
+<li>"Two-level frontier: politeness in the back queue, priority in the front queue."</li>
+<li>"Dedup with bloom filters plus an exact set is the only way at trillion scale."</li>
+<li>"Refetch scheduling is importance times change rate divided by capacity."</li>
+<li>"Spider traps are bounded by depth caps and parameter cardinality detection."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

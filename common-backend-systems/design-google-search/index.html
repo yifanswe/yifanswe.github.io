@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Google Search — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Google Search</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Google Search is the canonical web-scale information retrieval problem. The hard part is indexing the entire public web, answering arbitrary queries in under a second, ranking results by relevance and authority, and continuously updating to reflect a changing web.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every indexed page is discoverable via the appropriate query; query results are ranked deterministically by a stable scoring function; the index reflects the corpus within a bounded staleness; query latency is under a few hundred milliseconds at p99; the system survives partial index outages by returning best-effort results.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design the indexing pipeline (crawl → parse → index), the inverted index sharded for query serving, the ranking pipeline with PageRank-style signals, query planning and result merging, and reason about freshness vs cost tradeoffs.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Google Search as a pipeline from crawler to index to query serving. The crawler fetches the web; the indexer builds an inverted index sharded by term; query servers scatter-gather across shards, rank, and return. Ranking combines static signals (PageRank, content quality) with query-time signals (relevance, freshness, personalization). The interesting decisions are index sharding strategy, scatter-gather query latency, ranking architecture, freshness pipeline, and serving capacity.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>User submits a query, gets ranked list of relevant web pages.</li>
+<li>Support boolean operators, phrases, filters (site:, intext:).</li>
+<li>Personalization based on user history, location.</li>
+<li>Auto-suggest as the user types.</li>
+<li>Knowledge panels and direct answers (snippets).</li>
+<li>Image and video search (mention; separate indexes).</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Query p99 under 500 ms.</li>
+<li>Index covers tens of billions of pages.</li>
+<li>Freshness: minutes for news, hours/days for static pages.</li>
+<li>High availability of query serving.</li>
+<li>Multi-region; queries served from local region.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Crawling specifics (see Web Crawler design).</li>
+<li>Ad serving and auctions.</li>
+<li>Spam detection details.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Indexed pages</td>
+<td>100B+ web pages; trillions in long tail.</td>
+</tr>
+<tr>
+<td>Queries/sec</td>
+<td>100k+ globally.</td>
+</tr>
+<tr>
+<td>Index size</td>
+<td>Multiple petabytes for inverted index.</td>
+</tr>
+<tr>
+<td>Query latency</td>
+<td>&lt; 500 ms p99.</td>
+</tr>
+<tr>
+<td>Freshness</td>
+<td>News in minutes; rest hours to days.</td>
+</tr>
+<tr>
+<td>Update rate</td>
+<td>Millions of new/changed pages/hour.</td>
+</tr>
+<tr>
+<td>Distinct terms</td>
+<td>Billions across languages.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is scatter-gather latency across many index shards and the cost of recomputing ranking features at query time.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Crawl</td>
+<td>Fetch web pages.</td>
+<td>High throughput; respect politeness.</td>
+</tr>
+<tr>
+<td>Parse/extract</td>
+<td>Tokenize, language detect, structured data.</td>
+<td>Streaming.</td>
+</tr>
+<tr>
+<td>Indexer</td>
+<td>Build inverted index.</td>
+<td>Sharded by term.</td>
+</tr>
+<tr>
+<td>Ranker</td>
+<td>Score and order results.</td>
+<td>Multiple signal sources; online.</td>
+</tr>
+<tr>
+<td>Query serving</td>
+<td>Receive queries, scatter-gather, rank, return.</td>
+<td>Sub-second p99.</td>
+</tr>
+<tr>
+<td>Freshness pipeline</td>
+<td>Real-time index updates for hot pages.</td>
+<td>Minutes.</td>
+</tr>
+<tr>
+<td>Knowledge graph</td>
+<td>Entity-based answers.</td>
+<td>Separate retrieval path.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Web --crawl--&gt; Web Crawler --&gt; Page Store
+                                    |
+                                    v
+                            +--------------+
+                            | Parser /     |
+                            | Extractor    |
+                            +------+-------+
+                                   |
+                +------------------+------------------+
+                |                                     |
+                v                                     v
+        +---------------+                   +-----------------+
+        | Inverted Index|                   | Doc Metadata    |
+        | sharded by term|                  | (titles, snippets)|
+        +------+--------+                   +-------+---------+
+               |                                    |
+               v                                    v
+        +---------------+                   +-----------------+
+        | Query Serving |&lt;------------------+ Knowledge Graph |
+        | scatter-gather|                   +-----------------+
+        +------+--------+
+               |
+               v
+        +---------------+
+        | Ranker        |
+        | online        |
+        +------+--------+
+               |
+               v
+        Search Results Page
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Crawler</td>
+<td>Fetch and refresh web pages.</td>
+<td>See web crawler design.</td>
+</tr>
+<tr>
+<td>Page store</td>
+<td>Raw HTML; canonical URL → version.</td>
+<td>Petabytes.</td>
+</tr>
+<tr>
+<td>Parser</td>
+<td>Tokenize, language detect, extract structured data.</td>
+<td>Streaming.</td>
+</tr>
+<tr>
+<td>Indexer</td>
+<td>Build inverted index.</td>
+<td>Batch + streaming.</td>
+</tr>
+<tr>
+<td>Inverted index</td>
+<td>term → posting list of doc_ids with positions, scores.</td>
+<td>Sharded by term.</td>
+</tr>
+<tr>
+<td>Document metadata</td>
+<td>Title, snippet, score, language.</td>
+<td>Separate fast KV.</td>
+</tr>
+<tr>
+<td>Query frontend</td>
+<td>Parse query, route to backend.</td>
+<td>Stateless.</td>
+</tr>
+<tr>
+<td>Index server</td>
+<td>Each shard returns top candidate doc_ids for query terms.</td>
+<td>Many shards in parallel.</td>
+</tr>
+<tr>
+<td>Aggregator</td>
+<td>Merge candidates across shards; deduplicate; rank.</td>
+<td>One per query.</td>
+</tr>
+<tr>
+<td>Ranker</td>
+<td>Score documents using query-time features.</td>
+<td>ML-driven; multi-stage.</td>
+</tr>
+<tr>
+<td>Snippet generator</td>
+<td>Build summary for each result.</td>
+<td>From document content.</td>
+</tr>
+<tr>
+<td>Knowledge graph</td>
+<td>Entity-based answers; richer formats.</td>
+<td>Separate retrieval.</td>
+</tr>
+<tr>
+<td>Auto-suggest</td>
+<td>Predict completions.</td>
+<td>Trie + popularity.</td>
+</tr>
+<tr>
+<td>Personalization</td>
+<td>User preference signals.</td>
+<td>Bounded; privacy-respecting.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="document-record">Document Record</h4>
+<pre><code class="language-text">Document(
+  doc_id,                // assigned during indexing
+  url,
+  url_canonical,
+  title,
+  content_hash,
+  language,
+  static_rank,           // PageRank, authority
+  last_crawled,
+  last_indexed,
+  metadata: {...}
+)
+</code></pre>
+<h4 id="posting-list">Posting List</h4>
+<pre><code class="language-text">PostingList(
+  term,
+  postings: [(doc_id, term_freq, positions, scoring_data)],
+  total_doc_freq
+)
+</code></pre>
+<h4 id="inverted-index-shard">Inverted Index Shard</h4>
+<p>A shard owns posting lists for a subset of terms (sharded by term hash) — or owns a subset of documents (sharded by doc_id). The latter is common at Google's scale.</p>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">GET /search?q=
+GET /complete?q=                 # autosuggest
+GET /image-search?q=             # separate index
+GET /news-search?q=              # freshness-focused
+</code></pre>
+<h3 id="indexing-pipeline">Indexing Pipeline</h3>
+<ol>
+<li>Crawler stores raw HTML in page store.</li>
+<li>Parser extracts text, links, structured data.</li>
+<li>Tokenizer normalizes (lowercase, stemming, language-specific).</li>
+<li>Posting list builder: for each (term, doc_id), append entry with frequency and positions.</li>
+<li>Index builder writes inverted index in sorted segments per shard.</li>
+<li>Periodic merge (LSM-style) keeps index efficient.</li>
+</ol>
+<p>Static signals computed offline:</p>
+<ul>
+<li>PageRank from link graph.</li>
+<li>Content quality scores.</li>
+<li>Spam / penalty scores.</li>
+</ul>
+<p>Each document has a <code>static_rank</code> precomputed; used as a query-independent prior.</p>
+<p>Freshness pipeline:</p>
+<ul>
+<li>News and high-priority pages indexed in minutes.</li>
+<li>A separate, smaller "live index" serves recent content.</li>
+<li>Query merges results from main index + live index.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The index is two-tier: a giant batch-built main index covering the bulk of the web, plus a small live index that captures the freshest content. Queries merge both.</p>
+</blockquote>
+<h3 id="index-sharding">Index Sharding</h3>
+<p>Two strategies:</p>
+<p><strong>Document-based sharding:</strong></p>
+<ul>
+<li>Each shard owns a partition of documents.</li>
+<li>For a query, all shards process the query against their docs and return top-K.</li>
+<li>Aggregator merges.</li>
+<li>Pros: easy to add/remove shards; per-shard work is bounded.</li>
+<li>Cons: every query hits every shard.</li>
+</ul>
+<p><strong>Term-based sharding:</strong></p>
+<ul>
+<li>Each shard owns posting lists for a partition of terms.</li>
+<li>For a query, only shards holding query terms are contacted.</li>
+<li>Pros: smaller fan-out for narrow queries.</li>
+<li>Cons: hot terms become hot shards; cross-shard intersection is expensive.</li>
+</ul>
+<p>In practice, document-based is common at Google scale because every query hits roughly equal load. Term-based is used in some specialized cases.</p>
+<h3 id="query-serving">Query Serving</h3>
+<p>For a query like "best italian restaurants in NYC":</p>
+<ol>
+<li>Frontend receives query.</li>
+<li>Query rewriter expands: synonyms, spell correction, query understanding.</li>
+<li>Scatter to all index shards (or relevant subset).</li>
+<li>Each shard returns top-N candidate doc_ids with scoring data.</li>
+<li>Aggregator merges candidates, dedupes.</li>
+<li>Ranker pass: combine static rank + query-time features (BM25, semantic similarity, freshness, personalization) → final score.</li>
+<li>Top-K results: fetch titles, snippets from metadata store.</li>
+<li>Snippet generator creates contextual summaries.</li>
+<li>Knowledge graph: check if query has entity answer; add knowledge panel if so.</li>
+<li>Return result page.</li>
+</ol>
+<p>All within ~500 ms.</p>
+<p>Latency budget:</p>
+<ul>
+<li>Network round trip ~10 ms.</li>
+<li>Index shard query ~100-200 ms.</li>
+<li>Aggregation ~50 ms.</li>
+<li>Ranking pass ~50-100 ms.</li>
+<li>Snippet + metadata fetch ~50 ms.</li>
+<li>Total ~300-400 ms.</li>
+</ul>
+<h3 id="scatter-gather-tail-latency">Scatter-Gather Tail Latency</h3>
+<p>With thousands of shards, the slowest shard determines query latency.</p>
+<p>Mitigations:</p>
+<ul>
+<li>Hedged requests: send to two replicas of the same shard, take first.</li>
+<li>Tail-tolerance: respond after, say, 99% of shards return, drop slowest 1%.</li>
+<li>Per-shard timeouts.</li>
+<li>Health-aware routing.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Tail latency is the dominant cost in scatter-gather. Hedged requests and partial-response tolerance keep p99 reasonable.</p>
+</blockquote>
+<h3 id="ranking">Ranking</h3>
+<p>Multi-stage:</p>
+<ol>
+<li><strong>Lightweight per-shard scoring:</strong> Each shard scores its candidates with cheap features (BM25, static rank). Returns top-K per shard.</li>
+<li><strong>Aggregated scoring:</strong> Aggregator combines, applies more features (entity match, freshness).</li>
+<li><strong>ML ranker:</strong> Final pass over top results with a deep model (BERT-style or transformer-based) for the highest fidelity ranking.</li>
+</ol>
+<p>Signals:</p>
+<ul>
+<li>PageRank, authority, content quality.</li>
+<li>Query-document relevance (BM25, semantic similarity).</li>
+<li>Freshness for time-sensitive queries.</li>
+<li>Personalization (location, prior clicks).</li>
+<li>Click-through rate priors.</li>
+<li>Mobile-friendliness, page speed.</li>
+</ul>
+<h3 id="knowledge-graph">Knowledge Graph</h3>
+<p>For entity queries ("Barack Obama height"), the system retrieves from a structured knowledge graph rather than just text matching.</p>
+<ul>
+<li>Entity recognition in query.</li>
+<li>Knowledge graph lookup.</li>
+<li>Rendered as a knowledge panel + direct answer snippet.</li>
+</ul>
+<h3 id="auto-suggest">Auto-Suggest</h3>
+<ul>
+<li>Trie of popular queries with frequency.</li>
+<li>Bucketed by prefix.</li>
+<li>Personalized re-rank.</li>
+<li>Sub-50ms latency.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition strategy</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inverted index</td>
+<td>Document-based sharding (thousands of shards)</td>
+<td>Balanced query load.</td>
+</tr>
+<tr>
+<td>Document metadata</td>
+<td>Hash on doc_id</td>
+<td>Fast lookup.</td>
+</tr>
+<tr>
+<td>Page store</td>
+<td>Hash on URL</td>
+<td>Per-URL versions.</td>
+</tr>
+<tr>
+<td>Knowledge graph</td>
+<td>Entity-based</td>
+<td>Lookup by entity id.</td>
+</tr>
+<tr>
+<td>Ranking features</td>
+<td>Per-doc or per-query</td>
+<td>Pre-computed where possible.</td>
+</tr>
+<tr>
+<td>Live index</td>
+<td>Time-bucketed</td>
+<td>Freshness.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inverted index</td>
+<td>Eventually consistent (hourly batch + live tier)</td>
+<td>Web is not real-time.</td>
+</tr>
+<tr>
+<td>Document metadata</td>
+<td>Eventually consistent</td>
+<td>UI hint.</td>
+</tr>
+<tr>
+<td>Knowledge graph</td>
+<td>Strong on entity facts</td>
+<td>Direct answers must be correct.</td>
+</tr>
+<tr>
+<td>Ranking</td>
+<td>Stable function over current index</td>
+<td>Determinism.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Index replicated to each region for fast local serving.</li>
+<li>Query routed to nearest region.</li>
+<li>Updates flow from primary indexing to all regions.</li>
+<li>Freshness lag: minutes between primary and replica.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Slow shard.</td>
+<td>Hedged requests; partial response.</td>
+<td>Per-shard tail latency.</td>
+</tr>
+<tr>
+<td>Failed shard.</td>
+<td>Replica fallback; degrade with missing coverage.</td>
+<td>Shard health.</td>
+</tr>
+<tr>
+<td>Index serving overload.</td>
+<td>Shed; rate limit; prioritize logged-in users.</td>
+<td>QPS vs capacity.</td>
+</tr>
+<tr>
+<td>Bad rank model.</td>
+<td>Canary rollout; auto-rollback.</td>
+<td>Click-through rate.</td>
+</tr>
+<tr>
+<td>Spam injection.</td>
+<td>Spam detection layer; manual review.</td>
+<td>Anomalous URL appearance.</td>
+</tr>
+<tr>
+<td>Index lag for breaking news.</td>
+<td>Live index tier; pre-prioritized crawl.</td>
+<td>Time-from-publish-to-indexed.</td>
+</tr>
+<tr>
+<td>Personalization bug exposes private data.</td>
+<td>Opt-in personalization; clear separation.</td>
+<td>Privacy audit.</td>
+</tr>
+<tr>
+<td>Knowledge graph fact wrong.</td>
+<td>Manual override; fact provenance.</td>
+<td>User report rate.</td>
+</tr>
+<tr>
+<td>Cross-region replication lag.</td>
+<td>Async; bounded; alert.</td>
+<td>Replication lag.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Result quality (offline evaluation, click signals).</li>
+<li>Spam in results.</li>
+<li>Knowledge graph accuracy.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Query QPS by region.</li>
+<li>Index shard QPS and latency.</li>
+<li>Tail latency p99/p999.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Click-through rate.</li>
+<li>Top-N click distribution.</li>
+<li>Query reformulation rate.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Larger index covers more pages but adds query latency.</li>
+<li>Frequent re-indexing improves freshness but costs compute.</li>
+<li>More personalization improves relevance but raises privacy concerns.</li>
+<li>Deeper ranking models improve quality but cost compute.</li>
+<li>Hedged requests reduce tail latency but double cost.</li>
+<li>Two-tier index (main + live) gives freshness but increases complexity.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One big monolithic index.</td>
+<td>Sharded inverted index; document-based partitioning.</td>
+</tr>
+<tr>
+<td>Per-query full ranking.</td>
+<td>Multi-stage ranking; cheap then expensive.</td>
+</tr>
+<tr>
+<td>Ignore tail latency.</td>
+<td>Hedged requests; partial-response tolerance.</td>
+</tr>
+<tr>
+<td>Fresh + main as one index.</td>
+<td>Two-tier: small live index + large main.</td>
+</tr>
+<tr>
+<td>Synchronous ranking model.</td>
+<td>Lightweight pass before ML model.</td>
+</tr>
+<tr>
+<td>Forget knowledge graph.</td>
+<td>Entity recognition + structured lookup.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Index sharding</td>
+<td>Document-based vs term-based; tradeoffs.</td>
+</tr>
+<tr>
+<td>Tail latency</td>
+<td>Hedged; partial response; replicas.</td>
+</tr>
+<tr>
+<td>Ranking stages</td>
+<td>Per-shard cheap → aggregator → ML.</td>
+</tr>
+<tr>
+<td>Freshness</td>
+<td>Two-tier index; live tier feeding from priority crawl.</td>
+</tr>
+<tr>
+<td>Knowledge graph</td>
+<td>Entity recognition; structured retrieval; provenance.</td>
+</tr>
+<tr>
+<td>Auto-suggest</td>
+<td>Trie; personalization; sub-50ms.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Pipeline: crawl → parse → index → serve.</li>
+<li>Document-based shard partitioning.</li>
+<li>Scatter-gather with tail-latency mitigation.</li>
+<li>Multi-stage ranking.</li>
+<li>Two-tier index for freshness.</li>
+<li>Knowledge graph for entity answers.</li>
+<li>Auto-suggest as a separate fast path.</li>
+<li>Multi-region replicas.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Google Search is a scatter-gather query over an inverted index, layered with multi-stage ranking. The index is sharded by document with replicas for tail-latency mitigation; ranking goes from cheap per-shard scoring to expensive ML at the top of the result set. Freshness comes from a live tier merged with the main index. The hardest performance problem is tail latency in scatter-gather; the hardest correctness problem is ranking quality.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Google Search.</p>
+<p><strong>Candidate:</strong> Pipeline: crawler fetches the web, parser tokenizes, indexer builds a sharded inverted index, query servers scatter-gather, ranker scores, results returned. The invariant is sub-second query latency over an index covering tens of billions of pages, with relevance ranking and bounded freshness.</p>
+<p><strong>Interviewer:</strong> How is the index sharded?</p>
+<p><strong>Candidate:</strong> Document-based. Each shard owns a partition of documents. For a query, all shards process the query against their docs and return top-K candidates. Aggregator merges. The alternative is term-based — each shard owns posting lists for some terms — but at Google's scale, document-based is more common because every query hits roughly equal load.</p>
+<p><strong>Interviewer:</strong> Walk me through a query.</p>
+<p><strong>Candidate:</strong> User types "best italian restaurants nyc". Frontend rewrites: spelling, synonyms, intent detection. Scatter to thousands of index shards. Each shard scans its posting lists for "italian," "restaurants," "nyc," intersects, computes a lightweight score (BM25 + static rank), returns top-K (say 100) candidates. Aggregator merges across shards into top-1000. Multi-stage ranking: a mid-tier model scores top-1000 with more features; final ML model scores top-50 with heavy features (BERT, personalization, freshness). Top-10 are returned with snippets. Knowledge graph adds a knowledge panel if entity detected.</p>
+<p><strong>Interviewer:</strong> Tail latency — thousands of shards, one slow shard kills the query.</p>
+<p><strong>Candidate:</strong> Hedged requests: each shard has multiple replicas; send to two simultaneously, take first to respond. Partial-response tolerance: aggregator returns once 99% of shards respond, drops slow 1% with bounded quality loss. Per-shard timeouts. Health-aware routing demotes slow replicas. Capacity headroom around 60-70% utilization so a slow node doesn't cascade.</p>
+<p><strong>Interviewer:</strong> Ranking?</p>
+<p><strong>Candidate:</strong> Multi-stage. Cheap per-shard scoring with BM25 and static signals (PageRank, authority) returns top-K candidates per shard. Aggregator merges and applies more features (entity match, freshness). Top results pass through a deep ML model (transformer-based) for the highest-fidelity ranking. The two-stage structure controls compute: cheap features prune to a manageable set; expensive features evaluate only the top.</p>
+<p><strong>Interviewer:</strong> PageRank?</p>
+<p><strong>Candidate:</strong> Static, query-independent rank based on the link graph. Pages with many high-authority inbound links get higher PageRank. Computed offline in periodic batch jobs over the web link graph. Stored per document as a feature, used in ranking. Modern Google has many more signals beyond PageRank, but the same principle: pre-computed authority.</p>
+<p><strong>Interviewer:</strong> Freshness — a breaking news story.</p>
+<p><strong>Candidate:</strong> Two-tier index. The main index is built in batches (hourly or daily); covers the bulk of the web. A live index is much smaller, fed by priority crawl of news sites and recent updates, indexed in minutes. Queries merge results from both. The ranker boosts fresh results for time-sensitive queries. Editorial signals can promote specific stories.</p>
+<p><strong>Interviewer:</strong> Knowledge graph?</p>
+<p><strong>Candidate:</strong> Separate structured store of entities, attributes, relations. Entity recognition in the query (NER) detects e.g. "Barack Obama." Lookup in the knowledge graph retrieves attributes. The result page shows a knowledge panel with structured info, plus a direct-answer snippet for simple factual queries. Fact provenance — what source supports each fact — is critical to handle errors.</p>
+<p><strong>Interviewer:</strong> Auto-suggest?</p>
+<p><strong>Candidate:</strong> Trie of popular queries with frequency, sharded by prefix. As user types, server returns top completions. Personalization layer re-ranks based on user history and location. Sub-50ms latency. Cached client-side for common prefixes.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Index replicated to each region. Queries routed to nearest region. Index updates flow from primary indexing pipeline to all regions; replication lag is minutes. Knowledge graph replicated globally. Per-region capacity sized for local QPS.</p>
+<p><strong>Interviewer:</strong> Spam?</p>
+<p><strong>Candidate:</strong> Spam detection runs at parse time and indexing time. Signals: cloaking, doorway pages, link spam, content quality. Penalty scores reduce the page's rank. Outright spam is excluded from index. Manual review for edge cases; webmaster tools allow appeals.</p>
+<p><strong>Interviewer:</strong> Personalization?</p>
+<p><strong>Candidate:</strong> Opt-in. User's recent searches, location, language preferences influence ranking. Personalization features computed online from user profile, applied at the final ranking stage. Bounded — not so heavy that ranking becomes unpredictable. Privacy considerations: explicit user controls; anonymized signals.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Pipeline from crawler to inverted index to query serving. Document-based shard partitioning. Scatter-gather with hedged requests and partial-response tolerance for tail latency. Multi-stage ranking from cheap per-shard scoring to expensive ML at the top. Two-tier index for freshness. Knowledge graph for entity answers. Auto-suggest separate path. Multi-region replicas. The hardest performance problem is tail latency; the hardest correctness problem is ranking quality and spam handling.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: query latency, freshness, scale.</li>
+<li>Invariant: sub-second p99 over tens of billions of pages.</li>
+<li>Pipeline: crawl → parse → index → serve.</li>
+<li>Document-based shard partitioning.</li>
+<li>Scatter-gather with hedged requests.</li>
+<li>Multi-stage ranking (cheap → expensive).</li>
+<li>Two-tier index for freshness.</li>
+<li>Knowledge graph for entity answers.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Google Search is scatter-gather over a document-sharded inverted index with multi-stage ranking. Cheap per-shard scoring prunes candidates; expensive ML ranks the top. Hedged requests and partial-response tolerance keep tail latency tame. A two-tier index merges live and main for freshness. Knowledge graph powers entity answers. Auto-suggest is a separate fast path. The dominant performance problem is scatter-gather tail latency; the dominant correctness problem is ranking quality.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Scatter-gather over document-sharded inverted index."</li>
+<li>"Multi-stage ranking: cheap features prune, expensive features rank."</li>
+<li>"Hedged requests and partial-response tolerance are how we handle scatter-gather tail."</li>
+<li>"Two-tier index: main batch + live tier for freshness."</li>
+<li>"Knowledge graph powers direct entity answers; text retrieval handles the rest."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

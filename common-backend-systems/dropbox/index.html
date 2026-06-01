@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dropbox — File Sync Across Devices (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Dropbox — File Sync Across Devices (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Easy · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build Dropbox: a desktop client and web app where a user drops a file into a folder on one device and it appears on all their other devices within seconds. 500M users, average user has 100 GB, files range from a 10 KB text note to a 5 GB video.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Upload a file from any device and have it persist.
+- See and download every file the user owns from any other device.
+- Sync changes automatically — modify locally, the modification propagates.</p>
+<p>I'd defer sharing, comments, and selective sync; mention them so the interviewer knows they're scoped out.</p>
+<p><strong>Non-functional</strong>
+- Durability is the headline — Dropbox losing your file is the end of trust. Eleven nines for file bytes.
+- Sync latency target: seconds, not minutes, for small files.
+- Bandwidth efficiency — never re-upload bytes the server already has.
+- Support files up to ~50 GB; chunking is a hard requirement.
+- Strong read-after-write for metadata so the file you just uploaded shows up everywhere immediately.</p>
+<p><strong>Capacity</strong>
+- 500M users × 100 GB = 50 EB. Hot tier is far smaller — most bytes are cold.
+- Average file ~1 MB, chunked at 4 MB; 100B chunks lifetime.
+- Metadata is large but manageable; bytes dominate. If chunk metadata is ~100 B × 100B chunks × 3 replicas, that is ~30 TB. Object storage for 50 EB is the cost center.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>User</strong> — owns files, devices.</li>
+<li><strong>File</strong> — <code>file_id</code>, <code>owner_id</code>, <code>path</code>, <code>size</code>, <code>version</code>, <code>content_hash</code>.</li>
+<li><strong>Chunk</strong> — <code>chunk_id</code> (= content hash), <code>size</code>, <code>storage_url</code>. Deduped globally.</li>
+<li><strong>Device</strong> — <code>device_id</code>, last sync cursor.</li>
+<li><strong>Event</strong> — append-only log of file changes per user, drives sync.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST  /v1/upload/initiate       { path, size, chunk_hashes[] } → { upload_id, missing_chunks[] }
+PUT   /v1/upload/{upload_id}/chunk/{idx}  (binary)             → { ok }
+POST  /v1/upload/{upload_id}/commit                            → { file_id, version }
+GET   /v1/files?cursor=...      → { changes[], next_cursor }   // long-poll or WebSocket
+GET   /v1/files/{file_id}/download/{idx}                        → 302 to chunk URL
+</code></pre>
+<p>The two-phase upload (initiate → chunk PUTs → commit) lets the server tell the client which chunks it already has so the client only ships novel bytes.</p>
+<p>The sync cursor is opaque and server-issued: <code>{user_id, event_seq, device_id}</code>. The server never trusts a client-provided path diff; clients replay the per-user event log from the cursor.</p>
+<hr />
+<h2 id="4-data-flow-5-min">4. Data Flow (~5 min)</h2>
+<p>Upload: client chunks the file → hashes each chunk → calls <code>initiate</code> with the hash list → server replies with which chunks are missing → client uploads only those → calls <code>commit</code> → server writes a new file version and appends an event to the owner's event log.</p>
+<p>Download/sync: each client holds a cursor into the user's event log. A long-poll connection wakes when new events arrive; the client fetches the file metadata, sees which chunks it doesn't have, and downloads only those.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Client</strong> does all chunking and hashing locally (block-level deduplication, ~4 MB chunks).</li>
+<li><strong>API gateway / metadata service</strong> handles auth, upload coordination, and the events feed.</li>
+<li><strong>Metadata store (MySQL, sharded by user_id)</strong> holds files, versions, and chunk-id lists. Sharding by user keeps a user's data co-located.</li>
+<li><strong>Chunk store (object store like S3)</strong> holds raw chunks keyed by content hash. Eleven nines, geo-replicated.</li>
+<li><strong>Event log (per user)</strong> in Kafka or a sharded MySQL table; sync clients read from their cursor.</li>
+<li><strong>Notification service</strong> holds long-poll/WebSocket connections to clients and pushes "new event" pokes; clients then re-pull.</li>
+<li><strong>CDN</strong> sits in front of the chunk store so popular chunks (rare in Dropbox but real for shared files) don't always hit origin.</li>
+</ol>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code>+---------------------------+
+| DESKTOP / MOBILE CLIENTS  |
++------------+--------------+
+          |
+          +-- POST /upload/initiate,/commit --&gt; +-----------------------------+
+          |                                      | API Gateway / Metadata Svc  |
+          +-- GET /files?cursor,/metadata -----&gt; | auth, paths, versions       |
+          |                                      +----+------------+-----------+
+          +-- PUT signed chunk URLs -----------------+            |
+                                    missing  | append/read
+                                    chunks   | (user_id,seq)
+                                    v     v
+                                +------------+ +----------------+
+                                | Chunk Edge | | Sync/Event API |
+                                | CDN + URLs | | cursor service |
+                                +------+-----+ +-------+--------+
+                                    | miss          | poke only
+                                    v               v
+                             +---------------------+ +------------------+
+                             | Geo Object Store    | | Notification Svc |
+                             | chunks/{hash}/bytes | | WS / long-poll   |
+                             +----------+----------+ +------------------+
+                                  |
++---------------------------------------------------------+----------------+
+| Stores / Caches                                                          |
+| MetadataDB: (user_id,path)-&gt;file_id, current version                     |
+| Version: version:{file_id}:{v}-&gt;ordered chunk_id list                    |
+| Upload: upload:{upload_id}-&gt;missing chunk bitmap, TTL 24h                |
+| ChunkIndex: chunk:{sha256}-&gt;refcount,size,storage class                  |
+| EventLog: (user_id,seq)-&gt;change event, hot 30-90d                        |
+| Object: chunks/{hash_prefix}/{chunk_id}-&gt;4 MB encrypted chunk            |
++--------------------------+----------------------------------------------+
+                  | metadata/cache miss
+                  v
+            +--------------------+
+            | MySQL Metadata DB  |
+            | source of truth    |
+            | shard=user_id      |
+            +--------------------+
+</code></pre>
+<p>End-to-end I'd narrate: Alice edits a doc on her laptop → laptop computes new chunk hashes → initiate shows server has 95% of them → laptop uploads the 5% delta → commit writes version 7 → event lands in Alice's log → Alice's phone is long-polling, wakes up, fetches version 7 metadata, downloads the same 5% delta. Phone is now in sync.</p>
+<p>Concrete stores:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key pattern</th>
+<th>Value / data structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>File metadata</td>
+<td><code>(user_id, path)</code> and <code>file_id</code></td>
+<td>file row, current version</td>
+<td style="text-align: right;">~500 B</td>
+<td>forever</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Version table</td>
+<td><code>(file_id, version)</code></td>
+<td>chunk manifest list</td>
+<td style="text-align: right;">~100 B + 32 B/chunk</td>
+<td>forever / compact old</td>
+<td><code>file_id</code></td>
+</tr>
+<tr>
+<td>Chunk index</td>
+<td><code>chunk_id = sha256(bytes)</code></td>
+<td>refcount, size, storage class</td>
+<td style="text-align: right;">~100 B</td>
+<td>while refcount &gt;0</td>
+<td><code>chunk_id</code></td>
+</tr>
+<tr>
+<td>Object store</td>
+<td><code>chunks/{hash_prefix}/{chunk_id}</code></td>
+<td>encrypted chunk bytes</td>
+<td style="text-align: right;">4 MB target</td>
+<td>forever / lifecycle tier</td>
+<td><code>chunk_id</code></td>
+</tr>
+<tr>
+<td>Event log</td>
+<td><code>(user_id, seq)</code></td>
+<td>file change event</td>
+<td style="text-align: right;">~200 B</td>
+<td>30-90 days hot</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Upload session</td>
+<td><code>upload:{upload_id}</code></td>
+<td>missing chunks bitmap, path, owner</td>
+<td style="text-align: right;">~1 KB</td>
+<td>24 h</td>
+<td><code>upload_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>Upload path, stores touched:</p>
+<ol>
+<li>Client hashes chunks locally and calls <code>upload/initiate</code> with <code>chunk_hashes[]</code>.</li>
+<li>Metadata service checks chunk index by <code>chunk_id</code> in parallel and creates <code>upload:{upload_id}</code> listing only missing chunks.</li>
+<li>Client uploads missing chunks directly to object storage using signed URLs; each <code>PUT</code> is idempotent on <code>(upload_id, idx)</code>.</li>
+<li>Commit transaction writes file metadata, version manifest, chunk refcount increments, and the next <code>(user_id, seq)</code> event.</li>
+<li>Notification service wakes devices; each device reads <code>/files?cursor=seq</code>, then downloads only chunks absent from local disk.</li>
+</ol>
+<p>Sync/download path, hot vs cold:</p>
+<pre><code> HOT DEVICE — cursor inside event-log retention
+
+ Device ─▶ GET /v1/files?cursor={user_id, seq=900, device_id}
+          │
+          ▼
+ Metadata service reads EventLog[(user_id, seq &gt; 900)]
+          │
+          ├──▶ batch-read File metadata / Version manifests by file_id
+          ├──▶ create signed chunk URLs for chunk_id misses
+          └──▶ return changes[] + next_cursor={seq=917}
+          │
+          ▼
+ Device compares local chunk hashes, downloads missing chunks in parallel
+ through CDN/Object Store keyed by chunk_id, applies local rename/write,
+ then persists next_cursor on disk.
+
+ COLD DEVICE — cursor expired or brand-new device
+
+ Device ─▶ GET /v1/files?cursor=expired
+          │
+          ▼
+ Server returns cursor_expired + snapshot_cursor={user_id, path_after}
+          │
+          ▼
+ Device paginates MetadataDB[(user_id, path)] in path order,
+ receives current manifests, downloads missing chunk_ids, then switches
+ back to EventLog from the snapshot high-water mark.
+</code></pre>
+<p>Capacity sanity by store: object bytes dominate at 50 EB logical; even with erasure coding around 1.4x, storage and egress are the headline. At 4 MB target chunks, the upper bound is 12.5T logical chunk references; a 32 B manifest reference is ~400 TB raw, and a 100 B chunk-index row is ~1.25 PB raw before replication and dedup wins. File rows can be PB-scale if users really average tiny files, so old versions and deleted metadata need compaction/lifecycle rules. The event log is smaller: 500M users × 5 metadata changes/day × 200 B × RF=3 is ~1.5 TB/day, or ~135 TB for a 90-day hot window. Upload sessions are tiny by comparison: 10M concurrent sessions × 1 KB is ~10 GB with a 24 h TTL.</p>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Chunking and deduplication.</strong> Fixed-size 4 MB chunks are simpler and survive arbitrary insertions poorly. Content-defined chunking (Rabin fingerprint) survives inserts in the middle of a file but is more expensive client-side. I'd default to fixed chunks for the interview and call out CDC as the production answer for documents that get edited in place.</p>
+<p><strong>Why object store + sharded MySQL.</strong> The byte store wants durability, lifecycle tiers, and cheap massive capacity; S3/GCS-style object storage beats HDFS here because clients need signed object URLs and cross-region durability without operating storage nodes. Metadata wants transactions around path rename/version/event append for one user, so sharded MySQL by <code>user_id</code> is honest. Cassandra/DynamoDB can work for metadata if you accept weaker multi-row transactions or add an application transaction log.</p>
+<p>Be ready for "why not put metadata in the object store too?" The answer is that path rename, version conflict detection, and event append are small transactional writes keyed by <code>user_id</code>; object stores are excellent for immutable chunks but clumsy for ordered per-user metadata.</p>
+<p><strong>Conflict resolution.</strong> Two devices edit the same file offline. Server keeps both versions: <code>file.txt</code> and <code>file (Bob's conflicted copy).txt</code>. Last-writer-wins on metadata, but never silently discard bytes. Vector clocks per device would let us detect the conflict precisely.</p>
+<p><strong>Sync protocol.</strong> Long-poll with cursor is the simple answer. For active users, upgrade to a WebSocket. The event log per user means a client coming back online after a week just replays everything from its cursor — no diff computation needed.</p>
+<p><strong>Two views of the same user state.</strong> The path tree <code>(user_id, path)</code> is the current view, optimized for "show me my Dropbox." The event log <code>(user_id, seq)</code> is the change view, optimized for "tell this device what changed since seq 900." They are not competing sources of truth: commit writes both in one metadata transaction, and the snapshot fallback stitches them together with a high-water mark.</p>
+<p>Sync degradation state:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Latency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>active</td>
+<td>WebSocket poke + cursor replay</td>
+<td>event log hot partition</td>
+<td>seconds</td>
+</tr>
+<tr>
+<td>dormant</td>
+<td>cursor older than hot log</td>
+<td>metadata tree snapshot + recent events</td>
+<td>tens of seconds for large trees</td>
+</tr>
+<tr>
+<td>exhausted</td>
+<td>local state unknown/corrupt</td>
+<td>full manifest walk by <code>(user_id, path)</code></td>
+<td>minutes, resumable</td>
+</tr>
+<tr>
+<td>cold bytes</td>
+<td>chunk in archive tier</td>
+<td>restore request then delayed download</td>
+<td>minutes-hours</td>
+</tr>
+</tbody>
+</table>
+<p>The cursor carries <code>event_seq</code>; if it falls behind retention, the server returns <code>cursor_expired</code> and the client switches to snapshot sync instead of silently missing changes.</p>
+<p><strong>Hot vs cold storage.</strong> 90% of bytes are never read after upload. Tier chunks: hot (S3 standard) for recent and frequently accessed, cold (Glacier-style) for chunks untouched for 90 days. Metadata says where each chunk lives; rehydrate on first read.</p>
+<p>Capacity math: 50 EB logical bytes can drop with global dedup, but end-to-end encryption or per-user keys reduce cross-user dedup. With 4 MB chunks, 50 EB is roughly 12.5 trillion logical chunk references; the manifest/reference metadata is tens to hundreds of TB, while object bytes are exabytes. Dominant cost is object storage and egress, not the metadata DB.</p>
+<p><strong>Large file uploads.</strong> Resumable: each chunk PUT is idempotent on <code>(upload_id, idx)</code>. Client retries any chunk that failed. <code>commit</code> is the atomic point — partial uploads are garbage-collected after a TTL.</p>
+<p><strong>Edge stress tests.</strong> A rename storm in a large folder is metadata-heavy, so the server batches events under one parent-operation id and lets devices apply them in order from the event log. A hot chunk from a widely shared file is served through CDN and object-store range cache; the chunk index stays keyed by <code>chunk_id</code>, so it does not become a per-user hot key. A burst of uploads from one user is fenced by per-user commit sequencing: chunks can upload in parallel, but metadata commits serialize by <code>(user_id, seq)</code>. Multi-region drift is handled by assigning a metadata home region per user and replicating chunks globally; on failover, the new region resumes from the last replicated event sequence and rejects stale commits with an older metadata epoch. A brand-new device never replays years of events; it starts from the path snapshot and only then follows the live log.</p>
+<p><strong>Interview punch line for the edge cases:</strong> bytes can be parallel and content-addressed, but metadata must be ordered per user. That is the line that keeps sync predictable when devices go offline, regions fail over, or files are renamed in bulk.</p>
+<p><strong>End-to-end encryption (optional).</strong> Client encrypts chunks before upload with a per-file key wrapped by the user's master key. Server stores ciphertext only. Loses server-side dedup across users — call that out as the explicit tradeoff.</p>
+<p><strong>What I'd defer.</strong> Sharing and permissions, real-time collaborative editing on the same file, mobile bandwidth optimization, abuse detection on shared links.</p>
+<p><strong>Interview punch line:</strong> Dropbox is two systems joined by a cursor: immutable content-addressed bytes, and strongly consistent per-user metadata/events. Sync stays simple because devices replay ordered server events rather than guessing diffs.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

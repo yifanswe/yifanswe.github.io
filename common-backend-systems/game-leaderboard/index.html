@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Game Leaderboard (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Game Leaderboard (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Medium · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build a multiplayer game leaderboard. Players post scores; we show the global top 100, the player's rank, and the player's neighbors (±5 around them). 50M monthly active players, peak ~100k score writes/sec during weekend tournaments. Leaderboards for multiple scopes: global, friends-only, region, time window (daily / weekly / all-time).</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Player submits a score; system records and updates leaderboard.
+- Query top-K globally / for a region / for the player's friends.
+- Query the player's own rank + their N neighbors.</p>
+<p>I'd defer cheat detection depth and ranking tie-break rules beyond simple highest-score-wins.</p>
+<p><strong>Non-functional</strong>
+- Top-K query p99 &lt; 100 ms.
+- Rank-of-player query p99 &lt; 200 ms.
+- Eventual consistency on global ranks (&lt; 5 s) is fine; player-self rank should be near-real-time.
+- Handle write spikes during weekend tournaments.</p>
+<p><strong>Capacity</strong>
+- 50M players; daily leaderboard ~5M active; weekly ~15M; all-time ~50M entries.
+- 100k score writes/sec peak.
+- Redis memory is manageable but not free: daily 5M × ~100 B × RF=2 is ~1 GB; weekly 15M is ~3 GB; all-time 50M is ~10 GB. The dominant long-term cost is score history, not the top-K index.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Player</strong> — <code>player_id</code>, region, friends.</li>
+<li><strong>Score</strong> — <code>(player_id, scope, score, ts)</code>. Scope = <code>daily</code>, <code>weekly</code>, <code>all</code>, <code>region:X</code>, etc.</li>
+<li><strong>Leaderboard</strong> — derived, indexed by score.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST  /v1/scores                     { score, mode }                          → { rank, percentile }
+GET   /v1/leaderboards/{scope}?top=100                                        → { entries[] }
+GET   /v1/leaderboards/{scope}/me                                             → { rank, score, neighbors[] }
+GET   /v1/leaderboards/friends/me                                             → { friends_ranked[] }
+</code></pre>
+<p>User from token.</p>
+<p>The rank-neighbor cursor is server-issued and encodes <code>{scope, player_id, rank_snapshot_version, offset}</code> so scrolling around a player does not drift while new scores arrive.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Score ingest.</strong> Score POST → validated (basic sanity, anti-cheat hooks) → written to scores table (sharded by <code>player_id</code>) → published to Kafka for downstream.</li>
+<li><strong>Leaderboard store: Redis sorted set per scope.</strong> <code>ZADD leaderboard:daily:2026-05-18 score player_id</code>. Per scope, one ZSET. <code>ZADD GT</code> keeps only the player's best score.</li>
+<li><strong>Top-K queries.</strong> <code>ZREVRANGE leaderboard:daily 0 99 WITHSCORES</code> — O(K+log N). Cached briefly (1 s) for popular scopes.</li>
+<li><strong>Player rank query.</strong> <code>ZREVRANK leaderboard:daily player:42</code> — O(log N). Neighbors via <code>ZREVRANGE</code> around that rank.</li>
+<li><strong>Friend leaderboards.</strong> Player's friend list intersected with a global ZSET; per-friend scores fetched in a single <code>ZMSCORE</code> call, then sorted client-side.</li>
+<li><strong>Multiple scopes.</strong> Daily/weekly ZSETs roll over at boundary — drop yesterday's daily after the day ends. All-time keeps growing; periodically trim to top N + some buffer.</li>
+<li><strong>Persistence.</strong> Authoritative scores in MySQL (sharded by <code>player_id</code>) — Redis is the index. On Redis loss, rebuild from MySQL.</li>
+<li><strong>Region scopes.</strong> Separate ZSET per region (<code>leaderboard:region:us-west</code>). Lower cardinality, smaller sets, faster queries.</li>
+</ol>
+<p>End-to-end narration: Alice scores 9500 → POST writes the score row, <code>ZADD GT leaderboard:daily:2026-05-18 9500 alice</code>, <code>ZADD GT leaderboard:all 9500 alice</code>. Service returns Alice's new rank (<code>ZREVRANK leaderboard:daily alice</code> → rank 5, ZREVRANGE 0 9 returns top 10). Friend leaderboard: pull Alice's friends [bob, carol, ...] → <code>ZMSCORE leaderboard:daily alice bob carol ...</code> → sort descending → render.</p>
+<p>Concrete stores:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Score history</td>
+<td><code>score:{player_id}:{mode}:{ts}</code> row</td>
+<td style="text-align: right;">~80 B</td>
+<td>1 year raw, roll up after</td>
+<td><code>player_id</code></td>
+</tr>
+<tr>
+<td>Redis leaderboard</td>
+<td><code>lb:{scope}:{window}:{shard}</code> ZSET member=<code>player_id</code>, score=<code>score.tie_ts</code></td>
+<td style="text-align: right;">~100 B/member</td>
+<td>daily 48 h, weekly 8 weeks, all-time</td>
+<td><code>scope + player_id % N</code></td>
+</tr>
+<tr>
+<td>Top-K cache</td>
+<td><code>top:{scope}:{window}</code> packed list of 100 entries</td>
+<td style="text-align: right;">~2 KB</td>
+<td>1 s</td>
+<td><code>scope</code></td>
+</tr>
+<tr>
+<td>Friends graph</td>
+<td><code>friends:{player_id}</code> set/list</td>
+<td style="text-align: right;">~16 B/friend</td>
+<td>forever</td>
+<td><code>player_id</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">             +-------------------------------+
+             | GAME CLIENT                   |
+             | player device / tournament UI |
+             +------+-----------+------------+
+                |           |
+         POST /v1/scores    |           | GET /v1/leaderboards/{scope}
+                |           | GET /v1/leaderboards/{scope}/me
+                |           | GET /v1/leaderboards/friends/me
+                v           v
+       +----------------+  +----------------+  +-------------------+
+       | Score API      |  | Leaderboard    |  | Friends API       |
+       | sanity + anti- |  | API top/rank   |  | friend scope      |
+       | cheat hooks    |  | + neighbors    |  | projection        |
+       +-------+--------+  +-------+--------+  +---------+---------+
+           |                   |                     |
+           | publish score.updated                  | reads
+           v                   v                     v
+       +----------------+  +-----------------------------------------+
+       | Kafka          |-&gt;| Leaderboard Updater                     |
+       | score.updated  |  | ZADD GT daily/weekly/all-time/region    |
+       +----------------+  +-------------------+---------------------+
+                           |
+                           v
+       +-------------------------------------------------------------+
+       | STORE / CACHE GROUP                                        |
+       | MySQL score:{player_id}:{mode}:{ts} authoritative history  |
+       | Redis lb:{scope}:{window}:{shard} ZSET member=player_id    |
+       | Redis top:{scope}:{window} packed top 100, TTL 1 s         |
+       | friends:{player_id} set/list, profile MGET cache           |
+       +-------------------------+-----------------------------------+
+                 ^
+                 | top cache miss -&gt; parallel
+                 | ZREVRANGE shards + profile hydrate
+                 | Redis rebuild -&gt; replay MySQL scores
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Why Redis sorted sets.</strong> ZSET operations are O(log N) with very low constants — perfect for leaderboards. Range queries (<code>ZREVRANGE</code>) and rank lookups (<code>ZREVRANK</code>) at sub-millisecond. Memory cost: ~80 B per entry, so 50M players × 1 leaderboard ≈ 4 GB. Cluster shards by leaderboard key.</p>
+<p>Why not MySQL-only or Cassandra-only: they can store the authoritative score, but rank and neighbor queries need ordered-set operations on every write. Redis ZSET is the read index; MySQL is the source of truth. If an interviewer pushes on Redis durability, the answer is rebuildability plus RF/AOF, not treating Redis as the only copy.</p>
+<p>Capacity to say out loud: daily + weekly + all-time + 10 region boards are roughly <code>(5M + 15M + 50M + 50M) × 100 B × RF=2</code>, about 24 GB of Redis logical leaderboard entries before allocator overhead. MySQL score history is larger: 100k/sec peak is bursty, but even 1B score rows/year × 80 B × RF=3 is ~240 GB before indexes. The knobs are cap low-value windows, archive raw rows after season close, and keep all-time exact only for top ranks plus player-owned lookup.</p>
+<p><strong>Scaling a single hot leaderboard.</strong> Global daily leaderboard sees all 100k writes/sec. One Redis instance maxes out around 100k ops/sec. Mitigations:
+- <strong>Shard the leaderboard</strong> into N sub-ZSETs by <code>player_id % N</code>. Top-K reads merge sort across shards.
+- <strong>Write-batching</strong>: accumulate writes for 100 ms in the ingest tier, batch into one Lua-pipelined call. Lowers RTT cost; same total work but fewer round trips.</p>
+<p><strong>Top-K from sharded leaderboard.</strong> Each shard returns its local top K. Merge-sort to produce global top K. Same trick as YouTube Top-K (need local K' &gt; K to guarantee correctness).</p>
+<p>Top-K read path: client -&gt; leaderboard API -&gt; top-K cache lookup; on miss, parallel <code>ZREVRANGE lb:{scope}:{window}:{0..N-1} 0 K' WITHSCORES</code>; API merge-sorts, hydrates player profiles in one batch, writes <code>top:{scope}:{window}</code> for 1 s, returns.</p>
+<pre><code class="language-text">Top-K cache miss
+    API
+     |-- shard 0: ZREVRANGE 0..K'
+     |-- shard 1: ZREVRANGE 0..K'
+     |-- shard N: ZREVRANGE 0..K'
+     '-- profile MGET for winners
+                -&gt; merge by score/tie_ts -&gt; top:{scope}:{window} TTL 1s -&gt; client
+</code></pre>
+<p>This is a two-view design: the score row is content, while <code>lb:{scope}:{window}:{shard}</code> is the ranking index and <code>top:{scope}:{window}</code> is the read snapshot. They are derived from the same score event, so the service can rebuild every view from score history.</p>
+<p><strong>Rank of arbitrary player from sharded leaderboard.</strong> Harder. <code>ZREVRANK player_42 in shard 5</code> only gives local rank. To get global rank, sum <code>ZCOUNT score_above</code> across all shards. Implement as a single Lua-pipelined call; still O(N_shards × log N).</p>
+<p>Rank read path: find <code>player_id % N</code> for the local score, fetch score with <code>ZSCORE</code>, then parallel <code>ZCOUNT shard (score,+inf)</code> across all shards. Neighbor rows come from local shard plus nearby candidate ranges from adjacent score bands, then the API merge-sorts around the global rank.</p>
+<p>The rank cursor stores <code>{scope, window, player_id, score_watermark, shard_offsets[]}</code>. If new scores arrive while the user scrolls neighbors, the cursor keeps the page anchored to the snapshot score rather than drifting.</p>
+<p><strong>Daily/weekly rollover.</strong> Daily ZSET key includes the date; at midnight, new key starts being used; old key kept for read access for 24 h then archived to S3. Weekly aggregates from daily — score = max over the week, stored in <code>leaderboard:weekly:2026-W20</code>.</p>
+<p><strong>All-time leaderboard size.</strong> 50M entries × 80 B = 4 GB Redis memory. Manageable. Trim to top 10k + each player's best (the player needs to know "where they rank" in tail too). Use a hybrid: top 10k in Redis, all others in a sharded MySQL index for the long tail.</p>
+<p>State transition for the long tail:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th style="text-align: right;">Latency budget</th>
+<th>Cursor/state</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot rank</td>
+<td>Exact Redis</td>
+<td>sharded ZSET + <code>ZCOUNT</code></td>
+<td style="text-align: right;">&lt;200 ms</td>
+<td><code>score_watermark</code></td>
+</tr>
+<tr>
+<td>Tail rank</td>
+<td>Estimated percentile</td>
+<td>MySQL score histogram</td>
+<td style="text-align: right;">&lt;300 ms</td>
+<td><code>score_bucket</code></td>
+</tr>
+<tr>
+<td>Exact async</td>
+<td>Background recompute</td>
+<td>MySQL ordered index</td>
+<td style="text-align: right;">seconds</td>
+<td>job id returned internally</td>
+</tr>
+<tr>
+<td>Rebuilt</td>
+<td>Fresh Redis view</td>
+<td>replayed score history</td>
+<td style="text-align: right;">minutes after incident</td>
+<td>versioned window</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Friend leaderboards at scale.</strong> Player with 200 friends → <code>ZMSCORE</code> for 200 player_ids in one round trip. Sort 200 entries client-side. Fast (&lt; 10 ms).</p>
+<p><strong>Anti-cheat / validation.</strong> Server-side score validation: signed score from the game client, sanity checks (impossible score patterns), rate-limit submissions per player. Cheaters' entries quarantined (separate ZSET) rather than removed.</p>
+<p><strong>Replay / disaster.</strong> Redis ZSETs are an index; authoritative store is MySQL. On Redis cluster loss, rebuild from MySQL by replaying all-time and recent scores.</p>
+<p><strong>Graceful degradation.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th>User-visible behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Global ZSET hot</td>
+<td>Batch writes, serve cached top 100</td>
+<td>Redis shards + 1 s cache</td>
+<td>top-K may lag 1-2 s</td>
+</tr>
+<tr>
+<td>Player in trimmed all-time tail</td>
+<td>Estimate percentile, exact rank async</td>
+<td>MySQL score index</td>
+<td>show percentile first</td>
+</tr>
+<tr>
+<td>Redis shard lost</td>
+<td>Freeze affected scope, rebuild from score history</td>
+<td>MySQL replay</td>
+<td>stale but available top-K</td>
+</tr>
+<tr>
+<td>Friend list huge</td>
+<td>Cap to active friends, paginate</td>
+<td>friends graph + ZMSCORE</td>
+<td>exact within page</td>
+</tr>
+<tr>
+<td>Tournament spike</td>
+<td>Contest queue isolated from casual modes</td>
+<td>dedicated Redis/Kafka pool</td>
+<td>casual ranks lag</td>
+</tr>
+</tbody>
+</table>
+<p>Interview punch line: "The leaderboard itself is a secondary index; the durable fact is the player's best score, so losing Redis hurts freshness, not correctness."</p>
+<p><strong>What I'd defer.</strong> Detailed anti-cheat ML, season pass / battle pass progression, multi-game leaderboards, cross-platform identity, rewards distribution.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

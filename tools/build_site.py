@@ -72,16 +72,16 @@ SECTIONS = [
              "0.01% of keys take 50% of traffic; one shard melts."),
             ("strong-consistency-under-contention.md", "Strong Consistency Under Contention",
              "N actors race for 1 resource; the loser must see a clear “no”."),
-            ("idempotency-exactly-once.md", "Idempotency / Exactly-Once",
-             "Network retries cause duplicates; “exactly once” is a lie."),
+            ("idempotency-exactly-once.md", "Idempotency / Deduplicating Retries",
+             "Same request arrives N times; make repeats no-ops."),
             ("search-and-ranking.md", "Search and Ranking",
              "Find top K from billions in 100ms; recall + ranking split."),
             ("geo-spatial-queries.md", "Geo / Spatial Queries",
              "“What’s near me” over moving entities; lat/long does not shard."),
             ("real-time-aggregation.md", "Real-Time Aggregation",
              "Continuous compute over a firehose, with late events."),
-            ("coordination-exactly-one-execution.md", "Coordination / Exactly-One Execution",
-             "Only one node should act, even under partitions."),
+            ("coordination-exactly-one-execution.md", "Coordination / Single Active Node",
+             "Avoid split-brain: two nodes both acting as leader."),
             ("ordering-causal-consistency.md", "Ordering / Causal Consistency",
              "Events must respect “happens-before”; total order is expensive."),
             ("durability-at-scale.md", "Durability at Scale",
@@ -105,11 +105,11 @@ ARTICLE_TEMPLATE = """<!DOCTYPE html>
     <title>{title} — {author}</title>
     <link rel="stylesheet" href="/css/style.css">
     <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
-    <link rel="stylesheet" href="/css/style/github.min.css">
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
     <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
     <script src="/js/jquery.min.js"></script>
     <script src="/js/highlight.min.js"></script>
-    <script>hljs.initHighlightingOnLoad();</script>
+    <script src="/js/highlight-init.js"></script>
 </head>
 <body>
 <div class="container">
@@ -215,41 +215,68 @@ def strip_first_h1(text: str) -> str:
     return text
 
 
-def rewrite_sibling_links(html_text: str, slugs: set[str]) -> str:
-    """Make in-section cross-references resolve on the live site.
+# Source directories that have been published into a site section, so links
+# to their `.md` files can be rewritten to the live page. Slugs are the file
+# stem with underscores normalized to hyphens (see build_questions.py).
+PUBLISHED_DIRS = {
+    "questions": "common-backend-systems",
+    "hello_interview_prep": "common-backend-systems",
+}
 
-    `foo.md` -> `../foo/`, `foo.md#anchor` -> `../foo/#anchor`, `index.md` -> `../`.
-    Links pointing outside the section (e.g. ../questions/...) are left untouched.
+_LINK_RE = re.compile(
+    r'<a href="(?P<href>[^"]+?\.md(?:#[^"]*)?)">(?P<text>.*?)</a>', re.S
+)
+
+
+def relink_references(html_text: str, section_slug: str) -> str:
+    """Resolve every `.md` reference link to a live page, or de-link it.
+
+    - `foo.md` / `./foo.md`            -> `/<section_slug>/foo/`   (sibling doc)
+    - `../questions/foo.md`            -> `/common-backend-systems/foo/`
+    - targets with no published page (e.g. ../STAFF_GLOSSARY.md, ../index.md)
+      are unwrapped to plain text so no dead links remain.
+
+    Resolution is verified against the filesystem, so a link only survives if
+    its target page actually exists in the build.
     """
-    def repl(match: re.Match) -> str:
-        target, anchor = match.group("file"), match.group("anchor") or ""
-        if target == "index":
-            return f'href="../{anchor}"'
-        if target in slugs:
-            return f'href="../{target}/{anchor}"'
-        return match.group(0)
+    def repl(match: "re.Match") -> str:
+        href, text = match.group("href"), match.group("text")
+        path, anchor = (href.split("#", 1) + [""])[:2]
+        anchor = f"#{anchor}" if anchor else ""
 
-    pattern = re.compile(r'href="(?P<file>[A-Za-z0-9_-]+)\.md(?P<anchor>#[^"]*)?"')
-    return pattern.sub(repl, html_text)
+        p = path[2:] if path.startswith("./") else path
+        if "/" in p:
+            parent = p.split("/")[-2]
+            target_section = PUBLISHED_DIRS.get(parent)
+        else:
+            target_section = section_slug  # bare filename -> sibling in section
+
+        fname = p.split("/")[-1]
+        slug = fname[:-3].replace("_", "-").lower() if fname.endswith(".md") else ""
+
+        if slug and target_section and (REPO / target_section / slug / "index.html").exists():
+            return f'<a href="/{target_section}/{slug}/{anchor}">{text}</a>'
+        return text  # unpublished target -> drop the link, keep the text
+
+    return _LINK_RE.sub(repl, html_text)
 
 
-def convert_doc(md_text: str, slugs: set[str]) -> str:
+def convert_doc(md_text: str, section_slug: str) -> str:
     md = markdown.Markdown(extensions=MD_EXTENSIONS)
     body = md.convert(strip_first_h1(md_text))
-    return rewrite_sibling_links(body, slugs)
+    return relink_references(body, section_slug)
 
 
 def build_section(section: dict) -> None:
     slug = section["slug"]
     out_root = REPO / slug
     src_dir = section["src_dir"]
-    known_slugs = {Path(f).stem for f, _, _ in section["docs"]}
 
     cards = []
     for filename, title, desc in section["docs"]:
         doc_slug = Path(filename).stem
         md_text = (src_dir / filename).read_text(encoding="utf-8")
-        body = convert_doc(md_text, known_slugs)
+        body = convert_doc(md_text, slug)
 
         page = ARTICLE_TEMPLATE.format(
             title=html.escape(title),

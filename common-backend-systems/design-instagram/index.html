@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Instagram — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Instagram</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Instagram is a media-heavy social feed: photos, videos, stories, reels. It combines the fan-out problem from Twitter with the storage and serving cost of media at scale. The hard part is delivering personalized feeds with media at hundreds of milliseconds while storing exabytes of user content and respecting visibility rules.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every uploaded media is durably stored, viewable by authorized followers/public; the home feed of each follower eventually includes every post from accounts they follow (subject to ranking, visibility, blocks, and policy); media renders at the right resolution for each viewer's device and network; deletes and visibility changes are visible everywhere within seconds.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design photo/video upload and CDN serving, handle the same hybrid fan-out as Twitter, integrate ranking and stories, and reason about transcoding pipelines and storage tiering.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Instagram as a media-heavy feed system: upload pipeline writes original media to object storage, an async transcoding pipeline generates multiple resolutions, CDN serves to viewers. Feed delivery uses hybrid fan-out (push for normal accounts, pull for celebrities) like Twitter. Stories are time-limited, separate from feed. Ranking, search, and recommendations are side services. The interesting decisions are upload + transcoding, CDN sizing, fan-out, stories, and ranking timeouts.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>User uploads photos and videos (single, carousel, reels).</li>
+<li>User follows others, sees a feed.</li>
+<li>Stories: 24-hour ephemeral posts.</li>
+<li>Like, comment, save, share, DM.</li>
+<li>Search by user, hashtag, location.</li>
+<li>Explore page with recommendations.</li>
+<li>Profile page with all posts.</li>
+<li>Editing tools (filters, crops); applied client-side.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Billions of users; hundreds of millions of daily uploads.</li>
+<li>Feed read p99 under 500 ms including media URLs.</li>
+<li>Media URL → first byte under 100 ms via CDN.</li>
+<li>Storage durability 11 nines.</li>
+<li>Stories expire automatically.</li>
+<li>Multi-region.</li>
+<li>Deletes propagate fast.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Live video streaming.</li>
+<li>Shopping checkout.</li>
+<li>Ad targeting and bidding.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>2B+ MAU.</td>
+</tr>
+<tr>
+<td>Uploads</td>
+<td>500M+ photos and videos/day.</td>
+</tr>
+<tr>
+<td>Feed reads</td>
+<td>100B+/day.</td>
+</tr>
+<tr>
+<td>Stories</td>
+<td>500M+/day, 24h retention.</td>
+</tr>
+<tr>
+<td>Average photo</td>
+<td>200 KB-2 MB; video 1-100 MB.</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Exabytes; growing daily.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Feed render under 1 s; media start under 100 ms.</td>
+</tr>
+<tr>
+<td>Celebrity threshold</td>
+<td>Similar to Twitter; tunable.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is media storage and serving cost combined with feed delivery latency.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>User experience</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Upload</td>
+<td>Pick or capture; apply edits; post.</td>
+<td>Reliable async upload; transcode; visible after process.</td>
+</tr>
+<tr>
+<td>Feed</td>
+<td>Home feed of followed accounts.</td>
+<td>Sub-second; ranked.</td>
+</tr>
+<tr>
+<td>Stories</td>
+<td>Horizontal scroll of recent stories.</td>
+<td>Ephemeral 24h; ordered.</td>
+</tr>
+<tr>
+<td>Profile</td>
+<td>User's posts grid.</td>
+<td>Fast read; recent first.</td>
+</tr>
+<tr>
+<td>Explore</td>
+<td>Recommended content.</td>
+<td>Personalized; async pre-compute.</td>
+</tr>
+<tr>
+<td>DM</td>
+<td>Messages (see Messenger design).</td>
+<td>Separate.</td>
+</tr>
+<tr>
+<td>Search</td>
+<td>Users, hashtags, locations.</td>
+<td>Async index.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                    +---------------+
+   Client  --&gt;     | API Gateway    |
+                    +-------+-------+
+                            |
+       +---------+----------+----------+--------+
+       |         |          |          |        |
+       v         v          v          v        v
+ +--------+ +--------+ +--------+ +--------+ +--------+
+ | Upload | | Feed   | | Stories| | Search | | Explore|
+ +---+----+ +---+----+ +---+----+ +---+----+ +---+----+
+     |          |          |          |          |
+     v          v          v          v          v
++--------+ +--------+ +---------+ +-------+ +----------+
+|Storage |  Inbox   |  Stories | |Search | | Reco     |
+|+ Trans-| | Cache  | Store    | | Index | | Pipeline |
+|coder   | +--------+ +---------+ +-------+ +----------+
++---+----+
+    |
+    v
++--------+
+| CDN    |
++--------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Upload service</td>
+<td>Receives media upload; coordinates storage.</td>
+<td>Resumable upload; chunked for large videos.</td>
+</tr>
+<tr>
+<td>Object storage</td>
+<td>Stores original media.</td>
+<td>Durable; geo-replicated.</td>
+</tr>
+<tr>
+<td>Transcoder</td>
+<td>Generates multiple resolutions, formats, thumbnails.</td>
+<td>Async; queue-driven; spot-friendly.</td>
+</tr>
+<tr>
+<td>Post service</td>
+<td>Stores post metadata (caption, refs, location).</td>
+<td>Sharded by post_id (snowflake).</td>
+</tr>
+<tr>
+<td>Follow graph</td>
+<td>Same as Twitter.</td>
+<td>Sharded by user_id.</td>
+</tr>
+<tr>
+<td>Feed service</td>
+<td>Composes home feed via hybrid fan-out.</td>
+<td>Inbox + celebrity pull + ranking.</td>
+</tr>
+<tr>
+<td>Stories service</td>
+<td>Time-limited posts; auto-expire.</td>
+<td>Separate from feed; TTL-driven.</td>
+</tr>
+<tr>
+<td>CDN</td>
+<td>Serves media globally.</td>
+<td>Edge caches by media URL.</td>
+</tr>
+<tr>
+<td>Search index</td>
+<td>Inverted index of users, hashtags, location, captions.</td>
+<td>Eventual.</td>
+</tr>
+<tr>
+<td>Recommender</td>
+<td>Pre-computes Explore feed per user.</td>
+<td>Offline + online ranking.</td>
+</tr>
+<tr>
+<td>Engagement counters</td>
+<td>Likes, comments, saves; like the YouTube counter design.</td>
+<td>Sharded; async aggregation.</td>
+</tr>
+<tr>
+<td>Moderation</td>
+<td>Image/video classification, NSFW detection, policy enforcement.</td>
+<td>Pre-publish + ongoing.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="post">Post</h4>
+<pre><code class="language-text">Post(
+  post_id,
+  author_id,
+  type,                  // photo, carousel, video, reel
+  media_refs: [{media_id, type, durations, resolutions}],
+  caption,
+  hashtags,
+  mentions,
+  location,
+  visibility,            // public, followers, close_friends
+  status,                // active, deleted, hidden
+  posted_at,
+  engagement_counters_ref,
+  version
+)
+</code></pre>
+<h4 id="media">Media</h4>
+<pre><code class="language-text">Media(
+  media_id,
+  original_uri,          // s3://...
+  derived_versions: [{resolution, format, uri, size}],
+  transcoder_status,     // pending, completed, failed
+  width, height, duration,
+  uploaded_by,
+  uploaded_at
+)
+</code></pre>
+<h4 id="story">Story</h4>
+<pre><code class="language-text">Story(
+  story_id,
+  author_id,
+  media_ref,
+  caption?,
+  stickers?,
+  posted_at,
+  expires_at,            // posted_at + 24h
+  view_count,
+  viewers: [user_id, viewed_at]
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">POST   /uploads/init           # returns upload_url, media_id
+PUT    /uploads/{media_id}/chunk?index=
+POST   /uploads/{media_id}/complete
+POST   /posts                  # link media to a post
+DELETE /posts/{id}
+GET    /home                   # home feed
+GET    /users/{id}             # profile
+GET    /users/{id}/stories
+POST   /stories
+GET    /search?q=
+GET    /explore
+POST   /posts/{id}/like
+POST   /posts/{id}/comment
+</code></pre>
+<h3 id="upload-flow">Upload Flow</h3>
+<ol>
+<li>Client requests <code>/uploads/init</code> with media metadata.</li>
+<li>Server returns <code>upload_url</code> and <code>media_id</code>.</li>
+<li>Client uploads media in chunks (resumable) directly to a storage gateway or signed URL.</li>
+<li>Client calls <code>/uploads/{media_id}/complete</code>.</li>
+<li>Server records media as <code>transcoder_status=pending</code>; enqueues transcoder job.</li>
+<li>Client calls <code>POST /posts</code> with <code>media_ids</code> and caption to create the post.</li>
+<li>Post is created with <code>status=processing</code> until media has at least one usable derivative.</li>
+<li>Transcoder generates multiple resolutions (e.g., 240p, 480p, 720p, 1080p for video; thumbnail + multi-res for photo).</li>
+<li>On first derivative ready, post transitions to <code>active</code> and visible.</li>
+<li>Fan-out to follower inboxes begins (for non-celebrities).</li>
+</ol>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Upload and transcode is the bedrock. The post becomes visible the moment a usable derivative exists; subsequent derivatives improve quality for higher bandwidth viewers.</p>
+</blockquote>
+<h3 id="transcoding-pipeline">Transcoding Pipeline</h3>
+<p>For video especially:</p>
+<ul>
+<li>Split source into segments.</li>
+<li>Parallel transcode segments to each target resolution.</li>
+<li>Assemble.</li>
+<li>Generate adaptive streaming manifest (HLS / DASH).</li>
+<li>Thumbnails for scrubbing.</li>
+</ul>
+<p>Storage:</p>
+<ul>
+<li>Originals kept for ability to re-transcode (e.g., new format).</li>
+<li>Derivatives stored separately; can be tier-aged.</li>
+<li>Reference counts; deletes cascade.</li>
+</ul>
+<p>Cost optimization:</p>
+<ul>
+<li>Spot capacity for transcode workers.</li>
+<li>Skip rare-resolution derivatives until requested ("just-in-time" derivatives).</li>
+<li>Tier old originals to cold storage.</li>
+</ul>
+<h3 id="feed-delivery-same-hybrid-fan-out-as-twitter">Feed Delivery (Same Hybrid Fan-out As Twitter)</h3>
+<p>Same model: push for normal accounts, pull for celebrities. Inbox stores post_id only; hydration at read time fetches post + media URLs.</p>
+<p>Ranking is more central to Instagram than to Twitter; the default home feed is heavily ranked rather than chronological.</p>
+<ul>
+<li>Ranking service receives candidate post_ids + viewer context.</li>
+<li>Returns scored ids with strict timeout.</li>
+<li>Features: viewer-author affinity, post engagement, recency, media type, freshness.</li>
+</ul>
+<p>Read path:</p>
+<ol>
+<li>Fetch inbox + celebrity author timelines.</li>
+<li>Apply visibility filters.</li>
+<li>Rank.</li>
+<li>Hydrate post metadata + media URLs.</li>
+<li>Return.</li>
+</ol>
+<p>Media URLs point to CDN; client fetches.</p>
+<h3 id="stories">Stories</h3>
+<p>Stories are not in the main feed. They have their own surface (top of app, horizontal scroll).</p>
+<ul>
+<li>Per-user story list (recent 24h).</li>
+<li>Sorted by recency or by viewer's affinity.</li>
+<li>TTL-driven cleanup: stories older than 24h disappear.</li>
+<li>Viewer state tracked: who viewed which story (for "seen by" indicator).</li>
+<li>High view rate: counter sharding for celebrity stories.</li>
+</ul>
+<p>Storage:</p>
+<ul>
+<li>Stories in their own table partitioned by user_id.</li>
+<li>Background job removes expired stories.</li>
+<li>Media may be retained longer than 24h if user opts in (Highlights).</li>
+</ul>
+<h3 id="cdn-and-media-serving">CDN And Media Serving</h3>
+<ul>
+<li>Media served via CDN with global edge POPs.</li>
+<li>URLs signed for short-lived access (especially for private accounts).</li>
+<li>Adaptive bitrate for video.</li>
+<li>Cache hit ratio is critical for cost; &gt;90% target.</li>
+<li>Per-region warm caches for trending content.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Posts</td>
+<td><code>post_id</code> hash (snowflake)</td>
+<td>Even distribution.</td>
+</tr>
+<tr>
+<td>Media</td>
+<td><code>media_id</code> hash</td>
+<td>Direct lookup.</td>
+</tr>
+<tr>
+<td>Stories</td>
+<td><code>user_id</code> hash, time-bucketed</td>
+<td>Per-user ephemeral list.</td>
+</tr>
+<tr>
+<td>Feed inbox</td>
+<td><code>user_id</code> hash</td>
+<td>Per-user.</td>
+</tr>
+<tr>
+<td>Search index</td>
+<td>Token-shard</td>
+<td>Query-driven.</td>
+</tr>
+<tr>
+<td>Engagement counters</td>
+<td><code>post_id</code> hash, sub-counters for hot posts</td>
+<td>Hot posts.</td>
+</tr>
+<tr>
+<td>Follow graph</td>
+<td><code>user_id</code> hash</td>
+<td>Same as Twitter.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Post creation</td>
+<td>Strong</td>
+<td>Source of truth.</td>
+</tr>
+<tr>
+<td>Media metadata</td>
+<td>Strong on upload completion</td>
+<td>Required for hydration.</td>
+</tr>
+<tr>
+<td>Feed inbox</td>
+<td>Eventually consistent</td>
+<td>Bounded staleness.</td>
+</tr>
+<tr>
+<td>Engagement counters</td>
+<td>Eventually consistent</td>
+<td>UI hint.</td>
+</tr>
+<tr>
+<td>Stories visibility</td>
+<td>Strong on TTL boundary</td>
+<td>Must expire on time.</td>
+</tr>
+<tr>
+<td>Search index</td>
+<td>Eventually consistent</td>
+<td>Seconds lag.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Object storage geo-replicated.</li>
+<li>Originals in primary region; derivatives replicated globally.</li>
+<li>Feed inbox caches per region.</li>
+<li>Per-user home region for writes.</li>
+<li>CDN edges everywhere.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Transcode fails on a video.</td>
+<td>Retry; degrade to lower quality; mark post <code>processing</code> longer.</td>
+<td>Transcode failure rate.</td>
+</tr>
+<tr>
+<td>Hot post overwhelms engagement counter.</td>
+<td>Sub-counter sharding (same as YouTube likes).</td>
+<td>Per-counter QPS.</td>
+</tr>
+<tr>
+<td>CDN miss on viral content.</td>
+<td>Pre-warm; multi-tier cache.</td>
+<td>Origin egress; CDN hit ratio.</td>
+</tr>
+<tr>
+<td>Stories expiry job lags.</td>
+<td>TTL enforced at read time as final gate.</td>
+<td>Expired-still-visible count.</td>
+</tr>
+<tr>
+<td>Upload incomplete (user closes app).</td>
+<td>Resumable; stale partial uploads garbage-collected.</td>
+<td>Incomplete-upload age.</td>
+</tr>
+<tr>
+<td>Inbox cache loss.</td>
+<td>Rebuild from author timelines + follow graph.</td>
+<td>Cache miss rate.</td>
+</tr>
+<tr>
+<td>Mod fails to catch policy violation.</td>
+<td>Async re-classification; user reports.</td>
+<td>Moderation latency.</td>
+</tr>
+<tr>
+<td>Celebrity post fan-out storm.</td>
+<td>Hybrid threshold; backpressure; pull path.</td>
+<td>Fan-out backlog.</td>
+</tr>
+<tr>
+<td>Storage cost growth.</td>
+<td>Cold tiering of old originals; reference-counted dedup.</td>
+<td>Storage growth rate.</td>
+</tr>
+<tr>
+<td>Multi-region replication lag.</td>
+<td>Async; bounded; alert.</td>
+<td>Replication lag.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Stale post visibility after delete.</li>
+<li>Block/visibility violations.</li>
+<li>Story expired-but-shown count.</li>
+<li>Transcode failure rate.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Upload QPS; transcode queue depth.</li>
+<li>Feed read p99.</li>
+<li>CDN hit ratio, origin egress.</li>
+<li>Engagement counter lag.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>DAU; posts per user; engagement rates.</li>
+<li>Stories DAU.</li>
+<li>Explore engagement.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Pre-generating all resolutions wastes storage; on-demand is slower first-view.</li>
+<li>Ranking improves engagement but adds latency; strict timeouts protect feed.</li>
+<li>Per-user inbox materialization is expensive but speeds read.</li>
+<li>Stories 24h TTL is product-defining; cleanup must be reliable.</li>
+<li>Heavy media at scale dominates infrastructure cost; CDN strategy is critical.</li>
+<li>Privacy controls (close friends, private accounts) require filter at read.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Synchronous transcode before post visibility.</td>
+<td>Post visible at first derivative; higher quality lands later.</td>
+</tr>
+<tr>
+<td>Storing media in the post table.</td>
+<td>Separate media store; post holds refs.</td>
+</tr>
+<tr>
+<td>One CDN cache layer.</td>
+<td>Multi-tier: device → edge POP → regional → origin.</td>
+</tr>
+<tr>
+<td>Treating stories like posts.</td>
+<td>Separate surface; TTL; expiry job + read-time gate.</td>
+</tr>
+<tr>
+<td>No ranking timeout.</td>
+<td>Strict timeout + chronological fallback.</td>
+</tr>
+<tr>
+<td>Original media in hot storage forever.</td>
+<td>Tier to cold storage with time.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Upload + transcode</td>
+<td>Resumable upload; async pipeline; first-derivative visibility.</td>
+</tr>
+<tr>
+<td>Feed fan-out</td>
+<td>Hybrid like Twitter; ranking with timeout.</td>
+</tr>
+<tr>
+<td>Stories</td>
+<td>Separate surface; TTL; expiry + read-time gate.</td>
+</tr>
+<tr>
+<td>CDN</td>
+<td>Multi-tier; signed URLs for private; pre-warm for trending.</td>
+</tr>
+<tr>
+<td>Engagement counters</td>
+<td>Sub-counter sharding; periodic recount.</td>
+</tr>
+<tr>
+<td>Storage tiering</td>
+<td>Hot derivatives; cold originals; reference counting.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Separate upload, transcode, post metadata, feed, stories surfaces.</li>
+<li>First-derivative-ready visibility.</li>
+<li>Hybrid fan-out for feed.</li>
+<li>Stories with TTL + read-time gate.</li>
+<li>CDN multi-tier with hit ratio focus.</li>
+<li>Engagement counters sub-sharded.</li>
+<li>Search and recommendation as side systems.</li>
+<li>Multi-region with per-user home + CDN edges.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Instagram is Twitter plus a media pipeline. The fan-out is the same hybrid; the wrinkle is the upload-and-transcode flow that delays full quality but allows fast publication, plus stories with 24h TTL. The dominant infrastructure cost is media storage and CDN serving; the dominant correctness concern is feed delivery and visibility filtering.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Instagram.</p>
+<p><strong>Candidate:</strong> I will design it as a media-heavy social feed: upload pipeline writes media to object storage; transcoder generates multiple resolutions async; post metadata is separate from media; feed delivery uses hybrid fan-out like Twitter; stories are a separate ephemeral surface. The invariant is that uploaded media is durable, posts become visible once at least one derivative is ready, and the feed delivers ranked content from followed accounts within hundreds of milliseconds.</p>
+<p><strong>Interviewer:</strong> Walk me through upload.</p>
+<p><strong>Candidate:</strong> Client requests an upload URL and media_id. Uploads chunks directly to storage via signed URLs. When done, calls complete. Server marks media <code>transcoder_status=pending</code> and enqueues a transcoder job. Client posts the post metadata referencing the media_id. The post is created in <code>processing</code> state, becoming <code>active</code> once any derivative is ready — usually within seconds for photos, longer for video. Higher quality derivatives land later but the post is already visible.</p>
+<p><strong>Interviewer:</strong> Why first-derivative visibility?</p>
+<p><strong>Candidate:</strong> Two reasons. First, perceived publish latency. Users expect their post to appear immediately, not after a 30-second transcode. Second, the lowest quality is enough to render in feed previews; high-quality versions are only needed when the post is viewed full-screen on capable bandwidth. We optimize for "good enough to show" and improve quality asynchronously.</p>
+<p><strong>Interviewer:</strong> Feed delivery — same as Twitter?</p>
+<p><strong>Candidate:</strong> Yes, hybrid fan-out. Normal accounts push post_ids to follower inboxes; celebrities pull at read time. The feed service merges and ranks. Ranking is more aggressive than Twitter — Instagram's default is heavily ranked rather than chronological. Strict timeout on the ranker with chronological fallback.</p>
+<p><strong>Interviewer:</strong> Stories?</p>
+<p><strong>Candidate:</strong> Separate surface. Stories table partitioned by user_id, with <code>expires_at = posted_at + 24h</code>. The story bar at the top of the app shows recent stories from followed users, sorted by recency or affinity. A background job removes expired stories, and the read path filters anything past expiry as a final gate. Story media goes through the same transcoder.</p>
+<p><strong>Interviewer:</strong> A celebrity posts a viral story watched by millions. How does the counter not melt?</p>
+<p><strong>Candidate:</strong> Same pattern as YouTube likes. View counter for the story is sharded into sub-counters; views hash to a random sub-counter for atomic increment. Display sum aggregates. Per-viewer "seen" state is recorded in a separate per-story-per-viewer table if needed for "seen by" indicators, or aggregated to a count for very popular stories.</p>
+<p><strong>Interviewer:</strong> Storage cost?</p>
+<p><strong>Candidate:</strong> Exabytes of media. We tier aggressively. Hot tier (recent posts) on fast object storage. Warm tier (older posts that still get views) in cheaper storage. Cold tier (originals older than X months) in archival storage. Derivatives are smaller and stay in hot tier longer because they're served via CDN. Reference counting handles deletes: when no post references a media_id, it's eligible for cleanup.</p>
+<p><strong>Interviewer:</strong> CDN strategy?</p>
+<p><strong>Candidate:</strong> Multi-tier. Device cache (browser/app) → edge POPs → regional caches → origin. Hit ratio target above 90%. URLs are signed for private accounts. Trending content pre-warms edge caches via prediction. Adaptive bitrate for video using HLS/DASH manifests.</p>
+<p><strong>Interviewer:</strong> Search?</p>
+<p><strong>Candidate:</strong> Separate search service consuming post events. Inverted index on caption tokens, hashtags, location, username. Sharded by token. Eventually consistent — a post becomes searchable within seconds. Queries fan out to relevant shards, score, return.</p>
+<p><strong>Interviewer:</strong> Explore page?</p>
+<p><strong>Candidate:</strong> Offline + online recommendation pipeline. Daily offline job generates candidate set per user from collaborative filtering, embedding similarity, and trending. Online ranker scores candidates at request time with strict timeout. The candidate set may be 1000s; ranker returns top 50.</p>
+<p><strong>Interviewer:</strong> Deletes?</p>
+<p><strong>Candidate:</strong> Same as Twitter. Mark post <code>deleted</code>; the feed read path's hydration sees the deletion and skips. Inbox entries remain but display nothing. Media reference count decrements; storage cleanup is async. The deleting user's feed reflects the deletion immediately; followers see it within seconds.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Object storage geo-replicated. Originals in user's home region; derivatives replicated globally for fast CDN warm-up. Post metadata replicated. Per-user home region for writes. CDN serves locally everywhere. Cross-region replication lag is seconds; users may briefly see slightly stale feeds across regions, acceptable.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Instagram is Twitter plus a media pipeline. Upload writes original, async transcoder generates derivatives, post becomes visible at first derivative. Hybrid fan-out for feed; stories are a separate ephemeral surface with TTL. CDN multi-tier serves media; storage tiered by age. Engagement counters sub-sharded. Search and Explore are side systems. The dominant cost is media storage and CDN; the dominant correctness concern is feed delivery and visibility.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: media types, feed, stories, scale.</li>
+<li>Invariant: durable media, visible on first derivative, feed delivers.</li>
+<li>Upload + async transcode; first-derivative visibility.</li>
+<li>Post metadata separate from media.</li>
+<li>Hybrid fan-out for feed like Twitter; ranking with timeout.</li>
+<li>Stories separate surface with TTL.</li>
+<li>CDN multi-tier; storage tiering by age.</li>
+<li>Engagement counters sub-sharded; search/explore side.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Instagram is a media-heavy social feed. Upload writes the original; an async transcoder produces multiple resolutions; the post becomes visible at first derivative. The feed uses hybrid fan-out — push for normal accounts, pull for celebrities. Stories are a separate surface with 24h TTL. CDN multi-tier serves media at edge. Storage tiers age content to cheaper layers. Engagement counters are sub-sharded for hot posts. The dominant cost is media; the dominant correctness concern is feed visibility.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Posts go visible at first derivative; higher quality lands later async."</li>
+<li>"Feed is hybrid fan-out, same shape as Twitter."</li>
+<li>"Stories are a separate surface with TTL and a read-time gate."</li>
+<li>"CDN multi-tier with 90%+ hit ratio is what makes media affordable at scale."</li>
+<li>"Engagement counters sub-shard for hot posts; periodic recount keeps them honest."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

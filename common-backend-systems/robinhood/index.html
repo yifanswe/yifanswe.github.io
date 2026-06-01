@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robinhood — Trading Platform (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Robinhood — Trading Platform (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Hard · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build Robinhood. Users place stock orders (market, limit), see live price quotes, view portfolio P&amp;L, and the system routes orders to a market maker / exchange. 30M users, 100k orders/sec peak, real-time quotes for ~10k tickers from market data feeds at thousands of ticks/sec per popular ticker.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Place market and limit orders for a listed stock.
+- See live quote and your portfolio's live P&amp;L.
+- View order history and execution details.</p>
+<p>I'd defer options trading, crypto, fractional shares deep dive, and tax-lot accounting.</p>
+<p><strong>Non-functional</strong>
+- Correctness is the headline — no lost orders, no double-fills, no incorrect balances.
+- Quote latency to client &lt; 200 ms; order acknowledgment &lt; 500 ms; execution + settlement is exchange-bound.
+- Strong consistency on cash/position balances at all times.
+- Regulatory: durable audit log of every action.
+- Survive market-open spike: 100k orders/sec is the design target.</p>
+<p><strong>Capacity</strong>
+- 30M users; ~1M trading on any day; 5–10M orders/day peak; 100k/sec at open.
+- Market data: 10k tickers × ~10 ticks/sec average, hot tickers thousands/sec → ~1M ticks/sec aggregate ingest.
+- Order rows are large but manageable: 10M orders/day × ~1 KB × 7 years × 3 replicas ≈ 76 TB before indexes.
+- Raw market data can dominate if retained: 1M ticks/sec × ~100 B ≈ 8.6 TB/day raw, so keep hot quotes in Redis and compact/archive tick history aggressively.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>User / Account</strong> — <code>user_id</code>, cash_balance, positions.</li>
+<li><strong>Position</strong> — <code>(user_id, ticker) → shares, avg_cost</code>.</li>
+<li><strong>Order</strong> — <code>order_id, user_id, ticker, side, qty, type, limit_price, status, created_at</code>.</li>
+<li><strong>Execution / Fill</strong> — <code>fill_id, order_id, qty, price, ts</code>.</li>
+<li><strong>Quote</strong> — <code>(ticker) → bid, ask, last, ts</code>.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST  /v1/orders                       { ticker, side, qty, type, limit?, idempotency_key }   → { order_id, status }
+GET   /v1/orders/{id}
+DELETE /v1/orders/{id}                  // cancel
+GET   /v1/portfolio                     → { cash, positions[], pnl_live }
+WS    /v1/quotes                        → subscribe { tickers[] }
+WS    /v1/orders                        → subscribe to user's order events
+</code></pre>
+<p>Idempotency key mandatory on order placement.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Order entry service.</strong> Accepts orders, validates (enough buying power, market hours, position size limits), writes order row (status=<code>accepted</code>), publishes to order routing.</li>
+<li><strong>Pre-trade risk check.</strong> Single transactional step against the user's cash and positions: cash_balance ≥ order_value for buys; shares_held ≥ qty for sells. Implemented as a row update with <code>WHERE</code> clause to atomically reserve cash/shares. This is the most important consistency boundary.</li>
+<li><strong>Order routing.</strong> Routes the order to a broker-dealer or exchange via standard protocols (FIX). For Robinhood specifically, routes to market makers for payment for order flow (PFOF). The route response can be: immediate fill, queued, partial fill, or rejected.</li>
+<li><strong>Execution events.</strong> Fills come back asynchronously. Each fill updates the order (<code>partially_filled</code> or <code>filled</code>) and adjusts position + cash atomically.</li>
+<li><strong>Position service.</strong> Owns positions and cash. Single-writer per account ensures correctness. On each fill, applies the delta in one transaction.</li>
+<li><strong>Market data pipeline.</strong> Ingest from exchange / SIP feed (FIX/ITCH) → publish to Kafka topic per ticker → quote service maintains current best bid/ask in Redis → fan out to client WS subscribers.</li>
+<li><strong>Portfolio + P&amp;L.</strong> Computed real-time on read: cash + Σ(position.qty × current_price). Current price comes from the quote service. Cached briefly to dampen churn.</li>
+<li><strong>Audit log.</strong> Every order event appended to an immutable log (Kafka with very long retention + S3 cold storage) for regulatory replay.</li>
+</ol>
+<p>End-to-end narration: market opens at 9:30:00 ET → Alice places "buy 10 AAPL market" → order service validates buying power → atomic reserve $1750 from cash, write order row, publish to router → router sends FIX message to market maker → fill comes back in 200 ms at $174.95 × 10 → execution event updates position (+10 AAPL @ $174.95) and cash (release $50 over-reserved). Alice's portfolio WS sees the order fill, the position update, and updated P&amp;L within 1 s.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">+-----------------------------+
+| Mobile / Web Client         |
++----+---------------+--------+
+    |               |
+POST /v1/orders   GET /v1/portfolio
+WS /v1/quotes,/orders
+    v               v
++------------------------------------------------+
+| API Gateway / Auth                             |
++-----------+--------------------+---------------+
+          |                    |
+          v                    v
++-------------------+    +-----------------------+
+| Order Entry       |    | Portfolio Service     |
+| + Pre-trade Risk  |    | live P&amp;L hydration    |
++---------+---------+    +-----------+-----------+
+        |                          |
+        | reserve cash/shares      | quote/cache reads
+        v                          v
++-------------------+        +-------------------+
+| Position Service  |&lt;------&gt;| Quote Service     |
+| single writer     |        | WS Fanout         |
++---------+---------+        +---------+---------+
+        |                            ^
+        | outbox / fill events       | market ticks
+        v                            |
++---------------------------------------------------------------+
+| Async / Event Row                                             |
+| Outbox/Kafka -&gt; FIX Router -&gt; Market Maker / Exchange         |
+| Fill Events -&gt; Position Service -&gt; WS Event Fanout            |
+| Market Data Feed -&gt; Kafka ticker topics -&gt; Quote Service      |
+| Audit Events -&gt; audit/orders/yyyy/mm/dd/{partition}           |
++-------------------------+-------------------------------------+
+                     |
+                     v
++---------------------------------------------------------------+
+| Stores / Caches                                               |
+| acct:{user_id}; pos:{user_id}:{ticker} strongly consistent    |
+| orders:{user_id}:{order_id}; fills:{order_id}:{fill_id}       |
+| order_idem:{user_id}:{key} TTL 24-72h                         |
+| quote:{ticker} Redis hash TTL 5-30s; subs:{ticker} connections|
+| audit/orders/yyyy/mm/dd/{partition} append-only cold log      |
++-----------------------------+---------------------------------+
+                        |
+                        | quote miss / replay
+                        v
+                 +-----------------------+
+                 | Tick Archive / SIP    |
+                 | compact history       |
+                 +-----------------------+
+
+Primary write: order -&gt; risk reserve -&gt; outbox -&gt; FIX -&gt; fill -&gt; position.
+Primary read: portfolio -&gt; positions + quote:{ticker} in parallel -&gt; WS fanout.
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete stores and shard keys.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key pattern</th>
+<th>Data structure / entry</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Account balance</td>
+<td><code>acct:{user_id}</code></td>
+<td>strongly consistent row, cash/buying power/version, ~1 KB</td>
+<td>7 y+</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Positions</td>
+<td><code>pos:{user_id}:{ticker}</code></td>
+<td>row with qty/cost basis/reserved qty, ~150 B</td>
+<td>7 y+</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Orders</td>
+<td><code>orders:{user_id}:{order_id}</code></td>
+<td>order state row, ~1 KB</td>
+<td>7 y</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Executions</td>
+<td><code>fills:{order_id}:{fill_id}</code></td>
+<td>immutable fill row, ~500 B</td>
+<td>7 y</td>
+<td><code>order_id</code></td>
+</tr>
+<tr>
+<td>Idempotency</td>
+<td><code>order_idem:{user_id}:{key}</code></td>
+<td>response/status pointer, ~300 B</td>
+<td>24–72 h</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Current quote</td>
+<td><code>quote:{ticker}</code></td>
+<td>Redis hash bid/ask/last/ts, ~100 B</td>
+<td>TTL 5–30 s</td>
+<td><code>ticker</code></td>
+</tr>
+<tr>
+<td>Quote subscribers</td>
+<td><code>subs:{ticker}</code></td>
+<td>ephemeral connection IDs, ~16 B/sub</td>
+<td>while connected</td>
+<td><code>ticker</code></td>
+</tr>
+<tr>
+<td>Audit log</td>
+<td><code>audit/orders/yyyy/mm/dd/{partition}</code></td>
+<td>append-only event, ~500 B</td>
+<td>7 y+</td>
+<td>date + partition</td>
+</tr>
+</tbody>
+</table>
+<p>Cash/positions are authoritative content; quote Redis is a freshness cache. If quotes go stale, balances do not become stale.</p>
+<p><strong>Capacity by store.</strong> Account state is not the size problem; correctness is. <code>30M accounts × 1 KB × 3 replicas</code> is only ~90 GB, and even <code>30M users × 20 positions × 150 B × 3</code> is ~270 GB. The heavier stores are histories: <code>10M orders/day × 1 KB × 7 years × 3</code> is ~76 TB, and if fills average two per order, <code>20M fills/day × 500 B × 7 years × 3</code> is another ~76 TB. Audit can be larger because every order has multiple lifecycle events: <code>10M orders/day × 6 events × 500 B × 7 years × 3</code> is ~230 TB. Market data dwarfs all of that if retained raw: <code>1M ticks/sec × 100 B</code> is ~8.6 TB/day before replication, so I keep only current quotes hot, retain short tick windows for replay, and compact/archive historical ticks separately.</p>
+<p><strong>Place-order path.</strong>
+1. Client posts order with idempotency key; gateway authenticates and checks <code>order_idem:{user_id}:{key}</code>.
+2. Order entry loads <code>acct:{user_id}</code> and relevant <code>pos:{user_id}:{ticker}</code> on the same account shard.
+3. Pre-trade risk reserves cash/shares with a conditional update. This is the consistency boundary; no FIX message is sent before reservation commits.
+4. Order row <code>orders:{user_id}:{order_id}</code> is written as <code>accepted</code>, and an outbox event routes to the FIX adapter.
+5. Router sends to market maker/exchange. Fills arrive async and append <code>fills:{order_id}:{fill_id}</code>.
+6. Position service applies each fill to account cash/position in account-shard order, releases over-reservation, and emits user WS events.</p>
+<p><strong>Quote read path.</strong>
+1. Market data feed handler normalizes ticks and publishes by ticker.
+2. Quote service updates <code>quote:{ticker}</code> and pushes latest ticks to regional fan-out.
+3. Portfolio read fetches positions and current quotes in parallel, computes unrealized P&amp;L, and caches the result for ~1 s.</p>
+<p><strong>Hot and cold API paths.</strong></p>
+<table>
+<thead>
+<tr>
+<th>API path</th>
+<th>Hot path</th>
+<th>Cold/fallback path</th>
+<th>Server-side state</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /v1/orders</code></td>
+<td>Idempotency lookup → account/position conditional reserve on <code>user_id</code> shard → order row/outbox → FIX router</td>
+<td>If idempotency key already exists, return prior response; if account shard is unavailable, fail closed before routing</td>
+<td><code>order_idem:{user_id}:{key}</code>, order state, reservation version</td>
+</tr>
+<tr>
+<td><code>GET /v1/portfolio</code></td>
+<td>Load positions and quotes in parallel; use 1 s P&amp;L cache</td>
+<td>If quote cache misses or quote age &gt; threshold, show stale P&amp;L and reject market orders</td>
+<td>portfolio cache keyed by <code>user_id</code>, quote freshness timestamp</td>
+</tr>
+<tr>
+<td><code>WS /v1/quotes</code></td>
+<td>Regional fan-out sends latest tick at ~5 Hz per ticker</td>
+<td>If subscriber joins after a gap, first send current <code>quote:{ticker}</code>, then live stream</td>
+<td>subscription set <code>subs:{ticker}</code>, last delivered sequence</td>
+</tr>
+<tr>
+<td><code>DELETE /v1/orders/{id}</code></td>
+<td>State compare-and-set from <code>accepted</code> to <code>canceled</code></td>
+<td>If fill event committed first, cancel returns too late and order history shows fill</td>
+<td>order state version, fill log</td>
+</tr>
+</tbody>
+</table>
+<p>The order cursor is the <code>order_id</code>; the streaming cursor is a per-connection last event sequence so reconnect can replay missed order events from the user-event log.</p>
+<p><strong>Pre-trade risk — the correctness centerpiece.</strong> All cash and position reservations happen on a single row per account with optimistic concurrency. A buy order:</p>
+<pre><code>UPDATE accounts
+SET cash = cash - 1750, pending_orders = pending_orders + 1
+WHERE user_id = X AND cash &gt;= 1750;
+</code></pre>
+<p>On fill, release the reservation against actuals. On reject, refund.</p>
+<p><strong>Account sharding.</strong> Sharded by <code>user_id</code> so all of a user's orders, positions, cash live in one shard. Avoids distributed transactions across shards.</p>
+<p>Why single-writer/account-shard instead of a globally distributed transaction: most orders touch exactly one account and one ticker, so localizing cash and position state by <code>user_id</code> gives stronger correctness with less latency. Cross-account settlement and broker reconciliation happen asynchronously; they should not be in the order-entry p99 path.</p>
+<p><strong>Tech choice defense.</strong> For account and position state, I want a strongly consistent SQL/Spanner-style store because conditional updates, unique order IDs, and audit joins are first-class. Cassandra can absorb writes, but lightweight transactions would become the risky part of the money path. Redis is useful for quotes and ephemeral state, not as the source of truth for balances. For routing, a durable outbox/Kafka bridge beats direct synchronous FIX calls from the order transaction because a broker timeout should not erase an accepted order; the outbox gives replay with exactly-once effect at the router boundary.</p>
+<p>Be ready for "why not one giant event log?" The log is perfect for audit and replay, but the serving path still needs current account rows so a pre-trade risk check does not scan history.</p>
+<p><strong>Market data fan-out at 1M ticks/sec.</strong> Single quote-service node can't push to millions of WS clients. Pyramid:
+- Ingest tier writes ticks to Kafka per ticker.
+- Fan-out tier (regional) subscribes to relevant tickers, pushes to WS gateways.
+- WS gateways hold connections and forward the right tickers to each subscriber.
+Client subscribes to specific tickers, not the firehose.</p>
+<p><strong>Quote update batching.</strong> AAPL during open updates 1000×/sec. No human needs that refresh rate. WS layer rate-limits per-ticker push to clients to ~5 Hz, taking the most recent tick. Mid-trip ticks are dropped — fine.</p>
+<p><strong>Order routing protocol.</strong> FIX over TLS to broker-dealer / market maker. Latency-sensitive: keep persistent FIX connections, route by ticker class. For self-clearing brokers, would also handle the clearing/settlement (T+1 cycle).</p>
+<p><strong>Cancellation race.</strong> User cancels right as fill arrives. Atomic order row update with state check: <code>UPDATE orders SET status='canceled' WHERE id=X AND status='accepted'</code> — only succeeds if not already filled. If fill came first, cancel returns "too late."</p>
+<p><strong>Hot tickers at market open.</strong> All users want AAPL/TSLA at 9:30 sharp. Order entry has to absorb the spike. Mitigations:
+- Pre-warm worker pools and Redis cache.
+- Queue orders briefly at the routing tier; emit 202 Accepted with order_id, let the WS push the eventual fill.
+- For limit orders, return immediately and let the exchange handle the queueing.</p>
+<p><strong>P&amp;L computation.</strong> Realized P&amp;L from filled orders (deterministic, tax-lot aware). Unrealized P&amp;L = current price × shares - cost basis. Recomputed on each quote update for the user's open positions; cached for ~1 s.</p>
+<p><strong>Two-index framing.</strong> Order events are the same dataset presented two ways: user-keyed rows (<code>orders:{user_id}:{order_id}</code>) for app history and time/partition-keyed audit logs for regulatory replay. Quotes also have two views: content by ticker (<code>quote:{ticker}</code>) and subscriber membership by ticker (<code>subs:{ticker}</code>). Calling this out matters because I am not inventing separate truths; I am keeping one truth and multiple serving indexes.</p>
+<p><strong>Regulatory and audit.</strong> Every order event written to an append-only Kafka topic with 7-year retention (regulatory minimum). Reconciliation jobs compare positions vs broker statements daily.</p>
+<p><strong>Outages and degradation.</strong> If market data fails, freeze quote-display age timer in UI and refuse market orders (limit orders still safe). If router fails, queue orders with explicit user notice.</p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th>User-visible behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Quote stale</td>
+<td>quote-safe</td>
+<td><code>quote:{ticker}</code> age</td>
+<td>show stale badge; reject market orders, allow limits</td>
+</tr>
+<tr>
+<td>Router down</td>
+<td>accepted-not-routed</td>
+<td>order outbox</td>
+<td>return 202 with clear pending status, drain later if allowed</td>
+</tr>
+<tr>
+<td>Account shard degraded</td>
+<td>fail-closed for orders</td>
+<td>account DB</td>
+<td>block new orders; portfolio may show last cached state</td>
+</tr>
+<tr>
+<td>Hot ticker open</td>
+<td>dampened fan-out</td>
+<td>latest tick per ticker</td>
+<td>push 5 Hz latest quote, drop intermediate ticks</td>
+</tr>
+<tr>
+<td>Cancel/fill race</td>
+<td>state CAS</td>
+<td>order row + fill log</td>
+<td>whichever commits first wins; no ambiguous cancel</td>
+</tr>
+</tbody>
+</table>
+<p>"The punch line: market data can degrade to stale display, but order and balance state must fail closed because incorrect money is worse than unavailable trading."</p>
+<p><strong>What I'd defer.</strong> Options chains, fractional share aggregation, recurring investments, crypto trading rails, tax-lot accounting depth, regulatory filings pipeline (e.g., CAT reporting).</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

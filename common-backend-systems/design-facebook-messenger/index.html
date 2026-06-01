@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Facebook Messenger — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Facebook Messenger</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Facebook Messenger (or WhatsApp / iMessage) is real-time 1:1 and group messaging. The hard part is delivering every message to every participant exactly once with correct ordering, working across devices, surviving offline recipients, and providing read receipts / typing indicators / presence without making the system fragile.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every sent message is durably stored, delivered to every conversation participant at least once on each of their active devices, displayed in a consistent order across devices, and remains available offline; deletes and edits are eventually visible everywhere; read receipts and presence are best-effort but never claimed when not true.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can separate the messaging substrate (durable conversation log) from the delivery substrate (online push, offline fetch), handle multi-device sync, design end-to-end encryption (if asked), and reason about group fan-out vs 1:1 patterns.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Messenger around per-conversation append-only logs as the source of truth. Clients sync from their position in the log; a real-time push channel notifies them of new messages when online. Multi-device sync is solved by per-device cursors and a shared mailbox. For groups, the conversation log is still append-only; we just have more participants pulling. The interesting decisions are per-conversation ordering, multi-device sync, delivery acknowledgment, and end-to-end encryption.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Users send 1:1 and group messages (text, media, reactions).</li>
+<li>Messages must be persisted and available offline.</li>
+<li>Read receipts, typing indicators, delivery status.</li>
+<li>Presence (online / last seen).</li>
+<li>Multi-device support (phone + web simultaneously).</li>
+<li>Edit and delete messages.</li>
+<li>Message history syncs to new devices.</li>
+<li>Optional: end-to-end encryption.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Sub-second message delivery for online users.</li>
+<li>Months/years of message retention.</li>
+<li>Strong per-conversation ordering.</li>
+<li>Exactly-once user-visible delivery (with at-least-once underneath).</li>
+<li>Multi-region; messages cross continents in seconds.</li>
+<li>High availability for the messaging substrate.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Voice/video calls (WebRTC; different problem).</li>
+<li>Stories/status (separate).</li>
+<li>Search across all messages (huge separate problem).</li>
+<li>E2E encryption (mention; depth on request).</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>2B+ MAU.</td>
+</tr>
+<tr>
+<td>Messages/day</td>
+<td>100B+ globally.</td>
+</tr>
+<tr>
+<td>Average user</td>
+<td>Tens of conversations, hundreds of messages/day.</td>
+</tr>
+<tr>
+<td>Group size</td>
+<td>Up to thousands (WhatsApp 1024+; Messenger varies).</td>
+</tr>
+<tr>
+<td>Peak</td>
+<td>Millions of messages/sec at peak.</td>
+</tr>
+<tr>
+<td>Devices per user</td>
+<td>2-3 typical; up to 4-5 in some cases.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Online delivery sub-second; offline pickup on reconnect.</td>
+</tr>
+<tr>
+<td>Retention</td>
+<td>Indefinite by default.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is per-conversation throughput for very large group chats and the global presence/typing indicator overhead.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Conversation log</td>
+<td>Append-only ordered messages per conversation.</td>
+<td>Source of truth; strong per-conversation order.</td>
+</tr>
+<tr>
+<td>Sync substrate</td>
+<td>Each device pulls from its cursor in each conversation it's in.</td>
+<td>At-least-once; cursor advances on ack.</td>
+</tr>
+<tr>
+<td>Real-time push</td>
+<td>Notifies online clients of new messages to reduce poll lag.</td>
+<td>Best-effort; clients fall back to pull.</td>
+</tr>
+<tr>
+<td>Presence</td>
+<td>Online / last-seen / typing.</td>
+<td>Best-effort; ephemeral; not stored long.</td>
+</tr>
+<tr>
+<td>Receipts</td>
+<td>Delivered / read per device.</td>
+<td>Per-device state; conversation-aggregated.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                 +---------------+
+   Client ---&gt;   | API Gateway   |
+                 +-------+-------+
+                         |
+       +-----------------+-------------------+
+       |                                     |
+       v                                     v
++---------------+                  +-----------------+
+| Send Path     |                  | Sync / Pull Path|
++------+--------+                  +--------+--------+
+       |                                    |
+       v                                    v
++-----------------+              +---------------------+
+| Conversation   |               | Per-Device Cursor    |
+| Log Store      |               | + Inbox              |
+| (append-only)  |               +---------+-----------+
++--------+-------+                         |
+         |                                  |
+         v                                  v
++------------------+              +---------------------+
+| Event Stream     +-------------&gt;| Push Channel        |
+| (per-conv)       |              | (WebSocket/MQTT)    |
++--------+---------+              +---------+-----------+
+         |                                  |
+         v                                  v
++------------------+              +---------------------+
+| Receipt Store    |              | Presence Service    |
+| read/delivered   |              | online + typing     |
++------------------+              +---------------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Send service</td>
+<td>Receives outbound message; writes to log; broadcasts.</td>
+<td>Idempotent on client-side message id.</td>
+</tr>
+<tr>
+<td>Conversation log store</td>
+<td>Append-only per-conversation messages.</td>
+<td>Sharded by conversation_id; strong per-conv order.</td>
+</tr>
+<tr>
+<td>Per-device inbox cursor</td>
+<td>Tracks last delivered seq per conversation per device.</td>
+<td>Updated by ack from device.</td>
+</tr>
+<tr>
+<td>Push channel</td>
+<td>Persistent connection (WebSocket / MQTT) to online devices.</td>
+<td>Used for new-message notification + presence.</td>
+</tr>
+<tr>
+<td>Pull / sync service</td>
+<td>Returns messages since cursor when device polls.</td>
+<td>Bounded batch; pagination.</td>
+</tr>
+<tr>
+<td>Receipt service</td>
+<td>Stores delivered/read receipts per device per message.</td>
+<td>Aggregated for sender display.</td>
+</tr>
+<tr>
+<td>Presence service</td>
+<td>Online/offline/typing state.</td>
+<td>In-memory with TTL; not durable.</td>
+</tr>
+<tr>
+<td>Media service</td>
+<td>Image/video upload and serve.</td>
+<td>Separate from message metadata.</td>
+</tr>
+<tr>
+<td>E2E encryption (optional)</td>
+<td>Per-conversation key management; per-message encryption.</td>
+<td>Server only stores ciphertext.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="message">Message</h4>
+<pre><code class="language-text">Message(
+  message_id,            // server-assigned, unique per conversation
+  conversation_id,
+  sender_id,
+  client_message_id,     // for idempotent send
+  seq,                   // monotonic per conversation
+  content,               // text or media reference (encrypted blob if E2E)
+  reply_to_message_id?,
+  reactions: [(user_id, emoji, ts)],
+  sent_at,
+  edited_at?,
+  deleted_for_all?,
+  version
+)
+</code></pre>
+<h4 id="conversation">Conversation</h4>
+<pre><code class="language-text">Conversation(
+  conversation_id,
+  type,                  // dm, group
+  participants: [user_id],
+  group_metadata: { name, avatar, admins, created_at },
+  encryption: { mode, key_refs },
+  last_message_seq,
+  updated_at
+)
+</code></pre>
+<h4 id="device-cursor">Device Cursor</h4>
+<pre><code class="language-text">DeviceCursor(
+  device_id,
+  user_id,
+  conversation_id,
+  last_seq_delivered,
+  last_seq_read,
+  updated_at
+)
+</code></pre>
+<h4 id="receipt">Receipt</h4>
+<pre><code class="language-text">Receipt(
+  message_id,
+  conversation_id,
+  user_id,
+  device_id,
+  delivered_at?,
+  read_at?
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">POST   /conversations/{id}/messages
+       Headers: Idempotency-Key (client_message_id)
+       Body: content, reply_to?
+GET    /conversations/{id}/messages?since_seq=&amp;limit=
+POST   /conversations/{id}/messages/{message_id}/ack
+       Body: device_id, ack_type (delivered | read)
+GET    /sync?cursor=
+POST   /presence/typing { conversation_id }
+GET    /presence?user_ids=...
+
+WebSocket: persistent connection for real-time push
+</code></pre>
+<h3 id="write-path-send-a-message">Write Path: Send a Message</h3>
+<ol>
+<li>Client POSTs with <code>client_message_id</code> (idempotency key).</li>
+<li>Send service checks idempotency; if dup, returns prior result.</li>
+<li>Assign server-side <code>message_id</code> and a <code>seq</code> monotonic per conversation.</li>
+<li>Persist to conversation log store (replicated, durable).</li>
+<li>Update conversation's <code>last_message_seq</code>.</li>
+<li>Emit event to per-conversation stream.</li>
+<li>For each recipient device:
+   - If online (presence service says so), push notification via WebSocket containing message metadata or full content.
+   - If offline, the device fetches on next reconnect via pull.</li>
+<li>Return success to sender with <code>message_id</code> and <code>seq</code>.</li>
+</ol>
+<p>The send response does not wait for delivery acks; the sender sees their message ack'd as soon as the log write completes.</p>
+<h3 id="read-sync-path">Read / Sync Path</h3>
+<p>Each device maintains a cursor per conversation it's in.</p>
+<p>On connect / wakeup:</p>
+<ol>
+<li>Device sends current cursor for each conversation (or one global sync cursor).</li>
+<li>Sync service queries log store for messages with <code>seq &gt; cursor</code> per conversation.</li>
+<li>Returns messages, capped at batch size; client paginates if more.</li>
+<li>Device acks <code>delivered_seq</code> per conversation.</li>
+<li>Server updates <code>DeviceCursor</code>.</li>
+</ol>
+<p>For real-time push:</p>
+<ol>
+<li>Client maintains WebSocket connection.</li>
+<li>New messages in conversations the device participates in are pushed.</li>
+<li>Push contains either full content (small messages) or metadata (so client pulls full).</li>
+<li>Client acks; cursor advances.</li>
+</ol>
+<p>If WebSocket disconnects, the device falls back to pull on reconnect — no messages lost.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The push channel is an optimization, not the source of truth. The conversation log is. Clients can always recover by pulling from their cursor.</p>
+</blockquote>
+<h3 id="per-device-state-and-sync">Per-Device State And Sync</h3>
+<p>A user with phone + web + tablet has three devices. Each must:</p>
+<ul>
+<li>See the same conversation history.</li>
+<li>Send messages from any device.</li>
+<li>Receive new messages on all online devices.</li>
+<li>Have independent read state (read on phone doesn't read on web).</li>
+</ul>
+<p>Implementation:</p>
+<ul>
+<li>Each device has its own <code>DeviceCursor</code> per conversation.</li>
+<li>Sending from any device persists to the conversation log with the user as sender.</li>
+<li>All recipient devices (including the sender's other devices) get the message.</li>
+<li>Read receipts are per-device but aggregated for display.</li>
+</ul>
+<p>New device sign-in:</p>
+<ul>
+<li>Bootstraps cursor to "newest" or fetches recent history depending on policy.</li>
+<li>Subsequent syncs are incremental.</li>
+<li>For E2E encryption, key exchange to new device is a complex sub-problem (Signal Protocol-style).</li>
+</ul>
+<h3 id="group-messaging">Group Messaging</h3>
+<p>Same log structure, just more participants.</p>
+<ul>
+<li>Conversation log is per group; one append-only stream.</li>
+<li>Each participant's device has cursor over this log.</li>
+<li>Send fan-out: write once to the group log; recipient devices pull or push from the same source.</li>
+<li>Strong order per group (seq).</li>
+</ul>
+<p>Large groups (1000+ members):
+- Push fan-out cost scales with group size and online member count.
+- Pre-compute online members; push only to them.
+- Offline members pull on reconnect.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Groups don't multiply storage; they multiply read amplification. One write, many readers — and reads are cheap because they're append-only log scans from a cursor.</p>
+</blockquote>
+<h3 id="read-receipts-and-delivery-status">Read Receipts And Delivery Status</h3>
+<p>Each message has potentially many receipts: delivered and read per recipient device.</p>
+<p>Two views:</p>
+<ul>
+<li><strong>Sender view:</strong> "My message has been delivered to / read by N of M people."</li>
+<li><strong>System:</strong> Store receipts per (message_id, user_id, device_id).</li>
+</ul>
+<p>For groups with thousands, storing all receipts is heavy. Some platforms:</p>
+<ul>
+<li>Aggregate to counters: delivered_count, read_count.</li>
+<li>Show "Seen by all" once all participants ack.</li>
+<li>Skip per-recipient detail for very large groups.</li>
+</ul>
+<h3 id="presence-and-typing">Presence And Typing</h3>
+<p>Ephemeral, best-effort, in-memory.</p>
+<ul>
+<li>Online state: TTL'd entry in a presence store, refreshed by WebSocket keepalive.</li>
+<li>Typing: short-lived event (a few seconds), broadcast to conversation participants.</li>
+<li>Last-seen: updated on disconnect, with privacy controls.</li>
+</ul>
+<p>Not durable; restarts may lose presence state momentarily. Clients accept this.</p>
+<h3 id="ordering">Ordering</h3>
+<p>Per-conversation order is critical. Cross-conversation order doesn't matter.</p>
+<ul>
+<li>Sequence numbers assigned per conversation by the log store (atomic increment or single leader).</li>
+<li>All participants see the same order.</li>
+<li>Clock skew at send time is irrelevant; server assigns <code>seq</code> and <code>sent_at</code>.</li>
+</ul>
+<p>For multi-region: the conversation has a home region (typically the region of the first participant or the creator). Sends route to the home region for sequencing; replicated to other regions.</p>
+<h3 id="end-to-end-encryption-if-asked">End-to-End Encryption (If Asked)</h3>
+<ul>
+<li>Each user has identity keys (Signal Protocol: identity key, signed pre-key, one-time pre-keys).</li>
+<li>New conversations use X3DH key agreement.</li>
+<li>Per-message keys via Double Ratchet for forward secrecy.</li>
+<li>Server stores only ciphertext.</li>
+<li>Server cannot read messages but still routes by conversation_id and orders by seq.</li>
+<li>Multi-device: each device has its own key pair; sender encrypts to each recipient device separately, or uses Sender Keys for groups.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Conversation log</td>
+<td><code>conversation_id</code> hash</td>
+<td>Strong per-conv ordering; cheap reads.</td>
+</tr>
+<tr>
+<td>Device cursors</td>
+<td><code>user_id</code> hash</td>
+<td>Per-user state.</td>
+</tr>
+<tr>
+<td>Receipts</td>
+<td><code>conversation_id + message_id</code></td>
+<td>Sender-side aggregation.</td>
+</tr>
+<tr>
+<td>Presence</td>
+<td><code>user_id</code> hash</td>
+<td>Ephemeral; can be in Redis.</td>
+</tr>
+<tr>
+<td>Push connections</td>
+<td>Sticky to a push gateway by <code>device_id</code></td>
+<td>Maintain WebSocket affinity.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Conversation log writes</td>
+<td>Strong per-conversation (single seq order)</td>
+<td>Per-conv ordering required.</td>
+</tr>
+<tr>
+<td>Cross-conversation order</td>
+<td>Eventually consistent</td>
+<td>Doesn't matter.</td>
+</tr>
+<tr>
+<td>Device cursor</td>
+<td>Strong on update</td>
+<td>Avoid lost messages.</td>
+</tr>
+<tr>
+<td>Receipts</td>
+<td>Eventually consistent</td>
+<td>UX hint.</td>
+</tr>
+<tr>
+<td>Presence</td>
+<td>Eventually consistent, TTL'd</td>
+<td>Inherently ephemeral.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Push channel drops; user offline.</td>
+<td>Pull on reconnect from cursor; no messages lost.</td>
+<td>Reconnect rate; pull volume.</td>
+</tr>
+<tr>
+<td>Send retried; duplicate sent.</td>
+<td>Idempotent on <code>client_message_id</code>.</td>
+<td>Duplicate send rate.</td>
+</tr>
+<tr>
+<td>Conversation log shard hot (huge group).</td>
+<td>Sub-shard within conversation; or accept and scale shard.</td>
+<td>Per-shard QPS.</td>
+</tr>
+<tr>
+<td>Out-of-order message arrival on client.</td>
+<td>Client buffers and applies in seq order.</td>
+<td>Client reorder count.</td>
+</tr>
+<tr>
+<td>Cursor corruption / loss.</td>
+<td>Server keeps authoritative cursor; client can request full sync.</td>
+<td>Sync error rate.</td>
+</tr>
+<tr>
+<td>Multi-device send race.</td>
+<td>Per-conversation server-side seq prevents conflict.</td>
+<td>Send conflict rate.</td>
+</tr>
+<tr>
+<td>Group fan-out backpressure.</td>
+<td>Online-only push; pull for offline; backoff if overload.</td>
+<td>Push queue depth.</td>
+</tr>
+<tr>
+<td>Presence service outage.</td>
+<td>Treat all as offline; messages still deliver via pull.</td>
+<td>Presence service uptime.</td>
+</tr>
+<tr>
+<td>Receipt explosion (large groups).</td>
+<td>Aggregate to counters; cap detail to 1:1 and small groups.</td>
+<td>Receipt storage growth.</td>
+</tr>
+<tr>
+<td>Cross-region latency on send.</td>
+<td>Route to conversation home region; accept latency for sender.</td>
+<td>Cross-region send count.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Lost message rate (must be near zero; cursors detect).</li>
+<li>Out-of-order delivery rate.</li>
+<li>Duplicate user-visible deliveries.</li>
+<li>Receipt accuracy.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Send QPS by conversation type.</li>
+<li>Push fan-out rate.</li>
+<li>WebSocket connection count.</li>
+<li>Sync request rate.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>DAU; messages per user per day.</li>
+<li>Group size distribution.</li>
+<li>Read latency / delivery latency.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Conversation has a home region (typically the one with most active participants).</li>
+<li>Writes route to home region for sequencing.</li>
+<li>Log replicated to other regions for local reads.</li>
+<li>Push gateways are regional; the home region notifies remote push gateways for participants there.</li>
+<li>Presence is regional with cross-region propagation as needed.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Per-conversation strong ordering simplifies UX but limits per-conversation throughput.</li>
+<li>Pulling from a cursor is robust but requires the cursor to be reliably tracked.</li>
+<li>Storing full message content vs just metadata in pushes balances bandwidth vs latency.</li>
+<li>Per-device receipts give precision but bloat storage for large groups.</li>
+<li>Presence accuracy vs network cost: more frequent heartbeats = fresher presence = more battery.</li>
+<li>E2E encryption prevents server-side moderation; tradeoff with safety features.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Treating push as the delivery mechanism.</td>
+<td>Conversation log is source of truth; push is optimization.</td>
+</tr>
+<tr>
+<td>Single global seq for all conversations.</td>
+<td>Per-conversation seq; no global coordination.</td>
+</tr>
+<tr>
+<td>Per-recipient mailbox storage.</td>
+<td>One per-conversation log; cursors per device.</td>
+</tr>
+<tr>
+<td>Synchronous ack from all recipients before sender sees sent.</td>
+<td>Sender sees sent on log write; ack is per-recipient async.</td>
+</tr>
+<tr>
+<td>Ignoring multi-device.</td>
+<td>Device cursors per conversation; key management per device.</td>
+</tr>
+<tr>
+<td>Receipts as full records for large groups.</td>
+<td>Aggregate counters for &gt;N members.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Multi-device sync</td>
+<td>Per-device cursor; new-device bootstrap; key exchange if E2E.</td>
+</tr>
+<tr>
+<td>Group fan-out</td>
+<td>One log; online push + offline pull; pre-compute online list.</td>
+</tr>
+<tr>
+<td>E2E encryption</td>
+<td>Signal protocol; Double Ratchet; Sender Keys for groups.</td>
+</tr>
+<tr>
+<td>Receipts at scale</td>
+<td>Aggregate counters; per-receipt for 1:1 and small groups.</td>
+</tr>
+<tr>
+<td>Presence</td>
+<td>TTL'd in-memory; regional; not durable.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Per-conversation home region; replicated reads; cross-region push.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Per-conversation append-only log as source of truth.</li>
+<li>Per-device cursors for sync.</li>
+<li>Push is optimization; pull from cursor is fallback.</li>
+<li>Idempotent send with client_message_id.</li>
+<li>Multi-device handled via independent cursors.</li>
+<li>Group fan-out is one write, many cursors.</li>
+<li>Presence and typing are ephemeral, separate from log.</li>
+<li>E2E encryption awareness if asked.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Messenger is a per-conversation append-only log with cursors. The log is the source of truth; push is an optimization. Multi-device sync is just per-device cursors over the same log. Groups don't multiply storage; they multiply readers, which is cheap because reads are cursor-based log scans.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Facebook Messenger.</p>
+<p><strong>Candidate:</strong> I will design around a per-conversation append-only log as the source of truth, per-device cursors for sync, and a real-time push channel for online delivery. The invariant is exactly-once user-visible delivery per device, with per-conversation strong ordering. I will walk through send, sync, multi-device, and groups.</p>
+<p><strong>Interviewer:</strong> Walk me through sending a message.</p>
+<p><strong>Candidate:</strong> Client POSTs with a client-generated <code>message_id</code> for idempotency. Server checks for duplicate. If new, assign a server-side seq monotonic per conversation, persist to the conversation log (replicated), update conversation metadata, emit event. For each recipient device, if presence says online, push via WebSocket; if offline, do nothing — they'll pull on reconnect. The sender's other devices also receive the push. Response goes back to sender as soon as the log write commits.</p>
+<p><strong>Interviewer:</strong> How does the recipient device know about new messages?</p>
+<p><strong>Candidate:</strong> Two paths. Online: WebSocket push from the server contains the message (or metadata). The device renders and acks. Offline: on reconnect, the device sends its cursor — last delivered seq per conversation — and pulls everything since. The push channel is just an optimization for low-latency online delivery; the conversation log plus cursor is the durable mechanism.</p>
+<p><strong>Interviewer:</strong> Multi-device — user on phone and web simultaneously.</p>
+<p><strong>Candidate:</strong> Each device has its own cursor per conversation. When a message arrives, it pushes to both online devices independently. If they read on phone, the phone acks <code>read_seq</code>; the web cursor's <code>read_seq</code> is separate. Sending from any device writes to the same conversation log with the user as sender; all recipient devices, including the sender's other devices, see it.</p>
+<p><strong>Interviewer:</strong> How do you handle ordering across devices?</p>
+<p><strong>Candidate:</strong> Server assigns per-conversation seq. All devices see the same seq. Client buffers and applies in seq order. Clock skew at send time doesn't matter because the server assigns seq and timestamp on write. Cross-conversation order isn't guaranteed; doesn't matter for UX.</p>
+<p><strong>Interviewer:</strong> Group with 1000 members.</p>
+<p><strong>Candidate:</strong> Same log structure. One write per send; the conversation log captures it once. Each member's devices have cursors over this log. Push fan-out scales with the number of online members. We pre-compute the online member list before fan-out and only push to online devices; offline members pull on reconnect. For huge groups, we may have a separate push fan-out service that batches.</p>
+<p><strong>Interviewer:</strong> Read receipts at that scale?</p>
+<p><strong>Candidate:</strong> For 1:1 and small groups, store per-recipient receipts. For large groups, aggregate to counters: <code>delivered_count</code>, <code>read_count</code>. Display "Seen by 47 of 1000" or "Seen by everyone" once all ack. We stop tracking per-recipient detail above some threshold to keep storage bounded.</p>
+<p><strong>Interviewer:</strong> Presence and typing?</p>
+<p><strong>Candidate:</strong> Ephemeral, in-memory in a Redis-like store with TTL. Online state refreshed by WebSocket keepalive. Typing event is short-lived (a few seconds), broadcast to conversation participants via push. Last-seen is updated on disconnect, with privacy controls. None of this is durable; service restart may lose state, which is OK.</p>
+<p><strong>Interviewer:</strong> End-to-end encryption?</p>
+<p><strong>Candidate:</strong> Signal Protocol. Each user has identity keys and pre-keys. X3DH key agreement starts a conversation; Double Ratchet provides forward secrecy. Per-message keys; server stores only ciphertext. Multi-device: each device has its own key pair, and either sender encrypts to each recipient device or uses Sender Keys for groups. The server still routes by conversation_id and orders by seq, even though it can't read content.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Each conversation has a home region — usually the one with the most active participants or where it was created. Writes route to home region for sequencing. The log is replicated to other regions for fast local reads. Push gateways are regional; the home region notifies remote push gateways which forward to local devices. Cross-region delivery latency is mostly the replication lag — seconds.</p>
+<p><strong>Interviewer:</strong> What happens if the conversation home region fails?</p>
+<p><strong>Candidate:</strong> Failover to a replica region. The seq is preserved via consensus replication. Brief unavailability for writes while failover happens. Reads continue from replicas. After failover, the new region takes over sequencing.</p>
+<p><strong>Interviewer:</strong> What about message edits and deletes?</p>
+<p><strong>Candidate:</strong> Edit is a new event in the log: <code>MessageEdited(message_id, new_content, edited_at)</code>. Clients receive it and update their UI. Delete is similar: <code>MessageDeleted(message_id, deleted_for_all)</code>. The original message in the log is marked or replaced with a tombstone. Clients respect the latest state.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Per-conversation append-only log is the source of truth; per-device cursors track delivery. Push is an optimization for online delivery; pull from cursor is the fallback. Multi-device sync is per-device cursors over the same log. Groups are one log with many readers. Send is idempotent via client_message_id. Per-conversation strong ordering via server-assigned seq. Presence and typing are ephemeral. Multi-region uses per-conversation home regions with replicated reads. The hardest cases are large groups and multi-device sync, both handled by the log + cursor design.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: real-time, multi-device, groups, retention, encryption.</li>
+<li>Invariant: per-conv ordered, exactly-once user-visible, durable.</li>
+<li>Per-conversation append-only log; per-device cursor.</li>
+<li>Push for online; pull from cursor for offline.</li>
+<li>Multi-device: independent cursors over same log.</li>
+<li>Group: one log, many cursors; online push + offline pull.</li>
+<li>Receipts: per-device for small, aggregate counters for large.</li>
+<li>Presence ephemeral; E2E optional via Signal.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Messenger is a per-conversation append-only log with per-device cursors. The log is the source of truth; push is an optimization for online delivery. Multi-device sync is just per-device cursors over the same log. Groups are one log with many readers. Send is idempotent; ordering is per-conversation via server-assigned seq. Presence and typing are ephemeral. Multi-region uses per-conversation home regions. End-to-end encryption uses Signal Protocol with per-device keys.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"The conversation log is the source of truth; push is an optimization."</li>
+<li>"Per-device cursors over a shared log solve multi-device sync."</li>
+<li>"Groups multiply readers, not storage; reads are cheap from a cursor."</li>
+<li>"Server-assigned per-conversation seq gives consistent ordering across devices."</li>
+<li>"Receipts at large group scale aggregate to counters; per-recipient detail is for 1:1 and small groups."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

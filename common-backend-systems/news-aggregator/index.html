@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>News Aggregator — Google News Style (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">News Aggregator — Google News Style (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Easy · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build a news aggregator like Google News. We continuously crawl thousands of news sites, group articles about the same story into a cluster, and serve a homepage of "top stories" personalized by user interest. 100M daily active users (DAU), ~1M new articles/day from 10k publishers.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Crawl publisher RSS/feeds and full pages on a schedule.
+- Cluster articles that are about the same story.
+- Serve a ranked homepage per user — fresh, diverse, personalized.</p>
+<p>I'd defer paywalled content negotiation, deep editorial categorization, and notifications.</p>
+<p><strong>Non-functional</strong>
+- Freshness — a story breaking now should appear within ~minutes.
+- Homepage p99 &lt; 300 ms.
+- Read-dominated: ~1M articles/day in, but 100M users × 10 page views = 1B reads/day → ~12k QPS average, ~50k peak.
+- Eventual consistency on cluster membership is fine — we can reshuffle clusters as new articles arrive.</p>
+<p><strong>Capacity</strong>
+- 1M articles/day × 5 KB metadata = 5 GB/day, plus raw HTML in object storage.
+- Cluster index: ~50k active clusters at any time (a story dies in 24–48h).
+- Raw HTML is the dominant store: 1M/day × ~50 KB = ~50 GB/day before compression; keep 30 days hot (~1.5 TB) and archive older pages cheaply.
+- Vector working set is smaller: 2M articles in the 48h index × 512 floats × 4 B ≈ 4 GB raw vectors, maybe 2–3× with HNSW graph overhead.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Publisher</strong> — <code>feed_url</code>, crawl policy, last fetched.</li>
+<li><strong>Article</strong> — <code>url</code>, <code>publisher_id</code>, <code>title</code>, <code>published_at</code>, <code>embedding</code>, <code>cluster_id</code>.</li>
+<li><strong>Cluster</strong> — <code>cluster_id</code>, articles, canonical title, topic tags, freshness score.</li>
+<li><strong>User profile</strong> — interest vector / topic preferences.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>GET /v1/home?cursor=...        → { stories[], next_cursor }
+GET /v1/stories/{cluster_id}   → { canonical, articles[], related[] }
+GET /v1/topics/{topic}         → { stories[] }
+POST /v1/interactions          { cluster_id, action }  // implicit signals for personalization
+</code></pre>
+<p>User derived from token.</p>
+<hr />
+<h2 id="4-data-flow-5-min">4. Data Flow (~5 min)</h2>
+<ol>
+<li><strong>Crawler</strong> pulls publisher feeds on a per-publisher cadence (respect robots, rate limits).</li>
+<li><strong>Fetcher</strong> retrieves full article HTML, extracts main content (readability).</li>
+<li><strong>Enricher</strong> computes embedding, extracts entities, runs language detection.</li>
+<li><strong>Clusterer</strong> assigns the article to an existing cluster (cosine similarity &gt; threshold) or creates a new one.</li>
+<li><strong>Ranker</strong> computes per-cluster freshness + quality + diversity scores.</li>
+<li><strong>Personalizer</strong> intersects clusters with the user's interest vector at request time.</li>
+</ol>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Crawl scheduler.</strong> Per-publisher cron with backoff. Tier-1 publishers polled every 60s, tail every 30 min. Frontier in a priority queue (Redis sorted set by next-fetch time).</li>
+<li><strong>Fetcher workers.</strong> Pull URLs, dedupe by canonical URL, write raw HTML to object storage. Push article record to Kafka topic <code>articles.raw</code>.</li>
+<li><strong>Enrichment pipeline.</strong> Stream processor (Flink) consumes <code>articles.raw</code>, computes a sentence embedding (text encoder), writes enriched record to <code>articles.enriched</code> and a vector store (FAISS or Pinecone shard per topic).</li>
+<li><strong>Clustering service.</strong> For each enriched article, search vector store for nearest neighbors among recent articles (last 48h). If best match &gt; threshold, assign to that cluster; else create a new cluster. Cluster metadata in a primary store (MySQL or DynamoDB).</li>
+<li><strong>Ranking pipeline.</strong> Periodic (every 30s) batch job recomputes per-cluster scores: freshness decay + publisher quality + total coverage + diversity penalty. Writes top-N clusters per topic into a Redis cache.</li>
+<li><strong>Homepage service.</strong> On request: pull user's interest vector, fetch top clusters from the per-topic Redis cache, rerank by user fit, return top 20.</li>
+<li><strong>Feedback loop.</strong> <code>interactions</code> events go to Kafka → updates the user interest model (offline retraining + lightweight online update).</li>
+</ol>
+<p>End-to-end narration: a fire breaks at noon. NYT, Reuters, AP each publish within minutes. The crawler picks each up within its publisher cadence. Each article is enriched, vector-search finds the others, and a new cluster forms. The ranker on its next 30s tick scores this cluster highly (high freshness + 3 high-quality publishers). Within 5 minutes of the first article, the cluster is on the homepage for users whose interest vector includes "world news."</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">                +--------------------------------+
+                | CLIENTS AND PUBLISHER SOURCES  |
+                +----------+-------------+-------+
+                     |             |
+          GET /v1/home?cursor    |             | crawl RSS / HTML
+          POST /v1/interactions  |             v
+                     |      +--------------+
+                     |      | Crawl        |
+                     |      | Scheduler    |
+                     |      | + Fetchers   |
+                     |      +------+-------+
+                     |             |
+                     |      articles.raw
+                     v             v
+                +----------+---+  +------+-------+
+                | Homepage     |  | Enrichment   |
+                | Service      |  | + Clusterer  |
+                +------+-------+  +------+-------+
+                    |                 |
+                    | miss            | articles.enriched
+                    v                 v
+     +----------------------------------------------------------+
+     | STORE / CACHE                                            |
+     | crawl:due:{host} Redis ZSET, member=url_id               |
+     | s3://news/raw/yyyy/mm/dd/{article_id}.html blobs         |
+     | article:{article_id} metadata rows                       |
+     | vec:{locale}:{topic}:48h HNSW article_id + vector        |
+     | cluster:{cluster_id} metadata + member article_ids       |
+     | top:{locale}:{topic} Redis ZSET of ~5k cluster_ids       |
+     | profile:{user_id} topic weights + interest vector        |
+     +-----------+----------------------------+-----------------+
+              | cluster/profile miss       ^ refresh every 30s
+              v                            |
+       +-------------------+          +-------+--------+
+       | Cluster / Article |          | Ranking        |
+       | durable store     |          | Pipeline       |
+       +-------------------+          | freshness +    |
+                          | quality score  |
+                          +----------------+
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete stores and shard keys.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key pattern</th>
+<th>Data structure / entry</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Crawl frontier</td>
+<td><code>crawl:due:{host}</code></td>
+<td>Redis ZSET, member=<code>url_id</code>, score=<code>next_fetch_at</code>, ~80 B/member</td>
+<td>no TTL; removed after fetch</td>
+<td><code>host</code></td>
+</tr>
+<tr>
+<td>Raw article</td>
+<td><code>s3://news/raw/yyyy/mm/dd/{article_id}.html</code></td>
+<td>compressed HTML blob, ~20–50 KB</td>
+<td>30 d hot, archive 1 y</td>
+<td>date + <code>article_id</code></td>
+</tr>
+<tr>
+<td>Article metadata</td>
+<td><code>article:{article_id}</code></td>
+<td>title/url/publisher/entities/cluster_id, ~1–2 KB</td>
+<td>hot 30 d, cold forever</td>
+<td><code>article_id</code></td>
+</tr>
+<tr>
+<td>Recent vector index</td>
+<td><code>vec:{locale}:{topic}:48h</code></td>
+<td>HNSW entry = <code>article_id</code> + 512-dim vector, ~2 KB raw plus graph</td>
+<td>48 h sliding window</td>
+<td><code>(locale, topic)</code></td>
+</tr>
+<tr>
+<td>Cluster metadata</td>
+<td><code>cluster:{cluster_id}</code></td>
+<td>canonical title, members, centroid, scores, ~5 KB</td>
+<td>active 7 d, archive 90 d</td>
+<td><code>cluster_id</code></td>
+</tr>
+<tr>
+<td>Topic top list</td>
+<td><code>top:{locale}:{topic}</code></td>
+<td>Redis ZSET of ~5k <code>cluster_id</code>s, score=rank, ~100 KB/list</td>
+<td>refreshed every 30 s, TTL 5 min</td>
+<td><code>(locale, topic)</code></td>
+</tr>
+<tr>
+<td>User profile</td>
+<td><code>profile:{user_id}</code></td>
+<td>topic weights + 512-d interest vector, ~1-2 KB</td>
+<td>active 30 d cache, durable profile</td>
+<td><code>user_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>Capacity by store:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Math</th>
+<th>Dominant knob</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Raw article HTML</td>
+<td>1M/day * 50 KB ~= 50 GB/day; 30 d hot ~= 1.5 TB before archive</td>
+<td>compression and raw retention</td>
+</tr>
+<tr>
+<td>Article metadata</td>
+<td>1M/day * 2 KB * RF=3 ~= 6 GB/day</td>
+<td>cold archive policy</td>
+</tr>
+<tr>
+<td>Vector index</td>
+<td>2M active articles * ~2 KB * 2-3x graph overhead ~= 8-12 GB per locale/topic working set slice</td>
+<td>48 h TTL and topic partitioning</td>
+</tr>
+<tr>
+<td>Cluster metadata</td>
+<td>50k active clusters * 5 KB * RF=3 ~= 750 MB</td>
+<td>small; write contention on hot clusters matters more</td>
+</tr>
+<tr>
+<td>Topic top lists</td>
+<td>100 locales * 100 topics * 100 KB * RF=2 ~= 2 GB</td>
+<td>cap list length</td>
+</tr>
+<tr>
+<td>User profiles</td>
+<td>100M DAU * 2 KB ~= 200 GB hot if all cached</td>
+<td>active-user caching and fallback frontpage</td>
+</tr>
+</tbody>
+</table>
+<p>The interview point is that Redis holds indexes and ranked pointers, not article content. The big bytes are raw pages and article history; the low-latency path moves only cluster IDs and compact metadata.</p>
+<p><strong>Homepage read path.</strong>
+1. Client calls <code>GET /v1/home?cursor=C</code>; API gateway authenticates and forwards <code>user_id</code>.
+2. Homepage service decodes cursor <code>{topic_offsets, seen_cluster_ids, rank_version}</code> so pagination is stable across refreshes.
+3. In parallel, it fetches <code>profile:{user_id}</code> from Redis/MySQL fallback and top lists <code>top:{locale}:{topic}</code> for the user's top 5–10 topics.
+4. It merges ~500 candidate <code>cluster_id</code>s, drops <code>seen_cluster_ids</code>, applies diversity (MMR), then hydrates the top 20 from <code>cluster:{cluster_id}</code> and article snippets from <code>article:{article_id}</code>.
+5. Cache miss path: if a topic list is missing, fall back to regional <code>top:{locale}:frontpage</code>; if cluster metadata is missing, skip that candidate rather than blocking the page.
+6. Return stories plus an opaque cursor carrying offsets and dedupe state, not raw scores.</p>
+<p><strong>Article ingest path.</strong>
+1. Scheduler pops due URLs from <code>crawl:due:{host}</code> and writes fetch attempts keyed by <code>url_hash</code> for dedupe.
+2. Fetcher stores raw HTML in object storage, writes metadata row <code>article:{article_id}</code>, and emits <code>articles.raw</code>.
+3. Enricher computes embedding/entities and writes <code>articles.enriched</code>; entity extraction and embedding can run in parallel after main-text extraction.
+4. Clusterer searches <code>vec:{locale}:{topic}:48h</code>, updates <code>cluster:{cluster_id}</code> with a CAS on the centroid version, then inserts the vector.
+5. Ranking job updates <code>top:{locale}:{topic}</code>; homepage reads the new pointer list on the next refresh window.</p>
+<p>Hot homepage path vs cold path:
+1. Hot path reads <code>profile:{user_id}</code> and the user's top topic lists in parallel, merges cluster IDs, and hydrates only the final 20 clusters. The shard keys are <code>user_id</code>, <code>(locale, topic)</code>, and <code>cluster_id</code>.
+2. Cold profile path falls back to <code>top:{locale}:frontpage</code>, returns a stable cursor, and queues an async profile rebuild from recent interactions.
+3. Exhausted pagination path uses the cursor's <code>{topic_offsets, seen_cluster_ids, rank_version}</code> to continue within the same rank snapshot; if the Redis top list expired, it rebuilds from the cluster DB's rank snapshot and may return fewer stories.
+4. Cache-miss hydration skips missing clusters rather than blocking the page, because freshness matters more than complete recall on the homepage.</p>
+<p>Pipeline choice defense: Kafka/Flink-style streaming is a better fit than a pure cron batch because freshness is a product requirement measured in minutes. MySQL/DynamoDB works for cluster metadata because reads are by <code>cluster_id</code> and writes are small CAS updates; Elasticsearch is useful for keyword search, but it is not the primary clustering store. Redis top lists are pointer caches; using Redis as article storage would waste memory and complicate archival.</p>
+<p><strong>Clustering — the hard part.</strong> Naive K-means doesn't fit: clusters are unbounded and streaming. Use online clustering: each new article queries an HNSW index of recent articles (48h window); if cosine similarity to a centroid &gt; 0.85, join; else seed a new cluster. Centroid is the running mean of member embeddings. Old articles age out of the index.</p>
+<p>Why HNSW / FAISS instead of a SQL scan or periodic K-means: SQL cannot scan millions of recent vectors inside the ingest latency budget, and K-means assumes a mostly fixed cluster set. HNSW gives approximate nearest neighbor lookup in milliseconds and matches the streaming workload. Be ready for "why not Elasticsearch vector search?" — it is reasonable if search is already your operational base, but a dedicated vector index is easier to tune for recall/latency on the 48h working set.</p>
+<p><strong>Cluster quality.</strong> Bad clusters mix unrelated stories. Defense: hard cap similarity threshold, require ≥2 distinct publishers before promoting to homepage, decay centroids slowly so they don't drift.</p>
+<p><strong>Personalization without latency cost.</strong> Interest vectors are tiny (≤512 floats). Compute them offline, write to a per-user cache (Redis or in-process). At request time, the homepage service does a cheap dot product against precomputed top-K clusters per topic.</p>
+<p><strong>Two-view framing.</strong> Articles are accessed two ways: <code>article:{article_id}</code> is the content/metadata view, while <code>top:{locale}:{topic}</code> and <code>cluster:{cluster_id}.members</code> are pointer views over the same article set. The homepage should never scan articles directly; it merges ranked cluster pointers, then hydrates content at the end.</p>
+<p><strong>Freshness vs ranking stability.</strong> Pure freshness yields flicker — the top story changes every refresh. Use a hysteresis term so a cluster has to beat the current top by a margin before swapping in.</p>
+<p><strong>Diversity.</strong> Without a penalty, all top slots become the same story. Maximal Marginal Relevance (MMR) at rank time: each pick discounts clusters similar to already-picked clusters.</p>
+<p><strong>Crawl politeness and freshness budget.</strong> Per-publisher rate limits enforced in the scheduler. Use HTTP <code>If-Modified-Since</code> to avoid refetching unchanged pages. Sitemaps + RSS hubs (PubSubHubbub) push us toward zero polling latency for participating publishers.</p>
+<p>Serving state machine:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Cursor/session state</th>
+<th>Latency target</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot personalized</td>
+<td>profile + topic lists</td>
+<td><code>profile:{user_id}</code>, <code>top:{locale}:{topic}</code></td>
+<td>rank version + seen clusters</td>
+<td>&lt; 300 ms</td>
+</tr>
+<tr>
+<td>Cold user</td>
+<td>regional default</td>
+<td><code>top:{locale}:frontpage</code></td>
+<td>new cursor, empty profile</td>
+<td>&lt; 300 ms</td>
+</tr>
+<tr>
+<td>Exhausted</td>
+<td>deep pagination</td>
+<td>rank snapshot + cluster DB</td>
+<td>topic offsets + seen set</td>
+<td>&lt; 800 ms</td>
+</tr>
+<tr>
+<td>Fresh breaking</td>
+<td>promote cluster</td>
+<td>cluster metadata + trusted publisher rule</td>
+<td>rank version advances</td>
+<td>minutes to homepage</td>
+</tr>
+<tr>
+<td>Degraded clustering</td>
+<td>lexical fallback</td>
+<td>SimHash/entity index</td>
+<td>low-confidence marker internal</td>
+<td>&lt; 10 min freshness</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Edge stress tests.</strong> A single breaking story can create write contention on one <code>cluster:{cluster_id}</code>; use centroid-version CAS with retry and batch member appends. Dormant users should not force profile recomputation on the request path. Publisher bursts are bounded by per-host crawl queues and stream backpressure. Multi-region drift is acceptable if each region shows its own <code>rank_version</code> and converges within a few minutes. Cold start after vector-index loss uses lexical clustering first, then repairs clusters when the HNSW index is rebuilt.</p>
+<p><strong>Graceful degradation.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Latency budget</th>
+<th>Fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot breaking story</td>
+<td>push into fresh cluster</td>
+<td>vector index + cluster CAS</td>
+<td>&lt; 5 min to homepage</td>
+<td>promote with 2-publisher rule relaxed for trusted wires</td>
+</tr>
+<tr>
+<td>Dormant user profile</td>
+<td>cold personalize</td>
+<td>default regional top lists</td>
+<td>&lt; 300 ms</td>
+<td>serve frontpage, rebuild profile async</td>
+</tr>
+<tr>
+<td>Cursor past cached window</td>
+<td>cold pagination</td>
+<td>cluster DB by rank snapshot</td>
+<td>&lt; 800 ms</td>
+<td>return fewer stories + new cursor</td>
+</tr>
+<tr>
+<td>Vector index degraded</td>
+<td>lexical clustering</td>
+<td>title/entity SimHash</td>
+<td>&lt; 10 min freshness</td>
+<td>mark low confidence, repair clusters later</td>
+</tr>
+<tr>
+<td>Publisher throttles</td>
+<td>polite backoff</td>
+<td><code>Retry-After</code> + crawl frontier</td>
+<td>next allowed slot</td>
+<td>rely on feeds/sitemaps from other publishers</td>
+</tr>
+</tbody>
+</table>
+<p>"My punch line would be: the homepage is a pointer-serving problem; clustering is the expensive async problem, so I keep those failure domains separate."</p>
+<p><strong>Duplicate detection.</strong> Same article published on syndicated outlets. SimHash on title + first paragraph; if SimHash within 3 bits, treat as duplicate and merge metadata rather than creating a new article.</p>
+<p><strong>What I'd defer.</strong> Comment/discussion threading, paywall handling, video stories, fact-check integration, multilingual cluster merging.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

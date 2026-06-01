@@ -1,0 +1,1342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Uber Eats — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Uber Eats</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Uber Eats is a three-sided marketplace — eaters, restaurants (merchants), and couriers — built on top of a geospatial dispatch core. Unlike <a href="./design-uber-or-lyft.md">Uber/Lyft</a>, the courier match must align with <strong>food readiness</strong>: dispatch too early and the courier waits at the restaurant; too late and the food sits cold. There's also a catalog/discovery layer (menu, search, photos) absent from ride-hailing, and the order lifecycle has three independent actors that must hand off cleanly.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every order flows through cart → placed → accepted-by-merchant → preparing → ready → picked-up → delivered, with at-most-one-courier per order (or per batch), idempotent payment authorized at placement and captured at delivery, the menu shown to the eater matching the merchant's current availability within seconds, and fees deterministically computable from recorded events.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can compose a geospatial dispatch system with a catalog/search system and a multi-party order state machine — and whether you can reason about prep-time prediction, batching, item-level inventory ("86'd" items), and the failure modes specific to food delivery (restaurant rejects, courier no-show, missing items, cold food).</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Uber Eats as four layers. First, a catalog and discovery layer — restaurants, menus, search filtered by delivery radius and prep time. Second, an order service owning the cart and the three-party state machine. Third, a courier dispatch layer that reuses the Uber geo-index but adds prep-time-aware scheduling and batching. Fourth, payments and pricing, including delivery fee and tip. The interesting decisions are: how to time courier dispatch against predicted food-ready time, how to batch nearby orders, how to keep merchant menus consistent with real-time availability, and how to handle the failure modes where one of three parties drops out.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Eater browses restaurants filtered by location, cuisine, rating, delivery time.</li>
+<li>Eater builds a cart from one restaurant's menu; checks out with address, payment, tip.</li>
+<li>Restaurant receives the order on a tablet/POS, accepts (or rejects), marks ready.</li>
+<li>System matches a courier; courier picks up, delivers.</li>
+<li>Live tracking through the lifecycle.</li>
+<li>Ratings: eater rates restaurant and courier; courier rates eater.</li>
+<li>Refunds and credits for missing items, late delivery, wrong order.</li>
+<li>Promotions, group orders, scheduled orders, reorder.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Catalog read-heavy; eater browse must be sub-second.</li>
+<li>Order placement strongly consistent (no charging without accepting an order).</li>
+<li>Courier match latency a few seconds; dispatch timed to prep-ready.</li>
+<li>Item availability propagation seconds to a minute.</li>
+<li>Multi-region; cities are the natural shard.</li>
+<li>Auditability for orders, payments, refunds.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Grocery / convenience (different fulfillment shape).</li>
+<li>Restaurant POS hardware specifics.</li>
+<li>Map / routing engine internals.</li>
+<li>Recommendations ML beyond a high-level mention.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Eaters</td>
+<td>100M+ MAU; tens of millions DAU.</td>
+</tr>
+<tr>
+<td>Restaurants</td>
+<td>1M+ globally active.</td>
+</tr>
+<tr>
+<td>Couriers</td>
+<td>Millions; hundreds of thousands online at peak.</td>
+</tr>
+<tr>
+<td>Orders / day</td>
+<td>10s of millions.</td>
+</tr>
+<tr>
+<td>Concurrent in-flight orders</td>
+<td>Hundreds of thousands.</td>
+</tr>
+<tr>
+<td>Menu items / restaurant</td>
+<td>50-500.</td>
+</tr>
+<tr>
+<td>Catalog reads</td>
+<td>100k+ QPS peak (browse).</td>
+</tr>
+<tr>
+<td>Cities</td>
+<td>Hundreds globally.</td>
+</tr>
+</tbody>
+</table>
+<p>Bottleneck: catalog read fanout for browse plus prep-time-aware dispatch under contention.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Experience</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Eater</td>
+<td>Browse, cart, checkout, track.</td>
+<td>Fast catalog; live tracking.</td>
+</tr>
+<tr>
+<td>Restaurant</td>
+<td>Receive order, accept, prepare, mark ready.</td>
+<td>Reliable order delivery to tablet.</td>
+</tr>
+<tr>
+<td>Courier</td>
+<td>Receive offer, pick up, deliver.</td>
+<td>Real-time; prep-aware.</td>
+</tr>
+<tr>
+<td>Order lifecycle</td>
+<td>Three-party state machine.</td>
+<td>Strongly consistent.</td>
+</tr>
+<tr>
+<td>Pricing</td>
+<td>Items + fees + tip + tax + surge.</td>
+<td>Deterministic from events.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                              +-------------+
+                              | API Gateway |
+                              +------+------+
+                                     |
+   +------------+-------------+------+------+-------------+-----------+
+   |            |             |             |             |           |
+   v            v             v             v             v           v
+ Catalog    Search /      Order Svc    Dispatch /     Payment      Notification
+ (Menu,     Discovery     (Cart,       Courier        (Auth +      (Push/SMS)
+ Photos)                  Lifecycle)   Geo Index      Capture)
+                                       + Batching
+   |            |             |             |             |           |
+   +------------+-------------+------+------+-------------+-----------+
+                                     |
+                                     v
+                       Merchant Tablet / POS Adapter
+                       Courier App  /  Eater App
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Catalog service</td>
+<td>Restaurants, menus, photos, hours.</td>
+<td>Read-heavy; CDN + cache.</td>
+</tr>
+<tr>
+<td>Availability service</td>
+<td>Per-item / per-restaurant live availability ("86'd").</td>
+<td>Streaming updates.</td>
+</tr>
+<tr>
+<td>Search / discovery</td>
+<td>Find restaurants by location, cuisine, filters.</td>
+<td>Geo-bounded ES/Solr index.</td>
+</tr>
+<tr>
+<td>Order service</td>
+<td>Cart, checkout, three-party state machine.</td>
+<td>CAS transitions.</td>
+</tr>
+<tr>
+<td>Pricing service</td>
+<td>Compute item total, fees, surge, tax.</td>
+<td>Deterministic from cart + context.</td>
+</tr>
+<tr>
+<td>Promo service</td>
+<td>Codes, eligibility, atomic redemption.</td>
+<td>Reuse from Uber design.</td>
+</tr>
+<tr>
+<td>Payment service</td>
+<td>Authorize at placement; capture at delivery.</td>
+<td>Reuse <a href="./design-a-payment-system.md">payment design</a>.</td>
+</tr>
+<tr>
+<td>Merchant adapter</td>
+<td>Tablet app or POS integration.</td>
+<td>Idempotent acks; retry queue.</td>
+</tr>
+<tr>
+<td>Courier dispatch</td>
+<td>Match courier to order; prep-time-aware.</td>
+<td>Geo index + ETA + ready-time model.</td>
+</tr>
+<tr>
+<td>Batching engine</td>
+<td>Group nearby orders for one courier.</td>
+<td>Online bin-packing under SLA.</td>
+</tr>
+<tr>
+<td>ETA service</td>
+<td>Predict prep + drive + handoff times.</td>
+<td>Routing + ML.</td>
+</tr>
+<tr>
+<td>Live tracking</td>
+<td>Push order state + courier location to eater.</td>
+<td>Persistent stream.</td>
+</tr>
+<tr>
+<td>Rating / support / refunds</td>
+<td>Post-delivery workflows.</td>
+<td>Reuse from Uber backend.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="restaurant">Restaurant</h4>
+<pre><code class="language-text">Restaurant(
+  restaurant_id,
+  name,
+  cuisine_tags,
+  location,                // lat/lng + cell
+  delivery_radius,
+  hours,                   // weekly schedule + exceptions
+  rating_avg,
+  status,                  // open, closed, paused
+  prep_time_p50,           // learned, per hour-of-week
+  acceptance_rate,
+  payout_account
+)
+</code></pre>
+<h4 id="menu-item">Menu Item</h4>
+<pre><code class="language-text">MenuItem(
+  item_id,
+  restaurant_id,
+  name,
+  description,
+  price_cents,
+  modifier_groups: [...],  // size, add-ons, options
+  photo_url,
+  tags,                    // vegetarian, spicy, etc.
+  available,               // current availability
+  version
+)
+</code></pre>
+<h4 id="cart-order">Cart / Order</h4>
+<pre><code class="language-text">Order(
+  order_id,
+  eater_id,
+  restaurant_id,
+  courier_id?,
+  batch_id?,
+  items: [{item_id, qty, modifiers, unit_price}],
+  delivery_address,
+  delivery_instructions,
+  state,                   // see state machine
+  states_history: [(state, ts, actor)],
+  placed_at,
+  accepted_at,
+  ready_at?,
+  picked_up_at?,
+  delivered_at?,
+  pricing: {
+    subtotal,
+    delivery_fee,
+    service_fee,
+    surge_multiplier,
+    tip,
+    tax,
+    discount,
+    total,
+    courier_payout,
+    merchant_payout
+  },
+  payment_intent_id,
+  promo_code?,
+  rating?,
+  version
+)
+</code></pre>
+<h4 id="courier">Courier</h4>
+<pre><code class="language-text">Courier(
+  courier_id,
+  status,                  // offline, online_available, en_route_pickup,
+                           // at_restaurant, en_route_dropoff, multi_order
+  current_location,
+  current_cell,
+  vehicle_type,            // bike, car, scooter
+  active_orders: [order_id, ...],  // up to N for batching
+  rating_avg,
+  version
+)
+</code></pre>
+<h4 id="availability-event">Availability Event</h4>
+<pre><code class="language-text">AvailabilityEvent(
+  restaurant_id,
+  item_id?,                // null =&gt; whole restaurant
+  available,               // bool
+  reason,                  // sold_out, kitchen_overload, closing_soon
+  ts
+)
+</code></pre>
+<h3 id="concrete-stores-keys-ttls-and-capacity">Concrete Stores, Keys, TTLs, And Capacity</h3>
+<p>Uber Eats looks like one app, but the hot data splits into catalog snapshots, live overlays, orders, courier state, and indexes. Keep content stores separate from indexes: indexes mostly hold IDs and pointers; content stores hold hydrated objects.</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / shard</th>
+<th>Value</th>
+<th>TTL / retention</th>
+<th>Size math</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Restaurant DB</td>
+<td><code>restaurant_id</code>; shard by city then hash</td>
+<td>Restaurant profile, hours, delivery polygons, payout account pointer. About 4 KB/row.</td>
+<td>Durable; audit changes for years.</td>
+<td>1M restaurants × 4 KB × 3 replicas × 3 read regions ≈ 36 GB, small compared with orders.</td>
+</tr>
+<tr>
+<td>Menu item DB</td>
+<td><code>(restaurant_id, item_id)</code></td>
+<td>Item text, modifier groups, base price, photo pointer, version. About 1 KB/item.</td>
+<td>Durable; old versions archived.</td>
+<td>1M restaurants × 200 items × 1 KB ≈ 200 GB primary; with 3 replicas and global read copies ≈ 1-2 TB.</td>
+</tr>
+<tr>
+<td>Card snapshot cache</td>
+<td><code>card:{restaurant_id}:v{version}</code> in Redis</td>
+<td>Denormalized browse card JSON: name, cuisine tags, rating, photo URL, base ETA fields. 1-2 KB.</td>
+<td>24h TTL plus explicit invalidation on catalog writes.</td>
+<td>1M × 2 KB × RF2 × 3 regions ≈ 12 GB, cheap and extremely hot.</td>
+</tr>
+<tr>
+<td>Live availability overlay</td>
+<td><code>avail:{restaurant_id}</code> Redis hash <code>item_id -&gt; {available, version, reason}</code></td>
+<td>Only live state; not full menu content.</td>
+<td>No TTL while restaurant is active; expire after restaurant closes + 24h and rebuild from DB.</td>
+<td>200M item flags × ~60 B effective Redis cost ≈ 12 GB per full copy; RF2 ≈ 24 GB per region.</td>
+</tr>
+<tr>
+<td>Geo forward index</td>
+<td><code>geo:{h3_cell}:restaurants</code> and selected <code>geo:{h3_cell}:{filter}</code></td>
+<td>Sets of <code>restaurant_id</code> or <code>(restaurant_id, zone_id)</code> pointers.</td>
+<td>Rebuilt on polygon/menu/status changes; no user TTL.</td>
+<td>If 1M cells avg 500 ids × 8 B raw is 4 GB; Redis/set overhead makes it closer to 20-40 GB per region.</td>
+</tr>
+<tr>
+<td>Order DB</td>
+<td><code>order:{order_id}</code>; shard by <code>hash(order_id)</code>, secondary indexes on <code>eater_id</code>, <code>restaurant_id</code>, <code>courier_id</code></td>
+<td>Order row with state, item snapshot, pricing snapshot, payment intent. 4-8 KB.</td>
+<td>Hot 90 days; cold archive for support/tax.</td>
+<td>30M orders/day × 90 days × 6 KB ≈ 16 TB primary hot; with 3 replicas ≈ 48 TB. This is the dominant store.</td>
+</tr>
+<tr>
+<td>Order event log</td>
+<td><code>(order_id, seq)</code> append-only</td>
+<td>State transitions, actor, timestamp, pricing inputs. 300-600 B/event.</td>
+<td>Hot 90 days; cold for years.</td>
+<td>30M/day × ~12 events × 500 B ≈ 180 GB/day primary; archive quickly.</td>
+</tr>
+<tr>
+<td>Courier live state</td>
+<td><code>courier:{courier_id}</code> and <code>couriers:{h3_cell}</code> sorted set by freshness/ETA</td>
+<td>Location, status, active orders, last heartbeat.</td>
+<td>30-60s TTL; courier app refreshes every 4-10s.</td>
+<td>500k online × 300 B × RF3 is under 500 MB; geo-index overhead dominates but stays in GBs, not TBs.</td>
+</tr>
+<tr>
+<td>Browse session state</td>
+<td>opaque cursor encodes <code>{request_id, cell, rank_score, tie_breaker, index_version}</code>; optional <code>shown:{request_id}</code> set</td>
+<td>Cursor and dedupe IDs, not hydrated cards.</td>
+<td>10-30 minutes.</td>
+<td>1M active browse sessions × 2 KB ≈ 2 GB.</td>
+</tr>
+</tbody>
+</table>
+<p>Technology choices: use a relational or globally distributed SQL store for orders because state transitions need compare-and-swap, secondary lookups, and payment reconciliation. Use Elasticsearch / Solr for discovery because ranking needs geo + filters + text; Redis alone is not enough. Use Redis for snapshots and overlays because data is small, hot, and rebuildable. Be ready for "why not put menus directly in Elasticsearch?" — search index documents are pointers and ranking features; the menu DB remains the source of truth, and card snapshots provide the hydrated read model.</p>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">Eater:
+GET    /restaurants?lat=&amp;lng=&amp;cuisine=&amp;sort=    # browse
+GET    /restaurants/{id}/menu
+POST   /carts                                   # create/update
+POST   /orders                                  # checkout
+GET    /orders/{id}
+POST   /orders/{id}/cancel
+POST   /orders/{id}/rate
+
+Merchant:
+GET    /merchant/orders                         # poll or stream
+POST   /merchant/orders/{id}/accept
+POST   /merchant/orders/{id}/reject
+POST   /merchant/orders/{id}/ready
+POST   /merchant/menu/items/{id}/availability   # 86 an item
+
+Courier:
+POST   /courier/online
+POST   /courier/location
+POST   /courier/orders/{id}/accept
+POST   /courier/orders/{id}/arrived_pickup
+POST   /courier/orders/{id}/picked_up
+POST   /courier/orders/{id}/delivered
+</code></pre>
+<h3 id="step-by-step-hot-paths">Step-By-Step Hot Paths</h3>
+<p><strong>Browse restaurants — read-heavy path.</strong></p>
+<ol>
+<li>Eater app calls <code>GET /restaurants?lat=&amp;lng=&amp;filters=&amp;cursor=</code> with profile auth if logged in.</li>
+<li>Browse API maps lat/lng to H3 cell and reads <code>geo:{cell}:restaurants</code> plus neighbor cells in parallel.</li>
+<li>In parallel, it loads live overlays (<code>restaurant status</code>, <code>busy level</code>, availability summary), eater features, sponsored candidates, and cached ETA features.</li>
+<li>It filters candidate IDs by open-now, delivery polygon, hard filters, and availability. This stage operates on IDs and bitsets, not full menus.</li>
+<li>L1 ranker scores hundreds of IDs; L2 ranker scores the top ~50 with richer features.</li>
+<li>Card builder <code>MGET</code>s <code>card:{restaurant_id}:v{version}</code> from Redis, overlays live status, injects sponsored slots that still pass eligibility, and returns 10-15 cards.</li>
+<li>Cursor encodes rank score, tie-breaker, request/index version, and optionally a dedupe token. Later pages re-check live status but do not re-run the full global ranking.</li>
+</ol>
+<p><strong>Checkout — consistency hot spot.</strong></p>
+<ol>
+<li>Eater posts cart to <code>POST /orders</code> with idempotency key.</li>
+<li>Order service reads menu item versions and <code>avail:{restaurant_id}</code> under a short validation lock; stale cart prices trigger a confirm-before-place response.</li>
+<li>Pricing service computes fees, tax, promo, and tip placeholder from deterministic inputs; promo redemption is an atomic reservation.</li>
+<li>Payment service pre-authorizes <code>estimated_total</code> using <code>order_id</code> as idempotency key.</li>
+<li>Order DB transaction inserts <code>Order(state=placed)</code>, item/pricing snapshots, state-history event, and outbox events for merchant adapter and dispatch scheduler.</li>
+<li>Merchant adapter delivers to tablet/POS at least once; merchant acks are idempotent by <code>order_id</code>.</li>
+</ol>
+<p><strong>Dispatch — two-view pattern.</strong></p>
+<p>The same in-flight order is indexed two ways:</p>
+<table>
+<thead>
+<tr>
+<th>View</th>
+<th>Key</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Order-owned view</td>
+<td><code>order:{order_id}</code></td>
+<td>Authoritative state machine, pricing, payment, support history.</td>
+</tr>
+<tr>
+<td>Dispatch view</td>
+<td><code>dispatch:{h3_cell}:{ready_bucket}</code> → order IDs</td>
+<td>Fast matching by geography and predicted ready time.</td>
+</tr>
+</tbody>
+</table>
+<ol>
+<li>On <code>placed</code>, dispatch scheduler computes <code>food_ready_time</code> and inserts the order ID into <code>dispatch:{pickup_cell}:{ready_bucket}</code>.</li>
+<li>Matching workers scan buckets whose <code>dispatch_deadline &lt;= now</code>, read nearby <code>couriers:{h3_cell}</code> sorted sets, and score candidates.</li>
+<li>Worker reserves a courier with CAS on <code>courier:{courier_id}</code> and CASes the dispatch assignment on <code>order:{order_id}</code>.</li>
+<li>If merchant marks ready early, the order moves to an earlier bucket; if prep runs late, the offer can be delayed or reassigned before pickup.</li>
+</ol>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Browse is an ID-and-index problem until the final card build; checkout is a transactional state-machine problem; dispatch is the same order indexed a second way by cell and ready-time bucket.</p>
+</blockquote>
+<h3 id="order-lifecycle">Order Lifecycle</h3>
+<p>Three-party state machine:</p>
+<pre><code class="language-text">cart -&gt; placed -&gt; accepted -&gt; preparing -&gt; ready -&gt; picked_up -&gt; delivered
+          |          |           |           |          |
+          v          v           v           v          v
+        canceled  rejected   canceled     canceled  undelivered
+                  (by merchant)                     (return / refund)
+</code></pre>
+<p>Transitions and ownership:</p>
+<table>
+<thead>
+<tr>
+<th>Transition</th>
+<th>Actor</th>
+<th>CAS condition</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cart -&gt; placed</code></td>
+<td>Eater (checkout)</td>
+<td>Payment pre-auth succeeds.</td>
+</tr>
+<tr>
+<td><code>placed -&gt; accepted</code></td>
+<td>Merchant</td>
+<td>Within accept SLA (~2 min).</td>
+</tr>
+<tr>
+<td><code>placed -&gt; rejected</code></td>
+<td>Merchant</td>
+<td>Refund auth.</td>
+</tr>
+<tr>
+<td><code>accepted -&gt; preparing</code></td>
+<td>Merchant (auto on accept)</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>preparing -&gt; ready</code></td>
+<td>Merchant</td>
+<td>Triggers courier hand-off.</td>
+</tr>
+<tr>
+<td><code>ready -&gt; picked_up</code></td>
+<td>Courier</td>
+<td>At restaurant location.</td>
+</tr>
+<tr>
+<td><code>picked_up -&gt; delivered</code></td>
+<td>Courier</td>
+<td>At delivery location + eater confirm or photo.</td>
+</tr>
+<tr>
+<td>any -&gt; <code>canceled</code></td>
+<td>Eater / system</td>
+<td>Subject to refund policy.</td>
+</tr>
+</tbody>
+</table>
+<p>Each transition is CAS on <code>(order_id, from_state)</code>. State history is appended for audit.</p>
+<p>Courier dispatch state runs <strong>in parallel</strong> with the merchant prep state:</p>
+<pre><code class="language-text">order_placed --&gt; [dispatch scheduler]
+                       |
+                       v
+                courier_offered -&gt; courier_accepted -&gt; en_route_pickup
+                                                              |
+                                                              v
+                                                       at_restaurant
+                                                              |
+                                                       (waits for ready)
+                                                              |
+                                                              v
+                                                        picked_up
+</code></pre>
+<p>The merchant track and the courier track converge at <code>picked_up</code>.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Order state and courier state are two parallel state machines that converge at pickup. The hard timing problem is aligning the courier's arrival with the food-ready time.</p>
+</blockquote>
+<h3 id="catalog-and-search">Catalog And Search</h3>
+<p>Catalog is read-heavy and slowly mutating; search is geo-bounded.</p>
+<ul>
+<li>Restaurant + menu data stored in a relational store (Postgres / Spanner), partitioned by <code>restaurant_id</code>.</li>
+<li>Menu reads served via cache (Redis) + CDN for photos.</li>
+<li>Search index (Elasticsearch) keyed on cell + restaurant; documents include cuisine, rating, prep-time, delivery-time estimate.</li>
+<li>Browse query = geo cells within delivery radius + filters. Sorted by <code>score(eta, rating, popularity, sponsored)</code>.</li>
+<li>Availability changes ("86 the salmon", "restaurant paused") flow through a streaming pipeline that updates the search index and invalidates cache within seconds.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Browse is "restaurants near me that can deliver to me, filtered and ranked." It's an ES query over cells, decorated with live availability and ETA, and aggressively cached because reads dwarf writes.</p>
+</blockquote>
+<h3 id="deep-dive-displaying-restaurants-to-the-eater">Deep Dive: Displaying Restaurants To The Eater</h3>
+<p>This is the headline read path. Reads dwarf writes by roughly 1000:1, hundreds of thousands QPS at peak, and the answer has to feel instant while still honoring live changes within seconds.</p>
+<h4 id="the-query-restated">The Query, Restated</h4>
+<blockquote>
+<p>"Which restaurants can deliver to my address right now, ranked for me, with current ETA and live state — in under 300 ms p99."</p>
+</blockquote>
+<p>Decomposed:</p>
+<ol>
+<li><strong>Geospatial eligibility</strong> — eater's address falls inside each restaurant's delivery zone.</li>
+<li><strong>Open-now</strong> — current local time is within hours and the restaurant isn't paused.</li>
+<li><strong>Capacity</strong> — not in soft-throttle / hot-restaurant mode.</li>
+<li><strong>Filters</strong> — eater's cuisine, dietary tags, price tier, rating floor.</li>
+<li><strong>Ranking</strong> — ETA, rating, popularity, personalization, sponsored slots, business rules.</li>
+<li><strong>Decoration</strong> — name, photo URL, rating, delivery fee, ETA range, badges, current status.</li>
+</ol>
+<h4 id="why-its-harder-than-it-looks">Why It's Harder Than It Looks</h4>
+<ul>
+<li><strong>Geo is inverted vs. Uber.</strong> Each restaurant has its own delivery polygon. The question is "is the eater inside <em>this restaurant's</em> polygon?" — not "what's within X km of the eater?" The natural index direction flips.</li>
+<li><strong>ETA is dynamic.</strong> Each card's "32-45 min" depends on the restaurant's current prep load and the cell's traffic. Can't bake it into a daily snapshot.</li>
+<li><strong>Personalization.</strong> Two eaters at the same address should see different orderings.</li>
+<li><strong>Live availability.</strong> Restaurant pauses, hours changes, and new launches must surface within seconds.</li>
+<li><strong>Cold-start latency.</strong> First open of the app has to feel instant; we can't serialize geo + filters + ranker + ETA + ads + decoration end-to-end.</li>
+</ul>
+<h4 id="read-pipeline">Read Pipeline</h4>
+<pre><code class="language-text">  Eater App
+     |
+     v
+  [ Edge cache (anonymous / cold-start feed) ]
+     |
+     v
+  [ Browse API (regional) ]
+     |
+     +--&gt; Geo candidate set       (cell -&gt; [restaurant_id])
+     +--&gt; Open-now + status       (live overlay)
+     +--&gt; Filters (bitset)
+     +--&gt; L1 ranker (cheap)       (~hundreds -&gt; top 50)
+     +--&gt; L2 ranker (model)       (top 50 reordered)
+     +--&gt; ETA decorator           (cached prep + cell drive-time)
+     +--&gt; Sponsored auction       (slot injection)
+     +--&gt; Card builder            (assemble JSON)
+     |
+     v
+  Eater feed: ranked, decorated cards
+</code></pre>
+<h4 id="geo-candidate-set-forward-index-by-cell">Geo Candidate Set: Forward Index By Cell</h4>
+<p>Two ways to model eligibility:</p>
+<table>
+<thead>
+<tr>
+<th>Approach</th>
+<th>Read shape</th>
+<th>Write shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Polygon-on-restaurant</strong> (point-in-polygon per candidate)</td>
+<td>Slower reads — scan + PIP test.</td>
+<td>Cheap writes.</td>
+</tr>
+<tr>
+<td><strong>Cell-forward index</strong> <code>cell_id -&gt; [restaurant_id]</code></td>
+<td>One Redis <code>SMEMBERS</code>. Fast.</td>
+<td>More expensive writes; must update on every polygon change.</td>
+</tr>
+</tbody>
+</table>
+<p>We pick the forward index for the hot path; the polygon is the source of truth and used to rebuild the index. On restaurant write or polygon change, an indexer enumerates the H3 cells the polygon covers and updates the forward index plus invalidates affected eater-cell caches.</p>
+<p>Edge details:</p>
+<ul>
+<li><strong>Cell-boundary eater:</strong> query eater's cell plus immediate H3 neighbors, dedupe.</li>
+<li><strong>Multi-zone restaurants</strong> (different fees per sub-area): entries are <code>(restaurant_id, zone_id)</code> so fee is known at fetch.</li>
+<li><strong>Resolution choice:</strong> H3 res ~8-9 (~100-400 m); finer than dispatch since UX wants tight precision.</li>
+</ul>
+<h4 id="card-snapshot-cache">Card Snapshot Cache</h4>
+<p>Once we have candidate IDs, we need decoration data. We do <strong>not</strong> join against the catalog DB on the read path.</p>
+<ul>
+<li>A snapshot service materializes a denormalized "card" (~1-2 KB JSON) per restaurant on every catalog write: name, photo URL, rating, hours-compiled, base fee, tag bitset, prep_time_p50, status, <code>version</code>/<code>etag</code>.</li>
+<li>Stored in Redis cluster keyed by <code>restaurant_id</code>. Single <code>MGET</code> fetches all candidate cards in one round-trip.</li>
+<li><strong>Local LRU</strong> at the browse service catches the top-N restaurants per city — extremely hot tail.</li>
+<li><strong>Photos</strong> served from CDN by URL; eater app loads them after the text feed renders.</li>
+<li>Eater app sends <code>If-None-Match: &lt;etag&gt;</code> on refresh; unchanged cards return 304.</li>
+</ul>
+<p>Live state that <em>cannot</em> live in the snapshot — <code>status</code> (paused/closed), current <code>busy</code> level — sits in a separate Redis hash overlaid at card-build time.</p>
+<h4 id="open-now-and-hours">Open-Now And Hours</h4>
+<p>Each restaurant has weekly hours plus exception dates. At write, the catalog compiles hours into a list of <code>(open_ts, close_ts)</code> intervals for the next 7 days in local timezone, stored in the snapshot. At read, "open-now" is an interval lookup. "Closing soon" precomputed similarly. Scheduled-for-later orders flip the timestamp: same data structure, future <code>now</code>.</p>
+<h4 id="eta-on-the-card">ETA On The Card</h4>
+<p>Browse-time ETA is <strong>approximate</strong> by design:</p>
+<pre><code>eta_min = prep_time(restaurant, current_load) + drive_time(restaurant_cell, eater_cell)
+eta_max = eta_min + uncertainty_pad
+</code></pre>
+<ul>
+<li><code>prep_time</code> from the same model used by dispatch, refreshed every ~30 s and bumped by the order service when the restaurant's pending count crosses thresholds.</li>
+<li><code>drive_time</code> is <strong>not</strong> a routing-engine call per restaurant per browse. We precompute a <code>cell -&gt; cell</code> mean drive-time matrix refreshed every few minutes from observed deliveries. Coarse, fast, plenty good for a card.</li>
+<li>Cache <code>(eater_cell, restaurant_id) -&gt; eta</code> for ~60 s.</li>
+</ul>
+<p>We refine ETA on the restaurant menu screen where it's a single restaurant and a routing call is affordable.</p>
+<h4 id="ranking-two-stage">Ranking: Two-Stage</h4>
+<p>Latency budget forbids running a heavy model over hundreds of candidates. Two-stage:</p>
+<ol>
+<li><strong>L1 (cheap, fast):</strong> linear blend over precomputed features — popularity-in-cell, rating, ETA, delivery fee, eater's cuisine-affinity coarse vector. Reduces candidates from ~hundreds to top ~50.</li>
+<li><strong>L2 (ML model):</strong> richer features — eater embedding (offline daily, online deltas), restaurant embedding, time-of-day, weather, prior interactions. GBDT or lightweight transformer scoring <code>P(order | eater, restaurant, context)</code>. Reorders top 50.</li>
+</ol>
+<p>Features come from caches; we do not synchronously call backing stores during ranking. Eater embedding cached by <code>eater_id</code>; restaurant embedding baked into snapshot.</p>
+<p><strong>Cold-start eater</strong> (no history): skip personalization, fall back to popularity-in-cell ranker. No personalization round-trip on first open.</p>
+<h4 id="sponsored-slots">Sponsored Slots</h4>
+<p>Separate auction service returns <code>(restaurant_id, bid)</code> pairs. Injected at fixed positions (e.g., slot 1, slot 5) with a "Sponsored" label. Auction observes pacing and per-advertiser daily budget caps. Ad relevance gated by the same geo + open-now + filters checks so we never show an unreachable ad.</p>
+<h4 id="filters">Filters</h4>
+<p>Filters are hard constraints applied before ranking. Two flavors:</p>
+<ul>
+<li><strong>Bitset filters</strong> in the snapshot: each restaurant carries a bitset of tags (vegetarian, halal, fast-delivery, free-delivery-promo, …). CPU intersection on the candidate set, microseconds.</li>
+<li><strong>Index-level pre-filter</strong> for the most popular dimensions: <code>cell_id:vegetarian -&gt; [restaurant_id]</code>. Cheaper at read, more index space. Only used for the top few high-cardinality filters.</li>
+</ul>
+<h4 id="live-invalidation-pipeline">Live Invalidation Pipeline</h4>
+<p>A merchant pause, hours edit, or new launch must reflect within seconds.</p>
+<pre><code>Merchant action -&gt; Kafka(merchant_events)
+                       |
+        +--------------+---------------+--------------------+
+        v              v               v                    v
+  Forward-index   Card snapshot   Live status hash    Local-LRU
+  updater         updater         (paused/open)       fan-out invalidate
+</code></pre>
+<p>Eater app doesn't subscribe to every change; the next browse request gets fresh state. For an eater actively staring at a feed, we can push a "restaurant paused" hint over the live channel so the card greys out without a refresh.</p>
+<h4 id="pagination">Pagination</h4>
+<ul>
+<li>Above-the-fold: ~10-15 cards.</li>
+<li>API paginates with an opaque cursor encoding the L2 ranker score breakpoint and a tie-break key.</li>
+<li>Subsequent pages re-validate liveness for that page's restaurants but don't re-rank.</li>
+<li>We do not paginate at the index layer — that would break global order.</li>
+</ul>
+<h4 id="edge-cache-for-coldanonymous-traffic">Edge Cache For Cold/Anonymous Traffic</h4>
+<p>For logged-out or new-user requests the response is highly cacheable. Key the cached response by <code>(cell_id, filter_hash, user_segment)</code> with ~10-30 s TTL. Personalized users skip the cache and hit the feed builder. This single layer absorbs a large slice of dinner-peak traffic.</p>
+<h4 id="failure-modes-specific-to-browse">Failure Modes Specific To Browse</h4>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Mitigation</th>
+<th>Signal</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Forward index Redis down.</td>
+<td>Fallback to a colder "popular in city" list; degrade gracefully.</td>
+<td>Index miss rate.</td>
+</tr>
+<tr>
+<td>L2 ranker slow.</td>
+<td>L1-only fallback; emit warning.</td>
+<td>Ranker p99.</td>
+</tr>
+<tr>
+<td>ETA service slow.</td>
+<td>Stale ETA with "approximate" badge.</td>
+<td>ETA fetch p99.</td>
+</tr>
+<tr>
+<td>Stale snapshot (open but paused).</td>
+<td>Live status overlay catches it; eater sees paused on click.</td>
+<td>Snapshot/status divergence.</td>
+</tr>
+<tr>
+<td>Personalization service down.</td>
+<td>Popularity fallback; transparent to eater.</td>
+<td>Personalization availability.</td>
+</tr>
+<tr>
+<td>Hot cell (big event).</td>
+<td>Pre-warm caches; rate-limit per user refreshes; edge cache TTL bumped.</td>
+<td>Per-cell QPS.</td>
+</tr>
+<tr>
+<td>Photo CDN slow.</td>
+<td>Text renders without waiting on images; placeholder graphics.</td>
+<td>Photo p99.</td>
+</tr>
+<tr>
+<td>Feed empty (eater outside any polygon).</td>
+<td>Show "no restaurants deliver here yet"; offer pickup mode.</td>
+<td>Empty-feed rate.</td>
+</tr>
+</tbody>
+</table>
+<h4 id="operational-metrics-for-browse">Operational Metrics For Browse</h4>
+<ul>
+<li>Browse latency p50 / p99 (target sub-300 ms p99).</li>
+<li>Edge cache hit rate; Redis hit rate; local LRU hit rate.</li>
+<li>Ranker p99 and model-freshness lag.</li>
+<li>Stale-card rate (snapshot vs. live status divergence).</li>
+<li>Empty-feed rate (UX failure signal).</li>
+<li>CTR on top slots and on sponsored slots.</li>
+<li>Scroll depth and order-from-browse conversion (feeds the ranker).</li>
+</ul>
+<h4 id="tradeoffs-specific-to-browse">Tradeoffs Specific To Browse</h4>
+<ul>
+<li><strong>Cell-forward index vs. polygon-per-restaurant:</strong> forward index is faster but harder to invalidate on polygon edits — accepted cost.</li>
+<li><strong>Approximate ETA at browse vs. precise:</strong> approximate is necessary at this QPS; precise on menu open.</li>
+<li><strong>Two-stage ranker vs. one rich model:</strong> two-stage costs complexity but keeps p99 in budget.</li>
+<li><strong>Edge cache for anonymous vs. always personalize:</strong> small personalization loss for a large QPS win.</li>
+<li><strong>Push live invalidations vs. pull-on-next-request:</strong> mostly pull; push only for the active feed view.</li>
+</ul>
+<h4 id="interview-phrase">Interview Phrase</h4>
+<blockquote>
+<p>The browse query is "which restaurants can deliver to me right now, ranked for me, decorated with live state." We answer it with a cell-keyed forward index, denormalized card snapshots in Redis, a two-stage ranker, and an approximate ETA decorator. Live status flows through a Kafka invalidation pipeline. Anonymous and cold-start traffic hit an edge-cached feed; personalized users hit the feed builder. The art is keeping p99 under 300 ms while honoring live availability within seconds.</p>
+</blockquote>
+<h3 id="item-availability-86d">Item Availability ("86'd")</h3>
+<p>Restaurants run out of items intra-shift. The system must reflect that fast or eaters order things they can't get.</p>
+<ul>
+<li>Merchant tablet pushes <code>AvailabilityEvent</code> on item-out tap.</li>
+<li>Availability service writes to a per-restaurant Redis hash + emits to a Kafka topic.</li>
+<li>Search index consumer updates the item's <code>available</code> field.</li>
+<li>Catalog reads consult Redis for live availability before returning the menu.</li>
+<li>On order placement, the order service re-validates each item's availability under a brief lock; if any item is unavailable, the eater is prompted to substitute or remove.</li>
+</ul>
+<h3 id="pricing-and-fees">Pricing And Fees</h3>
+<p>Pricing is deterministic from the cart and context:</p>
+<pre><code class="language-text">subtotal      = sum(item.unit_price * qty + modifier prices)
+delivery_fee  = base + distance_fee + surge_multiplier * peak_fee
+service_fee   = round(subtotal * service_rate)
+tax           = tax_engine(subtotal, jurisdiction)
+discount      = promo_engine(eater, cart)
+tip           = eater-entered, editable up to N minutes after delivery
+total         = subtotal + delivery_fee + service_fee + tax - discount + tip
+
+merchant_payout = subtotal - commission - adjustments
+courier_payout  = base_payout + distance + time + tips + incentives
+</code></pre>
+<p>Every component is captured in <code>Order.pricing</code>. Reconciliation jobs recompute totals from the snapshot to catch drift.</p>
+<h3 id="courier-dispatch-prep-time-aware">Courier Dispatch (Prep-Time-Aware)</h3>
+<p>This is the biggest divergence from ride-hailing. We don't want the courier to arrive at the restaurant 10 minutes early (wasted time, courier walks away) or 10 minutes late (cold food, bad eater experience).</p>
+<p>Inputs to the scheduler:</p>
+<ul>
+<li><code>prep_time_estimate(restaurant, order_size, current_load)</code> — ML model trained on historical prep times by restaurant × hour-of-week.</li>
+<li><code>pickup_eta(courier, restaurant)</code> — routing engine.</li>
+<li><code>placed_at</code> timestamp.</li>
+</ul>
+<p>Target: <code>courier_arrival_at_restaurant ≈ food_ready_time</code>.</p>
+<p>Algorithm sketch:</p>
+<ol>
+<li>On <code>placed</code>, estimate <code>food_ready_time = placed_at + prep_time_estimate</code>.</li>
+<li>Compute <code>dispatch_deadline = food_ready_time - pickup_eta(best_candidate)</code>.</li>
+<li>Defer offering the order until <code>now &gt;= dispatch_deadline - safety_margin</code>.</li>
+<li>At dispatch time, run a matching pass over the geo index: candidate couriers within radius, score by ETA + rating + batching potential, atomically reserve via CAS on <code>Courier.status</code> (same as Uber).</li>
+<li>If merchant emits <code>ready</code> early or late, re-plan: pull dispatch forward or fall back to a closer courier.</li>
+<li>If best candidate's ETA exceeds the food-ready time by more than a threshold, dispatch immediately (cold-food risk dominates wasted-wait risk).</li>
+</ol>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Dispatch is a scheduling problem, not a matching problem. We match late on purpose so the courier arrives just as the food is ready. The prep-time model is the keystone.</p>
+</blockquote>
+<h3 id="batching">Batching</h3>
+<p>A courier picking up two orders from the same restaurant (or neighboring restaurants) on overlapping routes is a major efficiency win.</p>
+<p>Conditions for batching:</p>
+<ul>
+<li>Same or adjacent restaurants.</li>
+<li>Drop-off locations within a small detour.</li>
+<li>Both orders' ETA SLA still met.</li>
+<li>Eater hasn't opted out.</li>
+</ul>
+<p>Implementation:</p>
+<ul>
+<li>A streaming "batchable orders" buffer per cell.</li>
+<li>Online bin-packing: every few seconds, try to pair currently pending orders.</li>
+<li>Form a batch_id; dispatch as a unit.</li>
+<li>Courier app sees an ordered itinerary: pickup A, pickup B, drop A, drop B (route-optimized).</li>
+</ul>
+<p>Tradeoffs:</p>
+<ul>
+<li>Reduces courier supply needed by 10-30% in dense markets.</li>
+<li>Adds a few minutes to the second drop; mitigated by routing.</li>
+<li>Adds complexity to courier UI and state machine.</li>
+</ul>
+<h3 id="live-tracking">Live Tracking</h3>
+<p>Eater sees: restaurant accepted, preparing, courier en route, courier at restaurant, courier en route to you, delivered.</p>
+<ul>
+<li>Backed by persistent connection (WebSocket / SSE).</li>
+<li>Order service emits state-change events.</li>
+<li>Courier location updates from the geo-index pipeline are pushed to subscribed eaters during pickup/dropoff phases.</li>
+<li>For battery, courier app reports location every 4-10 seconds; server fans out at a lower cadence to eaters.</li>
+</ul>
+<h3 id="payment-integration">Payment Integration</h3>
+<p>Reuse <a href="./design-a-payment-system.md">payment system</a>:</p>
+<ol>
+<li>At placement: pre-authorize <code>estimated_total</code> (includes tip placeholder).</li>
+<li>At merchant accept: confirm the auth still holds.</li>
+<li>At delivered: capture the actual <code>total</code> (with final tip).</li>
+<li>Refunds: partial (missing item) or full (undelivered). Issued via the refund pipeline.</li>
+<li>Merchant payout: aggregated per cycle (daily/weekly); reconciled against accepted orders.</li>
+<li>Courier payout: aggregated per cycle; tips passed through 100%.</li>
+</ol>
+<p>Idempotency: <code>order_id</code> is the idempotency key for payment provider operations.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Restaurants / menus</td>
+<td><code>restaurant_id</code> hash</td>
+<td>Per-merchant CRUD.</td>
+</tr>
+<tr>
+<td>Search index</td>
+<td>Cell-based shards</td>
+<td>Geo-bounded queries.</td>
+</tr>
+<tr>
+<td>Orders</td>
+<td><code>order_id</code> hash; secondary on <code>eater_id</code>, <code>restaurant_id</code>, <code>courier_id</code></td>
+<td>Multi-direction lookup.</td>
+</tr>
+<tr>
+<td>Courier state</td>
+<td><code>courier_id</code> hash</td>
+<td>Per-courier CAS.</td>
+</tr>
+<tr>
+<td>Geo index</td>
+<td><code>cell_id</code> hash</td>
+<td>Per-cell membership.</td>
+</tr>
+<tr>
+<td>Availability</td>
+<td><code>restaurant_id</code> hash</td>
+<td>Per-restaurant hot key.</td>
+</tr>
+<tr>
+<td>Payments</td>
+<td><code>order_id</code></td>
+<td>Per-order intent.</td>
+</tr>
+<tr>
+<td>Cities</td>
+<td>Each city largely independent</td>
+<td>Natural sharding.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Catalog reads</td>
+<td>Eventually consistent (with TTL)</td>
+<td>Browse UX.</td>
+</tr>
+<tr>
+<td>Item availability</td>
+<td>Near-real-time (seconds)</td>
+<td>Avoid bad orders.</td>
+</tr>
+<tr>
+<td>Order state</td>
+<td>Strong (CAS)</td>
+<td>Money + handoffs.</td>
+</tr>
+<tr>
+<td>Courier state</td>
+<td>Strong (CAS)</td>
+<td>No double-booking.</td>
+</tr>
+<tr>
+<td>Geo index</td>
+<td>Eventually consistent</td>
+<td>Acceptable.</td>
+</tr>
+<tr>
+<td>Payment</td>
+<td>Strong end-to-end</td>
+<td>Money.</td>
+</tr>
+<tr>
+<td>Ratings</td>
+<td>Eventually consistent aggregate</td>
+<td>UX.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Operations per city in the nearest region.</li>
+<li>Catalog data replicated globally read-only; writes regionally primary.</li>
+<li>Cross-region eaters (travel) are rare; resolve to local catalog.</li>
+<li>Global services (accounts, payments) replicated globally with regional primaries.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Merchant doesn't accept order.</td>
+<td>Auto-reject after SLA; refund auth; eater re-routed.</td>
+<td>Acceptance time p99.</td>
+</tr>
+<tr>
+<td>Item out of stock after order placed.</td>
+<td>Push substitute prompt or partial refund.</td>
+<td>Substitution rate.</td>
+</tr>
+<tr>
+<td>Food not ready at courier arrival.</td>
+<td>Courier waits, paid wait time; or re-dispatched.</td>
+<td>Avg courier wait.</td>
+</tr>
+<tr>
+<td>Food ready before courier arrives.</td>
+<td>Re-plan dispatch; closer courier offered.</td>
+<td>Avg food-wait time.</td>
+</tr>
+<tr>
+<td>Courier no-show / abandons pickup.</td>
+<td>Re-dispatch; courier penalized.</td>
+<td>Reassignment rate.</td>
+</tr>
+<tr>
+<td>Courier loses connectivity en route.</td>
+<td>Last-known location + ETA; eater notified.</td>
+<td>Mid-trip disconnect rate.</td>
+</tr>
+<tr>
+<td>Wrong address / unreachable eater.</td>
+<td>Multi-attempt handoff protocol; eventually return-to-restaurant.</td>
+<td>Undelivered rate.</td>
+</tr>
+<tr>
+<td>Missing item on delivery.</td>
+<td>Refund pipeline; partial.</td>
+<td>Refund rate per restaurant.</td>
+</tr>
+<tr>
+<td>Merchant tablet offline.</td>
+<td>Phone fallback (call merchant); pause new orders.</td>
+<td>Tablet heartbeat loss.</td>
+</tr>
+<tr>
+<td>Promo abuse.</td>
+<td>Atomic redemption + anti-fraud rules.</td>
+<td>Promo anomaly.</td>
+</tr>
+<tr>
+<td>Surge spike (rainstorm + dinner peak).</td>
+<td>Surge pricing, expanded courier incentives, batching.</td>
+<td>Cell demand/supply.</td>
+</tr>
+<tr>
+<td>Hot restaurant (viral / Super Bowl).</td>
+<td>Throttle orders; show longer prep ETA; queue.</td>
+<td>Per-restaurant order rate.</td>
+</tr>
+<tr>
+<td>Catalog stale (price mismatch).</td>
+<td>Re-validate at checkout; eater confirms.</td>
+<td>Price-mismatch rate.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="graceful-degradation-state-table">Graceful Degradation State Table</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Normal mode</th>
+<th>Degraded mode</th>
+<th>Source used</th>
+<th>Latency budget</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Browse</td>
+<td>Personalized L2 ranking + live ETA</td>
+<td>L1 popularity ranking, stale ETA, no sponsored injection</td>
+<td>Geo index + card snapshots + live status overlay</td>
+<td>&lt;300 ms p99 normal; &lt;500 ms degraded.</td>
+</tr>
+<tr>
+<td>Menu</td>
+<td>Redis menu snapshot + availability overlay</td>
+<td>DB read-through for one restaurant; photos lazy-load</td>
+<td>Menu DB + <code>avail:{restaurant_id}</code></td>
+<td>&lt;200 ms cache hit; &lt;800 ms read-through.</td>
+</tr>
+<tr>
+<td>Checkout</td>
+<td>Full validation + payment pre-auth</td>
+<td>Return confirm/retry instead of placing if pricing, promo, or payment is uncertain</td>
+<td>Order DB + payment processor</td>
+<td>Do not create order unless auth and validation commit.</td>
+</tr>
+<tr>
+<td>Merchant tablet</td>
+<td>Push/stream order</td>
+<td>Polling, SMS/phone fallback, pause new orders</td>
+<td>Order outbox + merchant heartbeat</td>
+<td>Accept SLA around 2 min; pause before silently losing orders.</td>
+</tr>
+<tr>
+<td>Dispatch</td>
+<td>Prep-time-aware deferred matching</td>
+<td>Immediate closest-courier fallback when ready-time estimate is stale or food already ready</td>
+<td><code>dispatch:{cell}:{bucket}</code> + courier geo sets</td>
+<td>Seconds; cold-food risk beats courier-wait cost when late.</td>
+</tr>
+<tr>
+<td>Courier location</td>
+<td>Live stream every few seconds</td>
+<td>Last-known location + widened ETA band</td>
+<td><code>courier:{id}</code> TTL state</td>
+<td>4-10s normal update; stale badge after 30s.</td>
+</tr>
+<tr>
+<td>Payment capture</td>
+<td>Capture on delivered</td>
+<td>Pending settlement + reconciliation if processor timeout</td>
+<td>Payment intent + processor idempotency key</td>
+<td>User sees delivered; money state may be pending for minutes.</td>
+</tr>
+</tbody>
+</table>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The graceful degradation rule is different per surface: browse can get less personal, ETA can get wider, but checkout and payment must stop rather than guess.</p>
+</blockquote>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Order state inconsistency.</li>
+<li>Payment drift vs orders.</li>
+<li>Pricing recompute matches captured total.</li>
+<li>Double-assignment of couriers (must be zero).</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Browse QPS, p99 latency.</li>
+<li>Order-creation rate.</li>
+<li>Location updates per second.</li>
+<li>Search index lag.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Orders per city per hour.</li>
+<li>Acceptance rate (merchant).</li>
+<li>Reassignment rate (courier).</li>
+<li>Avg total time placed → delivered.</li>
+<li>Avg food-ready-to-pickup gap (≈0 is ideal).</li>
+<li>Refund rate / category (missing item, late, cold).</li>
+<li>Batch rate.</li>
+<li>Surge frequency.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li><strong>Match early vs match late:</strong> matching late aligns with food readiness but reduces dispatch optionality if the closest courier moves away.</li>
+<li><strong>Batching:</strong> increases efficiency but adds eater-side latency for second drop.</li>
+<li><strong>Strict item-availability propagation:</strong> fewer bad orders but more catalog mutation traffic.</li>
+<li><strong>Restaurant accept SLA:</strong> short SLA improves eater UX but penalizes slow merchants.</li>
+<li><strong>Per-cell sharding:</strong> natural but cross-cell delivery (long radius) needs explicit logic.</li>
+<li><strong>Aggressive surge:</strong> balances supply-demand but hits customer satisfaction.</li>
+<li><strong>Single-region payment authorize vs at delivery capture:</strong> auth-at-placement protects against fraud but requires precise final-capture logic for tips.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Treat dispatch like ride-hailing (match immediately).</td>
+<td>Prep-time-aware deferred dispatch.</td>
+</tr>
+<tr>
+<td>One state machine combining merchant + courier states.</td>
+<td>Two parallel state machines converging at pickup.</td>
+</tr>
+<tr>
+<td>Catalog as a single global table read on every browse.</td>
+<td>CDN + Redis cache; ES for search; geo-shard.</td>
+</tr>
+<tr>
+<td>Charge at placement only.</td>
+<td>Auth at placement, capture at delivered (final tip captured).</td>
+</tr>
+<tr>
+<td>Ignore "86'd" items.</td>
+<td>Streaming availability + checkout re-validation.</td>
+</tr>
+<tr>
+<td>One courier per order always.</td>
+<td>Online batching engine.</td>
+</tr>
+<tr>
+<td>Eater rates after delivery as the only feedback loop.</td>
+<td>Bidirectional ratings + automated refund triggers.</td>
+</tr>
+<tr>
+<td>Static prep-time per restaurant.</td>
+<td>ML prep-time model with hour-of-week × load features.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prep-time prediction</td>
+<td>ML model: features = restaurant, hour, current order load, item complexity; trained on historical ready-time deltas.</td>
+</tr>
+<tr>
+<td>Batching</td>
+<td>Online bin-packing per cell; constraints on SLA and detour; opt-in/out signals.</td>
+</tr>
+<tr>
+<td>Catalog at scale</td>
+<td>CDN for photos; Redis for menus; ES for search; streaming availability.</td>
+</tr>
+<tr>
+<td>Three-party state machine</td>
+<td>Two parallel tracks (merchant + courier) converging at pickup; CAS transitions.</td>
+</tr>
+<tr>
+<td>Hot restaurant</td>
+<td>Throttle order acceptance; queue; eater sees longer ETA; price signal.</td>
+</tr>
+<tr>
+<td>Refunds and disputes</td>
+<td>Categorized refunds (missing, late, cold) with thresholds and auto-grant logic.</td>
+</tr>
+<tr>
+<td>Geo dispatch</td>
+<td>Reuse Uber design; add ready-time scheduling.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Three-sided marketplace explicit; three actors with parallel state machines.</li>
+<li>Catalog + search layer separate from order layer.</li>
+<li>Prep-time-aware dispatch, not naive immediate match.</li>
+<li>Batching engine and its conditions.</li>
+<li>Item-level availability propagation.</li>
+<li>Auth-at-placement / capture-at-delivery payment.</li>
+<li>Per-city sharding; multi-region.</li>
+<li>Reconciliation for stuck orders, pricing drift, payouts.</li>
+</ul>
+<h3 id="interview-phrase_1">Interview Phrase</h3>
+<blockquote>
+<p>Uber Eats is a three-sided marketplace stitched together by a catalog/discovery layer, an order state machine, and a prep-time-aware courier dispatch. The big difference from ride-hailing is that we want the courier to arrive exactly when the food is ready, not as fast as possible. Catalog reads dominate; order state is the consistency hot spot; batching is the efficiency lever; pricing and payouts are deterministic from recorded events.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Uber Eats.</p>
+<p><strong>Candidate:</strong> I will design it as a three-sided marketplace — eaters, merchants, couriers — built on four layers. A catalog/discovery layer for browsing restaurants and menus. An order service owning a three-party state machine. A courier dispatch layer that reuses the Uber geo index but adds prep-time-aware scheduling and order batching. And payments/pricing on top. The invariant is that every order flows through cart → placed → accepted → preparing → ready → picked_up → delivered, with idempotent payments, at-most-one-courier per order (or batch), and a menu that reflects real-time merchant availability within seconds.</p>
+<p><strong>Interviewer:</strong> Start with browse and search.</p>
+<p><strong>Candidate:</strong> Catalog reads dominate, so I separate them from the write path. Restaurants and menus live in a relational store partitioned by <code>restaurant_id</code>. Menus are cached in Redis with TTL; photos served from CDN. Search runs against an Elasticsearch index sharded by geo cells. A browse query takes the eater's location, expands to the cells within delivery radius, filters by cuisine and rating, and sorts by a score combining ETA, rating, and popularity. Item availability changes flow through a streaming pipeline into both Redis and ES so menus stay accurate within seconds.</p>
+<p><strong>Interviewer:</strong> A restaurant runs out of salmon mid-shift. What happens?</p>
+<p><strong>Candidate:</strong> The merchant taps "86 the salmon" on their tablet. That fires an <code>AvailabilityEvent</code>. The availability service writes to the per-restaurant Redis hash and emits to a Kafka topic. Two consumers: one updates the ES document so search and browse stop showing it as available; one invalidates the menu cache. Within seconds, the eater seeing the menu sees salmon as unavailable. To close the race with in-flight checkouts, the order service re-validates item availability under a brief lock at checkout; if salmon is now unavailable, the eater is prompted to substitute or remove.</p>
+<p><strong>Interviewer:</strong> Eater checks out. Walk me through.</p>
+<p><strong>Candidate:</strong> Cart goes to the order service. We re-validate items and prices. We call pricing to compute subtotal + delivery fee + service fee + tax - discount + tip-placeholder. We pre-authorize the total via the payment service using <code>order_id</code> as the idempotency key. On auth success, we transition <code>cart → placed</code>, append to state history, and emit <code>OrderPlaced</code> to merchant-adapter and to the dispatch scheduler. The merchant tablet receives the order. The eater sees "Waiting for restaurant".</p>
+<p><strong>Interviewer:</strong> When do you dispatch a courier?</p>
+<p><strong>Candidate:</strong> This is the central scheduling problem. I do not dispatch immediately. I estimate <code>food_ready_time = placed_at + prep_time_estimate(restaurant, order_size, current_load)</code> from an ML model trained on historical ready times. I compute <code>dispatch_deadline = food_ready_time - pickup_eta(best_nearby_courier)</code>. I defer offering the order until that deadline minus a small safety margin. The goal is for the courier to arrive at the restaurant approximately when the food is ready — not 10 minutes early, not 10 minutes late.</p>
+<p><strong>Interviewer:</strong> How do you avoid double-booking a courier?</p>
+<p><strong>Candidate:</strong> Same atomic-CAS pattern as Uber. After scoring candidates from the geo index, the dispatcher does a conditional update on the courier's state: <code>UPDATE Courier SET status=offer_pending, active_orders=active_orders+order_id WHERE courier_id=? AND status=online_available</code>. Only one CAS wins. Losing dispatchers move on to the next candidate. For batching, the CAS condition is "courier is available or already holding a batchable order at the same restaurant."</p>
+<p><strong>Interviewer:</strong> Tell me more about batching.</p>
+<p><strong>Candidate:</strong> Batching is the major efficiency lever. In each cell, a buffer accumulates pending orders. Every few seconds we run an online bin-packing pass: pair orders from the same or adjacent restaurants whose drop-offs are within a small detour and whose SLAs still permit batching. If we find a pair, we mint a <code>batch_id</code> and dispatch both to one courier with a route-optimized itinerary: pickup A, pickup B, drop A, drop B. Eaters can opt out for time-sensitive orders. The trade-off is a few minutes added to the second drop in exchange for substantially fewer courier-trips per order.</p>
+<p><strong>Interviewer:</strong> Merchant marks the order ready.</p>
+<p><strong>Candidate:</strong> That CAS transitions <code>preparing → ready</code> and emits <code>OrderReady</code>. The courier's state likely is <code>en_route_pickup</code> or <code>at_restaurant</code>. If the courier is already at the restaurant, handoff begins; the courier scans the bag, transitions <code>ready → picked_up</code>. If the courier hasn't arrived yet, the order sits at the counter — and this is exactly the cost we are trying to minimize via prep-time-aware dispatch. If the ready event comes much earlier than predicted, the dispatcher re-plans and may pull dispatch forward to the closest available courier.</p>
+<p><strong>Interviewer:</strong> Courier delivers.</p>
+<p><strong>Candidate:</strong> Courier transitions <code>picked_up → delivered</code>, optionally with a handoff photo or eater confirmation. The order service triggers payment capture for the final total (including final tip, which the eater can edit for a window). The payment service uses <code>order_id</code> as idempotency key. Merchant and courier payouts aggregate into the next payout cycle. Eater is prompted to rate; courier rates the eater.</p>
+<p><strong>Interviewer:</strong> Eater says an item is missing. What happens?</p>
+<p><strong>Candidate:</strong> Eater files an issue in the app. The refund pipeline categorizes — missing item, wrong item, cold food, late — and runs eligibility rules. Within thresholds, refunds are auto-granted (partial for missing item, in credits or original payment). Above thresholds, support takes the ticket. The order transitions to a sub-state in the post-delivery flow; the merchant's missing-item rate is tracked and impacts ranking and possibly chargeback to the merchant.</p>
+<p><strong>Interviewer:</strong> Merchant tablet goes offline during peak.</p>
+<p><strong>Candidate:</strong> Merchant adapter watches heartbeats. On loss, we pause new orders for that restaurant (search marks them as paused). Existing in-flight orders escalate to a phone call to the merchant for accept/reject. We retry pushing accepted orders on reconnect. Eaters with in-flight orders are notified of potential delays. The acceptance SLA timer pauses while we attempt out-of-band contact.</p>
+<p><strong>Interviewer:</strong> Hot restaurant — a viral spot getting 10x normal orders.</p>
+<p><strong>Candidate:</strong> First, we let the merchant signal capacity (e.g., "kitchen busy, +20 minutes"). We propagate longer prep ETA to browse and checkout. If the order rate exceeds capacity, we throttle: accept fewer new orders, show a longer queue ETA, surface alternatives. Prep-time model adapts quickly to the new load via current-load features. Couriers in that cell will see incentives and migrate. The hot restaurant becomes a hot shard; we can pre-shard if it stays hot.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Cities are the natural shard, like Uber. Each city's catalog, order, and dispatch run in the nearest region. Catalog is the one part that benefits from global read replication for traveling eaters. Payments and accounts are global with regional primaries. Cross-city is rare and handled with explicit logic — most deliveries are intra-city, and delivery radius enforces it.</p>
+<p><strong>Interviewer:</strong> Reconciliation.</p>
+<p><strong>Candidate:</strong> Nightly jobs. Recompute order pricing from snapshots; flag drift. Compare payment captures to delivered orders. Recompute merchant payouts from accepted orders minus commission minus refunds; compare to the next payout. Reconcile courier payouts against completed deliveries and tips. Flag stuck orders (in <code>preparing</code> past 2 hours, in <code>ready</code> past 30 minutes) for support intervention.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Three-sided marketplace. Catalog/search layer for browse, sharded by city, cached aggressively. Order service with a three-party state machine — merchant and courier tracks run in parallel and converge at pickup. Dispatch is prep-time-aware: match late on purpose so courier arrives when food is ready. Batching is the efficiency lever. Item availability streams in seconds. Payment auth at placement, capture at delivery, idempotent on <code>order_id</code>. Per-city sharding; reconciliation catches drift. The biggest divergence from Uber is timing — we don't match fastest, we match aligned to readiness.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: browse, cart, three-party order, courier dispatch, payment, ratings.</li>
+<li>Invariant: order flows through state machine; at-most-one courier per order; menu reflects live availability; payments idempotent.</li>
+<li>Layers: catalog/search, order service, dispatch (prep-time-aware) + batching, payment.</li>
+<li>Catalog reads dominate → CDN + Redis + ES; availability streams in seconds.</li>
+<li>Order state machine + parallel courier state machine, converge at pickup.</li>
+<li>Dispatch deferred to ≈ food-ready time; CAS on courier state; batching engine.</li>
+<li>Auth-at-placement, capture-at-delivery payment with order_id idempotency.</li>
+<li>Per-city sharding; reconciliation jobs.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Uber Eats is a three-sided marketplace sitting on top of a geospatial dispatch core. Catalog and search dominate reads and are aggressively cached. Order placement is strongly consistent and re-validates live item availability. Courier dispatch is prep-time-aware: we deliberately wait to match so the courier arrives when the food is ready, and we batch nearby orders to gain efficiency. Merchant and courier tracks are parallel state machines that converge at pickup. Payments are auth-at-placement, capture-at-delivery, idempotent on order_id. Cities are the natural shard. Reconciliation catches pricing, payout, and stuck-order drift. The hardest correctness problem is the three-party handoff; the hardest scale problem is browse fanout; the most distinctive design choice is matching late on purpose.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Dispatch is a scheduling problem, not a matching problem — we match late so the courier arrives when the food is ready."</li>
+<li>"Merchant and courier states are two parallel state machines that converge at pickup."</li>
+<li>"Catalog reads dominate; the order path is the consistency hot spot."</li>
+<li>"Item availability propagates through a streaming pipeline in seconds; checkout re-validates under a brief lock."</li>
+<li>"Payment is auth-at-placement, capture-at-delivery, idempotent on order_id."</li>
+<li>"Batching is the efficiency lever; it trades a few minutes on the second drop for fewer courier-trips per order."</li>
+<li>"Each city is the natural sharding unit, same as Uber proper."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

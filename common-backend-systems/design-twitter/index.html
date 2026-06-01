@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Twitter — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Twitter</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Twitter (X) is the canonical "social feed" problem: short posts, follow graph, home timeline, all at planet scale. The hard part is the asymmetry — a celebrity with 100M followers posts once, but a normal user's timeline reads need to be sub-second. The naive fan-out-on-write or fan-out-on-read both fail at the extremes.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every tweet is stored exactly once in an authoritative store; the home timeline of each follower eventually includes every tweet from authors they follow (respecting visibility, blocks, deletes); the home timeline reads in sub-second p99; and the system handles celebrity and viral cases without blocking normal users.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can articulate the hybrid fan-out strategy (push for normal authors, pull for celebrities), separate authoritative storage from timeline projections, handle deletions and visibility changes correctly, and design ranking/search as separate concerns from feed delivery.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Twitter around a hybrid fan-out strategy. The authoritative tweet store and follow graph are the source of truth. For normal authors, we push (fan-out on write) tweet ids into follower timeline inboxes. For celebrities with millions of followers, we pull (fan-out on read) at home-timeline construction time, merging celebrity tweets with the precomputed inbox. The interesting decisions are the celebrity threshold, deletion and visibility propagation, ranking, and hot-event surge handling.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Users post tweets (text, optional media); reply, retweet, quote, like.</li>
+<li>Users follow each other; unfollow; block; mute.</li>
+<li>Home timeline shows tweets from followed users.</li>
+<li>User timeline shows a user's own posts.</li>
+<li>Search by text, hashtag, user.</li>
+<li>Real-time notifications on mentions, likes, replies.</li>
+<li>Delete a tweet; edits if supported.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Hundreds of millions of daily active users.</li>
+<li>Home timeline read latency under 200 ms p99.</li>
+<li>Tweet post latency under 1 second.</li>
+<li>Some lag in timeline freshness is acceptable (seconds).</li>
+<li>High availability: timeline reads must work during write outages.</li>
+<li>Deletes and blocks must take effect quickly (seconds, not minutes).</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Ad insertion and ranking.</li>
+<li>Trending topic detection (separate).</li>
+<li>DM messaging (separate, see Facebook Messenger design).</li>
+<li>Spaces / live audio (separate).</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>500M monthly active.</td>
+</tr>
+<tr>
+<td>Posts/day</td>
+<td>500M tweets/day.</td>
+</tr>
+<tr>
+<td>Average follow count</td>
+<td>100; long tail to millions.</td>
+</tr>
+<tr>
+<td>Celebrities</td>
+<td>10k+ users with &gt;1M followers.</td>
+</tr>
+<tr>
+<td>Home timeline reads</td>
+<td>100B+/day; 1M+/sec peak.</td>
+</tr>
+<tr>
+<td>Tweet writes</td>
+<td>~6k/sec average; 100k/sec at peak events.</td>
+</tr>
+<tr>
+<td>Tweet size</td>
+<td>~1 KB text; media in separate storage.</td>
+</tr>
+<tr>
+<td>Timeline page size</td>
+<td>20-50 tweets.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Read p99 200 ms; write p99 1 s.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is the read path: home timeline reads outnumber writes by 4 orders of magnitude.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>User experience</th>
+<th>System requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Post</td>
+<td>Compose, tap, posted.</td>
+<td>Sub-second; durable; eventually visible to followers.</td>
+</tr>
+<tr>
+<td>Home timeline</td>
+<td>List of recent tweets from followed users.</td>
+<td>Sub-second read; bounded staleness OK.</td>
+</tr>
+<tr>
+<td>User profile</td>
+<td>A user's tweets.</td>
+<td>Read from their author timeline.</td>
+</tr>
+<tr>
+<td>Search</td>
+<td>Find tweets by query.</td>
+<td>Separate index; eventually consistent.</td>
+</tr>
+<tr>
+<td>Notifications</td>
+<td>Mentions, likes, replies.</td>
+<td>Async; pushed via separate notification system.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                +--------------+
+   Client  --&gt;  | API Gateway  |
+                +------+-------+
+                       |
+       +---------------+----------------+
+       |               |                |
+       v               v                v
++-------------+ +--------------+ +---------------+
+| Write Path  | | Read Path    | | Search Path   |
++-----+-------+ +-----+--------+ +------+--------+
+      |               |                 |
+      v               v                 v
++-------------+ +--------------+ +---------------+
+| Tweet Store | | Timeline Svc | | Search Index  |
+| Follow Graph| | Inbox Cache  | | (eventual)    |
++------+------+ +------+-------+ +---------------+
+       |               ^
+   tweet event         |
+       |               | pull author
+       v               | tweets +
++-------------+        | merge celebrity
+| Fan-out     +--------+
+| Workers     |
+| (normal     |
+|  authors)   |
++-------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tweet store</td>
+<td>Source of truth for tweet content + metadata.</td>
+<td>Sharded by <code>tweet_id</code>.</td>
+</tr>
+<tr>
+<td>Follow graph</td>
+<td>Who follows whom; supports follower lookup.</td>
+<td>Sharded by <code>user_id</code>; specialized for fan-out.</td>
+</tr>
+<tr>
+<td>Fan-out workers</td>
+<td>Push new tweets from normal authors to follower inboxes.</td>
+<td>Skip celebrities (over follower threshold).</td>
+</tr>
+<tr>
+<td>Timeline inbox</td>
+<td>Per-user precomputed list of recent tweet ids.</td>
+<td>Cap to last N (e.g., 800).</td>
+</tr>
+<tr>
+<td>Home timeline service</td>
+<td>On read: merge inbox + celebrity authors' recent tweets; rank; return.</td>
+<td>Composite; pulls from cache and store.</td>
+</tr>
+<tr>
+<td>Author timeline</td>
+<td>Per-author recent tweets, fetched directly.</td>
+<td>Cached for popular authors.</td>
+</tr>
+<tr>
+<td>Search service</td>
+<td>Inverted index of tweet content.</td>
+<td>Eventual; consumes tweet event stream.</td>
+</tr>
+<tr>
+<td>Ranking service</td>
+<td>Optional reorder of timeline candidates.</td>
+<td>ML-driven; sub-100 ms timeout.</td>
+</tr>
+<tr>
+<td>Visibility/safety service</td>
+<td>Apply blocks, mutes, deletes, content policy.</td>
+<td>Final gate before returning.</td>
+</tr>
+<tr>
+<td>Media service</td>
+<td>Image/video storage and serving.</td>
+<td>CDN-fronted.</td>
+</tr>
+<tr>
+<td>Event stream</td>
+<td>Tweet, follow, like, delete events for derived systems.</td>
+<td>Kafka-style.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="tweet">Tweet</h4>
+<pre><code class="language-text">Tweet(
+  tweet_id,            // snowflake id with embedded timestamp
+  author_id,
+  content,
+  media_refs[],
+  reply_to_tweet_id?,
+  quoted_tweet_id?,
+  retweet_of?,
+  language,
+  posted_at,
+  status,              // active, deleted, hidden
+  visibility,          // public, protected, conversation_only
+  version
+)
+</code></pre>
+<h4 id="follow-edge">Follow Edge</h4>
+<pre><code class="language-text">Follow(
+  follower_id,
+  followee_id,
+  followed_at,
+  status               // active, blocked, muted
+)
+</code></pre>
+<p>Two indexes: by <code>follower_id</code> (who do I follow) and by <code>followee_id</code> (who follows me).</p>
+<h4 id="timeline-inbox">Timeline Inbox</h4>
+<pre><code class="language-text">TimelineInbox(
+  user_id,
+  entries: [(tweet_id, author_id, ts)],
+  capped_at: N
+)
+</code></pre>
+<p>Stored in a fast KV (Redis), one entry per user. Capped to recent N entries.</p>
+<h4 id="author-timeline">Author Timeline</h4>
+<pre><code class="language-text">AuthorTimeline(
+  user_id,
+  recent_tweets: [tweet_id, ts],
+  cached_until
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">POST   /tweets                # post; returns tweet_id
+GET    /tweets/{tweet_id}
+DELETE /tweets/{tweet_id}
+GET    /users/{id}/timeline   # author timeline
+GET    /home                  # home timeline; paginated
+POST   /users/{id}/follow
+DELETE /users/{id}/follow
+POST   /tweets/{tweet_id}/like
+GET    /search?q=...
+</code></pre>
+<h3 id="write-path-post-a-tweet">Write Path: Post a Tweet</h3>
+<ol>
+<li>Client POSTs <code>/tweets</code>.</li>
+<li>API authenticates, validates, runs policy filters (spam, content).</li>
+<li>Generate <code>tweet_id</code> (snowflake: timestamp + machine + sequence).</li>
+<li>Write to tweet store, partitioned by <code>tweet_id</code>.</li>
+<li>Emit <code>TweetCreated</code> event to stream.</li>
+<li>Update author's <code>AuthorTimeline</code> cache.</li>
+<li><strong>Fan-out decision:</strong>
+   - If author is "normal" (followers under threshold, e.g., 10k-100k): fan-out workers consume the event and append <code>tweet_id</code> to each follower's <code>TimelineInbox</code>.
+   - If author is "celebrity" (over threshold): skip fan-out; rely on read-time merge.</li>
+<li>Return tweet_id.</li>
+</ol>
+<p>The post response does not wait for fan-out to complete. Fan-out is async; followers may see the tweet seconds later.</p>
+<h3 id="read-path-home-timeline">Read Path: Home Timeline</h3>
+<ol>
+<li>Client requests <code>/home</code>.</li>
+<li>Home timeline service fetches user's <code>TimelineInbox</code> from cache (most recent N tweet ids).</li>
+<li>For users the viewer follows who are celebrities, fetch their recent tweets from <code>AuthorTimeline</code> cache.</li>
+<li>Merge inbox + celebrity tweets, sorted by time (or by ranker score).</li>
+<li>Hydrate tweet ids to full tweet content via tweet store (batched).</li>
+<li>Apply visibility filters: deletes, blocks, mutes, safety.</li>
+<li>Optionally rank via ranking service (with timeout fallback to chronological).</li>
+<li>Return page.</li>
+</ol>
+<p>The composite read is fast because the inbox is precomputed and celebrity author timelines are small and cached. Tweet hydration is a batched key-value read.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The home timeline is a merge of a precomputed inbox plus a small set of celebrity author timelines. The inbox absorbs the fan-out cost; the celebrity merge keeps the post path cheap for big accounts.</p>
+</blockquote>
+<h3 id="hybrid-fan-out-why-the-split">Hybrid Fan-out: Why The Split</h3>
+<p>Pure fan-out on write (push):
+- Cheap reads (just read inbox).
+- Expensive writes for celebrities (one tweet → 100M inbox appends).</p>
+<p>Pure fan-out on read (pull):
+- Cheap writes (just store).
+- Expensive reads (must query authors-followed-by-viewer for each request).</p>
+<p>Hybrid:
+- Normal authors push.
+- Celebrities pull at read time.
+- A user following 200 normal accounts and 10 celebrities gets: precomputed inbox + 10 small celebrity timeline reads.</p>
+<p>Threshold tuning:
+- Set so that fan-out write cost equals read amplification savings.
+- Typically 10k-1M followers; depends on platform.</p>
+<p>Edge case: a non-celebrity user goes viral. Move them to celebrity bucket dynamically based on follower growth.</p>
+<h3 id="deletes-and-visibility">Deletes And Visibility</h3>
+<p>A deleted tweet must disappear quickly. Naive: scan all timelines and remove. Better:</p>
+<ul>
+<li>Mark tweet as <code>deleted</code> in tweet store.</li>
+<li>Hydration step in read path returns nothing (or a tombstone) for deleted tweets.</li>
+<li>Inbox entries remain (small storage overhead) but display nothing.</li>
+</ul>
+<p>For blocks: when A blocks B, the read path filters B's tweets from A's home timeline at hydration. No need to rewrite inboxes.</p>
+<p>For protected accounts: visibility flag on tweet; read path checks viewer is approved follower.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Deletes and blocks are applied at read time, not at write time. The inbox is a fast index; the truth lives in the tweet store and visibility service.</p>
+</blockquote>
+<h3 id="ranking">Ranking</h3>
+<p>The default home timeline is reverse-chronological. Ranking optionally reorders based on engagement signals:</p>
+<ul>
+<li>Recency.</li>
+<li>Author affinity (how often viewer engages with author).</li>
+<li>Tweet engagement (likes, replies, retweets).</li>
+<li>Topic relevance.</li>
+</ul>
+<p>Implementation:</p>
+<ul>
+<li>Ranking is a side service called after candidate generation.</li>
+<li>Strict timeout (e.g., 100 ms). On timeout, fall back to chronological.</li>
+<li>Cached features per user.</li>
+</ul>
+<h3 id="search">Search</h3>
+<p>Inverted index built by consuming the tweet event stream:</p>
+<ul>
+<li>Tokenize tweet content; index by token to <code>(tweet_id, posted_at)</code>.</li>
+<li>Shard by token hash or term + time.</li>
+<li>Real-time near-online indexing (seconds lag).</li>
+<li>Separate from feed delivery; runs in its own cluster.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tweet store</td>
+<td><code>tweet_id</code> hash (snowflake includes time)</td>
+<td>Even distribution; lookups by id.</td>
+</tr>
+<tr>
+<td>Follow graph</td>
+<td><code>follower_id</code> for outgoing; <code>followee_id</code> for incoming</td>
+<td>Need both directions.</td>
+</tr>
+<tr>
+<td>Timeline inbox</td>
+<td><code>user_id</code> hash</td>
+<td>Per-user partition.</td>
+</tr>
+<tr>
+<td>Author timeline</td>
+<td><code>user_id</code> hash</td>
+<td>Per-author cache.</td>
+</tr>
+<tr>
+<td>Search index</td>
+<td>Token or term hash</td>
+<td>Query-driven sharding.</td>
+</tr>
+</tbody>
+</table>
+<p>Hot follow-graph lookups (celebrity follower list): pre-cached and updated incrementally as followers join/leave.</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tweet store</td>
+<td>Strong write</td>
+<td>Source of truth.</td>
+</tr>
+<tr>
+<td>Follow graph</td>
+<td>Strong write</td>
+<td>Used to drive fan-out and visibility.</td>
+</tr>
+<tr>
+<td>Timeline inbox</td>
+<td>Eventually consistent</td>
+<td>Inbox is a projection; bounded staleness.</td>
+</tr>
+<tr>
+<td>Search index</td>
+<td>Eventually consistent</td>
+<td>Indexing lag of seconds.</td>
+</tr>
+<tr>
+<td>Visibility decisions</td>
+<td>Strong at hydration time</td>
+<td>Block/delete must be enforced.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fan-out lag for popular post.</td>
+<td>Auto-scale fan-out workers; sample for celebrities; threshold-based push/pull split.</td>
+<td>Fan-out backlog; per-author lag.</td>
+</tr>
+<tr>
+<td>Celebrity tweet floods inboxes if mis-classified.</td>
+<td>Dynamic celebrity detection; threshold adjustment; back-off on burst.</td>
+<td>Inbox write rate spikes.</td>
+</tr>
+<tr>
+<td>Deleted tweet still visible.</td>
+<td>Read-time hydration check; soft delete in tweet store; cache TTLs.</td>
+<td>Stale-read alerts.</td>
+</tr>
+<tr>
+<td>Block bypass.</td>
+<td>Final visibility gate in read path.</td>
+<td>Block escape count.</td>
+</tr>
+<tr>
+<td>Ranking service slow.</td>
+<td>Hard timeout + chronological fallback.</td>
+<td>Ranker timeout rate.</td>
+</tr>
+<tr>
+<td>Tweet store hot shard (one popular tweet).</td>
+<td>Replicas; cache layer; CDN for embedded media.</td>
+<td>Per-shard QPS.</td>
+</tr>
+<tr>
+<td>Inbox cache eviction loses entries.</td>
+<td>Reconstruct from author timelines + follow graph (slow path).</td>
+<td>Cache miss rate.</td>
+</tr>
+<tr>
+<td>Hot trending event.</td>
+<td>Backpressure on fan-out; degrade gracefully (no ranking, fewer recommendations).</td>
+<td>Event QPS by topic.</td>
+</tr>
+<tr>
+<td>Search lag.</td>
+<td>Async indexing; show "no results" or partial results.</td>
+<td>Indexing lag.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Stale post visibility (deleted tweets shown).</li>
+<li>Block-violation count.</li>
+<li>Inbox vs ground-truth divergence (sampled).</li>
+<li>Fan-out lag distribution.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Read p50/p99 by region.</li>
+<li>Write p50/p99.</li>
+<li>Fan-out worker backlog.</li>
+<li>Cache hit ratio.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Tweets per user per day.</li>
+<li>Home timeline DAU.</li>
+<li>Engagement rate (like/reply/retweet per timeline impression).</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Tweet store and follow graph replicated globally; each user has a home region for primary writes.</li>
+<li>Inbox caches regional; updated via the event stream.</li>
+<li>Reads from local region; cross-region tail only if needed.</li>
+<li>Search indexes per region with replicated tweets.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Hybrid fan-out balances write and read cost but is more complex than either pure approach.</li>
+<li>Storing inboxes pre-materialized uses lots of memory; capped to recent N reduces but doesn't eliminate cost.</li>
+<li>Ranking improves engagement but adds latency; strict timeouts protect feeds.</li>
+<li>Read-time visibility filtering is correct but adds lookup cost.</li>
+<li>Snowflake ids enable time-ordering without coordination but require careful clock management.</li>
+<li>Eventually consistent inbox means a fresh tweet may not appear immediately; usually acceptable.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pure fan-out on write.</td>
+<td>Hybrid with celebrity pull path.</td>
+</tr>
+<tr>
+<td>Storing full tweet in inbox.</td>
+<td>Store tweet id; hydrate at read time.</td>
+</tr>
+<tr>
+<td>Apply blocks at write time.</td>
+<td>Apply at read time; inbox is content-id only.</td>
+</tr>
+<tr>
+<td>Synchronous ranking.</td>
+<td>Strict timeout with chronological fallback.</td>
+</tr>
+<tr>
+<td>No celebrity threshold.</td>
+<td>Dynamic threshold based on follower count + posting frequency.</td>
+</tr>
+<tr>
+<td>Replicating tweet content across all inboxes.</td>
+<td>Tweet store is single source; inboxes hold ids.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fan-out strategy</td>
+<td>Hybrid; threshold tuning; viral promotion.</td>
+</tr>
+<tr>
+<td>Visibility &amp; deletes</td>
+<td>Read-time hydration; tombstone in store.</td>
+</tr>
+<tr>
+<td>Ranking</td>
+<td>Side service with timeout; feature caching.</td>
+</tr>
+<tr>
+<td>Search</td>
+<td>Async inverted index; sharding by term + time.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Per-user home region; replicated reads; regional caches.</td>
+</tr>
+<tr>
+<td>Trending events</td>
+<td>Backpressure; degrade gracefully.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Hybrid fan-out: push for normal, pull for celebrity.</li>
+<li>Tweet store is authoritative; inbox holds ids.</li>
+<li>Read-time hydration with visibility filtering.</li>
+<li>Ranking as side service with fallback.</li>
+<li>Snowflake ids for time-ordered, no-coordination ids.</li>
+<li>Multi-region with regional caches.</li>
+<li>Async search index.</li>
+<li>Operational metrics that catch correctness drift.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Twitter's design center is the fan-out strategy. Normal authors push their tweets into precomputed inboxes; celebrities pull at read time. Tweet content lives in one authoritative store; inboxes are id lists. Visibility, deletes, and blocks are applied at read time, not write time. Ranking and search are separate side services.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Twitter.</p>
+<p><strong>Candidate:</strong> I will design around a hybrid fan-out strategy. The authoritative tweet store and follow graph are the source of truth. For normal authors, we push tweet ids into follower inboxes (fan-out on write). For celebrities with huge follower counts, we skip fan-out and pull at read time. The home timeline merges the precomputed inbox with the celebrity author timelines. The invariant is that every follower eventually sees every authored tweet, subject to visibility.</p>
+<p><strong>Interviewer:</strong> Walk me through posting a tweet.</p>
+<p><strong>Candidate:</strong> Client POSTs the tweet text. We authenticate, run policy checks, assign a snowflake id (timestamp-prefixed for natural time ordering), persist to the tweet store sharded by tweet_id. Emit a <code>TweetCreated</code> event to a stream. Update the author's recent-tweets cache. If the author is below the celebrity follower threshold, fan-out workers append the tweet_id to each follower's inbox. If the author is a celebrity, we skip fan-out. Response returns the tweet_id without waiting for fan-out completion.</p>
+<p><strong>Interviewer:</strong> Walk me through reading the home timeline.</p>
+<p><strong>Candidate:</strong> Fetch the user's inbox from Redis — a list of recent tweet ids capped at, say, 800. Identify which followed users are celebrities; fetch their recent author timelines from cache. Merge the inbox and celebrity tweets sorted by time. Hydrate tweet ids to content via batched reads from the tweet store. Apply visibility filters: deletes, blocks, mutes, age-gating. Optionally call the ranking service with a strict timeout; fall back to chronological order on timeout. Return the page.</p>
+<p><strong>Interviewer:</strong> A celebrity has 100 million followers. What happens at post time?</p>
+<p><strong>Candidate:</strong> With pure fan-out on write, we'd append 100M times — minutes of work and massive write amplification. The hybrid avoids it: we don't fan out for celebrities. Their followers' home timelines fetch celebrity tweets at read time from a small per-author cache. The cost is read amplification — for a follower of 10 celebrities, that's 10 small cache lookups — which is much cheaper than 100M writes per post.</p>
+<p><strong>Interviewer:</strong> How do you set the celebrity threshold?</p>
+<p><strong>Candidate:</strong> Tune so total work is minimized. If a user has F followers and posts P tweets per day, fan-out cost is F * P writes/day. If they have R followers reading the timeline R_r times per day, pull cost is R * R_r reads/day. Find the F where push cost exceeds pull cost. In practice, somewhere between 10k and 1M. Adjust dynamically: a user gaining followers fast gets promoted; idle accounts demoted.</p>
+<p><strong>Interviewer:</strong> A user goes viral suddenly. They're still classified as normal.</p>
+<p><strong>Candidate:</strong> Detect rapid follower growth and promote them to celebrity status. Existing fan-out backlog from before promotion completes naturally; new posts use pull. Also: if a single tweet from a normal user goes viral (retweets cascading), the fan-out workers might back up. We backpressure: queue depth alerts, dynamic worker scaling, and a fallback where we stop pushing if the queue is too deep and rely on pull for those followers.</p>
+<p><strong>Interviewer:</strong> How do you handle deletes?</p>
+<p><strong>Candidate:</strong> Mark the tweet as <code>deleted</code> in the tweet store. Don't scan and clean inboxes — they hold tweet_ids, and the read-time hydration sees the deleted status and returns nothing for that entry. Caches respect a TTL or invalidation event. So a deleted tweet stops appearing in feeds within seconds of the delete, without touching billions of inboxes.</p>
+<p><strong>Interviewer:</strong> Blocks?</p>
+<p><strong>Candidate:</strong> Same pattern. A block is a state on the follow edge or a separate block list. At read-time hydration, the visibility service checks: is the author in my block list? Is the author protected and I'm not approved? Filter out. The inbox doesn't need to be rewritten when blocks change; the next read picks up the new block.</p>
+<p><strong>Interviewer:</strong> Search?</p>
+<p><strong>Candidate:</strong> Separate service. Indexer consumes the tweet event stream and builds an inverted index — tokens → posting list of (tweet_id, posted_at). Sharded by token hash or by term + time. Eventual consistency: a tweet is searchable a few seconds after posting. Read pattern is query → token lookup → score → return tweet ids → hydrate via tweet store. The search service does not interact with the feed delivery path.</p>
+<p><strong>Interviewer:</strong> Ranking?</p>
+<p><strong>Candidate:</strong> Side service with strict timeout. The home timeline service generates candidates (inbox + celebrity tweets). Sends candidate ids + viewer context to the ranking service. Ranker returns scored ids. If timeout, fall back to chronological. The ranker uses features like viewer-author affinity, tweet engagement, recency. Heavy features are precomputed.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Tweet store and follow graph replicate globally with each user having a home region for primary writes. Inbox caches are regional and rebuilt from the event stream. Reads come from the local region. Cross-region replication has bounded lag, typically seconds. For posts, we accept a small window where users in different regions see the new tweet at slightly different times.</p>
+<p><strong>Interviewer:</strong> Trending event — World Cup goal. Now what?</p>
+<p><strong>Candidate:</strong> Spike of posts, retweets, likes. Fan-out workers scale up. We backpressure: if queues are backing up, defer some fan-outs and switch to pull for affected authors temporarily. Ranking service may degrade to chronological under load. Search indexing prioritizes the hot terms. Caches around popular tweets absorb hot reads. We monitor and degrade gracefully — feeds slow slightly but stay correct.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Hybrid fan-out. Normal authors push tweet ids to follower inboxes; celebrities are pulled at read time. Tweet content lives in one authoritative store; inboxes hold ids only. Read path hydrates ids, applies visibility filters, optionally ranks with a timeout. Snowflake ids give time-ordered tweets without coordination. Search and ranking are side services. Multi-region uses per-user home regions with eventual replication. The hardest cases are celebrities and viral spikes, handled by dynamic threshold promotion and backpressure.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: scale, latency, viral cases, deletes.</li>
+<li>Invariant: every authored tweet eventually visible to followers, subject to visibility.</li>
+<li>Hybrid fan-out: push normal, pull celebrity.</li>
+<li>Authoritative tweet store; inbox holds ids only.</li>
+<li>Snowflake ids for time-ordering.</li>
+<li>Read-time visibility: deletes, blocks, mutes.</li>
+<li>Ranking + search as side services with timeouts.</li>
+<li>Multi-region with per-user home regions.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Twitter is the canonical hybrid fan-out problem. Normal authors push tweet ids into precomputed inboxes; celebrities pull at read time. The tweet store is the single source of truth; inboxes and caches are projections. Deletes and blocks are applied at read time via the visibility gate, not by rewriting inboxes. Ranking and search are side services with timeouts and async indexing. Multi-region uses per-user home regions with eventually-replicated inbox caches. The hardest cases — celebrities, viral spikes — are handled by dynamic thresholds and backpressure.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Hybrid fan-out: push for normal authors, pull for celebrities."</li>
+<li>"Inboxes hold tweet ids; the tweet store is the single source of content."</li>
+<li>"Deletes and blocks are applied at read time; don't rewrite billions of inboxes."</li>
+<li>"Ranking is a side service with a hard timeout and chronological fallback."</li>
+<li>"Snowflake ids give time-ordered tweets without global coordination."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

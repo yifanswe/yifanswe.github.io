@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Distributed Cache — Redis/Memcached Class (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Distributed Cache — Redis/Memcached Class (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Hard · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build a distributed in-memory cache from scratch. Clients PUT/GET keys, the cache shards across many nodes, evicts under memory pressure, survives node failure with minimal data loss, and serves at sub-millisecond latency. Target: 10M ops/sec across a 100-node cluster, 1 TB hot working set.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- <code>GET(key) → value</code>, <code>PUT(key, value, ttl?)</code>, <code>DELETE(key)</code>.
+- Optional <code>INCR</code>, <code>EXPIRE</code>, list/hash operations as scope allows.
+- Cluster auto-partitioning across N nodes.
+- Eviction policy when memory full.</p>
+<p>I'd defer pub/sub, scripting, and persistence-as-DB modes.</p>
+<p><strong>Non-functional</strong>
+- p99 latency &lt; 1 ms intra-DC, p99 &lt; 5 ms cross-DC.
+- 10M ops/sec across the cluster.
+- Survive single-node failure without availability loss; acceptable data loss for purely-cache use.
+- Linear scaling: add a node, gain ~1% capacity.</p>
+<p><strong>Capacity</strong>
+- 100 nodes × 32 GB RAM = 3.2 TB total; ~1 TB hot working set.
+- Key/value sizes: small (avg key 50 B, avg value 500 B). ~2B objects in steady state.
+- With metadata overhead (hash entry, TTL, LRU pointers, allocator slack), a 550 B logical object is closer to 700-900 B in RAM. At 2B objects, the true footprint is ~1.4-1.8 TB before replication.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Key</strong> — opaque bytes, hashed to a partition.</li>
+<li><strong>Entry</strong> — <code>{ key, value, expires_at, last_access }</code>.</li>
+<li><strong>Partition</strong> — range / hash bucket assigned to a node.</li>
+<li><strong>Node</strong> — process holding partitions in-memory.</li>
+<li><strong>Cluster topology</strong> — mapping from key → owning node.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<p>Binary protocol over TCP (like RESP for Redis or memcached binary). Sketch:</p>
+<pre><code>GET    key                          → value | nil
+SET    key value [EX seconds]       → OK
+DEL    key                          → 1 | 0
+INCR   key                          → integer
+EXPIRE key seconds                  → 1 | 0
+</code></pre>
+<p>Clients hold the cluster topology and route directly to the owning node.</p>
+<p>Clients send an optional <code>client_topology_version</code>. If a node receives a request for a vnode it no longer owns, it returns <code>MOVED {node, topology_version}</code> so the client refreshes and retries once.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Cluster topology — consistent hashing.</strong> Key space mapped to a ring. Each node owns a contiguous range. Adding a node steals one range; removing returns one range. Implement with virtual nodes (each physical node owns ~100 vnodes) so load distributes evenly.</li>
+<li><strong>Client routing.</strong> Clients fetch topology from a coordinator (gossip-based or a small etcd/ZooKeeper cluster), cache it, and route requests directly to the owning node. On <code>MOVED</code> redirect, refresh topology.</li>
+<li><strong>Node internals.</strong> Each node runs an event-loop process:
+   - In-memory hash table (open-addressing or chained) holding entries.
+   - Eviction policy (LRU, LFU, allkeys-lru). LRU implemented via a doubly-linked list + hash map; LFU via approximate frequency counters.
+   - TTL expiration: lazy on read + periodic scan.
+   - Single-threaded execution per node for simplicity (Redis model) or sharded threads (Memcached threading).</li>
+<li><strong>Replication for HA.</strong> Each partition has a primary + 1–2 replicas. Writes go to primary; async replicate to replicas. On primary failure, replica promotes via the coordinator.</li>
+<li><strong>Cluster coordinator.</strong> Tracks node liveness (heartbeats / gossip), promotes replicas, rebalances on add/remove. Lightweight Raft cluster (etcd-style) holds authoritative topology.</li>
+<li><strong>Multi-tier serving (optional).</strong> Client SDK has an L1 in-process cache (millisecond budget); cache cluster is L2.</li>
+</ol>
+<p>End-to-end narration: client wants key <code>user:42</code>. Hashes to ring position 0x4A3, mapped to vnode V37, owned by node N7. Client TCP connects to N7 (already pooled), sends <code>GET user:42</code> → N7 hash-table lookup → finds entry, checks expiry, updates LRU → returns value. Total ~200 µs.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">                       +-------------------------------+
+                       | CLIENT SDKS                   |
+                       | app L1 cache + conn pools     |
+                       +-----------+-------------------+
+                                   |
+       GET key / SET key value ttl | topology fetch / MOVED refresh
+                                   v
+       +-------------------+   +-------------------------------+
+       | Coordinator       |--&gt;| topology_version: vnode -&gt;    |
+       | Quorum (Raft)     |   | primary, replicas             |
+       +---------+---------+   +-------------------------------+
+                 | publishes / promotes
+                 v
+       +-------------------+        async replication log        +----------------+
+       | Cache Node N7     |------------------------------------&gt;| Replica Nodes  |
+       | primary V37       | vnode:37:offset mutations          | failover       |
+       +---------+---------+                                     +----------------+
+                 |
+                 v
+       +----------------------------------------------------------+
+       | STORE / CACHE GROUP                                     |
+       | entry table hash(key) -&gt; entry pointer                   |
+       | raw key bytes -&gt; value pointer, expires_at, flags        |
+       | TTL wheel / expiry buckets, LRU/LFU metadata             |
+       | replication log vnode:{id}:offset, seconds-minutes lag   |
+       | topology_version map, few MB in coordinator and clients  |
+       +-------------------------+--------------------------------+
+                                 |
+                                 | GET miss / expired entry
+                                 v
+                         +---------------+
+                         | Caller        |
+                         | Backing Store |
+                         | then SET fill |
+                         +---------------+
+</code></pre>
+<p>Concrete node data structures:</p>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Key pattern</th>
+<th>Value / data structure</th>
+<th style="text-align: right;">Size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Entry table</td>
+<td><code>hash(key)</code></td>
+<td>hash table slot -&gt; entry pointer</td>
+<td style="text-align: right;">~16 B/slot</td>
+<td>while key exists</td>
+<td>vnode hash</td>
+</tr>
+<tr>
+<td>Entry object</td>
+<td>raw key bytes</td>
+<td>value pointer, expiry, flags, LRU links</td>
+<td style="text-align: right;">~80-150 B overhead + value</td>
+<td>key TTL or eviction</td>
+<td>vnode hash</td>
+</tr>
+<tr>
+<td>TTL index</td>
+<td>expiry bucket</td>
+<td>timing wheel / min-heap of keys</td>
+<td style="text-align: right;">~8-16 B/key with TTL</td>
+<td>until expiry</td>
+<td>node-local</td>
+</tr>
+<tr>
+<td>LRU/LFU state</td>
+<td>entry pointer</td>
+<td>linked list pointers or tiny freq counter</td>
+<td style="text-align: right;">~8-24 B/key</td>
+<td>while resident</td>
+<td>node-local</td>
+</tr>
+<tr>
+<td>Topology</td>
+<td><code>topology_version</code></td>
+<td>vnode -&gt; primary, replicas</td>
+<td style="text-align: right;">few MB</td>
+<td>until next rebalance</td>
+<td>coordinator</td>
+</tr>
+<tr>
+<td>Replication log</td>
+<td><code>vnode:{id}:offset</code></td>
+<td>recent writes for replicas</td>
+<td style="text-align: right;">value-sized</td>
+<td>seconds-minutes</td>
+<td>vnode</td>
+</tr>
+</tbody>
+</table>
+<p>GET path:</p>
+<ol>
+<li>Client hashes key to vnode using cached topology and sends directly to primary N7.</li>
+<li>N7 verifies topology version and ownership, then does one hash-table lookup.</li>
+<li>If found, it checks <code>expires_at</code>; expired entries are deleted and returned as nil.</li>
+<li>If live, it updates approximate recency/frequency metadata and returns bytes.</li>
+<li>On <code>MOVED</code> or timeout, client refreshes topology and retries the new primary; it does not broadcast.</li>
+</ol>
+<p>SET path:</p>
+<ol>
+<li>Client hashes key to vnode and sends <code>SET key value ttl</code> to the primary with its <code>client_topology_version</code>.</li>
+<li>Primary checks ownership, writes the entry table, installs/updates TTL metadata, and appends the mutation to the vnode replication log.</li>
+<li>It asynchronously ships the mutation to replicas keyed by <code>vnode:{id}:offset</code>; if the write durability mode is <code>cache-fast</code>, it returns after primary memory write.</li>
+<li>For <code>cache-safe</code>, it waits for one replica ack or a 1-2 ms budget, then returns <code>OK</code> or <code>TRY_AGAIN</code>.</li>
+<li>On topology change, the primary returns <code>MOVED</code> before mutating so the client retries against the new owner.</li>
+</ol>
+<p>Hot vs cold lookup path:</p>
+<pre><code>Hot hit:   client L1 -&gt; owner node hash table -&gt; value
+Cold miss: client L1 miss -&gt; owner node miss -&gt; caller backing store -&gt; SET refill
+Moved:     client -&gt; old owner -&gt; MOVED(version) -&gt; topology refresh -&gt; new owner
+Failed:    client -&gt; timeout -&gt; replica/new primary after coordinator promotion
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Consistent hashing details.</strong> A single key maps to a 32-bit position via SHA-256 (truncated). Each node has ~100 vnodes at random positions. Adding a node: pick 100 random positions, the keys that fall in those positions migrate from their old owners. On removal, keys redistribute among remaining nodes.</p>
+<p>Capacity math per node: 32 GB RAM - 20% reserved for allocator fragmentation, replication buffers, and OS leaves ~25 GB usable. At ~800 B physical entry size, that is ~31M entries/node. Across 100 nodes, usable primary capacity is ~3.1B entries; with one replica it is ~1.55B logical entries. The dominant cost is RAM overhead per entry, not raw value bytes, so compact metadata and sampling-based eviction matter.</p>
+<p>Replication and metadata math: with one async replica, the 1 TB hot working set becomes 2 TB resident. Topology metadata is tiny: 10k vnodes x 3 node IDs x ~8 B is under 1 MB plus versioning. Replication logs are bounded by lag, not retention; at 10M ops/sec x 700 B average physical mutation, even a 10-second lag is ~70 GB cluster-wide, so each node needs backpressure before logs eat the memory reserved for cache values.</p>
+<p><strong>Why not just Redis Cluster?</strong> In production I would use Redis/Memcached unless the interview asks from scratch. The design here borrows Redis's single-threaded event loop for predictable latency and Memcached's client-side sharding for scale. etcd/ZooKeeper/Raft is for tiny topology metadata; putting every cache write through Raft would destroy throughput.</p>
+<p>Be ready for "why not DynamoDB/Cassandra?" They are durable key-value stores with millisecond latencies and disk-backed replication; this system optimizes for sub-millisecond in-memory reads and accepts cache loss. Be ready for "why not pure client-side consistent hashing without a coordinator?" It is fast, but replica promotion and migration need one authoritative topology version or clients disagree during failure.</p>
+<p><strong>Migration during scaling.</strong> When a vnode moves N7 → N12, both nodes briefly own it. Migration protocol:
+1. Coordinator marks <code>vnode in migration N7→N12</code>.
+2. New writes go to N12.
+3. N7 streams existing keys to N12.
+4. On done, coordinator updates topology; clients see the change on next refresh.
+5. Old N7 deletes the range.</p>
+<p>Migration state machine:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Owner behavior</th>
+<th>Client behavior</th>
+<th>Risk</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>stable</td>
+<td>N7 primary</td>
+<td>route to N7</td>
+<td>normal</td>
+</tr>
+<tr>
+<td>migrating</td>
+<td>writes dual-write or forward to N12; N7 streams snapshot</td>
+<td>old topology still works</td>
+<td>temporary extra latency</td>
+</tr>
+<tr>
+<td>cutover</td>
+<td>coordinator publishes new version</td>
+<td>clients get <code>MOVED</code> and refresh</td>
+<td>short retry spike</td>
+</tr>
+<tr>
+<td>cleanup</td>
+<td>N7 deletes vnode after grace period</td>
+<td>route only to N12</td>
+<td>stale clients rejected</td>
+</tr>
+</tbody>
+</table>
+<p>Serving degradation state:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Latency / correctness</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>hot</td>
+<td>L1 + primary hit</td>
+<td>client cache or owner hash table</td>
+<td>sub-ms, may be TTL-stale</td>
+</tr>
+<tr>
+<td>warm</td>
+<td>primary miss</td>
+<td>caller backing store then <code>SET</code> refill</td>
+<td>caller pays backing-store latency</td>
+</tr>
+<tr>
+<td>replica promotion</td>
+<td>new primary</td>
+<td>async replica state through last offset</td>
+<td>sub-second failover, latest writes may be lost</td>
+</tr>
+<tr>
+<td>topology stale</td>
+<td>redirect</td>
+<td><code>MOVED</code> with new version</td>
+<td>one retry</td>
+</tr>
+<tr>
+<td>memory pressure</td>
+<td>eviction</td>
+<td>sampled LRU/LFU</td>
+<td>correctness preserved as miss</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Eviction policies.</strong>
+- <strong>LRU</strong>: doubly linked list of entries by recency; O(1) update. Memory cost: 2 pointers per entry.
+- <strong>LFU</strong>: approximate counters (logarithmic counter à la Redis); resistant to scan attacks.
+- <strong>Random sampling LRU</strong> (Redis approximation): sample N entries, evict oldest. Lower memory cost, near-LRU quality.</p>
+<p><strong>TTL expiration.</strong> Two strategies, used together:
+- <strong>Lazy expiry</strong>: on each <code>GET</code>, check <code>expires_at</code>; if expired, delete and return nil.
+- <strong>Active expiry</strong>: a background task samples random keys with TTLs, deletes expired ones. Bounds memory growth from never-read expired keys.</p>
+<p><strong>Hot keys.</strong> A single key (<code>feature_flag_X</code>) drawing millions of QPS overwhelms its owning node. Mitigations:
+- <strong>Client-side caching with TTL</strong>: most recent value held for 100ms; absorbs hot reads.
+- <strong>Replicate hot keys</strong> to multiple nodes; clients spread reads.
+- <strong>Auto-detect hot keys</strong> server-side, broadcast to clients to enable replication.</p>
+<p>Hot-key fallback is explicit: normal mode serves from one primary; detected-hot mode replicates read-only copies to <code>hot:{key}:{replica_id}</code> on several nodes; stale-safe mode lets clients use L1 cache for 100-500 ms; write-heavy hot keys like counters are rejected or redirected to a different service because cache nodes are not a general counter database.</p>
+<p>The two-view pattern shows up in topology and data: topology has one strongly consistent view in the coordinator, while cached values are deliberately weak and per-vnode. I would never require data-plane consensus for every value; only the map of who owns the value needs consensus.</p>
+<p><strong>Persistence.</strong> Pure cache: no persistence; data loss on full restart accepted. Cache-with-snapshot: periodic RDB-style snapshot + AOF log of writes; replay on restart. Tradeoff is between memory write throughput and recovery time.</p>
+<p><strong>Cross-region.</strong> Each region runs its own cluster (cache locality matters for latency). Cross-region replication is opt-in per-key — most caches don't need it. For sessions that must be globally visible, use a different layer (replicated K-V store).</p>
+<p><strong>Concurrency model.</strong> Single-threaded per node (Redis-style) gives simple correctness and zero locking overhead. Multi-core utilization via running multiple processes per machine. Alternative: per-thread shards within a process; locks confined to per-shard structures.</p>
+<p><strong>Failure semantics.</strong> A node dying loses its in-memory contents. With replication, the replica promotes and serves; without, those keys become cold cache misses (acceptable for a cache). Clients receive errors during failover (sub-second), then succeed.</p>
+<p>Failure modes table:</p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Behavior</th>
+<th>Latency budget</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>expired key</td>
+<td>lazy delete on read, return nil</td>
+<td>&lt;1 ms</td>
+</tr>
+<tr>
+<td>evicted key</td>
+<td>miss, caller falls through to backing store</td>
+<td>caller-owned</td>
+</tr>
+<tr>
+<td>primary failed with replica</td>
+<td>coordinator promotes replica, clients refresh</td>
+<td>&lt;1 s failover</td>
+</tr>
+<tr>
+<td>primary failed without replica</td>
+<td>keys cold-miss until repopulated</td>
+<td>availability preserved</td>
+</tr>
+<tr>
+<td>coordinator unavailable</td>
+<td>clients keep old topology; no rebalance</td>
+<td>existing traffic continues</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Backpressure.</strong> Per-connection request limits; reject when CPU saturated. Out-of-memory triggers eviction; if eviction can't keep up, return errors rather than corrupt data.</p>
+<p><strong>What I'd defer.</strong> Multi-master writes, pub/sub, Lua scripting, secondary indexes, geospatial commands, cluster-wide transactions.</p>
+<p><strong>Interview punch line:</strong> a cache is allowed to lose values, but it is not allowed to become a distributed database by accident. Keep topology metadata strongly coordinated, keep data-plane reads direct and fast, and define miss/failover behavior clearly.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

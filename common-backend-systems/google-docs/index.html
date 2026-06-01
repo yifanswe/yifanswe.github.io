@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Google Docs — Collaborative Editing (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Google Docs — Collaborative Editing (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Hard · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build Google Docs. Up to ~50 people edit the same document at once, each typing keystroke by keystroke. Everyone sees each other's cursors and edits within a second. Offline edits sync on reconnect. 100M daily documents touched, peak ~100 collaborators on the busiest docs.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Multiple users edit the same document in real-time.
+- See other users' cursors and edits live.
+- Document is durable; reload returns the same content.
+- Offline edits sync on reconnect without manual conflict resolution.</p>
+<p>I'd defer comments, suggestion mode, version history depth, sharing/ACL beyond mentioning, and rich embedded objects.</p>
+<p><strong>Non-functional</strong>
+- Real-time updates: typing → other clients see &lt; 500 ms.
+- Strong convergence — all participants eventually see the same final document for a given set of edits.
+- Survive offline editing; merge gracefully.
+- Durability — never lose committed edits.</p>
+<p><strong>Capacity</strong>
+- 100M docs touched/day; concurrent active sessions ~10M.
+- Hot docs: ~100 concurrent editors → 100 × ~5 ops/s = 500 ops/s per doc.
+- Total ops: dominated by long tail; assume 1B ops/day globally.
+- Op log storage is modest but latency-sensitive: 1B ops/day × ~150 B/op × RF=3 ≈ 450 GB/day. Snapshots at ~50 KB for 100M touched docs are ~5 TB per snapshot generation before RF; snapshot/object storage is the dominant durable byte cost.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Document</strong> — <code>doc_id</code>, owner, ACL, current snapshot, version.</li>
+<li><strong>Op</strong> — edit operation (insert / delete with position + content + author + logical timestamp).</li>
+<li><strong>Session</strong> — <code>session_id, doc_id, user_id, cursor_position</code>.</li>
+<li><strong>Snapshot</strong> — periodic materialization of doc state for fast load.</li>
+</ul>
+<hr />
+<h2 id="3-api-protocol-5-min">3. API / Protocol (~5 min)</h2>
+<pre><code>WS  /v1/docs/{doc_id}/sync
+  ← client: { op, base_version }
+  → server: { op, version, author }    // op stream from peers
+  → server: { presence, cursor }       // presence beacons
+
+HTTP:
+POST /v1/docs                              → { doc_id }
+GET  /v1/docs/{doc_id}/snapshot            → snapshot + version
+</code></pre>
+<p>User from token; doc_id and base_version on each op for ordering.</p>
+<p>The server issues monotonically increasing versions per doc. Reconnect cursors encode <code>{doc_id, last_acked_version, client_session_id}</code>; presence has no cursor because it is best-effort.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<p>This problem is about <strong>conflict resolution</strong>. Two viable models:</p>
+<h3 id="operational-transformation-ot">Operational Transformation (OT)</h3>
+<ul>
+<li>Each op references a base version.</li>
+<li>Server has the canonical sequence; when a new op arrives based on an older version, the server transforms it against intervening ops before applying.</li>
+<li>Client similarly transforms received ops against any local in-flight ops.</li>
+</ul>
+<h3 id="conflict-free-replicated-data-types-crdt">Conflict-free Replicated Data Types (CRDT)</h3>
+<ul>
+<li>Each character has a unique, globally ordered ID (Logoot, RGA, Yjs).</li>
+<li>Insert specifies "after which character"; delete refers to character ID.</li>
+<li>Commutative — any order of applying ops yields the same result. No transformation needed.</li>
+</ul>
+<p>I'd default to <strong>OT</strong> for an interview because it matches what Google Docs actually uses and the server-as-authority model is easier to explain; mention CRDT as the alternative used by Figma and Yjs.</p>
+<h3 id="system-layout">System layout</h3>
+<ol>
+<li><strong>Edit session router.</strong> Hash <code>doc_id</code> to a session server (single-owner pattern). All edits for one doc converge on one server for ordering. This is the heart.</li>
+<li><strong>Session server.</strong> Holds the canonical op log in memory + a streaming queue per connected client. Applies OT to incoming ops, broadcasts transformed ops to peers, persists ops to durable storage.</li>
+<li><strong>Op log storage.</strong> Append-only — Cassandra/Spanner keyed by <code>(doc_id, seq)</code>. Replicated for durability.</li>
+<li><strong>Snapshot service.</strong> Every N ops or M seconds, fold the op log into a doc snapshot and persist. Loaders fetch latest snapshot + tail of ops.</li>
+<li><strong>Presence / cursors.</strong> Separate channel from edits — ephemeral, lossy. Each client pushes cursor position; session server broadcasts. No persistence needed.</li>
+<li><strong>WebSocket gateway.</strong> Persistent connection per client; routes to the right session server.</li>
+<li><strong>Offline buffer.</strong> Client retains uncommitted ops locally. On reconnect, replays from its last server-acknowledged version.</li>
+</ol>
+<p>End-to-end narration: Alice and Bob both have the doc open. Alice types "hello" → her client sends op <code>insert(pos=0, "hello", base_version=42)</code> → session server is at version 47 already → server transforms Alice's op against ops 43–47 → applies, broadcasts to all sessions including Bob. Bob's client receives <code>insert(pos=5, "hello", version=48)</code>, applies it (also transforming against his unacknowledged local op if any), and renders.</p>
+<p>Concrete stores:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Op log</td>
+<td><code>op:{doc_id}:{version}</code> append row</td>
+<td style="text-align: right;">~150 B text op</td>
+<td>forever or compact after snapshots</td>
+<td><code>doc_id</code></td>
+</tr>
+<tr>
+<td>Snapshot store</td>
+<td><code>snapshot:{doc_id}:{version}</code> compressed document body</td>
+<td style="text-align: right;">10-200 KB</td>
+<td>latest + version history policy</td>
+<td><code>doc_id</code></td>
+</tr>
+<tr>
+<td>Session owner map</td>
+<td><code>doc_owner:{doc_id}</code> -&gt; session server lease</td>
+<td style="text-align: right;">~100 B</td>
+<td>30 s TTL</td>
+<td><code>doc_id</code></td>
+</tr>
+<tr>
+<td>Presence</td>
+<td><code>presence:{doc_id}:{session_id}</code> cursor/selection</td>
+<td style="text-align: right;">~200 B</td>
+<td>10 s TTL</td>
+<td><code>doc_id</code></td>
+</tr>
+<tr>
+<td>Client dedupe</td>
+<td><code>seen_op:{doc_id}:{client_op_id}</code></td>
+<td style="text-align: right;">~32 B</td>
+<td>24 h</td>
+<td><code>doc_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>Capacity by store:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Math</th>
+<th>Dominant knob</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Op log</td>
+<td>1B ops/day * 150 B/op * RF=3 ~= 450 GB/day; 30 d hot tail ~= 13.5 TB</td>
+<td>compact old ops into snapshots, keep only audit window hot</td>
+</tr>
+<tr>
+<td>Snapshots</td>
+<td>100M touched docs * 50 KB avg * RF=3 ~= 15 TB for one latest-snapshot generation</td>
+<td>version-history policy and snapshot interval dominate bytes</td>
+</tr>
+<tr>
+<td>Presence</td>
+<td>10M live sessions * 200 B * RF=2 ~= 4 GB</td>
+<td>10 s TTL; drop updates under load</td>
+</tr>
+<tr>
+<td>Owner map</td>
+<td>100M recently touched docs * 100 B * RF=2 ~= 20 GB worst case</td>
+<td>lease TTL and lazy recreation</td>
+</tr>
+<tr>
+<td>Dedupe</td>
+<td>1B client op ids/day * 32 B * RF=2 ~= 64 GB/day</td>
+<td>24 h TTL; shard by <code>doc_id</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">                         +---------------------------+
+                         |      Browser clients      |
+                         +-----+----------------+----+
+                               |                |
+       WS /v1/docs/{doc_id}/sync|                |GET /v1/docs/{doc_id}/snapshot
+                               v                v
+                      +----------------+   +----------------+
+                      | WebSocket      |   | Snapshot API   |
+                      | gateway        |   | / loader       |
+                      +--------+-------+   +--------+-------+
+                               | owner lookup      | latest snapshot + tail
+                               v                   |
+                      +----------------+           |
+                      | Edit session   |           |
+                      | router         |           |
+                      +--------+-------+           |
+                               | doc_id shard      |
+                               v                   |
+                      +----------------+           |
+                      | Session server |&lt;----------+
+                      | OT order/owner |
+                      +---+--------+---+
+                          |        |
+      presence/cursors    |        | append op + broadcast ACK
+              +-----------+        v
+              v              +----------------+
+        +----------+         | ACL / Auth     |
+        | Presence |         | checks         |
+        | fanout   |         +----------------+
+        +----+-----+
+             |
+             v
+   +----------------------------------------------------------+
+   | Stores / Caches                                          |
+   | doc_owner:{doc_id} -&gt; session server lease, 30s TTL      |
+   | op:{doc_id}:{version} append row, ~150 B/op              |
+   | snapshot:{doc_id}:{version} compressed body, 10-200 KB   |
+   | presence:{doc_id}:{session_id} cursor, 10s TTL           |
+   | seen_op:{doc_id}:{client_op_id} dedupe, 24h TTL          |
+   +--------------------+--------------------------+----------+
+                        | owner miss / failover    | snapshot stale
+                        v                          v
+              +-------------------+       +------------------+
+              | Owner election    |&lt;------| Snapshot service |
+              | + op-log replay   | async | folds op log     |
+              +-------------------+       +------------------+
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>OT in practice.</strong> Each op carries (<code>type, position, content, base_version, author</code>). Server maintains canonical op log. On receipt:
+1. If <code>base_version == current_version</code>, apply and broadcast.
+2. Else transform <code>op</code> against ops <code>(base_version + 1 ... current_version)</code> using transformation rules (a delete shifts positions of subsequent inserts, etc.).
+3. Apply, increment version, broadcast.</p>
+<p>Client mirrors this for in-flight local ops it hasn't gotten the server ACK for.</p>
+<p>Write path trace: client -&gt; WebSocket gateway -&gt; owner lookup by <code>doc_id</code> -&gt; session server validates ACL and <code>client_op_id</code>; session server fetches missing tail ops if <code>base_version</code> is stale; transforms, appends <code>op:{doc_id}:{version}</code> durably, updates in-memory snapshot, then broadcasts. Append and broadcast are ordered: if durable append fails, the op is not acknowledged.</p>
+<p>Hot write path, step by step:
+1. Client sends <code>{doc_id, client_op_id, base_version, op}</code> over the existing WebSocket.
+2. Gateway hashes <code>doc_id</code>, checks <code>doc_owner:{doc_id}</code>, and forwards to the current session owner; this is the shard key at every hop.
+3. Owner validates ACL and <code>seen_op:{doc_id}:{client_op_id}</code> in parallel with loading the short op tail from memory.
+4. If <code>base_version</code> is current, the owner applies immediately; if it is stale, it reads <code>op:{doc_id}:{base_version+1...current}</code> from memory or the durable log and transforms first.
+5. Owner appends <code>op:{doc_id}:{new_version}</code> durably, then ACKs the author and broadcasts to peer streams. Presence updates never block this path.</p>
+<p>Cold load / recovery path:
+1. Client loads <code>snapshot:{doc_id}:{snapshot_version}</code> from the snapshot store and asks the gateway for the live owner.
+2. If owner exists, it streams ops after <code>snapshot_version</code>; if owner is cold, the gateway elects one with a <code>doc_owner:{doc_id}</code> lease.
+3. New owner replays durable ops after the snapshot, rebuilds the in-memory document, and only then admits writers.
+4. Cursor state persists as <code>{doc_id, last_acked_version, client_session_id}</code> so reconnect and pagination through the op tail resume from the right version.</p>
+<p><strong>CRDT alternative.</strong> Each character gets a unique ID (a fractional position). Insert says "between X and Y, insert with ID Z." Concurrent inserts produce a consistent order without server transformation. Server can be a simple relay. Storage cost is higher per character.</p>
+<p>Why OT here rather than CRDT: with a central session owner, OT keeps operations small and gives the server one canonical version for ACL, audit, and undo. CRDT is stronger for offline-first peer-to-peer editing, but the per-character IDs and tombstones increase storage and make rich document operations harder to explain in 45 minutes.</p>
+<p>Storage choice defense: Spanner fits if I want strongly consistent per-document transactions and cross-region replicas, but it is expensive for a pure append log. Cassandra fits the append-heavy <code>(doc_id, version)</code> access pattern if the session owner is the consistency point. Kafka alone is not enough because users need random tail replay by doc and long-term durability beyond log retention. Be ready for "why not only object storage?" -- object storage is perfect for snapshots, but too slow and coarse for per-keystroke tail reads.</p>
+<p><strong>Single-owner per doc.</strong> All edits for a doc must serialize at one node so the OT canonical order is well-defined. Achieved by consistent-hashing <code>doc_id</code> to a session server. On owner failure, leader election + log replay from durable op store.</p>
+<p><strong>Snapshotting.</strong> Reading 6 months of ops to load a doc is prohibitive. Periodic snapshots: every 1000 ops or 5 min, fold ops into a snapshot. Load = snapshot + ops since snapshot.</p>
+<p>Load path trace: <code>GET snapshot</code> reads the latest <code>snapshot:{doc_id}:{version}</code> and, in parallel, asks the owner for the op tail after that version. If the owner is cold, the gateway replays the tail from the durable op log and elects a new owner before admitting editors.</p>
+<p><strong>Offline / disconnect.</strong> Client keeps a local op log. On reconnect, sends <code>{since_version: N}</code>. Server replays missed ops to client; client transforms and replays its buffered local ops, sending each as a new op based on the new version.</p>
+<p><strong>Cursor / presence.</strong> Different channel: high frequency, no persistence. Cursors flicker is fine. Throttle to ~10 Hz per user.</p>
+<p><strong>ACL / sharing.</strong> Permissions checked at session connect (read-only vs editor). Server tags ops with author; clients enforce read-only by refusing to send.</p>
+<p><strong>Conflict patterns OT handles cleanly.</strong>
+- Insert + insert at same position: deterministic by author tiebreak.
+- Insert + delete on the same range: insert wins (text preserved), delete shifted.
+- Concurrent identical edits: deduped by op ID.</p>
+<p><strong>What it doesn't handle gracefully.</strong> Schema-level conflicts (one user inserting a table, another deleting the surrounding paragraph). These require op types beyond text — Google Docs uses a richer op model with structural ops.</p>
+<p><strong>Hot doc scaling.</strong> 100 collaborators on one doc → 500 ops/s on a single session server. Comfortable for one node. Beyond that (1000s of viewers reading), separate read replicas pull from the op log; only writers go through the owner.</p>
+<p><strong>Two-view model.</strong> The durable dataset is the same document history, exposed in two views: <code>op:{doc_id}:{version}</code> is the fine-grained edit index for sync/replay, while <code>snapshot:{doc_id}:{version}</code> is the hydrated content view for fast load. The snapshot is derived; if it is stale or missing, replaying the op index recovers correctness.</p>
+<p><strong>Edge stress tests.</strong> A dormant document whose owner lease expired cold-starts from snapshot plus log tail and should load in under 2 s for normal docs. A user paginating far back in version history leaves the hot op tail and reads compacted audit storage, so the UI should switch to a history-loading state. A celebrity/shared public doc with thousands of viewers should fan out through read-only replicas while the writer path remains single-owner. Multi-region drift is handled by routing all active edits for a doc to one write region; remote regions serve snapshots and subscribe to the op stream with visible lag.</p>
+<p>Session state machine:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Transition</th>
+<th>Latency target</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Active</td>
+<td>owner in memory</td>
+<td>owner doc state + hot op tail</td>
+<td>normal edits</td>
+<td>&lt; 500 ms peer visibility</td>
+</tr>
+<tr>
+<td>Warm reconnect</td>
+<td>owner alive, client stale</td>
+<td>owner memory + op tail</td>
+<td>client cursor behind</td>
+<td>&lt; 1 s catch-up</td>
+</tr>
+<tr>
+<td>Cold doc</td>
+<td>no owner lease</td>
+<td>snapshot + durable op log</td>
+<td>first editor opens</td>
+<td>&lt; 2 s before editable</td>
+</tr>
+<tr>
+<td>Recovery</td>
+<td>owner failed</td>
+<td>durable op log + lease election</td>
+<td>heartbeat miss</td>
+<td>seconds; freeze writes</td>
+</tr>
+<tr>
+<td>Archive history</td>
+<td>compacted versions</td>
+<td>snapshot chain + archived ops</td>
+<td>user opens old version</td>
+<td>slower, read-only first</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Durability.</strong> Every accepted op fsynced to the op log before broadcasting. Snapshots are async.</p>
+<p><strong>Graceful degradation.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th>User-visible behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner fails</td>
+<td>Freeze writes, elect owner, replay log tail</td>
+<td>op log + owner map</td>
+<td>seconds of reconnect</td>
+</tr>
+<tr>
+<td>Client offline</td>
+<td>Local optimistic edits</td>
+<td>browser local log</td>
+<td>sync on reconnect</td>
+</tr>
+<tr>
+<td>Snapshot stale</td>
+<td>Snapshot + longer op tail</td>
+<td>snapshot store + op log</td>
+<td>slower load, correct doc</td>
+</tr>
+<tr>
+<td>Presence fan-out hot</td>
+<td>Drop/throttle cursor updates</td>
+<td>presence TTL store</td>
+<td>text edits unaffected</td>
+</tr>
+<tr>
+<td>Op log store degraded</td>
+<td>Reject new edits after small buffer</td>
+<td>session memory + durable log</td>
+<td>fail closed to avoid lost edits</td>
+</tr>
+</tbody>
+</table>
+<p>Interview punch line: "The single-owner server is not a scalability weakness here; it is the mechanism that makes OT understandable, durable, and auditable per document."</p>
+<p><strong>What I'd defer.</strong> Comments and suggestions, version history UI, rich object embeds (images, tables), import/export, fine-grained sharing.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

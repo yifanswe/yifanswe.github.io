@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design ChatGPT — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design ChatGPT</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>ChatGPT is a streaming chat interface over a large language model. The hard part is the GPU economics — every token generated costs GPU compute — combined with conversation state, streaming token delivery, safety filtering, and scaling across millions of concurrent sessions on a finite GPU fleet.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every chat request is routed to an inference worker with the requested model loaded, generates tokens within the model's latency budget, streams them to the client, applies safety filtering before display, persists the conversation history per user, and is billed/quota-tracked deterministically; GPU capacity is shared across users with fairness controls.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design GPU inference serving with batching, streaming token delivery via SSE/WebSocket, conversation state management, safety filtering pipelines, and reason about GPU cost optimization (continuous batching, KV cache, quantization).</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design ChatGPT around four core systems: a chat session service holding conversation state, an inference fleet of GPU workers serving models with continuous batching, a streaming gateway that delivers tokens as they're generated, and safety filtering pipelines on both input and output. The interesting decisions are GPU scheduling and batching, conversation context management, streaming protocols, safety integration, and cost optimization.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>User sends prompts; assistant streams responses.</li>
+<li>Multi-turn conversations with history.</li>
+<li>Multiple models (GPT-4, GPT-4o, etc.).</li>
+<li>File and image uploads (vision).</li>
+<li>Function calling / tool use.</li>
+<li>Conversation history saved per user.</li>
+<li>Edit / regenerate messages.</li>
+<li>Custom instructions per user.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Time-to-first-token under 1 second.</li>
+<li>Token-per-second throughput acceptable for streaming UX.</li>
+<li>Tens of millions of concurrent sessions.</li>
+<li>High availability.</li>
+<li>Strict safety: filter unsafe content.</li>
+<li>Multi-region.</li>
+<li>Pay-per-token billing accuracy.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Model training pipeline (separate; massive distinct system).</li>
+<li>Custom GPTs / agent platform internals.</li>
+<li>Memory feature internals.</li>
+<li>Plugin / browsing details.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>100M+ weekly.</td>
+</tr>
+<tr>
+<td>Concurrent sessions</td>
+<td>Millions.</td>
+</tr>
+<tr>
+<td>Tokens generated</td>
+<td>Trillions/day.</td>
+</tr>
+<tr>
+<td>GPU fleet</td>
+<td>Hundreds of thousands.</td>
+</tr>
+<tr>
+<td>TTFT</td>
+<td>&lt; 1 s.</td>
+</tr>
+<tr>
+<td>Tokens/sec per stream</td>
+<td>30-100.</td>
+</tr>
+<tr>
+<td>Average response</td>
+<td>Hundreds to thousands of tokens.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is GPU capacity. Every token costs compute; the fleet must be scheduled efficiently.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Chat session</td>
+<td>Conversation state per user.</td>
+<td>Strongly consistent.</td>
+</tr>
+<tr>
+<td>Inference</td>
+<td>Generate tokens from prompt.</td>
+<td>GPU-heavy; batched.</td>
+</tr>
+<tr>
+<td>Streaming</td>
+<td>Deliver tokens to client live.</td>
+<td>SSE/WS.</td>
+</tr>
+<tr>
+<td>Safety</td>
+<td>Filter unsafe input/output.</td>
+<td>Pre and post.</td>
+</tr>
+<tr>
+<td>Billing / quota</td>
+<td>Track token usage.</td>
+<td>Strong.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Client --request--&gt; API Gateway
+                          |
+                          v
+                  +-----------------+
+                  | Auth + Quota    |
+                  +--------+--------+
+                          |
+                          v
+                  +-----------------+
+                  | Safety Filter   |
+                  | (input)         |
+                  +--------+--------+
+                          |
+                          v
+                  +-----------------+
+                  | Session State   |
+                  | (history)       |
+                  +--------+--------+
+                          |
+                          v
+                  +-----------------+
+                  | Inference       |
+                  | Scheduler       |
+                  +--------+--------+
+                          |
+                          v
+                  +-----------------+
+                  | GPU Worker      |
+                  | (model + batch) |
+                  +--------+--------+
+                          |
+              token stream
+                          |
+                          v
+                  +-----------------+
+                  | Safety Filter   |
+                  | (output)        |
+                  +--------+--------+
+                          |
+                          v
+                  Client (streaming)
+                          |
+                          v
+                  Persist conversation
+                  Update quota
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>API gateway</td>
+<td>Auth, rate limit, route.</td>
+<td>Standard.</td>
+</tr>
+<tr>
+<td>Session service</td>
+<td>Conversation history per user.</td>
+<td>Strong; per-user partitioned.</td>
+</tr>
+<tr>
+<td>Conversation store</td>
+<td>Persist messages.</td>
+<td>Sharded by user_id.</td>
+</tr>
+<tr>
+<td>Safety classifier</td>
+<td>Input/output filtering.</td>
+<td>Pre-inference + per-token.</td>
+</tr>
+<tr>
+<td>Inference scheduler</td>
+<td>Place requests on GPU workers.</td>
+<td>Affinity, batching, model placement.</td>
+</tr>
+<tr>
+<td>GPU worker</td>
+<td>Runs model; performs inference.</td>
+<td>Holds KV cache for active streams.</td>
+</tr>
+<tr>
+<td>Continuous batching engine</td>
+<td>Combine concurrent requests into batched forward passes.</td>
+<td>Critical for GPU efficiency.</td>
+</tr>
+<tr>
+<td>Streaming gateway</td>
+<td>Maintains SSE/WebSocket to client.</td>
+<td>Per-session.</td>
+</tr>
+<tr>
+<td>Quota service</td>
+<td>Per-user token budgets.</td>
+<td>Counter + decrement on each token.</td>
+</tr>
+<tr>
+<td>Billing</td>
+<td>Aggregate usage; charge.</td>
+<td>Eventually consistent.</td>
+</tr>
+<tr>
+<td>Tool / function calling</td>
+<td>Execute tools mid-conversation.</td>
+<td>Loops back to inference.</td>
+</tr>
+<tr>
+<td>Vision / multimodal preprocessor</td>
+<td>Image and file ingestion.</td>
+<td>Generates embeddings.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="conversation">Conversation</h4>
+<pre><code class="language-text">Conversation(
+  conversation_id,
+  user_id,
+  title,
+  created_at,
+  updated_at,
+  model,                  // gpt-4, gpt-4o, ...
+  system_prompt,
+  messages: [Message],
+  custom_instructions,
+  total_tokens
+)
+</code></pre>
+<h4 id="message">Message</h4>
+<pre><code class="language-text">Message(
+  message_id,
+  conversation_id,
+  role,                   // user, assistant, tool
+  content,
+  tool_calls?,
+  tool_results?,
+  created_at,
+  token_count,
+  edit_history?
+)
+</code></pre>
+<h4 id="inference-request">Inference Request</h4>
+<pre><code class="language-text">InferenceRequest(
+  request_id,
+  conversation_id,
+  user_id,
+  model,
+  messages,               // full context
+  max_tokens,
+  temperature,
+  stream: true,
+  safety_filter_level,
+  tools?
+)
+</code></pre>
+<h4 id="quota-state">Quota State</h4>
+<pre><code class="language-text">Quota(
+  user_id,
+  plan,
+  token_budget,
+  used_this_period,
+  reset_at
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text"># REST
+POST   /conversations
+POST   /conversations/{id}/messages    # streamed response via SSE
+GET    /conversations/{id}
+PATCH  /conversations/{id}             # edit, regenerate
+DELETE /conversations/{id}
+
+# Streaming protocol
+SSE or WebSocket:
+  event: token, content: &quot;Hello&quot;
+  event: token, content: &quot; world&quot;
+  event: tool_call, ...
+  event: done
+</code></pre>
+<h3 id="inference-flow">Inference Flow</h3>
+<ol>
+<li>User sends message.</li>
+<li>API auth + quota check.</li>
+<li>Input safety filter: classify prompt; reject if violates policy.</li>
+<li>Append user message to conversation in session store.</li>
+<li>Build inference request: full conversation history + system prompt.</li>
+<li>Send to inference scheduler.</li>
+<li>Scheduler picks GPU worker with the requested model loaded.</li>
+<li>Worker enqueues request into continuous batch.</li>
+<li>Forward pass generates one token at a time.</li>
+<li>Each token streams back to client via SSE.</li>
+<li>Output safety filter applied per token or per chunk.</li>
+<li>On completion, persist assistant message; update quota.</li>
+</ol>
+<h3 id="continuous-batching">Continuous Batching</h3>
+<p>The core GPU optimization. Naive: one request at a time per GPU. Wasteful — GPUs are massively parallel.</p>
+<p>Continuous batching:
+- GPU runs inference in batches of N requests.
+- Each forward pass produces one token for each active request in the batch.
+- Completed requests leave the batch; new ones join.
+- KV cache (key-value attention cache) maintained per request.
+- Effective throughput much higher than sequential.</p>
+<p>Implementation: vLLM, TGI (HuggingFace Text Generation Inference), or custom serving stack.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Continuous batching is the GPU economy. Without it, a single 8xH100 server serves a handful of users; with it, hundreds. KV cache management determines how many concurrent streams the worker holds.</p>
+</blockquote>
+<h3 id="kv-cache">KV Cache</h3>
+<p>Transformer attention requires the keys and values of all prior tokens. Recomputing per token is wasteful.</p>
+<ul>
+<li>KV cache stores K, V tensors for each token in the active conversation.</li>
+<li>Memory cost scales with context length and concurrent requests.</li>
+<li>KV cache eviction: when memory pressured, complete a request or swap to CPU.</li>
+<li>Pre-allocated cache pools per worker; bounded concurrency per worker.</li>
+</ul>
+<h3 id="streaming-protocol">Streaming Protocol</h3>
+<p>Server-Sent Events (SSE) is the typical choice:</p>
+<ul>
+<li>Server sends <code>data: {token}\n\n</code> per token.</li>
+<li>Client receives via EventSource API.</li>
+<li>Half-duplex; client → server is separate request.</li>
+</ul>
+<p>WebSocket is an alternative for full-duplex; useful for cancel mid-stream.</p>
+<p>The streaming connection holds open for the duration of the response (seconds to minutes for long generations).</p>
+<h3 id="safety-filtering">Safety Filtering</h3>
+<p>Two phases:</p>
+<p><strong>Input filter:</strong>
+- Classifier checks user prompt for policy violations.
+- Reject obvious unsafe (CSAM, terrorism, etc.).
+- Soft-warn or transform for borderline (e.g., medical, legal advice).</p>
+<p><strong>Output filter:</strong>
+- Per-token or per-chunk classifier.
+- If output looks unsafe, abort stream + apologize.
+- Some checks happen on full response (jailbreak detection).</p>
+<p>For sensitive topics: model fine-tuning enforces refusals + RLHF; safety classifier is the belt-and-suspenders.</p>
+<p>Hybrid: small fast classifier inline + larger model for ambiguous cases.</p>
+<h3 id="conversation-state-management">Conversation State Management</h3>
+<p>Conversation history is the model's context. As history grows:</p>
+<ul>
+<li>Context window limit (8k, 32k, 200k tokens depending on model).</li>
+<li>For long conversations, truncate or summarize older messages.</li>
+<li>Summarization: periodically summarize and replace early messages with summary.</li>
+<li>"Memory" feature: extract long-term facts about the user, store separately, inject into system prompt.</li>
+</ul>
+<p>Persist conversation messages durably so user can resume.</p>
+<h3 id="gpu-fleet-scheduling">GPU Fleet Scheduling</h3>
+<p>Workers in the fleet:</p>
+<ul>
+<li>Each worker has one or more GPUs.</li>
+<li>A worker loads one (or sometimes a few) models.</li>
+<li>Workers grouped by model; scheduler routes to the right pool.</li>
+<li>Within a pool, scheduler picks workers with capacity.</li>
+<li>Bin-packing across the fleet.</li>
+</ul>
+<p>Auto-scaling:</p>
+<ul>
+<li>Track active streams per model.</li>
+<li>Add workers when demand rises; drain idle workers.</li>
+<li>Cold start: load model weights (large, slow).</li>
+<li>Mitigation: keep a warm pool; pre-load popular models.</li>
+</ul>
+<p>Multi-model deployment:
+- Larger models (GPT-4) need multi-GPU per worker (model parallelism).
+- Smaller models (3.5) fit on one GPU.
+- Quantization (FP8, int8) reduces memory and increases throughput.</p>
+<h3 id="tool-function-calling">Tool / Function Calling</h3>
+<p>Model decides to call a tool (function with defined schema):</p>
+<ol>
+<li>Model output: <code>tool_call(name, args)</code>.</li>
+<li>Streaming pauses; client or server executes tool.</li>
+<li>Tool result fed back as a new message.</li>
+<li>Inference resumes with the result in context.</li>
+</ol>
+<p>Supports browsing, code execution, image generation, custom tools.</p>
+<h3 id="vision-multimodal">Vision / Multimodal</h3>
+<p>Images are tokenized into image embeddings:</p>
+<ol>
+<li>Image uploaded; vision preprocessor extracts patches.</li>
+<li>Embeddings prepended to text tokens in the prompt.</li>
+<li>Model handles unified attention.</li>
+</ol>
+<p>Adds latency and memory cost; pre-cached for repeat use.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Conversations</td>
+<td><code>user_id</code> hash</td>
+<td>Per-user history.</td>
+</tr>
+<tr>
+<td>Quota</td>
+<td><code>user_id</code> hash</td>
+<td>Per-user counter.</td>
+</tr>
+<tr>
+<td>GPU fleet</td>
+<td>By model pool</td>
+<td>Routing affinity.</td>
+</tr>
+<tr>
+<td>Streaming gateway</td>
+<td>Sticky to client connection</td>
+<td>WebSocket / SSE state.</td>
+</tr>
+<tr>
+<td>Billing events</td>
+<td>Time + user</td>
+<td>Audit.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Conversation history</td>
+<td>Strong (writes for each message)</td>
+<td>User expects continuity.</td>
+</tr>
+<tr>
+<td>Quota</td>
+<td>Strong (CAS decrement)</td>
+<td>Money.</td>
+</tr>
+<tr>
+<td>Streaming</td>
+<td>Best-effort delivery</td>
+<td>Client retries.</td>
+</tr>
+<tr>
+<td>Safety classification</td>
+<td>Eventually consistent for retroactive analysis</td>
+<td>OK.</td>
+</tr>
+<tr>
+<td>Billing</td>
+<td>Strong eventually</td>
+<td>Aggregated.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Conversation storage per user home region.</li>
+<li>GPU fleets in multiple regions.</li>
+<li>Inference routed to nearest region with capacity for the requested model.</li>
+<li>Cross-region failover possible.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU worker crash mid-stream.</td>
+<td>Save partial response; resume from prefill on new worker.</td>
+<td>Worker failures.</td>
+</tr>
+<tr>
+<td>Capacity exhausted.</td>
+<td>Queue with bounded wait; rate-limit beyond.</td>
+<td>Queue depth.</td>
+</tr>
+<tr>
+<td>Unsafe output slips through.</td>
+<td>Multi-layer safety; post-hoc audit.</td>
+<td>Safety incidents.</td>
+</tr>
+<tr>
+<td>Streaming connection drops.</td>
+<td>Client reconnects; server resumes from cursor.</td>
+<td>Reconnect rate.</td>
+</tr>
+<tr>
+<td>Token quota exhausted mid-stream.</td>
+<td>Stop generation; partial result delivered; clear message.</td>
+<td>Quota exhaustion.</td>
+</tr>
+<tr>
+<td>Cold-start latency.</td>
+<td>Warm pool; pre-load popular models.</td>
+<td>TTFT distribution.</td>
+</tr>
+<tr>
+<td>Hot-key user (one user runs thousands of requests).</td>
+<td>Per-user concurrency limits; rate-limit.</td>
+<td>Per-user RPS.</td>
+</tr>
+<tr>
+<td>Long context blows KV cache.</td>
+<td>Truncate or summarize history.</td>
+<td>Context overflow rate.</td>
+</tr>
+<tr>
+<td>Model rollout regression.</td>
+<td>Canary + auto-rollback.</td>
+<td>Per-model error rate.</td>
+</tr>
+<tr>
+<td>Cross-region failover.</td>
+<td>Warm replica fleets.</td>
+<td>Failover RTO.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Safety filter false positives/negatives.</li>
+<li>Conversation persistence success.</li>
+<li>Quota drift vs billed.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>TTFT (time to first token) p99.</li>
+<li>Tokens/sec per stream.</li>
+<li>GPU utilization.</li>
+<li>Queue depth.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Active users; tokens per user.</li>
+<li>Tool call usage.</li>
+<li>Conversion to paid.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Larger batch = better GPU utilization but worse TTFT.</li>
+<li>Larger context = better quality but more memory and slower.</li>
+<li>Tighter safety = fewer incidents but more refusals (user complaints).</li>
+<li>Quantization saves memory but degrades quality slightly.</li>
+<li>More aggressive auto-scaling = lower latency but higher cost.</li>
+<li>Sticky streaming connections vs reconnect-on-failure.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One request per GPU.</td>
+<td>Continuous batching.</td>
+</tr>
+<tr>
+<td>Recompute KV cache per token.</td>
+<td>Maintain KV cache.</td>
+</tr>
+<tr>
+<td>Synchronous response.</td>
+<td>Streaming via SSE/WS.</td>
+</tr>
+<tr>
+<td>One-shot safety check at start.</td>
+<td>Pre-input + per-token output filtering.</td>
+</tr>
+<tr>
+<td>Single model deployment.</td>
+<td>Pool per model; route by request.</td>
+</tr>
+<tr>
+<td>Unlimited context.</td>
+<td>Truncate or summarize; enforce limits.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Continuous batching</td>
+<td>KV cache; concurrent requests; vLLM-style.</td>
+</tr>
+<tr>
+<td>Streaming</td>
+<td>SSE protocol; client cursor; reconnect.</td>
+</tr>
+<tr>
+<td>Safety</td>
+<td>Two-stage filter; classifier model.</td>
+</tr>
+<tr>
+<td>Cost optimization</td>
+<td>Quantization; batching; KV reuse; speculative decoding.</td>
+</tr>
+<tr>
+<td>Conversation state</td>
+<td>Persistence; summarization; memory.</td>
+</tr>
+<tr>
+<td>Multimodal</td>
+<td>Vision tokens; preprocessor.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Conversation store + inference fleet + streaming + safety.</li>
+<li>Continuous batching on GPUs.</li>
+<li>KV cache management.</li>
+<li>SSE streaming.</li>
+<li>Pre-input + post-output safety.</li>
+<li>Per-user quota and history.</li>
+<li>Multi-region fleet.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>ChatGPT is a streaming chat over GPU inference. The economic challenge is GPU utilization — continuous batching is the answer. The user experience challenge is streaming token-by-token delivery via SSE. The safety challenge is input + output filtering as a separate plane. Conversation state is per-user persistent; quota and billing are strong-consistency counters.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design ChatGPT.</p>
+<p><strong>Candidate:</strong> Four core systems: chat session service holding conversation history, inference fleet of GPU workers with continuous batching, streaming gateway delivering tokens via SSE, and safety filtering on both input and output. The invariant is every request runs through safety, generates within budget, streams to client, persists history, and decrements quota. The dominant cost is GPU; the dominant performance challenge is TTFT.</p>
+<p><strong>Interviewer:</strong> Walk me through a chat message.</p>
+<p><strong>Candidate:</strong> User submits prompt. Gateway authenticates, checks quota. Input safety classifier scans for policy violations — obvious unsafe is rejected. Session store appends the user message to conversation. Inference request is built: full message history + system prompt. Scheduler picks a GPU worker pool for the requested model, picks a worker with capacity. Worker enqueues into continuous batch. Forward pass starts generating tokens. Each token streams back via SSE; output safety filter validates per chunk. On done, persist assistant message and update quota.</p>
+<p><strong>Interviewer:</strong> Continuous batching — explain.</p>
+<p><strong>Candidate:</strong> GPUs are massively parallel; sequential per-request inference wastes compute. Continuous batching combines concurrent requests into a single forward pass. Each pass produces one token for every active request in the batch. KV cache maintained per request so subsequent passes don't recompute prior tokens. Completed requests leave the batch; new ones join. Result: a single H100 server handles hundreds of concurrent streams instead of a handful. vLLM and TGI implement this pattern.</p>
+<p><strong>Interviewer:</strong> KV cache?</p>
+<p><strong>Candidate:</strong> Transformer attention requires keys and values of all prior tokens. Recomputing per token is O(n²). KV cache stores K, V tensors after each token, so the next token's attention is O(n) marginal. Memory cost scales with context length × concurrent requests. Workers pre-allocate KV cache pools; concurrency is bounded by total cache memory.</p>
+<p><strong>Interviewer:</strong> TTFT — how do you keep it low?</p>
+<p><strong>Candidate:</strong> Several factors. Time-to-first-token includes: queue wait, prefill (process all input tokens in parallel), then first decode step. Mitigations: keep GPU fleet warm with model loaded; bound queue depth; prioritize TTFT over batch size. Continuous batching helps even TTFT because new requests join active batches without waiting for the batch to drain.</p>
+<p><strong>Interviewer:</strong> Streaming protocol?</p>
+<p><strong>Candidate:</strong> SSE typically — server sends <code>data: {token}\n\n</code> per token. Client uses EventSource API. Half-duplex; client-to-server is a separate POST. WebSocket as alternative for full-duplex (cancel mid-stream). Connection stays open for the response duration — seconds to minutes for long generations. Reconnect-on-drop with cursor for resumption.</p>
+<p><strong>Interviewer:</strong> Safety?</p>
+<p><strong>Candidate:</strong> Two-stage. Input filter: classifier scans prompt; rejects obvious unsafe (CSAM, terrorism, etc.). Soft-warn for borderline. Output filter: per-token or per-chunk classifier — if output drifts unsafe, abort with apology. Belt-and-suspenders: model fine-tuning enforces refusals via RLHF, safety classifier is a secondary check. Some checks evaluate full response post-stream for jailbreak patterns.</p>
+<p><strong>Interviewer:</strong> Long conversation — 100 messages, 50k tokens.</p>
+<p><strong>Candidate:</strong> Context window limit (depending on model: 8k, 32k, 128k, 200k). For longer: truncate or summarize. Summarization: periodically replace early messages with a summary message, keeping the recent N verbatim. "Memory" feature: extract long-term facts about the user separately, inject into system prompt. The full history is persisted for user reference; only the windowed/summarized version goes to the model.</p>
+<p><strong>Interviewer:</strong> Tool calling?</p>
+<p><strong>Candidate:</strong> Model output may include <code>tool_call(name, args)</code> in a structured format. Streaming pauses; the server or client executes the tool (browse the web, run code, call an API). Tool result fed back as a new message. Inference resumes with result in context. Supports plugins, browsing, code execution, image generation, custom tools.</p>
+<p><strong>Interviewer:</strong> GPU fleet — how do you scale?</p>
+<p><strong>Candidate:</strong> Workers grouped by model. Each worker loads one (or a few) models; bigger models use multi-GPU model parallelism. Auto-scaling per model based on demand. Warm pool pre-loaded with popular models. Cold start is slow (loading multi-GB weights) — mitigated by keeping minimum warm capacity. Quantization (FP8, int8) reduces memory and increases throughput at small quality cost.</p>
+<p><strong>Interviewer:</strong> A worker crashes mid-stream.</p>
+<p><strong>Candidate:</strong> The streaming connection breaks. Client receives partial response. On reconnect, server can resume from the persisted partial: re-prefill the context up to the last delivered token and continue generation on a new worker. Or just present the partial result with a regenerate button. Depends on UX choice.</p>
+<p><strong>Interviewer:</strong> Quota and billing?</p>
+<p><strong>Candidate:</strong> Per-user token budget. Each token decrement counter (input + output tokens). Pre-flight check: estimate response size; reject if grossly over budget. During streaming, real-time decrement; if depleted, stop generation and surface "quota exhausted." Billing aggregates usage periodically; charges per plan.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Conversation storage per user home region. GPU fleets in multiple regions. Inference routes to nearest region with capacity for the requested model. Cross-region failover if local capacity exhausted. Some users may experience higher latency if their home region is heavily loaded.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Streaming chat over GPU inference. Continuous batching is the GPU efficiency lever. KV cache management bounds concurrency per worker. SSE delivers tokens to client. Two-stage safety (input + output) filters policy violations. Conversation history persisted per user with truncation/summarization for long contexts. Tool calling integrates external execution. Per-user quota and billing. Multi-region fleets. The hardest economic problem is GPU cost; the hardest performance problem is TTFT.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: chat, streaming, models, safety, scale.</li>
+<li>Invariant: safe input/output; streamed tokens; persisted history.</li>
+<li>Session + inference + streaming + safety.</li>
+<li>Continuous batching on GPUs with KV cache.</li>
+<li>SSE streaming protocol.</li>
+<li>Two-stage safety filtering.</li>
+<li>Conversation truncation/summarization for long contexts.</li>
+<li>Per-user quota; multi-region.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>ChatGPT is streaming chat over GPU inference. Continuous batching with KV cache is the GPU efficiency lever — it turns each GPU from a few-stream server into a hundred-stream server. SSE delivers tokens. Two-stage safety filters input and output. Conversation history persisted per user; long contexts truncated or summarized. Tool calling integrates external execution. Per-user quota tracks tokens. Multi-region with GPU fleet auto-scaling. The dominant cost is GPU; the dominant performance metric is time-to-first-token.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Continuous batching is what makes GPU inference economical."</li>
+<li>"KV cache management bounds concurrency per worker."</li>
+<li>"Streaming via SSE; the connection lives for the response duration."</li>
+<li>"Safety is two-stage — input classifier plus output filter."</li>
+<li>"Long contexts get truncated or summarized; the persisted history is separate from what we send to the model."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

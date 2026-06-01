@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design a YouTube Likes Counter — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design a YouTube Likes Counter</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A likes counter sounds trivial — increment a number — until you account for billions of videos, viral hot keys with millions of likes per minute, idempotency for double-tap, dislike toggling, fraud, and the user expecting their own like to appear immediately while everyone else can tolerate seconds of lag.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Each (user, video) like is recorded at most once and is reversible; the displayed count converges within bounded staleness to <code>count(active likes)</code> for that video; the user's own like state is consistent from their perspective immediately after they tap; and fraudulent or abusive likes are filtered before the count is publicly visible.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can model likes as a per-user state (not just a counter), handle hot videos without locking on one row, design read-your-own-write semantics, and integrate fraud filtering without slowing the like action.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design the likes system in two layers: an authoritative per-user like state that records who liked which video and when, and a denormalized counter per video that is updated asynchronously from the state changes. The interesting decisions are hot-video counter sharding, read-your-own-write semantics for the user's own like, idempotency for double-tap, and fraud filtering before the count goes public.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>User can like a video; one like per user per video.</li>
+<li>Toggle off (unlike) reverses the action.</li>
+<li>Display total like count per video.</li>
+<li>Show "you liked this" indicator to the user who liked.</li>
+<li>Per-user history: "videos I liked."</li>
+<li>Filter spam, bots, click farms.</li>
+<li>Optional dislike (or treat as separate; modern YouTube hides dislikes).</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Sub-second response for the like action.</li>
+<li>Counter freshness: seconds to minutes for normal videos; tolerate longer for viral.</li>
+<li>Read-your-own-write: the liking user sees their like instantly.</li>
+<li>Strong correctness on per-user state (one like per user per video).</li>
+<li>Approximate display count is acceptable.</li>
+<li>Petabyte scale: billions of videos, trillions of like records over time.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Recommendation impact of likes (separate system).</li>
+<li>Display of "people you know liked" (separate social system).</li>
+<li>Comment likes (similar design, separate scale).</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Videos</td>
+<td>5B existing; 500M+ active.</td>
+</tr>
+<tr>
+<td>Users</td>
+<td>2B+.</td>
+</tr>
+<tr>
+<td>Like events</td>
+<td>10B+ per day; 100k-1M/sec peak.</td>
+</tr>
+<tr>
+<td>Viral video</td>
+<td>10k-100k likes/sec on one video.</td>
+</tr>
+<tr>
+<td>Read QPS</td>
+<td>Likes count on every video page; tens of millions/sec.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Like action sub-second; count freshness seconds.</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Trillions of (user, video) records over time.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is the viral video: one video receiving 100k likes per second pins any single counter row.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Purpose</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Per-user like state</td>
+<td>Records (user, video, action, ts).</td>
+<td>Strongly consistent per user; the user-visible truth.</td>
+</tr>
+<tr>
+<td>Per-video counter</td>
+<td>Denormalized total for display.</td>
+<td>Eventually consistent; approximate OK.</td>
+</tr>
+<tr>
+<td>Fraud filter</td>
+<td>Removes inauthentic likes from public count.</td>
+<td>Async; runs before count is finalized for display.</td>
+</tr>
+</tbody>
+</table>
+<p>Three reasons to separate state from counter:
+1. The counter is hot; the per-user state is naturally sharded by user.
+2. Toggling on/off is a per-user state change; counter must derive from current state.
+3. Fraud filtering happens after the like is recorded but before the count is publicly visible.</p>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">User --tap like--&gt; Client
+                    |
+                    v
+            +------------------+
+            | Like API         |
+            | idempotent       |
+            +--------+---------+
+                     |
+                     v
+            +------------------+
+            | Per-User Like DB |
+            | (user_id, video) |
+            +--------+---------+
+                     |
+              emit event
+                     v
+            +------------------+
+            | Event Stream     |
+            | like/unlike      |
+            +--------+---------+
+                     |
+        +------------+------------+
+        |            |            |
+        v            v            v
++--------------+ +-----------+ +-------------+
+| Fraud Filter | | Counter   | | Personal    |
+|              | | Aggregator| | Like History|
++------+-------+ +-----+-----+ +-------------+
+       |               |
+       v               v
++--------------+ +--------------+
+| Fraud Score  | | Video Counter|
+| KV           | | Store        |
++--------------+ +------+-------+
+                        |
+                        v
+                  +--------------+
+                  | Read Service |
+                  | merged view  |
+                  +--------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Like API</td>
+<td>Accepts like/unlike actions.</td>
+<td>Idempotent on <code>(user_id, video_id, action)</code>.</td>
+</tr>
+<tr>
+<td>Per-user like DB</td>
+<td>Source of truth: which user liked which video.</td>
+<td>Partitioned by user.</td>
+</tr>
+<tr>
+<td>Event stream</td>
+<td>Likes and unlikes as events.</td>
+<td>At-least-once; partitioned by video.</td>
+</tr>
+<tr>
+<td>Counter aggregator</td>
+<td>Updates per-video count from events.</td>
+<td>Periodic flush; sharded counter for hot videos.</td>
+</tr>
+<tr>
+<td>Counter store</td>
+<td>Per-video like count.</td>
+<td>Fast KV; multi-tier cache.</td>
+</tr>
+<tr>
+<td>Fraud filter</td>
+<td>Scores likes; flags inauthentic.</td>
+<td>ML + rules; runs async.</td>
+</tr>
+<tr>
+<td>Personal history</td>
+<td>List of videos a user liked.</td>
+<td>Indexed by user_id.</td>
+</tr>
+<tr>
+<td>Read service</td>
+<td>Returns video count, user's own like state, merged for UI.</td>
+<td>Composes counter + user state with bounded staleness.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="per-user-like">Per-User Like</h4>
+<pre><code class="language-text">UserLike(
+  user_id,
+  video_id,
+  status,                // active, removed
+  liked_at,
+  removed_at,
+  fraud_status,          // unknown, valid, suspicious, removed
+  version
+)
+</code></pre>
+<p>Partitioned by <code>user_id</code>. Read pattern: "did this user like this video?" → point lookup by <code>(user_id, video_id)</code>. List pattern: "what videos did this user like?" → range scan within partition.</p>
+<h4 id="video-counter">Video Counter</h4>
+<pre><code class="language-text">VideoCounter(
+  video_id,
+  count,                 // approximate, derived from valid likes
+  raw_count,             // total likes including fraud-pending
+  last_updated,
+  version
+)
+</code></pre>
+<p>Hot videos use sharded sub-counters: <code>VideoCounter(video_id, shard_id, count)</code>; the display is the sum.</p>
+<h4 id="like-event">Like Event</h4>
+<pre><code class="language-text">LikeEvent(
+  event_id,              // deterministic: hash(user_id, video_id, action, ts_window)
+  user_id,
+  video_id,
+  action,                // like, unlike
+  timestamp,
+  source                 // client, server-side replay
+)
+</code></pre>
+<h4 id="fraud-score">Fraud Score</h4>
+<pre><code class="language-text">FraudScore(
+  user_id,
+  video_id,
+  score,
+  reasons[],
+  decided_at
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">POST /videos/{video_id}/like
+Headers:
+  Idempotency-Key (optional; client-generated)
+Body:
+  user_id (from auth)
+  action: like | unlike
+
+GET  /videos/{video_id}
+  -&gt; { count, user_has_liked }
+
+GET  /users/{user_id}/liked-videos?cursor=
+</code></pre>
+<h3 id="write-path-like-action">Write Path: Like Action</h3>
+<ol>
+<li>Client POSTs <code>/videos/{video_id}/like</code> with action.</li>
+<li>API authenticates user; validates.</li>
+<li>Conditional update on <code>UserLike(user_id, video_id)</code>:
+   - If no record: insert with <code>status=active</code>.
+   - If <code>status=active</code> and action is <code>like</code>: no-op (idempotent).
+   - If <code>status=active</code> and action is <code>unlike</code>: update to <code>removed</code>, set <code>removed_at</code>.
+   - If <code>status=removed</code> and action is <code>like</code>: update to <code>active</code>, set new <code>liked_at</code>.</li>
+<li>Emit <code>LikeEvent</code> to stream.</li>
+<li>Update user's local cache so they see their like immediately.</li>
+<li>Return success.</li>
+</ol>
+<p>Latency: one DB write per like, plus async event emission. Sub-second easily.</p>
+<h3 id="read-path-display-likes-on-video-page">Read Path: Display Likes On Video Page</h3>
+<ol>
+<li>Client requests <code>/videos/{video_id}</code>.</li>
+<li>Read service queries:
+   - <code>VideoCounter(video_id)</code> for the count (multi-tier cache; CDN, in-memory).
+   - <code>UserLike(user_id, video_id)</code> for whether the current user has liked (only if user is authenticated).</li>
+<li>Merge: return <code>{ count, user_has_liked }</code>.</li>
+<li>Display.</li>
+</ol>
+<p>For unauthenticated users, only the count is fetched.</p>
+<h3 id="read-your-own-write">Read-Your-Own-Write</h3>
+<p>When the user taps like, the UI immediately shows their like before the server even responds:</p>
+<ul>
+<li>Client optimistically updates UI on tap.</li>
+<li>API call confirms.</li>
+<li>On confirmation, the count displayed may not yet reflect their like (because the counter aggregator is async). The UI handles this by adding +1 to the displayed count locally if the user's like is active.</li>
+</ul>
+<p>Server-side, the user's <code>UserLike</code> row is strongly consistent: if they refresh, they see <code>user_has_liked = true</code> immediately, and the displayed count includes their +1 client-side overlay until the counter aggregator catches up.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The user must see their own like instantly. The counter can lag. So we composite the displayed count from the eventually-consistent counter plus a client-side +1 for the user's own action.</p>
+</blockquote>
+<h3 id="counter-aggregation">Counter Aggregation</h3>
+<p>Counter updates are async to keep the like action fast and to absorb viral spikes.</p>
+<p>Approach: stream processor consumes like events and updates per-video counters.</p>
+<p>For normal videos:</p>
+<ol>
+<li>Consume event.</li>
+<li>Atomically increment or decrement video counter in counter store.</li>
+</ol>
+<p>For viral (hot) videos:</p>
+<ol>
+<li>Hash by <code>(video_id, random_shard)</code> to a sub-counter.</li>
+<li>Atomically increment the sub-counter.</li>
+<li>Read path aggregates sub-counters: <code>count = sum(sub_counter[i] for i in 0..N)</code>.</li>
+</ol>
+<p>Sub-counter strategy:</p>
+<ul>
+<li>Detect hot videos (incoming rate &gt; threshold).</li>
+<li>Promote them to use N sub-counters (e.g., 100).</li>
+<li>Demote when traffic cools down.</li>
+</ul>
+<p>Periodic full recount from per-user like DB serves as ground truth:</p>
+<ul>
+<li>Background job per video aggregates all <code>UserLike(video_id, status=active, fraud_status=valid)</code> rows.</li>
+<li>Overwrites counter with authoritative count.</li>
+<li>Runs hourly or daily for high-traffic videos.</li>
+</ul>
+<h3 id="fraud-filtering">Fraud Filtering</h3>
+<p>Detecting inauthentic likes:</p>
+<ul>
+<li>Click farms: many accounts liking the same video in short time.</li>
+<li>Bots: synthetic accounts liking.</li>
+<li>Reward fraud: users liking for incentives outside the platform.</li>
+</ul>
+<p>Pipeline:</p>
+<ol>
+<li>Fraud service consumes like events.</li>
+<li>Per-user signals: account age, prior fraud, IP reputation, like rate.</li>
+<li>Per-video signals: sudden burst, geographic skew, follower overlap.</li>
+<li>ML scoring produces a fraud_score per (user, video).</li>
+<li>Scores above threshold mark the UserLike as <code>fraud_status = suspicious</code>.</li>
+<li>Counter aggregator only counts valid likes; suspicious likes are excluded.</li>
+</ol>
+<p>Effect: the publicly displayed count reflects only validated likes. The user who placed the like may still see "you liked this" on their own UI even if fraud-flagged, depending on policy (silent removal vs explicit notification).</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>UserLike</td>
+<td><code>user_id</code> hash</td>
+<td>User-scoped queries; trillion records.</td>
+</tr>
+<tr>
+<td>VideoCounter</td>
+<td><code>video_id</code> hash</td>
+<td>One read per video page.</td>
+</tr>
+<tr>
+<td>Like events</td>
+<td><code>video_id</code> hash</td>
+<td>Counter aggregation per video.</td>
+</tr>
+<tr>
+<td>User liked-videos index</td>
+<td><code>user_id</code> hash</td>
+<td>List queries.</td>
+</tr>
+<tr>
+<td>Fraud scores</td>
+<td><code>video_id</code> hash</td>
+<td>Per-video aggregation.</td>
+</tr>
+</tbody>
+</table>
+<p>For UserLike, querying "who liked this video" is rare (used by fraud and aggregation). If needed, a secondary index by video_id exists but is large.</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Per-user like state</td>
+<td>Strong (read-your-own-write)</td>
+<td>User experience demands it.</td>
+</tr>
+<tr>
+<td>Counter</td>
+<td>Eventually consistent</td>
+<td>Display tolerates lag.</td>
+</tr>
+<tr>
+<td>Like history list</td>
+<td>Eventually consistent within user partition</td>
+<td>Acceptable lag.</td>
+</tr>
+<tr>
+<td>Fraud score</td>
+<td>Eventually consistent</td>
+<td>Async ML.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Double-tap from client.</td>
+<td>Idempotent on <code>(user_id, video_id, action)</code> plus client debouncing.</td>
+<td>Duplicate like attempts.</td>
+</tr>
+<tr>
+<td>Counter aggregator falls behind.</td>
+<td>Backpressure; auto-scale; periodic full recount.</td>
+<td>Aggregator lag; counter drift from ground truth.</td>
+</tr>
+<tr>
+<td>Viral video pins one counter shard.</td>
+<td>Auto-promote to sub-counter sharding.</td>
+<td>Per-counter QPS; lag per video.</td>
+</tr>
+<tr>
+<td>Counter drift from missed events.</td>
+<td>Daily full recount from UserLike.</td>
+<td>Drift % between counter and recount.</td>
+</tr>
+<tr>
+<td>Stream loses events.</td>
+<td>Durable Kafka; idempotent consumers.</td>
+<td>Consumer lag; replay coverage.</td>
+</tr>
+<tr>
+<td>Fraud filter false positives.</td>
+<td>Manual review queue; user appeal.</td>
+<td>Reversal rate per fraud reason.</td>
+</tr>
+<tr>
+<td>Bot wave inflates count before fraud kicks in.</td>
+<td>Display delay for new videos; fraud filter latency monitoring.</td>
+<td>Suspicious like rate by video.</td>
+</tr>
+<tr>
+<td>User's like not visible immediately.</td>
+<td>Strong read of UserLike; client-side +1 overlay.</td>
+<td>Read-your-write violations.</td>
+</tr>
+<tr>
+<td>Storage explosion.</td>
+<td>Coldness-based tiering; archive old liked videos.</td>
+<td>Storage growth rate.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Counter vs recount drift per video.</li>
+<li>Duplicate UserLike rows (must be zero).</li>
+<li>Read-your-write failures (must be near zero).</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Like QPS by region.</li>
+<li>Aggregator lag by video.</li>
+<li>Counter store p99 latency.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Likes per video distribution.</li>
+<li>Fraud detection rate.</li>
+<li>User engagement metrics tied to likes.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>UserLike partitioned by user; user's home region owns writes.</li>
+<li>Like events replicate cross-region for counter aggregation in any region.</li>
+<li>Counter store replicates eventually; reads from local region.</li>
+<li>Cross-region eventual convergence within seconds is acceptable for displayed count.</li>
+</ul>
+<p>For a global viral event, multi-region sub-counter sharding spreads the write load. Periodic recount reconciles across regions.</p>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Storing per-user like state at trillion scale is expensive but is the only way to support unlike and fraud removal correctly.</li>
+<li>Sub-counter sharding for hot videos adds complexity; periodic recount keeps it honest.</li>
+<li>Async counter update sacrifices freshness for performance; client-side +1 overlay hides the lag.</li>
+<li>Aggressive fraud filtering may hide legitimate likes; appeal mechanism exists.</li>
+<li>Strong user state is per-partition cheap; global counter strong consistency would not scale.</li>
+<li>Dislike support roughly doubles state size; YouTube hides them publicly for that reason among others.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Just incrementing a counter.</td>
+<td>Per-user state is the source of truth; counter is derived.</td>
+</tr>
+<tr>
+<td>Synchronous counter update.</td>
+<td>Async via event stream; periodic recount for correctness.</td>
+</tr>
+<tr>
+<td>Single counter row per video.</td>
+<td>Sub-counter sharding for hot videos.</td>
+</tr>
+<tr>
+<td>Ignoring fraud.</td>
+<td>Async ML scoring; exclude suspicious from public count.</td>
+</tr>
+<tr>
+<td>Forgetting read-your-write.</td>
+<td>Strong UserLike read; client-side +1 overlay.</td>
+</tr>
+<tr>
+<td>Counting events not state.</td>
+<td>Toggling on/off makes event count meaningless; use current state.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot video counter</td>
+<td>Sub-counter sharding; auto-promote; periodic recount.</td>
+</tr>
+<tr>
+<td>Read-your-write</td>
+<td>Strong UserLike read; optimistic client overlay.</td>
+</tr>
+<tr>
+<td>Fraud filtering</td>
+<td>Async ML; exclude suspicious from public count; reversal.</td>
+</tr>
+<tr>
+<td>Storage scale</td>
+<td>Per-user partitioning; cold tiering; trillion-record indexing.</td>
+</tr>
+<tr>
+<td>Idempotency</td>
+<td>Conditional state transition; client debouncing.</td>
+</tr>
+<tr>
+<td>Periodic recount</td>
+<td>Background job; comparing counter to authoritative state.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Separate per-user state from per-video counter.</li>
+<li>Per-user state is strongly consistent; counter is eventually consistent.</li>
+<li>Sub-counter sharding for hot videos.</li>
+<li>Async counter update via event stream.</li>
+<li>Periodic full recount for correctness.</li>
+<li>Read-your-write via strong state read + client overlay.</li>
+<li>Fraud filtering as async pipeline excluding suspicious from public count.</li>
+<li>Per-user partitioning for scale.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>A likes counter is two things: per-user state and per-video count. The state is the truth; the count is a fast projection. Hot videos break naive counters; sub-counter sharding plus periodic recount keeps them honest. The user must see their own like instantly; the count can lag.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design YouTube's likes counter.</p>
+<p><strong>Candidate:</strong> Two layers. First, per-user like state — a record per (user, video) with status active or removed. This is the source of truth; it's strongly consistent and partitioned by user. Second, a per-video counter that's updated asynchronously from like events. The counter is eventually consistent and exists for fast display. The hardest cases are hot videos and read-your-own-write.</p>
+<p><strong>Interviewer:</strong> Why not just increment a counter on like?</p>
+<p><strong>Candidate:</strong> Two reasons. First, likes are toggleable — unlike must reverse the count, which requires knowing the per-user state. If we only stored a counter, we couldn't tell whether a click is a new like or a re-tap on an existing like. Second, fraud filtering removes inauthentic likes from the public count; we need per-user records to identify and exclude them. The counter is derived from the per-user state, not the other way around.</p>
+<p><strong>Interviewer:</strong> A video goes viral and gets 100,000 likes per second. What happens to the counter?</p>
+<p><strong>Candidate:</strong> A single counter row would be pinned and bottlenecked. We auto-detect hot videos (incoming rate above threshold) and promote them to sub-counter sharding: split into, say, 100 sub-counters. Each like event hashes to a random sub-counter for atomic increment. The displayed count sums all sub-counters. When the rate cools, we demote and consolidate.</p>
+<p><strong>Interviewer:</strong> How do you keep the counter from drifting?</p>
+<p><strong>Candidate:</strong> A periodic recount job reads the per-user state. For each video, count <code>UserLike</code> rows with <code>status=active, fraud_status=valid</code>. Overwrite the counter. Runs hourly for high-traffic videos, daily for everything else. This is the ground truth. The async event-driven counter is an approximation; the recount keeps it honest.</p>
+<p><strong>Interviewer:</strong> When the user taps like, they should see their like immediately. How?</p>
+<p><strong>Candidate:</strong> Two pieces. Server side: the UserLike state is written synchronously in the like request and is strongly consistent. So if the user refreshes, the <code>user_has_liked</code> field is correct. Client side: the UI optimistically updates <code>count = count + 1</code> and <code>you_liked = true</code> on tap. This bridges the gap between the synchronous state write and the async counter update. The user perceives instant feedback even though the global counter takes seconds to catch up.</p>
+<p><strong>Interviewer:</strong> Double-tap — how do you handle idempotency?</p>
+<p><strong>Candidate:</strong> The like operation is a conditional state transition: if status is already active and action is like, it's a no-op. The DB write doesn't change anything. If the client sends three taps in a second, only the first matters; the others are no-ops on the server. Clients also debounce locally.</p>
+<p><strong>Interviewer:</strong> Fraud — how is it detected and applied?</p>
+<p><strong>Candidate:</strong> Async fraud pipeline consumes the event stream. It scores likes using ML on signals like account age, IP reputation, geographic anomalies, follower overlap with the video creator, like rate per account. Scores above threshold flag the UserLike row's <code>fraud_status</code> as <code>suspicious</code>. The counter aggregator and the periodic recount only count <code>fraud_status=valid</code> likes. So the public count reflects only validated likes. The user who placed the like may still see their own action in their history.</p>
+<p><strong>Interviewer:</strong> Storage — trillions of UserLike rows.</p>
+<p><strong>Candidate:</strong> Partition by <code>user_id</code>. The natural query patterns are (a) "did user X like video Y" — point lookup within user's partition; (b) "what videos has user X liked" — range scan within user's partition. Both are cheap. The expensive query — "who liked this video" — happens during fraud analysis and periodic recount, where we tolerate large scans. We can maintain a secondary index by <code>video_id</code> for hot videos if needed, but it's not the default.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> User's home region owns their UserLike. Like events replicate cross-region for counter aggregation, which can happen anywhere. Counter store replicates eventually; reads come from local region. For global viral events, sub-counter sharding spans regions naturally — each region updates its local sub-counter, and aggregation sums them.</p>
+<p><strong>Interviewer:</strong> How fresh is the count?</p>
+<p><strong>Candidate:</strong> Normal videos: a few seconds lag from the async aggregator. Viral videos: depends on aggregator throughput and sub-counter shard count. Periodic recount catches up to actual within minutes to hours. For UX, the user sees their own like instantly via client overlay; the displayed total may show a small lag for everyone else, which is unnoticeable for billions but tolerable for viral spikes.</p>
+<p><strong>Interviewer:</strong> What if a user is shadowbanned? Their likes should not count.</p>
+<p><strong>Candidate:</strong> Their UserLike rows have <code>fraud_status=suspicious</code> (or a separate flag). The counter aggregator and recount exclude them. From the user's perspective, their like appears (they see "you liked this"); from the world's, the count doesn't change. This is policy-driven.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Per-user state is the source of truth; per-video counter is a derived projection. State is strongly consistent and partitioned by user; counter is eventually consistent and sharded for hot videos. Async aggregation via event stream; periodic recount for correctness. Read-your-write via strong state plus client overlay. Async fraud pipeline excludes suspicious likes from the public count. The hardest case is viral hot videos, handled by sub-counter sharding plus periodic recount.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: toggleable, one per user, viral hot videos, fraud.</li>
+<li>Invariant: per-user state authoritative; counter derived.</li>
+<li>Per-user state + per-video counter split.</li>
+<li>Sub-counter sharding for hot videos.</li>
+<li>Async counter update via event stream.</li>
+<li>Periodic recount for correctness.</li>
+<li>Read-your-write via strong state + client overlay.</li>
+<li>Async fraud filter; exclude suspicious from public count.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>A likes counter is per-user state plus a derived counter. The state is the truth, strongly consistent and per-user partitioned; the counter is a fast eventually-consistent projection. Hot videos use sub-counter sharding; periodic recount keeps the counter honest. The user sees their own like instantly via strong state read plus client-side overlay; the displayed total catches up within seconds. Fraud filtering is async and excludes suspicious likes from the public count.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"The per-user state is the truth; the counter is a fast projection that's allowed to lag."</li>
+<li>"Hot videos break a single counter row; sub-counter sharding plus periodic recount handles them."</li>
+<li>"Read-your-own-write is solved by strong state read plus client-side overlay."</li>
+<li>"Toggling means we can't just count events; we count current state."</li>
+<li>"Fraud filtering excludes inauthentic likes from the public count without revealing the action to the user."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

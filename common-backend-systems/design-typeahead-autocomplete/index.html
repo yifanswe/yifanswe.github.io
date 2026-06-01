@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Typeahead / Autocomplete — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Typeahead / Autocomplete</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Typeahead is a deceptively-simple-looking feature: as the user types, suggest completions ranked by popularity. The hard part is sub-50ms latency on every keystroke, ranking based on shifting popularity, supporting personalization, and updating the suggestion corpus continuously.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>For every keystroke, the system returns relevant completions ranked by a combination of popularity, recency, and personalization within tens of milliseconds; the suggestion corpus reflects recent query trends within bounded staleness; misspellings and typos still produce relevant results.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design a trie or inverted-index structure for prefix lookup, scale it across regions, integrate freshness from query logs, handle misspellings, and reason about the latency budget per keystroke.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design typeahead as a prefix-indexed structure (trie or inverted prefix index) backing a low-latency suggest service. As the user types, each keystroke fires a request that returns top-N completions. Background pipelines aggregate query logs to update suggestion popularity. Personalization adjusts rank at the edge. The interesting decisions are the index data structure, freshness pipeline, fuzzy/typo handling, and latency at scale.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>User types into a search box; suggestions appear after each keystroke.</li>
+<li>Suggestions are ranked by popularity, freshness, and personalization.</li>
+<li>Top 5-10 suggestions returned.</li>
+<li>Support typos and misspellings.</li>
+<li>Multi-language.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Sub-50ms latency per request (target for "instant" feel).</li>
+<li>Hundreds of thousands of requests per second peak.</li>
+<li>Suggestion corpus updated daily or hourly with new query trends.</li>
+<li>Multi-region serving.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Showing actual search results below suggestions (separate search).</li>
+<li>Knowledge-graph-style entity completions.</li>
+<li>Voice-driven suggestions.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Queries indexed</td>
+<td>Hundreds of millions of distinct queries.</td>
+</tr>
+<tr>
+<td>QPS</td>
+<td>1M+ keystrokes/sec globally.</td>
+</tr>
+<tr>
+<td>Latency budget</td>
+<td>30-50 ms p99 from server.</td>
+</tr>
+<tr>
+<td>Index size</td>
+<td>Few GB compressed in memory.</td>
+</tr>
+<tr>
+<td>Update frequency</td>
+<td>Hourly batch + real-time delta.</td>
+</tr>
+<tr>
+<td>Per-user personalization</td>
+<td>Lightweight; cached.</td>
+</tr>
+</tbody>
+</table>
+<p>Bottleneck: serving latency at high QPS plus distinct-suggestion index size.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Purpose</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Suggest service</td>
+<td>Returns completions for a prefix.</td>
+<td>Ultra-low latency.</td>
+</tr>
+<tr>
+<td>Index</td>
+<td>Prefix-keyed structure.</td>
+<td>In-memory; sharded.</td>
+</tr>
+<tr>
+<td>Aggregation pipeline</td>
+<td>Builds suggestion popularity from logs.</td>
+<td>Batch + streaming.</td>
+</tr>
+<tr>
+<td>Personalization</td>
+<td>Re-ranks for the user.</td>
+<td>Optional; lightweight.</td>
+</tr>
+<tr>
+<td>Fuzzy match</td>
+<td>Handles typos.</td>
+<td>Edit-distance or n-gram.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">User types --keystroke--&gt; Edge / CDN
+                                 |
+                                 v
+                        +------------------+
+                        | Suggest Service  |
+                        | (in-memory index)|
+                        +--------+---------+
+                                 |
+                +---------+------+------+---------+
+                |         |             |         |
+                v         v             v         v
+        Prefix Index  Popularity   Personalization  Fuzzy/Typo
+        (trie)        Store        Cache            Resolver
+
+Background:
+  Query Logs --aggregator--&gt; Popularity Updates --reindex--&gt; Suggest Service
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Edge / CDN</td>
+<td>Caches suggestions for very common prefixes.</td>
+<td>First line of defense.</td>
+</tr>
+<tr>
+<td>Suggest service</td>
+<td>Looks up prefix in memory; ranks; returns.</td>
+<td>Stateless; horizontal.</td>
+</tr>
+<tr>
+<td>Prefix index</td>
+<td>Trie or inverted index for prefix → candidate completions.</td>
+<td>Distributed; sharded by prefix.</td>
+</tr>
+<tr>
+<td>Popularity store</td>
+<td>Per-suggestion score.</td>
+<td>Updated by aggregation pipeline.</td>
+</tr>
+<tr>
+<td>Personalization cache</td>
+<td>Per-user signals.</td>
+<td>Edge-cached.</td>
+</tr>
+<tr>
+<td>Aggregation pipeline</td>
+<td>Builds suggestion popularity from query logs.</td>
+<td>Daily/hourly batch + streaming.</td>
+</tr>
+<tr>
+<td>Fuzzy resolver</td>
+<td>Edit-distance lookup for typos.</td>
+<td>Slower path; sparingly invoked.</td>
+</tr>
+<tr>
+<td>Auto-suggest dataset</td>
+<td>Curated suggestions (e.g., trending).</td>
+<td>Editorial overrides.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="suggestion">Suggestion</h4>
+<pre><code class="language-text">Suggestion(
+  text,
+  popularity_score,
+  category,
+  language,
+  last_updated
+)
+</code></pre>
+<h4 id="trie-node-logical">Trie Node (logical)</h4>
+<pre><code class="language-text">TrieNode(
+  prefix,
+  top_n_suggestions: [(text, score), ...]
+)
+</code></pre>
+<p>Each trie node caches the top-N suggestions for that prefix, so lookup is O(prefix_length) plus reading the cached list.</p>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">GET /suggest?q={prefix}&amp;lang=&amp;user_token=
+  -&gt; [
+       { &quot;text&quot;: &quot;...&quot;, &quot;score&quot;: 0.95, &quot;highlight&quot;: &quot;...&quot; },
+       ...
+     ]
+</code></pre>
+<p>Headers typically include locale and user context (for personalization).</p>
+<h3 id="prefix-index-design">Prefix Index Design</h3>
+<p>Two viable structures:</p>
+<p><strong>Trie (in-memory):</strong></p>
+<ul>
+<li>Each node represents a prefix.</li>
+<li>Each node stores top-N completions for that prefix.</li>
+<li>Lookup: walk prefix character-by-character; return node's top-N.</li>
+<li>O(prefix_length) time.</li>
+<li>Memory-efficient with compression (PATRICIA trie, ternary search trie).</li>
+</ul>
+<p><strong>Inverted prefix index:</strong></p>
+<ul>
+<li>For each suggestion, generate all prefixes; map prefix → list of (suggestion, score).</li>
+<li>Lookup: prefix key → list, sorted by score.</li>
+<li>Easy to shard; each shard handles a key range.</li>
+<li>More storage but predictable distribution.</li>
+</ul>
+<p>For top-N at every prefix node, pre-compute and cache:</p>
+<ul>
+<li>Walk the trie once offline.</li>
+<li>At each node, take the top-N highest-scored suggestions in its subtree.</li>
+<li>Store in the node.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>I pre-compute top-N at every prefix node so lookup is O(prefix_length) regardless of the subtree size. Updates rebuild the affected ancestors when popularity shifts.</p>
+</blockquote>
+<h3 id="lookup-path">Lookup Path</h3>
+<ol>
+<li>Client emits keystroke <code>"app"</code>.</li>
+<li>Edge cache hit: return cached suggestions immediately.</li>
+<li>On miss, route to suggest service.</li>
+<li>Service queries prefix index for "app" → returns pre-computed top-N.</li>
+<li>Apply personalization re-rank if user_token present.</li>
+<li>Return suggestions, highlight matching part.</li>
+<li>Round trip target: under 50ms.</li>
+</ol>
+<p>For very-common prefixes ("a", "the"), the CDN handles most traffic.</p>
+<h3 id="personalization">Personalization</h3>
+<p>Lightweight, per-user:</p>
+<ul>
+<li>Stored as a small feature vector (recent queries, click patterns).</li>
+<li>Cached at the edge near the user.</li>
+<li>Re-rank: blend popularity score with personal-affinity score.</li>
+<li>Cap latency impact: &lt;5ms.</li>
+</ul>
+<p>Privacy: respect opt-outs; bound retention.</p>
+<h3 id="fuzzy-typo-tolerance">Fuzzy / Typo Tolerance</h3>
+<p>When the prefix doesn't match anything popular, try edit-distance.</p>
+<ul>
+<li>Generate candidates within edit distance 1 or 2.</li>
+<li>Look up each candidate in the index; collect suggestions.</li>
+<li>Slower than exact match; invoked on low-confidence matches.</li>
+</ul>
+<p>Alternative: n-gram index where each suggestion is indexed by its constituent n-grams; query n-gram overlap finds approximate matches.</p>
+<h3 id="freshness-pipeline">Freshness Pipeline</h3>
+<p>Suggestions update over time:</p>
+<ul>
+<li>Query logs from search service feed an aggregation pipeline.</li>
+<li>Daily batch: aggregate query counts per term over the last N days.</li>
+<li>Streaming layer: real-time tracking of breaking trends.</li>
+<li>Combined: <code>score = popularity_baseline + recent_velocity</code>.</li>
+<li>Re-index periodically or apply deltas in place.</li>
+</ul>
+<p>For breaking events (e.g., "lottery winner"), real-time signals can push a suggestion into the top quickly.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Strategy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prefix index</td>
+<td>Sharded by first 1-2 characters of prefix.</td>
+</tr>
+<tr>
+<td>QPS</td>
+<td>Stateless service replicas; CDN absorbs bulk.</td>
+</tr>
+<tr>
+<td>Memory</td>
+<td>Compress trie; cap top-N per node; tier rarely-used.</td>
+</tr>
+<tr>
+<td>Personalization</td>
+<td>Edge-cached per user; bounded.</td>
+</tr>
+<tr>
+<td>Hot prefix ("a")</td>
+<td>CDN-cacheable; pre-warm.</td>
+</tr>
+</tbody>
+</table>
+<p>For multi-language: separate indexes per language, routed by <code>Accept-Language</code>.</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Suggestion popularity</td>
+<td>Eventually consistent (hourly batch + streaming)</td>
+<td>Trends move slowly.</td>
+</tr>
+<tr>
+<td>Personalization</td>
+<td>Eventually consistent at edge</td>
+<td>Bounded staleness.</td>
+</tr>
+<tr>
+<td>Index lookup</td>
+<td>Strong within a replica</td>
+<td>Read from local in-memory state.</td>
+</tr>
+<tr>
+<td>Editorial overrides</td>
+<td>Strong</td>
+<td>Manual changes take effect quickly.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Index replicated to every region.</li>
+<li>Edge CDN caches common prefixes per region.</li>
+<li>Personalization per user, regional cache.</li>
+<li>Updates pushed to all regions from central pipeline.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Index load slow.</td>
+<td>Pre-warm replicas; staged rollout.</td>
+<td>Replica readiness.</td>
+</tr>
+<tr>
+<td>Suggest service slow.</td>
+<td>Aggressive timeout; fall back to popular suggestions.</td>
+<td>p99 latency.</td>
+</tr>
+<tr>
+<td>Stale index missing trending term.</td>
+<td>Streaming layer catches up; editorial push.</td>
+<td>Trend detection lag.</td>
+</tr>
+<tr>
+<td>Personalization service down.</td>
+<td>Drop personalization; return popularity-ranked.</td>
+<td>Personalization availability.</td>
+</tr>
+<tr>
+<td>Spam suggestion.</td>
+<td>Filter pipeline; manual review.</td>
+<td>Spam-suggestion reports.</td>
+</tr>
+<tr>
+<td>Typo not resolved.</td>
+<td>Fuzzy fallback; spell correction.</td>
+<td>Fuzzy hit rate.</td>
+</tr>
+<tr>
+<td>Hot prefix saturation.</td>
+<td>CDN cache; pre-warm.</td>
+<td>Hot-prefix QPS.</td>
+</tr>
+<tr>
+<td>Multi-language mixup.</td>
+<td>Locale routing; language detection.</td>
+<td>Cross-locale results.</td>
+</tr>
+<tr>
+<td>Adversarial popularity manipulation.</td>
+<td>Anomaly detection; baseline floor.</td>
+<td>Sudden trend signals.</td>
+</tr>
+<tr>
+<td>Regional index divergence.</td>
+<td>Centralized indexing pipeline; replica health.</td>
+<td>Divergence count.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Top-N quality (offline evaluation).</li>
+<li>Stale-trend lag.</li>
+<li>Personalization accuracy.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>QPS by region.</li>
+<li>p99 latency.</li>
+<li>Index memory per shard.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Click-through rate on suggestions.</li>
+<li>Suggestion-to-search conversion.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Pre-computed top-N speeds reads but requires rebuild on updates.</li>
+<li>Tries are memory-efficient but harder to update; inverted index easier to update but uses more memory.</li>
+<li>Personalization improves relevance but adds latency.</li>
+<li>Fuzzy matching helps typos but is slow; fallback path.</li>
+<li>Aggressive caching at edge saves origin cost but staleness for hot trends.</li>
+<li>More languages = more indexes = more memory.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Database lookup per keystroke.</td>
+<td>In-memory index; sub-millisecond lookup.</td>
+</tr>
+<tr>
+<td>Compute top-N per request.</td>
+<td>Pre-compute at each trie node.</td>
+</tr>
+<tr>
+<td>Synchronous personalization.</td>
+<td>Edge-cached; lightweight blend.</td>
+</tr>
+<tr>
+<td>No typo handling.</td>
+<td>Edit-distance or n-gram fallback.</td>
+</tr>
+<tr>
+<td>Single global index.</td>
+<td>Sharded; multi-language; replicated.</td>
+</tr>
+<tr>
+<td>Static suggestions.</td>
+<td>Continuous freshness pipeline.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Trie design</td>
+<td>Compressed trie; pre-computed top-N per node.</td>
+</tr>
+<tr>
+<td>Freshness</td>
+<td>Batch + streaming pipeline; trend detection.</td>
+</tr>
+<tr>
+<td>Personalization</td>
+<td>Edge cache; lightweight blend.</td>
+</tr>
+<tr>
+<td>Fuzzy matching</td>
+<td>Edit-distance or n-gram fallback.</td>
+</tr>
+<tr>
+<td>Multi-language</td>
+<td>Per-language indexes; locale routing.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Index replicated to each region.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>In-memory prefix index (trie or inverted).</li>
+<li>Pre-computed top-N per node.</li>
+<li>Stateless suggest service; CDN-fronted.</li>
+<li>Freshness via batch + streaming pipeline.</li>
+<li>Edge-cached personalization.</li>
+<li>Fuzzy fallback for typos.</li>
+<li>Sharded and replicated globally.</li>
+<li>Operational metrics for latency, freshness, CTR.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Typeahead is sub-50ms prefix lookup with pre-computed top-N suggestions. The trie or inverted prefix index lives in memory; suggest service is stateless and CDN-fronted. Freshness comes from a continuous aggregation pipeline; personalization blends at the edge. The hardest performance constraint is the per-keystroke latency budget; the hardest correctness concern is trend freshness.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design typeahead.</p>
+<p><strong>Candidate:</strong> Sub-50ms per-keystroke suggest service backed by an in-memory prefix index — typically a compressed trie with pre-computed top-N suggestions at each node. Edge CDN caches common prefixes. Background pipeline aggregates query logs to update suggestion popularity. Personalization re-ranks lightly at the edge. The invariant is fast, relevant, fresh suggestions on every keystroke.</p>
+<p><strong>Interviewer:</strong> Why pre-compute top-N at each node?</p>
+<p><strong>Candidate:</strong> Lookup latency. If I had to walk the subtree of every queried prefix and rank, it would scale with subtree size — bad for short prefixes like "a" with millions of completions underneath. Pre-computing top-N per node makes lookup O(prefix_length) plus reading a small list. Updates rebuild affected ancestor nodes.</p>
+<p><strong>Interviewer:</strong> How big is the index?</p>
+<p><strong>Candidate:</strong> Hundreds of millions of distinct queries, each with metadata. A compressed trie holds prefixes as edges with shared paths; top-N at each node adds memory. Estimate: a few GB to tens of GB compressed in memory. Fits per replica.</p>
+<p><strong>Interviewer:</strong> How fresh are the suggestions?</p>
+<p><strong>Candidate:</strong> Two pipelines. Batch: daily or hourly, aggregate query counts over recent windows from logs, update popularity scores, regenerate top-N per trie node. Streaming: real-time signal for breaking trends (e.g., a sudden viral query). Streaming layer applies deltas to the index without full rebuild. So a brand-new viral query can surface within minutes.</p>
+<p><strong>Interviewer:</strong> Personalization?</p>
+<p><strong>Candidate:</strong> Edge-cached per-user vector summarizing recent queries and clicks. When a request arrives with user_token, the edge fetches the user's vector and blends a personal-affinity score with popularity score. Cap latency at 5ms. Privacy: bounded retention, opt-out, anonymized.</p>
+<p><strong>Interviewer:</strong> A user mistypes — "appl" instead of "apple."</p>
+<p><strong>Candidate:</strong> Exact prefix lookup returns suggestions for "appl" if any exist. If results are sparse or low-confidence, fuzzy fallback: generate candidate prefixes within edit distance 1 ("appe", "apple", etc.), look up each, merge results. The fallback is slower so we only invoke it when needed. Alternative: maintain an n-gram index where each suggestion is indexed by its 2-3-grams; query n-gram overlap finds approximate matches.</p>
+<p><strong>Interviewer:</strong> "a" gets 100k QPS — how does the system survive?</p>
+<p><strong>Candidate:</strong> CDN absorbs most of it. The top-N for prefix "a" is small and globally stable; cache it at the edge with a short TTL. Origin sees only the misses. We pre-warm popular prefixes to keep the CDN hot. The suggest service for cache misses has stateless replicas behind a load balancer.</p>
+<p><strong>Interviewer:</strong> Multi-language?</p>
+<p><strong>Candidate:</strong> Separate index per language. Locale from request determines routing. Some languages share prefixes (e.g., proper names in Latin script); we handle by indexing in both languages with locale-aware ranking.</p>
+<p><strong>Interviewer:</strong> How do you ensure trending terms surface fast?</p>
+<p><strong>Candidate:</strong> Streaming layer monitors query velocity per term. When velocity spikes (e.g., a celebrity event), the term's popularity score is boosted. Streaming applies the delta to the trie's top-N for affected prefixes within seconds to minutes. Editorial overrides exist for known events (e.g., elections).</p>
+<p><strong>Interviewer:</strong> Spam suggestions?</p>
+<p><strong>Candidate:</strong> Filter pipeline before indexing. Blocklists, heuristics (very short non-words, gibberish), ML classifiers. Suggestions below a quality floor are excluded. Manual review queue for borderline cases. Anomaly detection catches sudden manipulation attempts.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Index replicated to each region from a central indexing pipeline. Edge CDN per region caches common prefixes. Personalization cache per region. Failover: if a region's suggest service is degraded, route to the next-nearest region or serve from CDN with stale data.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> In-memory prefix index — trie with pre-computed top-N per node — serves sub-50ms lookups via stateless suggest service fronted by CDN. Background pipeline updates popularity from query logs in batch plus streaming for trends. Personalization blends lightly at the edge. Fuzzy matching handles typos. Sharded per language, replicated per region. The hardest performance constraint is per-keystroke latency; the hardest correctness concern is trend freshness.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: keystroke latency, freshness, typos.</li>
+<li>Invariant: sub-50ms; relevant; fresh.</li>
+<li>In-memory trie with pre-computed top-N per node.</li>
+<li>Stateless suggest service; CDN-fronted.</li>
+<li>Batch + streaming popularity pipeline.</li>
+<li>Edge personalization; fuzzy fallback.</li>
+<li>Per-language index; per-region replicas.</li>
+<li>CTR and latency as key metrics.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Typeahead is sub-50ms prefix lookup. In-memory trie with pre-computed top-N at each node makes lookup O(prefix_length). Stateless suggest service backed by CDN absorbs popular prefixes. Background pipeline updates popularity from query logs in batch plus streaming for breaking trends. Personalization blends lightly at the edge. Fuzzy fallback handles typos. Per-language and per-region replication. The hardest performance constraint is the per-keystroke latency budget.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Pre-compute top-N per trie node so lookup is O(prefix_length)."</li>
+<li>"CDN absorbs hot prefixes; suggest service handles the long tail."</li>
+<li>"Freshness comes from batch + streaming; trends surface within minutes."</li>
+<li>"Personalization blends at the edge with a strict latency cap."</li>
+<li>"Fuzzy fallback only on low-confidence exact match."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

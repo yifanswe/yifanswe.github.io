@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design an Ad Click Aggregator — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design an Ad Click Aggregator</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>An ad click aggregator counts ad events for billing, reporting, and budget enforcement. The hard part is that every click is money: undercounting loses revenue, overcounting violates advertiser trust, fraud is a constant attack, and budget caps must stop ads before a single extra click leaks through.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>For each billable click event, the system ingests exactly once, deduplicates retries and fraud, aggregates to per-campaign and per-ad counters that converge to the authoritative total, and stops serving ads the moment a campaign reaches its budget — with reconciliation between fast counters and the authoritative ledger.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can separate the fast-but-approximate aggregation path from the slow-but-correct billing ledger, handle late-arriving events, dedupe at scale, enforce budget caps under bursty traffic, and reason about fraud filtering before money moves.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design two paths over the same click stream: a fast aggregation path that updates per-campaign counters within seconds for budget caps and dashboards, and a slow correctness path that produces the authoritative billing record with full dedup, fraud filtering, and late event handling. The interesting decisions are how to dedupe at high throughput, how to enforce budget caps under burst, how to reconcile the two paths, and how to handle fraud filtering without slowing the ad server.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Capture every click on every ad with attribution (user, campaign, ad, placement, timestamp).</li>
+<li>Aggregate clicks per ad, per campaign, per advertiser at sub-minute granularity.</li>
+<li>Enforce campaign budget caps; stop serving when budget exhausted.</li>
+<li>Provide near-real-time dashboards for advertisers.</li>
+<li>Generate authoritative billing records for invoicing.</li>
+<li>Filter fraudulent clicks (bot traffic, click farms, accidental).</li>
+<li>Handle attribution windows (clicks that lead to conversions hours later).</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Ingest 1M+ click events per second peak.</li>
+<li>Update counters within seconds; budget cap enforcement under 5 seconds.</li>
+<li>Exactly-once effects on billing.</li>
+<li>Auditability: every billed click traceable to its raw event.</li>
+<li>Multi-region capture; central billing.</li>
+<li>Fraud filter must not slow ad serving.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Ad targeting / auction system (separate).</li>
+<li>Conversion attribution algorithms beyond click attribution.</li>
+<li>Long-term data warehouse / OLAP.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Click events</td>
+<td>1M/sec peak; 10B/day.</td>
+</tr>
+<tr>
+<td>Impressions</td>
+<td>100x clicks.</td>
+</tr>
+<tr>
+<td>Active campaigns</td>
+<td>Millions globally, tens of thousands hot at peak.</td>
+</tr>
+<tr>
+<td>Latency for budget enforcement</td>
+<td>&lt; 5 seconds globally.</td>
+</tr>
+<tr>
+<td>Latency for dashboards</td>
+<td>Minute-level acceptable.</td>
+</tr>
+<tr>
+<td>Billing reconciliation</td>
+<td>Hourly or daily authoritative roll-up.</td>
+</tr>
+<tr>
+<td>Event size</td>
+<td>~1 KB enriched.</td>
+</tr>
+<tr>
+<td>Retention</td>
+<td>Raw clicks 90 days; aggregates years.</td>
+</tr>
+<tr>
+<td>Fraud filter</td>
+<td>Removes 5-20% of raw events.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is enforcing budget caps fast enough to prevent advertiser overspend, while still doing dedup and fraud filtering.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Purpose</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot path (real-time aggregation)</td>
+<td>Per-campaign counters for budget cap and live dashboards.</td>
+<td>Sub-5-second freshness; approximate OK.</td>
+</tr>
+<tr>
+<td>Cold path (authoritative billing)</td>
+<td>Per-event ledger with dedup and fraud filtering.</td>
+<td>Exactly-once effects; correct for invoicing.</td>
+</tr>
+<tr>
+<td>Fraud path</td>
+<td>Detects and filters fraudulent clicks before billing.</td>
+<td>Async; need not block ad serving.</td>
+</tr>
+</tbody>
+</table>
+<p>This is the classic <strong>lambda architecture</strong> (hot path + cold path) or <strong>kappa architecture</strong> (single ordered log read at two speeds). The reason both paths exist: budget enforcement needs speed, billing needs correctness.</p>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Ad Server  --emit click--&gt;  Click Ingest Endpoint (regional)
+                                   |
+                                   v
+                            +-------------+
+                            | Kafka / Log |  (partitioned by campaign_id)
+                            +-+---------+-+
+                              |         |
+            +-----------------+         +-----------------+
+            | Hot Path (Stream Compute) |  Cold Path (Batch + Stream)|
+            |  - dedup window           |  - exact dedup             |
+            |  - per-campaign counter   |  - fraud filter            |
+            |  - budget cap enforcement |  - attribution             |
+            +-----------+---------------+-+--------------------------+
+                        |                 |
+                        v                 v
+                  +-----------+   +------------------+
+                  | Counter KV|   | Billing Ledger   |
+                  | Redis     |   | append-only      |
+                  +-----+-----+   +---------+--------+
+                        |                   |
+                        v                   v
+                +---------------+  +-------------------+
+                | Ad Server     |  | Invoicing / Reports|
+                | reads counter |  +-------------------+
+                +---------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Click ingest endpoint</td>
+<td>Receives click event from ad-serving infrastructure.</td>
+<td>Lightweight; appends to log; near-zero latency.</td>
+</tr>
+<tr>
+<td>Distributed log (Kafka)</td>
+<td>Buffers and partitions click stream.</td>
+<td>Partition key is campaign_id for affinity.</td>
+</tr>
+<tr>
+<td>Stream processor (hot)</td>
+<td>Per-window aggregation; updates campaign counters.</td>
+<td>Approximate dedup via Bloom filter; sub-second updates.</td>
+</tr>
+<tr>
+<td>Counter store (KV)</td>
+<td>Per-campaign and per-ad running totals.</td>
+<td>Atomic increments; sharded; read by ad server.</td>
+</tr>
+<tr>
+<td>Batch processor (cold)</td>
+<td>Exact dedup, fraud filter, attribution.</td>
+<td>Runs hourly or as continuous stream with longer windows.</td>
+</tr>
+<tr>
+<td>Billing ledger</td>
+<td>Authoritative per-click record.</td>
+<td>Append-only; partitioned by date+campaign.</td>
+</tr>
+<tr>
+<td>Fraud detection</td>
+<td>Identifies bot/farm traffic.</td>
+<td>ML model + rules; runs async on raw stream.</td>
+</tr>
+<tr>
+<td>Budget enforcer</td>
+<td>Decides "campaign over budget" for ad server.</td>
+<td>Reads counter; flips campaign status.</td>
+</tr>
+<tr>
+<td>Reconciler</td>
+<td>Compares hot counter to cold ledger; corrects drift.</td>
+<td>Hourly job; explains differences.</td>
+</tr>
+<tr>
+<td>Reporting API</td>
+<td>Serves dashboards and reports.</td>
+<td>Reads from materialized aggregate store.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="click-event">Click Event</h4>
+<pre><code class="language-text">ClickEvent(
+  click_id,              // server-assigned unique id
+  request_id,            // from ad server, included in click URL
+  campaign_id,
+  ad_id,
+  user_id,
+  device_id,
+  ip,
+  user_agent,
+  placement,
+  timestamp,
+  geo,
+  referrer,
+  cost_per_click         // denormalized at event time
+)
+</code></pre>
+<h4 id="campaign-state">Campaign State</h4>
+<pre><code class="language-text">Campaign(
+  campaign_id,
+  advertiser_id,
+  budget_total,
+  budget_spent_authoritative,    // updated by billing ledger
+  budget_spent_estimate,         // updated by hot path
+  status,                         // active, paused, over_budget
+  pricing_model,
+  daily_budget,
+  updated_at,
+  version
+)
+</code></pre>
+<h4 id="billing-record">Billing Record</h4>
+<pre><code class="language-text">BillingRecord(
+  click_id,
+  campaign_id,
+  cost,
+  billing_status,        // valid, fraud, duplicate
+  billed_at,
+  reconciliation_id
+)
+</code></pre>
+<h4 id="aggregate-materialized">Aggregate (materialized)</h4>
+<pre><code class="language-text">Aggregate(
+  campaign_id,
+  ad_id,
+  time_bucket,           // 1-min, 1-hr, 1-day
+  click_count,
+  unique_users,          // HyperLogLog
+  cost_total
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<p>Ingest:</p>
+<pre><code class="language-text">POST /click
+Body:
+  request_id          // attestation from ad server
+  click_id            // server-generated by ingest
+  ... event fields
+</code></pre>
+<p>Query:</p>
+<pre><code class="language-text">GET /campaigns/{id}/aggregates?bucket=1m&amp;since=&amp;until=
+GET /campaigns/{id}/budget-status
+POST /campaigns/{id}/budget-adjust
+</code></pre>
+<p>Internal:</p>
+<pre><code class="language-text">GetBudgetRemaining(campaign_id) -&gt; approximate remaining   // ad server uses this
+</code></pre>
+<h3 id="click-capture-and-dedup">Click Capture And Dedup</h3>
+<p>Each click is generated by the ad server. The click URL includes:</p>
+<ul>
+<li><code>request_id</code>: signed token from the ad server identifying the impression.</li>
+<li><code>campaign_id</code>, <code>ad_id</code>, <code>placement</code>.</li>
+<li>A signed timestamp to detect stale/replayed clicks.</li>
+</ul>
+<p>The ingest endpoint:</p>
+<ol>
+<li>Validates the signature.</li>
+<li>Assigns a server-side <code>click_id</code> (UUID).</li>
+<li>Appends to Kafka partitioned by <code>campaign_id</code>.</li>
+<li>Returns redirect to the destination URL.</li>
+</ol>
+<p>Dedup strategy:</p>
+<ul>
+<li><strong>Hot path:</strong> Bloom filter per partition with a recent-window TTL. False positives drop counter increments but are statistically bounded.</li>
+<li><strong>Cold path:</strong> Exact dedup using <code>request_id</code> as the key in a persistent set. If the same <code>request_id</code> appears twice, only one is billed.</li>
+</ul>
+<p>Why both? Because the hot path needs to be fast and approximate; the cold path needs to be exact and can be slower.</p>
+<h3 id="hot-path-real-time-aggregation">Hot Path: Real-Time Aggregation</h3>
+<p>A stream processor (Flink, Spark Streaming, Kafka Streams) consumes the click stream:</p>
+<ol>
+<li>Read event from partition.</li>
+<li>Bloom-filter dedup check; skip if duplicate within recent window.</li>
+<li>Apply lightweight fraud filter (block list IP, obvious bot patterns).</li>
+<li>Atomically increment counter for <code>(campaign_id, time_bucket)</code> in counter KV.</li>
+<li>If campaign's running total exceeds budget × threshold (e.g., 95%), set campaign status to <code>near_budget</code>. If exceeds budget, set <code>over_budget</code> and notify ad server.</li>
+</ol>
+<p>The ad server reads campaign status from a fast cache (refreshed every second or so). When status flips to <code>over_budget</code>, the ad server stops bidding/serving for that campaign.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The hot path optimizes for fast budget enforcement. It is approximate — slight over-count is OK because the cold path will reconcile, but undercount is bad because it lets ads serve past budget.</p>
+</blockquote>
+<h3 id="budget-cap-enforcement">Budget Cap Enforcement</h3>
+<p>A key correctness concern: a campaign with $1000 budget at $1/click should not exceed by significant amounts.</p>
+<p>The challenge: clicks arrive at 10k/sec for one hot campaign; even with a 1-second counter update, the ad server can serve thousands of extra clicks.</p>
+<p>Mitigations:</p>
+<ul>
+<li><strong>Pacing:</strong> Limit per-second spend. Smooths the burst that causes overshoot.</li>
+<li><strong>Predictive cutoff:</strong> Stop serving when counter reaches 95% of budget, not 100%, accounting for in-flight clicks.</li>
+<li><strong>Per-region budget split:</strong> Pre-allocate budget across regions to avoid global counter contention.</li>
+<li><strong>Fast counter:</strong> Counter KV in-memory; sub-millisecond increments.</li>
+<li><strong>Direct ad-server notification:</strong> When budget threshold crosses, push notification rather than poll.</li>
+</ul>
+<p>Even with these, slight over-serving is expected. The platform absorbs that as a cost of doing business — typically capped at a small percentage.</p>
+<h3 id="cold-path-authoritative-billing">Cold Path: Authoritative Billing</h3>
+<p>A batch or continuous stream processor:</p>
+<ol>
+<li>Reads from Kafka (or a backup S3 archive) in larger windows (e.g., 1 hour).</li>
+<li>Performs exact dedup using <code>request_id</code> against a persistent set.</li>
+<li>Applies fraud filter from the ML pipeline (which may have processed the events earlier).</li>
+<li>Performs attribution if needed.</li>
+<li>Writes billing records to the ledger with <code>billing_status = valid</code> or <code>fraud</code> or <code>duplicate</code>.</li>
+<li>Updates <code>budget_spent_authoritative</code> on the campaign.</li>
+</ol>
+<p>The ledger is the source of truth for invoicing. Reconciliation against the hot path counter is automatic.</p>
+<h3 id="fraud-filtering">Fraud Filtering</h3>
+<p>Patterns to catch:</p>
+<ul>
+<li>High click rate from one user/device/IP.</li>
+<li>Clicks without preceding impression.</li>
+<li>Clicks from known bot user agents.</li>
+<li>Clicks that don't convert at expected rate.</li>
+<li>Geographic anomalies.</li>
+<li>Click farms (synchronized clicks from many devices).</li>
+</ul>
+<p>Implementation:</p>
+<ul>
+<li>A separate fraud service consumes the click stream.</li>
+<li>Runs ML models and rule-based checks.</li>
+<li>Writes a <code>fraud_score</code> per click_id to a side table.</li>
+<li>Cold path uses fraud_score to decide billing status.</li>
+<li>Hot path may use only fast rules (block list) because waiting for ML adds latency.</li>
+</ul>
+<p>The fraud path is async because billing is async. The hot path slightly over-counts; reconciliation corrects.</p>
+<h3 id="late-events-and-out-of-order">Late Events And Out-of-Order</h3>
+<p>Events arrive late:</p>
+<ul>
+<li>Mobile clients with poor connectivity.</li>
+<li>Network buffering.</li>
+<li>Cross-region replication lag.</li>
+</ul>
+<p>The stream processor uses <strong>watermarks</strong> to handle out-of-order:</p>
+<ul>
+<li>A watermark is "we've received events up to time T."</li>
+<li>Aggregates for time buckets older than the watermark are finalized.</li>
+<li>Events older than the watermark go to a separate "late" pipeline that adjusts past aggregates.</li>
+</ul>
+<p>For billing, the cold path runs after a delay (e.g., 1 hour) to let most late events arrive. Anything later goes into next period's adjustments.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Click stream</td>
+<td><code>campaign_id</code></td>
+<td>Co-locate same campaign's events for aggregation.</td>
+</tr>
+<tr>
+<td>Counter KV</td>
+<td><code>campaign_id</code></td>
+<td>Atomic increments per campaign; one shard per hot campaign.</td>
+</tr>
+<tr>
+<td>Billing ledger</td>
+<td><code>date + campaign_id</code></td>
+<td>Time-range queries for invoicing.</td>
+</tr>
+<tr>
+<td>Dedup set (cold)</td>
+<td><code>hash(request_id)</code></td>
+<td>Even distribution.</td>
+</tr>
+<tr>
+<td>Aggregates</td>
+<td><code>campaign_id + time_bucket</code></td>
+<td>Query pattern.</td>
+</tr>
+</tbody>
+</table>
+<p>Hot campaign mitigation: very hot campaigns may pin a single counter shard. Mitigation: shard the counter further (<code>campaign_id + region_id</code> sub-counters), then aggregate.</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ingest log</td>
+<td>Durable, partitioned, at-least-once</td>
+<td>Foundation; no events lost.</td>
+</tr>
+<tr>
+<td>Hot counter</td>
+<td>Approximate; updated near-real-time</td>
+<td>Budget cap enforcement.</td>
+</tr>
+<tr>
+<td>Cold billing ledger</td>
+<td>Exactly-once via dedup</td>
+<td>Money.</td>
+</tr>
+<tr>
+<td>Fraud score</td>
+<td>Eventually consistent</td>
+<td>Async ML.</td>
+</tr>
+<tr>
+<td>Aggregate reports</td>
+<td>Eventually consistent</td>
+<td>Hourly/daily roll-ups.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Click events ingested in the region where the user is.</li>
+<li>Per-region streams flow into a global Kafka cluster, or regional Kafkas replicate to a central one for cold path.</li>
+<li>Hot counters may be regional with cross-region reconciliation, or global with sharded campaigns.</li>
+<li>Billing is centralized: one authoritative ledger.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Click event lost in ingest.</td>
+<td>Durable Kafka writes; ad server retries with same <code>request_id</code>.</td>
+<td>Ingest error rate, log lag.</td>
+</tr>
+<tr>
+<td>Same click counted twice (retry, duplicate request_id).</td>
+<td>Bloom filter (hot), exact dedup (cold).</td>
+<td>Duplicate rate; counter drift.</td>
+</tr>
+<tr>
+<td>Budget cap exceeded by large margin.</td>
+<td>Predictive cutoff; pacing; faster propagation to ad server.</td>
+<td>Over-budget percentage per campaign.</td>
+</tr>
+<tr>
+<td>Fraud not detected before billing.</td>
+<td>Run fraud filter before authoritative ledger write; allow retroactive reversal in next period.</td>
+<td>Fraud detection lag; reversal volume.</td>
+</tr>
+<tr>
+<td>Late events arrive after billing closed.</td>
+<td>Adjustment records in next billing period.</td>
+<td>Late event rate; adjustment volume.</td>
+</tr>
+<tr>
+<td>Stream processor lag.</td>
+<td>Auto-scale; alert on lag; backfill from log.</td>
+<td>Consumer lag.</td>
+</tr>
+<tr>
+<td>Counter KV hot shard.</td>
+<td>Shard further by region or sub-key.</td>
+<td>Per-shard QPS.</td>
+</tr>
+<tr>
+<td>Reconciliation discovers large drift.</td>
+<td>Investigate; correct via authoritative path.</td>
+<td>Drift % per period.</td>
+</tr>
+<tr>
+<td>Region down during burst.</td>
+<td>Buffer in alternate region; reconcile on recovery.</td>
+<td>Per-region ingest rate.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Hot counter vs cold ledger drift (target under a few percent at hourly checkpoint).</li>
+<li>Duplicate detection rate.</li>
+<li>Fraud detection rate and false positives.</li>
+<li>Over-budget percentage per campaign.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Ingest QPS by region.</li>
+<li>Stream consumer lag.</li>
+<li>Counter store QPS and latency.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Click volume by campaign/ad.</li>
+<li>Cost per campaign; revenue.</li>
+<li>Conversion rate (if attribution included).</li>
+<li>Advertiser dashboard freshness.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Lambda architecture has two pipelines to maintain; kappa is simpler but requires longer reprocessing.</li>
+<li>Approximate hot path is fast but allows budget over-serve; tight enforcement requires faster propagation.</li>
+<li>Per-region budget splits avoid contention but can waste budget when one region is busy.</li>
+<li>Fraud filtering after billing requires reversal; before billing adds latency.</li>
+<li>Bloom filter dedup is cheap but lets some duplicates through.</li>
+<li>Aggregating by minute is fresher but adds storage; hour aggregates are more efficient.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One pipeline trying to be both fast and authoritative.</td>
+<td>Split hot path and cold path; reconcile.</td>
+</tr>
+<tr>
+<td>Synchronous fraud check on click.</td>
+<td>Async fraud with retroactive correction.</td>
+</tr>
+<tr>
+<td>Budget cap as hard "stop at 100%".</td>
+<td>Predictive cutoff at 95% considering in-flight.</td>
+</tr>
+<tr>
+<td>Global counter without sharding.</td>
+<td>Region- or sub-campaign sharding.</td>
+</tr>
+<tr>
+<td>Trusting client-side click id.</td>
+<td>Server-side <code>click_id</code> plus signed <code>request_id</code> from ad server.</td>
+</tr>
+<tr>
+<td>Forgetting late events.</td>
+<td>Watermarks; adjustment periods; reprocessing budget.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Budget cap enforcement</td>
+<td>Predictive cutoff; per-region splits; fast counter; ad server cache.</td>
+</tr>
+<tr>
+<td>Dedup strategy</td>
+<td>Hot Bloom filter; cold exact set on request_id.</td>
+</tr>
+<tr>
+<td>Fraud filtering</td>
+<td>Async ML pipeline; rules + scores; retroactive reversal.</td>
+</tr>
+<tr>
+<td>Late events</td>
+<td>Watermarks; finalize windows after delay; adjustment records.</td>
+</tr>
+<tr>
+<td>Reconciliation</td>
+<td>Hourly compare; drift alarms; cold ledger is source of truth.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Regional ingest; central billing; per-region budget allocation.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Two pipelines: hot (fast, approximate) and cold (slow, exact).</li>
+<li>Server-side click_id; signed request_id; exact dedup in cold path.</li>
+<li>Predictive budget cutoff with in-flight margin.</li>
+<li>Async fraud filtering with retroactive reversal.</li>
+<li>Watermarks for late events; adjustment periods.</li>
+<li>Reconciliation between counter and ledger.</li>
+<li>Multi-region ingest with central billing.</li>
+<li>Bloom filter for hot dedup; exact for cold.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>An ad click aggregator is a textbook lambda architecture problem. The hot path is fast and approximate for budget enforcement and dashboards; the cold path is slow and exact for billing. They reconcile periodically. The hardest correctness problem is budget over-serve under burst; the hardest scale problem is dedup of billions of events per day.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design an ad click aggregator.</p>
+<p><strong>Candidate:</strong> I will design two pipelines over the same click stream: a hot path that updates per-campaign counters in real time for budget enforcement and dashboards, and a cold path that produces the authoritative billing ledger with exact dedup and fraud filtering. The invariant is that every billable click is counted exactly once in the ledger and budget caps are enforced fast enough to prevent significant over-spend.</p>
+<p><strong>Interviewer:</strong> How do you stop serving ads when budget runs out?</p>
+<p><strong>Candidate:</strong> The hot path stream processor updates a per-campaign counter in a fast KV store on every click. When the counter reaches 95% of budget — accounting for in-flight clicks — the campaign status flips to <code>over_budget</code> and an event pushes to the ad server's cache. The ad server checks status on every serve request; clients refresh their local cache every second or so. So there's a few-second window where small over-serve happens, which we accept and absorb.</p>
+<p><strong>Interviewer:</strong> Why 95%, not 100%?</p>
+<p><strong>Candidate:</strong> Predictive cutoff. There's always a window between "counter reads at 100%" and "ad server stops bidding." At 10k clicks/sec on a hot campaign, even a 1-second window means 10k extra clicks. Setting the cutoff at 95% reserves a buffer for in-flight load. The exact percentage depends on click rate and propagation latency.</p>
+<p><strong>Interviewer:</strong> How do you dedupe?</p>
+<p><strong>Candidate:</strong> Two layers. The ad server includes a signed <code>request_id</code> in the click URL — every click for a given impression has the same <code>request_id</code>. In the hot path, a Bloom filter per partition rejects duplicates within a recent window; it's fast but allows occasional false positives, which is OK because the cold path will fix it. In the cold path, an exact dedup set keyed by <code>request_id</code> is the authoritative deduplicator. The billing ledger records only the first occurrence; subsequent duplicates are marked.</p>
+<p><strong>Interviewer:</strong> Fraud — how do you filter it?</p>
+<p><strong>Candidate:</strong> Async fraud service consumes the click stream. It runs rules (IP block lists, bot user agents, click rate per device) and ML scoring. Each click_id gets a fraud score written to a side table. The cold path uses this score when deciding billing status. The hot path applies only the fastest rules to avoid slowing down; small over-counts in the hot path are reconciled later.</p>
+<p><strong>Interviewer:</strong> What about clicks that arrive late?</p>
+<p><strong>Candidate:</strong> The stream processor uses watermarks. We say "we've received events up to time T," and any older events are processed but go to an "adjustments" path that updates past aggregates. The cold path waits an hour or so after the wall clock before finalizing the billing record for that hour, giving late events time to arrive. Anything truly late lands in next period's adjustments.</p>
+<p><strong>Interviewer:</strong> How does the cold path reconcile with the hot path?</p>
+<p><strong>Candidate:</strong> Every hour, a reconciler compares hot counter total against cold ledger total per campaign. If drift is within tolerance (a few percent), we accept and update the authoritative <code>budget_spent</code>. If drift exceeds threshold, alert and investigate. The cold ledger is always the source of truth for invoicing; the hot counter is operational.</p>
+<p><strong>Interviewer:</strong> A campaign has $1 million budget and very high click rate. How do you not pin one shard?</p>
+<p><strong>Candidate:</strong> Per-region budget allocation. We split the $1M across regions proportional to expected traffic — say $300k US, $200k EU, etc. Each region has its own counter shard. A region that exhausts its allocation can request a transfer from another region's slack via a slower coordination service. This avoids global counter contention while preserving overall budget control.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Click events ingested in the region they originate. Each region has Kafka and stream processors. Hot counters are regional with cross-region reconciliation. The cold path consumes from a central Kafka (cross-region replicated) and writes one authoritative ledger. This keeps the hot path latency low while keeping billing centralized.</p>
+<p><strong>Interviewer:</strong> What happens if Kafka goes down briefly?</p>
+<p><strong>Candidate:</strong> Ad server ingestion buffers locally with a small bounded queue, then drops if Kafka is unreachable for too long. We accept a small percentage of lost clicks during catastrophic outages. The ad server may also fall back to a secondary ingest in another region. We monitor click-loss rate and have alerts.</p>
+<p><strong>Interviewer:</strong> Dashboards — how do you serve those?</p>
+<p><strong>Candidate:</strong> Stream processor maintains per-campaign per-minute aggregates in a query store (e.g., a time-series DB or columnar store). Dashboards read these directly with a 30-60 second lag from real time. For long-range queries, we serve from pre-aggregated hourly and daily rollups produced by the cold path.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Lambda architecture. Hot path for budget enforcement and dashboards, cold path for authoritative billing. Signed <code>request_id</code> from ad server enables dedup; Bloom filter in hot, exact set in cold. Predictive cutoff at 95% prevents most over-serve. Fraud filtering is async with retroactive correction. Late events handled via watermarks and adjustment periods. Per-region budget splits avoid hot-shard contention. Reconciliation hourly verifies hot/cold convergence.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: budget cap fast; billing exact; fraud; late events.</li>
+<li>Invariant: billable click counted once in ledger; cap enforced near-real-time.</li>
+<li>Lambda architecture: hot + cold paths.</li>
+<li>Server-side click_id + signed request_id for dedup.</li>
+<li>Hot path: stream processor + counter KV; predictive cutoff at 95%.</li>
+<li>Cold path: exact dedup, fraud filter, billing ledger.</li>
+<li>Watermarks for late events; reconciliation between paths.</li>
+<li>Per-region budget allocation for hot campaigns; central billing.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>An ad click aggregator splits into two pipelines over the same click stream. The hot path keeps per-campaign counters fresh enough to enforce budget caps in under five seconds; the cold path produces the authoritative billing ledger with exact dedup and fraud filtering. They reconcile hourly. The hardest correctness problem is preventing significant over-serve under burst, solved with predictive cutoff and per-region budget allocation. The hardest scale problem is exact dedup over billions of daily events, solved with hot Bloom filters and cold exact sets keyed on a signed request_id.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Two paths: hot for speed, cold for correctness. Reconciliation keeps them honest."</li>
+<li>"Budget enforcement is predictive, not reactive — stop at 95% to account for in-flight clicks."</li>
+<li>"Dedup uses Bloom filter in the hot path and an exact set keyed by <code>request_id</code> in the cold path."</li>
+<li>"Fraud filtering is async with retroactive reversal in the billing ledger."</li>
+<li>"Per-region budget allocation is how a $10M campaign doesn't pin one counter shard."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

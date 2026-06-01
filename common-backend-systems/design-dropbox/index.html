@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Dropbox — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Dropbox</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Dropbox synchronizes file trees across many devices per user. The hard part is efficient sync (don't re-upload unchanged content), conflict resolution when multiple devices change a file, deduplication at scale, and offline-friendly UX.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every committed file change is durably stored, eventually replicated to all of the user's devices, and a given file's content at any point matches one of a deterministic set of versions; concurrent edits produce conflict copies (or a merge) rather than silent data loss; deletes are reversible within a retention window; storage charges scale with deduplicated unique content.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design chunk-based deduplication, an efficient sync protocol that minimizes bandwidth, a metadata service that owns the canonical file tree per user, and conflict handling under multi-device editing.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Dropbox as three planes: a metadata service that owns each user's file tree and version history, a content-addressable block store for file chunks with cross-user dedup, and a sync protocol that exchanges deltas between clients and the metadata service. The interesting decisions are chunking strategy, delta sync, conflict resolution, and dedup that respects privacy.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>User uploads, modifies, deletes files in a folder tree.</li>
+<li>Files sync across the user's devices.</li>
+<li>Sharing: folders shared with other users with permissions.</li>
+<li>File versioning: see and restore older versions.</li>
+<li>Selective sync: not every device gets every file.</li>
+<li>Web access: download files from a browser.</li>
+<li>Comments, links, mobile preview.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Petabyte-scale storage with cross-user dedup.</li>
+<li>Sync latency: changes propagate within seconds when devices are online.</li>
+<li>Bandwidth-efficient: don't re-upload unchanged parts.</li>
+<li>Durable: file content never lost.</li>
+<li>Available offline: clients work without network.</li>
+<li>Multi-region.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Real-time collaborative editing (separate; see Google Docs).</li>
+<li>Full-text search across all files.</li>
+<li>DRM / managed file rights.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>500M+.</td>
+</tr>
+<tr>
+<td>Files</td>
+<td>Hundreds of billions.</td>
+</tr>
+<tr>
+<td>File size</td>
+<td>KB-GB; average a few MB.</td>
+</tr>
+<tr>
+<td>Daily upload</td>
+<td>Petabytes.</td>
+</tr>
+<tr>
+<td>Devices per user</td>
+<td>2-5 typical.</td>
+</tr>
+<tr>
+<td>Sync latency</td>
+<td>Seconds for online; minutes for batched.</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Exabytes; growing daily.</td>
+</tr>
+<tr>
+<td>Dedup ratio</td>
+<td>30-60% reduction for typical workloads.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is metadata service scaling per user and the bandwidth of the sync protocol.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Metadata service</td>
+<td>Owns user's file tree, versions, sharing.</td>
+<td>Strongly consistent per user; the truth.</td>
+</tr>
+<tr>
+<td>Block store</td>
+<td>Stores deduplicated content chunks.</td>
+<td>Content-addressable; durable.</td>
+</tr>
+<tr>
+<td>Sync protocol</td>
+<td>Negotiates which blocks each client needs to upload/download.</td>
+<td>Bandwidth-efficient.</td>
+</tr>
+<tr>
+<td>Client</td>
+<td>Watches local filesystem; syncs with metadata service.</td>
+<td>Resilient; handles offline.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">+-------------------+         +-------------------+
+| Client (desktop)  |&lt;-------&gt;| API Gateway       |
+| Filesystem watcher|         | (auth)            |
++-------------------+         +---------+---------+
+                                        |
+                       +----------------+----------------+
+                       |                                 |
+                       v                                 v
+              +------------------+              +------------------+
+              | Metadata Service |              | Block Service    |
+              | File tree + ver  |              | content-addressed|
+              +--------+---------+              +---------+--------+
+                       |                                  |
+                       v                                  v
+              +------------------+              +------------------+
+              | Metadata Store   |              | Block Store      |
+              | sharded by user  |              | object storage   |
+              +------------------+              +------------------+
+                       |
+                       v
+              +------------------+
+              | Notification     |
+              | service          |
+              +------------------+
+                       |
+                       v
+              Push to other user devices
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Client</td>
+<td>Filesystem watcher; chunking; conflict handling.</td>
+<td>Local SQLite for sync state.</td>
+</tr>
+<tr>
+<td>API gateway</td>
+<td>Auth; route.</td>
+<td>Standard.</td>
+</tr>
+<tr>
+<td>Metadata service</td>
+<td>Manages user namespaces and file trees.</td>
+<td>Sharded per user; transactional.</td>
+</tr>
+<tr>
+<td>Block service</td>
+<td>Get/put blocks.</td>
+<td>Block id is hash of content.</td>
+</tr>
+<tr>
+<td>Block store</td>
+<td>Durable storage.</td>
+<td>Object storage; geo-replicated.</td>
+</tr>
+<tr>
+<td>Notification service</td>
+<td>Push sync events to other devices.</td>
+<td>WebSocket / long poll.</td>
+</tr>
+<tr>
+<td>Sharing service</td>
+<td>Permissions on folders/files.</td>
+<td>Affects visibility in metadata.</td>
+</tr>
+<tr>
+<td>Version service</td>
+<td>Old file versions; revert.</td>
+<td>Append-only version chain.</td>
+</tr>
+<tr>
+<td>Dedup index</td>
+<td>Per-user dedup table; sometimes cross-user.</td>
+<td>Content-addressable.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="file-folder-node">File / Folder Node</h4>
+<pre><code class="language-text">Node(
+  node_id,
+  user_id,                 // or workspace id
+  parent_id,
+  type,                    // file, folder
+  name,
+  current_version_id?,
+  shared_folder_id?,
+  created_at,
+  modified_at,
+  deleted_at?,
+  version
+)
+</code></pre>
+<h4 id="file-version">File Version</h4>
+<pre><code class="language-text">FileVersion(
+  version_id,
+  node_id,
+  size,
+  block_refs: [block_id, offset, length],
+  hash,                    // full file hash
+  created_by_device,
+  created_at,
+  parent_version_id?       // for tracking edits
+)
+</code></pre>
+<h4 id="block">Block</h4>
+<pre><code class="language-text">Block(
+  block_id,                // SHA-256 of content
+  size,
+  storage_uri,
+  reference_count,
+  encrypted_key_ref?
+)
+</code></pre>
+<h4 id="sync-cursor">Sync Cursor</h4>
+<pre><code class="language-text">SyncCursor(
+  user_id,
+  device_id,
+  last_event_id            // last event applied
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">POST   /blocks/{block_id}        # PUT if not exists
+GET    /blocks/{block_id}
+POST   /files                    # create or update file version
+PATCH  /files/{node_id}/move
+DELETE /files/{node_id}
+GET    /events?since=cursor      # changes since last sync
+POST   /shares
+GET    /folders/{id}/contents
+</code></pre>
+<h3 id="chunking-and-dedup">Chunking And Dedup</h3>
+<p>Each file is split into chunks. Choice of chunking strategy matters:</p>
+<p><strong>Fixed-size chunks (e.g., 4 MB):</strong>
+- Simple.
+- Bad for insertions: changing the start of a file shifts all chunks; dedup breaks.</p>
+<p><strong>Variable-size chunks via content-defined chunking (CDC, e.g., Rabin fingerprint):</strong>
+- Boundary determined by content; insertion only affects nearby chunks.
+- Better dedup for slightly-modified files.
+- More CPU at chunk time.</p>
+<p>For each chunk:</p>
+<ul>
+<li><code>block_id = SHA-256(content)</code>.</li>
+<li>Upload if not exists (check via API).</li>
+<li>Reference count incremented when a file version uses it.</li>
+<li>When references drop to zero, eligible for garbage collection.</li>
+</ul>
+<p>Dedup scope:</p>
+<ul>
+<li>Per-user (always).</li>
+<li>Cross-user (privacy-sensitive; requires careful key management).</li>
+</ul>
+<p>For cross-user dedup with encryption:</p>
+<ul>
+<li>Convergent encryption: derive encryption key from content hash; two users with the same file produce the same ciphertext. Enables dedup but leaks "do you have this file?"</li>
+<li>Per-user encryption: prevents cross-user dedup but is privacy-safer.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Content-defined chunking with content-addressable blocks gives both bandwidth efficiency and dedup. Cross-user dedup is a privacy decision, not just an engineering one.</p>
+</blockquote>
+<h3 id="sync-protocol">Sync Protocol</h3>
+<p>Each device has a local cursor over the user's event stream. The metadata service maintains a per-user append-only event log.</p>
+<p>Sync flow:</p>
+<ol>
+<li>Client connects; sends its cursor.</li>
+<li>Server responds with events since the cursor: file added, modified, deleted, moved, shared.</li>
+<li>For modifications: client compares its local block list with the server's; downloads missing blocks; updates local file.</li>
+<li>Local change: client computes new block list; uploads new blocks (checking existence first); commits new file version with block_refs.</li>
+<li>Server emits event; other devices pull and sync.</li>
+</ol>
+<p>Bandwidth efficiency:</p>
+<ul>
+<li>Only changed blocks transferred.</li>
+<li>Existence check (<code>HEAD /blocks/{id}</code>) before upload.</li>
+<li>Server-side delta computation for small edits.</li>
+</ul>
+<h3 id="conflict-resolution">Conflict Resolution</h3>
+<p>Two devices edit the same file while offline. Both upload modified versions.</p>
+<p>Server-side detection:</p>
+<ul>
+<li>Each FileVersion has <code>parent_version_id</code>.</li>
+<li>If a client commits with <code>parent_version_id = V</code>, but the current server version is <code>V'</code> (where <code>V' != V</code>), conflict.</li>
+</ul>
+<p>Resolution policy:</p>
+<ul>
+<li>Default: create a "conflict copy" — <code>filename (Device A conflict copy).ext</code>. Both versions preserved.</li>
+<li>Three-way merge for text: optional in some products.</li>
+<li>For binary files, no merge; conflict copy is the right answer.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Dropbox does not silently merge edits; it preserves both versions as conflict copies. Three-way merge is risky for binary files.</p>
+</blockquote>
+<h3 id="move-vs-copy">Move Vs Copy</h3>
+<p>Moving a file changes the metadata but does not re-upload content.</p>
+<ul>
+<li>Move: metadata transaction changing <code>parent_id</code> or <code>name</code>.</li>
+<li>Copy: new node, same block_refs, increment reference counts.</li>
+</ul>
+<p>This makes large folder moves nearly free.</p>
+<h3 id="sharing">Sharing</h3>
+<p>Shared folders have a shared root node visible in multiple users' trees.</p>
+<ul>
+<li>Shared folder has its own ACL.</li>
+<li>Each member's tree references the shared folder by id.</li>
+<li>Permissions checked at the metadata service.</li>
+<li>Sync protocol delivers events for shared folders to all members.</li>
+</ul>
+<h3 id="versioning">Versioning</h3>
+<p>Each file modification creates a new FileVersion.</p>
+<ul>
+<li>Old versions retained for a window (30 days typical) or longer for paid tiers.</li>
+<li>Restore: copy old version's <code>block_refs</code> as a new current version.</li>
+<li>Garbage collection removes old versions past retention.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Metadata nodes</td>
+<td><code>user_id</code> (or workspace_id)</td>
+<td>Per-user tree; transactional within partition.</td>
+</tr>
+<tr>
+<td>Event log</td>
+<td><code>user_id</code></td>
+<td>Per-user sync cursor.</td>
+</tr>
+<tr>
+<td>Blocks</td>
+<td><code>block_id</code> hash</td>
+<td>Even distribution.</td>
+</tr>
+<tr>
+<td>Block ref counts</td>
+<td><code>block_id</code> hash</td>
+<td>Same shard as block.</td>
+</tr>
+<tr>
+<td>Shared folders</td>
+<td><code>shared_folder_id</code></td>
+<td>Independent of any one user's partition.</td>
+</tr>
+</tbody>
+</table>
+<p>Hot partition: a single user with millions of files in one folder. Mitigation: sub-shard the folder if it grows beyond threshold; or simply accept and scale the user's partition.</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Metadata per user</td>
+<td>Strong</td>
+<td>Source of truth.</td>
+</tr>
+<tr>
+<td>Block existence</td>
+<td>Strong</td>
+<td>Required before commit.</td>
+</tr>
+<tr>
+<td>Block content</td>
+<td>Immutable (content-addressed)</td>
+<td>Cannot change once written.</td>
+</tr>
+<tr>
+<td>Sync to other devices</td>
+<td>Eventually consistent (seconds)</td>
+<td>OK.</td>
+</tr>
+<tr>
+<td>Sharing events</td>
+<td>Eventually consistent</td>
+<td>Members see additions within seconds.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Conflict between concurrent edits.</td>
+<td>Conflict copy.</td>
+<td>Conflict rate per user.</td>
+</tr>
+<tr>
+<td>Upload incomplete (network drop).</td>
+<td>Resumable; partial chunks discarded.</td>
+<td>Incomplete-upload age.</td>
+</tr>
+<tr>
+<td>Block corruption.</td>
+<td>Hash verification on read; replicate; alert.</td>
+<td>Hash mismatch rate.</td>
+</tr>
+<tr>
+<td>Garbage collection deletes referenced block.</td>
+<td>Reference count + grace period; verify before delete.</td>
+<td>GC-deleted-but-referenced count.</td>
+</tr>
+<tr>
+<td>Metadata store hot user partition.</td>
+<td>Sub-shard; or vertical scale.</td>
+<td>Per-partition QPS.</td>
+</tr>
+<tr>
+<td>Sync stuck on bad event.</td>
+<td>Skip with quarantine; manual repair.</td>
+<td>Stuck-cursor count.</td>
+</tr>
+<tr>
+<td>Cross-user dedup leaks existence.</td>
+<td>Per-user dedup as default; convergent encryption with care.</td>
+<td>Privacy audit.</td>
+</tr>
+<tr>
+<td>Restore old version after GC.</td>
+<td>Maintain version history bounded by retention.</td>
+<td>Restore failures past retention.</td>
+</tr>
+<tr>
+<td>Shared folder revoked.</td>
+<td>Metadata change; client removes local copy.</td>
+<td>Revoke propagation lag.</td>
+</tr>
+<tr>
+<td>Massive folder upload (10M files).</td>
+<td>Throttle; batch events; progress reporting.</td>
+<td>Per-user upload rate.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Conflict rate per user.</li>
+<li>Hash mismatch on block read.</li>
+<li>Sync cursor lag.</li>
+<li>Lost-block events (must be zero).</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Upload/download QPS and bandwidth.</li>
+<li>Metadata service QPS per user.</li>
+<li>Event log fan-out latency.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Dedup ratio.</li>
+<li>Storage per user.</li>
+<li>Active devices per user.</li>
+<li>Sharing activity.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>User home region for metadata.</li>
+<li>Block store replicates globally for fast download.</li>
+<li>Sync notification routes to user's home region; remote devices subscribe via local gateways.</li>
+<li>Cross-region replication latency tolerated.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Content-defined chunking saves bandwidth but costs CPU; fixed-size is simpler but less efficient.</li>
+<li>Cross-user dedup saves storage but raises privacy concerns.</li>
+<li>Storing every block forever wastes space; ref-count + GC adds complexity.</li>
+<li>Three-way merge is nice for text but dangerous for binary; default to conflict copies.</li>
+<li>Larger blocks reduce metadata overhead but reduce dedup benefit; smaller blocks the opposite.</li>
+<li>Strong per-user consistency limits cross-user transactions; transactional shared folders are harder.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Re-upload entire file on change.</td>
+<td>Chunked delta sync; check block existence.</td>
+</tr>
+<tr>
+<td>Silent merge of concurrent edits.</td>
+<td>Conflict copy as default; ask user.</td>
+</tr>
+<tr>
+<td>Last-writer-wins.</td>
+<td>Detect concurrent edit via parent_version_id.</td>
+</tr>
+<tr>
+<td>Synchronous metadata + block writes.</td>
+<td>Two-phase: blocks first, metadata commit second.</td>
+</tr>
+<tr>
+<td>Sharing as duplication.</td>
+<td>Shared folder referenced by both users.</td>
+</tr>
+<tr>
+<td>Single global metadata service.</td>
+<td>Per-user sharding.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Chunking and dedup</td>
+<td>CDC vs fixed; content-addressed; ref counts.</td>
+</tr>
+<tr>
+<td>Sync protocol</td>
+<td>Cursor-based event log; delta blocks; existence checks.</td>
+</tr>
+<tr>
+<td>Conflict resolution</td>
+<td>Detect via parent_version; create conflict copy.</td>
+</tr>
+<tr>
+<td>Sharing</td>
+<td>Shared folder as separate node; ACL; sync to all members.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Per-user home; replicated blocks; regional gateways.</td>
+</tr>
+<tr>
+<td>Storage efficiency</td>
+<td>Dedup + tiered storage + reference counts.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Metadata + blocks split.</li>
+<li>Content-addressed blocks with dedup.</li>
+<li>Chunked upload/download with existence check.</li>
+<li>Per-user event log for sync.</li>
+<li>Conflict copy as default for concurrent edits.</li>
+<li>Sharing via shared folder nodes.</li>
+<li>Versioning + GC of unreferenced blocks.</li>
+<li>Multi-region with user home regions.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Dropbox is a per-user file tree with content-addressed block storage. Chunked delta sync minimizes bandwidth; conflict copies preserve both versions on concurrent edits; cross-user dedup is a privacy tradeoff. The metadata service is the source of truth; the block store is content-addressable and immutable.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Dropbox.</p>
+<p><strong>Candidate:</strong> I will design two planes plus a sync protocol. The metadata plane owns each user's file tree, versions, and sharing — strongly consistent per user. The block plane is content-addressable storage, immutable, deduplicated. The sync protocol exchanges events from a per-user log between clients and the metadata service, transferring only changed blocks.</p>
+<p><strong>Interviewer:</strong> How does a file upload work?</p>
+<p><strong>Candidate:</strong> Client chunks the file using content-defined chunking — boundaries determined by content fingerprint. Each chunk's block_id is the SHA-256 of its content. For each chunk, the client checks <code>HEAD /blocks/{block_id}</code>. If exists, skip. Otherwise, upload. After all blocks exist, the client commits a new FileVersion with the list of block_refs and the parent_version_id. The metadata service performs the commit transactionally; emits an event.</p>
+<p><strong>Interviewer:</strong> Why content-defined chunking?</p>
+<p><strong>Candidate:</strong> Insertions and small edits don't shift the chunks. If I insert text at the top of a file, fixed-size chunking shifts every chunk boundary and dedup breaks. CDC sets boundaries based on content, so only the chunks immediately around the edit change. The rest dedupes.</p>
+<p><strong>Interviewer:</strong> How does sync work?</p>
+<p><strong>Candidate:</strong> Each device has a cursor in the user's event log. On connect, it sends its cursor; the server returns all events since (created, modified, deleted, moved, shared). For modifications, the client compares the new version's block_refs against what it has locally; downloads only missing blocks; reconstructs the file. The event log is per-user; sync is bounded by the user's activity, not the global system.</p>
+<p><strong>Interviewer:</strong> Two devices edit the same file while offline.</p>
+<p><strong>Candidate:</strong> When device A comes online and commits a new version, the metadata service applies it and updates <code>current_version_id</code>. When device B comes online and tries to commit with <code>parent_version_id = old_version</code>, the server detects conflict: the current version is no longer the parent device B thinks. Server creates a conflict copy — a new node with name like <code>file (Device B conflict copy).ext</code>. Both versions are preserved. The user resolves manually.</p>
+<p><strong>Interviewer:</strong> Why not auto-merge?</p>
+<p><strong>Candidate:</strong> For text, three-way merge is feasible. For binary — most files — it's dangerous. A silent merge corrupts content. Conflict copies make both versions visible so the user decides. Some products do offer text merging as opt-in.</p>
+<p><strong>Interviewer:</strong> Storage — dedup helps?</p>
+<p><strong>Candidate:</strong> A lot. Same content uploaded by the same user dedupes by content hash. Cross-user dedup is more sensitive: if two users have the same file, do they share blocks? Yes saves storage but leaks existence information. Convergent encryption (encryption key derived from content) supports cross-user dedup, but exposes "do you have this file?" attacks. Per-user dedup is the safer default.</p>
+<p><strong>Interviewer:</strong> How do moves work?</p>
+<p><strong>Candidate:</strong> Metadata-only operation. Moving a 1 TB folder is a single transaction changing <code>parent_id</code>. No content re-uploaded. Same for renames. Copies create new nodes with the same block_refs and increment reference counts.</p>
+<p><strong>Interviewer:</strong> Versioning?</p>
+<p><strong>Candidate:</strong> Each modification creates a new FileVersion linked to the prior. Old versions retained for 30 days (or per tier). Restore copies an old version's block_refs as a new current. Garbage collection removes unreferenced versions and decrements block ref counts; blocks with zero refs and past a grace period are deleted from the block store.</p>
+<p><strong>Interviewer:</strong> Sharing?</p>
+<p><strong>Candidate:</strong> Shared folder is a node that multiple users' trees reference. ACL on the shared folder governs permissions. Sync events for the shared folder flow to all members. Adding a file to a shared folder publishes the event; all members' clients pick it up and download blocks.</p>
+<p><strong>Interviewer:</strong> Selective sync?</p>
+<p><strong>Candidate:</strong> Per-device configuration of which folders sync locally. Client honors the config: subscribe to events for those folders only; download blocks only for those. Metadata still has the full tree; the client just doesn't materialize unselected folders.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Per-user home region for metadata. Block store geo-replicated for fast download. Notification service has regional gateways; the user's home region publishes events; remote gateways subscribe and forward to local devices. Cross-region replication is async with bounded lag.</p>
+<p><strong>Interviewer:</strong> A user uploads 10 million files at once.</p>
+<p><strong>Candidate:</strong> Throttle. Per-user upload rate limit. Batched event emission to avoid notification spam. Progress reported to the client. Metadata transactions are bounded in size; the client uploads incrementally. The user's partition may become hot; we sub-shard if needed.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Metadata service per user owns the file tree. Block service stores content-addressed immutable chunks with dedup. Chunked delta sync minimizes bandwidth via existence checks. Conflicts produce conflict copies. Sharing is a shared folder node with ACL. Versioning + reference counting + GC manage storage. Per-user home region with replicated blocks for multi-region. The hardest correctness problem is conflict handling; the hardest scale problem is large folder operations and per-user partition hotspots.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: sync, sharing, versioning, devices.</li>
+<li>Invariant: per-user metadata authoritative; blocks immutable.</li>
+<li>Metadata + content-addressed block store.</li>
+<li>Content-defined chunking; existence check before upload.</li>
+<li>Per-user event log for sync.</li>
+<li>Conflict copies for concurrent edits.</li>
+<li>Sharing via shared folder node.</li>
+<li>Versioning + GC; multi-region per-user home.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Dropbox is a per-user file tree on top of content-addressed block storage. Chunked delta sync only transfers what changed; existence checks before upload exploit dedup. Concurrent edits become conflict copies; auto-merge is risky for binary files. Sharing uses a shared folder node referenced by multiple users. Versioning is append-only with reference-counted GC. Per-user home region with globally-replicated blocks gives both correctness and performance.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Content-defined chunking with content-addressed blocks gives both bandwidth efficiency and dedup."</li>
+<li>"Concurrent edits produce conflict copies; we don't silently merge binary files."</li>
+<li>"Moves and copies are metadata-only operations; no content re-uploaded."</li>
+<li>"Cross-user dedup is a privacy decision, not just an engineering one."</li>
+<li>"Per-user event log makes sync bounded by activity, not by global scale."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Google Bigtable — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Google Bigtable</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a>. Bigtable, <a href="../hadoop-distributed-file-system/">HDFS / GFS</a>, and <a href="../design-a-distributed-lock-manager-like-chubby/">Chubby</a> are deeply linked — read them together.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Bigtable (the 2006 paper) is the canonical column-family distributed store. The hard part is partitioning a sorted-by-row-key table across thousands of servers, supporting fast random reads and sequential scans, while maintaining strong per-row consistency.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every row is owned by exactly one tablet at any moment; reads and writes for a row go to its current tablet server; tablets split and migrate without losing data or duplicating ownership; the underlying GFS storage provides durability; Chubby coordinates ownership.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can articulate the row-key-sharded tablet model, the SSTable + commit log + GFS storage, tablet server architecture, Chubby's role in coordination, and the column-family data model.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would describe Bigtable as a sparse, distributed, persistent multi-dimensional sorted map keyed by row+column+timestamp. The table is partitioned into tablets — contiguous row ranges — each owned by one tablet server. Tablets are stored as SSTables in GFS for durability. A master assigns tablets to servers; Chubby coordinates membership and exclusive ownership via leases. The interesting decisions are tablet ownership semantics, SSTable storage on GFS, locality groups, and Chubby's role.</p>
+</blockquote>
+<h3 id="requirements-the-paper-sets">Requirements The Paper Sets</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Multi-dimensional sorted map: <code>(row_key, column_family:column_qualifier, timestamp) → value</code>.</li>
+<li>Row-key range queries.</li>
+<li>Per-row atomic updates (read-modify-write within a row).</li>
+<li>Versioning by timestamp.</li>
+<li>Column families with shared compression.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Petabytes of data across thousands of servers.</li>
+<li>Low-latency random reads/writes.</li>
+<li>High throughput sequential scans.</li>
+<li>Strong per-row consistency.</li>
+<li>Distributed but single-region in original paper.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Data</td>
+<td>Petabytes per table.</td>
+</tr>
+<tr>
+<td>Servers</td>
+<td>Thousands of tablet servers.</td>
+</tr>
+<tr>
+<td>Tablets per table</td>
+<td>Millions.</td>
+</tr>
+<tr>
+<td>Tablet size</td>
+<td>~100-200 MB before split.</td>
+</tr>
+<tr>
+<td>Cells per row</td>
+<td>Up to billions (though usually fewer).</td>
+</tr>
+</tbody>
+</table>
+<h3 id="core-concepts">Core Concepts</h3>
+<h4 id="data-model">Data Model</h4>
+<pre><code class="language-text">Table
+  └── Row (uniquely identified by row_key, sorted lex)
+       └── Column Family
+            └── Column Qualifier
+                 └── Timestamp
+                      └── Value
+</code></pre>
+<p>Each cell can hold multiple timestamped versions; old versions GC'd per policy.</p>
+<p>Example (Webtable):</p>
+<pre><code>row_key:        com.google.www
+column family:  contents
+column quals:   t1, t2, t3 (different timestamps)
+value:          HTML content at each time
+</code></pre>
+<p>Row keys sort lexicographically. Reversing the URL ("com.google.www") groups related URLs together, enabling efficient prefix scans.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Row key design is the single biggest decision in Bigtable. Lexicographic sorting means related rows live in the same tablet — efficient scans, but careful to avoid hot tablets from sequential keys.</p>
+</blockquote>
+<h4 id="column-families">Column Families</h4>
+<p>Defined at table creation. Within a family, columns share:
+- Storage (one SSTable per family on disk).
+- Compression.
+- Access controls.</p>
+<p>Column qualifiers within a family are dynamic — you can add new ones at write time without schema change.</p>
+<p>This design separates frequently-accessed columns from rarely-accessed ones at the storage layer.</p>
+<h4 id="tablets">Tablets</h4>
+<p>A tablet is a contiguous range of rows: <code>[start_row, end_row)</code>.</p>
+<ul>
+<li>Initially one tablet per table.</li>
+<li>When tablet grows beyond threshold (~100-200 MB), it splits into two.</li>
+<li>Each tablet is owned by exactly one tablet server.</li>
+<li>Tablets are the unit of distribution.</li>
+</ul>
+<p>A tablet is composed of:
+- A commit log on GFS.
+- A memtable (in-memory recent writes).
+- Multiple SSTables on GFS.</p>
+<h4 id="sstables">SSTables</h4>
+<p>Persistent, sorted, immutable string-to-string maps. Stored as files on GFS.</p>
+<ul>
+<li>Indexed by row key + column family + qualifier + timestamp.</li>
+<li>Block-organized; bloom filters for fast negative lookups.</li>
+<li>Immutable after creation; compaction creates new SSTables.</li>
+</ul>
+<h4 id="compaction">Compaction</h4>
+<ul>
+<li><strong>Minor compaction:</strong> memtable flushed to a new SSTable on disk.</li>
+<li><strong>Merging compaction:</strong> merge a few SSTables to reduce count.</li>
+<li><strong>Major compaction:</strong> merge all SSTables into one; removes tombstones.</li>
+</ul>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                +-------------+
+   Client  --&gt;  | Bigtable    |
+                | Master      |  (one)
+                +------+------+
+                       |
+                       v
+       Chubby (membership, root tablet location)
+                       |
+                       v
+           +-------------------------+
+           |  Tablet Servers (many)  |
+           |  - serve tablets        |
+           |  - read/write SSTables  |
+           +-----+---------+----+----+
+                 |         |    |
+                 v         v    v
+                  GFS (SSTables + commit logs)
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Master</td>
+<td>Assigns tablets to tablet servers; load balancing; schema changes.</td>
+<td>One per cluster.</td>
+</tr>
+<tr>
+<td>Tablet server</td>
+<td>Owns a set of tablets; serves reads/writes.</td>
+<td>Many.</td>
+</tr>
+<tr>
+<td>GFS</td>
+<td>Stores SSTables and commit logs.</td>
+<td>Underlying durable storage.</td>
+</tr>
+<tr>
+<td>Chubby</td>
+<td>Stores master/tablet-server liveness; root tablet location; schemas.</td>
+<td>Single coordination service.</td>
+</tr>
+<tr>
+<td>Client library</td>
+<td>Caches tablet location; talks directly to tablet servers.</td>
+<td>Heavy caching.</td>
+</tr>
+<tr>
+<td>Compaction</td>
+<td>Background SSTable merging.</td>
+<td>Per tablet.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="tablet-location-hierarchy">Tablet Location Hierarchy</h3>
+<p>To locate the tablet owning a given row key, Bigtable uses a three-level hierarchy:</p>
+<pre><code>Chubby file -&gt; root tablet -&gt; METADATA tablets -&gt; user tablets
+</code></pre>
+<ul>
+<li>Chubby file contains location of root tablet.</li>
+<li>Root tablet (special, never splits) stores locations of METADATA tablets.</li>
+<li>METADATA tablets store locations of all user tablets.</li>
+</ul>
+<p>Clients cache aggressively; on cache miss, walk down the hierarchy. Three-level lookup, but cached after first.</p>
+<h3 id="write-path">Write Path</h3>
+<ol>
+<li>Client sends mutation to the appropriate tablet server (cached lookup).</li>
+<li>Tablet server writes to commit log on GFS (durability).</li>
+<li>Inserts into memtable (in-memory sorted map).</li>
+<li>Returns success.</li>
+</ol>
+<p>Memtable flush (minor compaction):
+- When memtable reaches size threshold, flush to a new SSTable on GFS.
+- Truncate commit log up to the flushed point.</p>
+<h3 id="read-path">Read Path</h3>
+<ol>
+<li>Client sends read to tablet server.</li>
+<li>Tablet server reads from memtable + all relevant SSTables.</li>
+<li>Merges results (latest timestamp per cell).</li>
+<li>Applies any visible tombstones.</li>
+<li>Returns rows.</li>
+</ol>
+<p>Bloom filters skip SSTables that don't contain the queried keys.</p>
+<p>For range scans: sequential read of SSTables in key order, merged.</p>
+<h3 id="tablet-split">Tablet Split</h3>
+<p>When a tablet grows beyond threshold:</p>
+<ol>
+<li>Tablet server picks a split point (median row key).</li>
+<li>Updates METADATA to reflect two new tablet ranges.</li>
+<li>Original SSTables still apply to both (they're indexed by row range).</li>
+<li>Client cache invalidates on next access.</li>
+</ol>
+<p>Split is fast — just a metadata change. Physical data isn't copied; SSTables are shared until compaction.</p>
+<h3 id="tablet-reassignment">Tablet Reassignment</h3>
+<p>When a tablet server fails, the master detects (via Chubby) and reassigns tablets to other servers.</p>
+<ol>
+<li>Master detects failed tablet server (Chubby lease expiry).</li>
+<li>For each tablet on failed server, master assigns to a new server.</li>
+<li>New server reads the tablet's commit log + SSTables from GFS.</li>
+<li>Replays uncommitted log entries into a new memtable.</li>
+<li>Ready to serve.</li>
+</ol>
+<p>Chubby's role: ensures only one master, ensures only one server owns a tablet at a time.</p>
+<h3 id="chubbys-role">Chubby's Role</h3>
+<ul>
+<li>Master election (only one master).</li>
+<li>Tablet server membership (each server holds a unique Chubby lock; dropping the lock = dead).</li>
+<li>Schema storage.</li>
+<li>Root tablet location.</li>
+</ul>
+<p>Without Chubby, Bigtable can't operate.</p>
+<h3 id="locality-groups">Locality Groups</h3>
+<p>A locality group is a set of column families stored together on disk.</p>
+<ul>
+<li>Default: each column family is its own locality group.</li>
+<li>Frequently-co-accessed families can share a locality group for less disk IO.</li>
+<li>Locality groups can be memory-loaded for very fast access.</li>
+</ul>
+<h3 id="compression">Compression</h3>
+<p>Per-column-family compression. Two-stage:
+1. First, a key-encoding step that exploits sorted nature.
+2. Then a content-encoding step (Bentley-McIlroy, Snappy, etc.).</p>
+<p>Compression ratios of 10:1 common.</p>
+<h3 id="single-row-transactions">Single-Row Transactions</h3>
+<p>Bigtable supports atomic read-modify-write within a single row:</p>
+<pre><code>ApplyMutation(row_key, mutations, condition)
+</code></pre>
+<p>Tablet server holds a lock on the row, applies mutations atomically. No cross-row atomicity.</p>
+<h3 id="multi-row-transactions">Multi-Row Transactions</h3>
+<p>Not native. Layered services (Megastore, Spanner) added this on top with extra coordination.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Strategy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot row</td>
+<td>Application-level sharding (suffix the key).</td>
+</tr>
+<tr>
+<td>Hot tablet</td>
+<td>Split (auto).</td>
+</tr>
+<tr>
+<td>Server failure</td>
+<td>Chubby + master reassign.</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>GFS handles durability + replication.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Per-row writes</td>
+<td>Strong (tablet server serializes)</td>
+<td>Single owner.</td>
+</tr>
+<tr>
+<td>Cross-row</td>
+<td>None (no distributed transactions)</td>
+<td>Design choice.</td>
+</tr>
+<tr>
+<td>GFS storage</td>
+<td>Strong (replicated 3x)</td>
+<td>Underlying.</td>
+</tr>
+<tr>
+<td>Tablet ownership</td>
+<td>Strong via Chubby</td>
+<td>At-most-one.</td>
+</tr>
+<tr>
+<td>Schema changes</td>
+<td>Strong via Chubby</td>
+<td>Atomic.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tablet server fails.</td>
+<td>Master reassigns; new server loads from GFS.</td>
+<td>Reassign time.</td>
+</tr>
+<tr>
+<td>Master fails.</td>
+<td>Chubby election picks new master.</td>
+<td>Election time.</td>
+</tr>
+<tr>
+<td>Chubby outage.</td>
+<td>Bigtable unavailable for new ops; existing leases run out.</td>
+<td>Chubby availability.</td>
+</tr>
+<tr>
+<td>GFS partial failure.</td>
+<td>GFS handles replication; Bigtable continues.</td>
+<td>GFS health.</td>
+</tr>
+<tr>
+<td>Hot tablet.</td>
+<td>Auto-split; app-level sharding.</td>
+<td>Per-tablet QPS.</td>
+</tr>
+<tr>
+<td>Compaction storm.</td>
+<td>Throttle; pace.</td>
+<td>Pending compactions.</td>
+</tr>
+<tr>
+<td>Split race.</td>
+<td>METADATA write coordinated.</td>
+<td>Conflict count.</td>
+</tr>
+<tr>
+<td>Lease expiry mid-op.</td>
+<td>Detect; abort; retry.</td>
+<td>Lease expiry events.</td>
+</tr>
+<tr>
+<td>Schema change races.</td>
+<td>Chubby coordinates.</td>
+<td>Schema version.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Tablet ownership uniqueness (zero double-owners).</li>
+<li>Lost writes (zero).</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Tablets per server.</li>
+<li>Pending compactions.</li>
+<li>GFS bandwidth.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Read/write QPS per table.</li>
+<li>Latency.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Strong per-row consistency, no multi-row transactions: clean design choice.</li>
+<li>Row-key design determines everything; sequential keys risk hot tablets.</li>
+<li>Column families separate storage but require upfront schema.</li>
+<li>Compaction is necessary but expensive; tunable.</li>
+<li>Three-level location lookup adds initial latency; aggressive client caching mitigates.</li>
+<li>Single master is a SPOF in lite versions; failover via Chubby.</li>
+<li>Relies on GFS and Chubby — both must work for Bigtable to work.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sequential row keys for time-series.</td>
+<td>Hash prefix or reverse-time to avoid hot tablets.</td>
+</tr>
+<tr>
+<td>One giant column family.</td>
+<td>Locality groups per access pattern.</td>
+</tr>
+<tr>
+<td>Multi-row transactions in app.</td>
+<td>Acknowledge limitation; layer Megastore/Spanner.</td>
+</tr>
+<tr>
+<td>Forget compaction.</td>
+<td>Major compaction periodically; tombstone cleanup.</td>
+</tr>
+<tr>
+<td>Hard-coded tablet locations.</td>
+<td>Use METADATA hierarchy with client cache.</td>
+</tr>
+<tr>
+<td>Single Chubby file.</td>
+<td>Multiple lock files per cluster.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tablet split</td>
+<td>Metadata change; SSTables shared until compaction.</td>
+</tr>
+<tr>
+<td>Tablet reassignment</td>
+<td>Chubby + master + GFS replay.</td>
+</tr>
+<tr>
+<td>Compaction</td>
+<td>Minor, merging, major; tombstones.</td>
+</tr>
+<tr>
+<td>Column families</td>
+<td>Storage separation; locality groups.</td>
+</tr>
+<tr>
+<td>Row key design</td>
+<td>Hot tablet avoidance; range query efficiency.</td>
+</tr>
+<tr>
+<td>Chubby integration</td>
+<td>Master election, tablet ownership, schema.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Sparse multi-dimensional map: row + column + timestamp.</li>
+<li>Tablet-based partitioning.</li>
+<li>SSTables on GFS for durability.</li>
+<li>Chubby for coordination.</li>
+<li>Memtable + commit log + SSTable architecture.</li>
+<li>Tablet split as metadata-only.</li>
+<li>Column families + locality groups.</li>
+<li>Per-row strong consistency; no multi-row.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Bigtable is a row-key-sharded distributed sorted map. Tablets — contiguous row ranges — are the unit of distribution; each owned by one tablet server. Storage is SSTables on GFS; commit logs ensure durability; Chubby coordinates ownership. The per-row consistency is strong; multi-row transactions are not native. Row-key design and column-family structure determine performance.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Describe Bigtable.</p>
+<p><strong>Candidate:</strong> Distributed sorted map keyed by (row, column, timestamp). Sparse, persistent, multi-dimensional. Tables partition into tablets — contiguous row ranges, ~100-200 MB each. Each tablet owned by one tablet server. Storage is SSTables on GFS. Commit logs ensure durability. Chubby coordinates master election and tablet ownership. Per-row writes are strongly consistent; no cross-row transactions.</p>
+<p><strong>Interviewer:</strong> Walk me through a write.</p>
+<p><strong>Candidate:</strong> Client sends mutation to the tablet server owning the row's tablet (looked up via METADATA hierarchy, cached). Tablet server writes to commit log on GFS (durability), inserts into in-memory memtable (sorted). Returns success. Memtable flushes to a new SSTable when full (minor compaction). Commit log is truncated up to flushed point. Multiple SSTables exist per tablet over time; compaction merges them.</p>
+<p><strong>Interviewer:</strong> Read path.</p>
+<p><strong>Candidate:</strong> Read goes to the tablet server. Server reads from memtable + relevant SSTables (Bloom filter avoids SSTables that don't have the key). Merges all data by timestamp (latest wins per cell). Applies tombstones. Returns rows. For range queries, sequential read in row order; merge across SSTables maintains sorted output.</p>
+<p><strong>Interviewer:</strong> Tablet split.</p>
+<p><strong>Candidate:</strong> When a tablet's data exceeds threshold (~200 MB), the tablet server picks a split point — typically the median row key. Updates METADATA: the original tablet range splits into two. SSTables aren't physically copied; they're indexed by row range and apply to both halves until compaction. Split is fast — just a metadata operation.</p>
+<p><strong>Interviewer:</strong> Tablet server fails.</p>
+<p><strong>Candidate:</strong> Tablet server holds a Chubby lock. When it crashes or its lease expires, the lock releases. Master detects this. For each tablet on the failed server, master assigns to another tablet server. The new server reads the tablet's commit log + SSTables from GFS, replays unflushed log entries into a new memtable, and starts serving. The whole takeover happens in seconds; GFS provides durability so no data is lost.</p>
+<p><strong>Interviewer:</strong> Chubby's role.</p>
+<p><strong>Candidate:</strong> Coordination only — not in the data path. Master election: only one master at a time. Tablet server membership: each holds a unique Chubby lock. Lock loss = server dead. Schema storage. Root tablet location (the entry point of the METADATA hierarchy). Bigtable can't operate without Chubby.</p>
+<p><strong>Interviewer:</strong> Row key design.</p>
+<p><strong>Candidate:</strong> The single biggest decision. Row keys sort lexicographically; related rows live in the same or adjacent tablets, enabling efficient range scans. Webtable famously uses reversed URLs ("com.google.www") to group related sites. But sequential keys (like timestamps) create hot tablets — all writes go to the same tablet server. Fix: hash prefix or reverse-time to distribute.</p>
+<p><strong>Interviewer:</strong> Column families.</p>
+<p><strong>Candidate:</strong> Defined at table creation. Within a family, columns share storage (one SSTable per family per tablet), compression, and access control. Column qualifiers within a family are dynamic — added at write time without schema change. Separates frequently from rarely accessed columns at the storage layer. Locality groups can collocate multiple families for shared disk IO.</p>
+<p><strong>Interviewer:</strong> Compaction.</p>
+<p><strong>Candidate:</strong> Three types. Minor compaction: memtable flushes to a new SSTable. Merging compaction: combine several SSTables into one to reduce count. Major compaction: merge all SSTables into one, removing tombstones. Trade-off: too few SSTables = more disk usage but better reads; too many = slower reads. Tuned per workload.</p>
+<p><strong>Interviewer:</strong> No cross-row transactions?</p>
+<p><strong>Candidate:</strong> By design. Layered services (Megastore, Spanner) provide them via Paxos / Two-Phase Commit on top. Bigtable keeps the per-tablet design simple. For most use cases, single-row atomicity is enough; apps that need more layer it on.</p>
+<p><strong>Interviewer:</strong> Locality groups.</p>
+<p><strong>Candidate:</strong> A locality group is a set of column families stored together. Default: one group per family. Configurable: group families that are typically accessed together — e.g., page metadata and contents — to reduce disk IO. Memory-loaded groups stay in RAM for very fast access.</p>
+<p><strong>Interviewer:</strong> Compression.</p>
+<p><strong>Candidate:</strong> Per column family or per locality group. Two-stage: key encoding exploiting sorted keys, then content compression (Bentley-McIlroy + Snappy or similar). Compression ratios of 10:1 are common, especially for highly-redundant data like web pages.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Bigtable is a row-key-sharded distributed sorted map. Tablets partition the table; each owned by one tablet server. SSTables on GFS provide durable storage; commit log + memtable architecture handles writes; compaction maintains read performance. Chubby coordinates ownership. Per-row strong consistency; no multi-row transactions natively. Row-key design is critical. The strengths are linear scale and efficient range queries; the limitations are no cross-row transactions and hot-tablet risk from poor row-key design.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Sparse multi-dimensional map: (row, col_fam:qual, ts).</li>
+<li>Tablets (row ranges) partition the table.</li>
+<li>One tablet server per tablet.</li>
+<li>SSTables on GFS; commit log + memtable.</li>
+<li>Compaction (minor / merging / major).</li>
+<li>Chubby for coordination; master assigns tablets.</li>
+<li>Column families + locality groups for storage layout.</li>
+<li>Per-row strong; no cross-row transactions.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Bigtable is a row-key-sharded distributed sorted map. Tablets are contiguous row ranges, each owned by one tablet server. Storage is SSTables on GFS; commit logs ensure durability; memtables hold recent writes; compaction merges SSTables. Chubby coordinates master election and tablet ownership. Per-row strong consistency; no multi-row transactions natively. Row-key design determines performance — sequential keys risk hot tablets.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Row key design is the single biggest decision in Bigtable."</li>
+<li>"Tablets are metadata; split is a metadata operation, not a data copy."</li>
+<li>"Memtable + commit log + SSTable + compaction is the LSM pattern this paper popularized."</li>
+<li>"Chubby is in the control plane, not the data plane."</li>
+<li>"Per-row strong consistency; multi-row needs a layer above."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

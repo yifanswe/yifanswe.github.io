@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Metrics &amp; Monitoring — Datadog / Prometheus Class (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Metrics &amp; Monitoring — Datadog / Prometheus Class (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Hard · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build a metrics &amp; monitoring system. Hosts emit time-series metrics (counters, gauges, histograms) every 10 s. Engineers query for charts and alerts on conditions. 1M hosts × ~500 metrics each = 500M unique series × 6 datapoints/min = 3B datapoints/minute (~50M/sec). Queries scan minutes to months.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Hosts push metric datapoints <code>(name, tags{}, value, ts)</code>.
+- Query: arbitrary tag filters + aggregations (avg, p99) over time windows.
+- Alerts: rules that evaluate against the metric store and fire on condition.</p>
+<p>I'd defer logging, tracing, and APM correlation — sibling systems.</p>
+<p><strong>Non-functional</strong>
+- Ingest 50M datapoints/sec sustained.
+- Query p99 &lt; 1 s for typical dashboard queries (last 1 h aggregated).
+- Survive a single zone failure with no data loss.
+- Retention: 15 days raw, 1 year downsampled.
+- Eventual consistency on query — slight lag (~15 s) is fine.</p>
+<p><strong>Capacity</strong>
+- 50M points/sec × 24 B/point ≈ 1.2 GB/sec raw → ~100 TB/day → 1.5 PB at 15-day raw retention.
+- After compression (typical 10×): ~150 TB.
+- Cardinality: 500M unique series. Cardinality is the silent killer.
+- The inverted index is smaller than raw samples but still material: if each series has ~6 tag postings at ~8 B/series_id, 500M series costs ~24 GB per full index copy before compression/overhead. The dominant cost remains raw/warm sample storage.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Series</strong> — <code>(metric_name, tags{}) → series_id</code>. Unique combination.</li>
+<li><strong>Datapoint</strong> — <code>(series_id, ts, value)</code>.</li>
+<li><strong>Aggregation tier</strong> — downsampled (e.g., 1-min, 1-h, 1-d).</li>
+<li><strong>Alert rule</strong> — <code>query, threshold, window</code>.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST  /v1/ingest                    // host agent → batched metrics
+GET   /v1/query?q=...&amp;from=...&amp;to=...    → time-series result
+POST  /v1/alerts                    { rule }   → { alert_id }
+</code></pre>
+<p>Query language: PromQL-style — <code>avg_over_time(http_latency{service="checkout"}[5m])</code>.</p>
+<p>Query cursors are rarely user-facing, but long table queries should carry <code>{tenant, query_hash, shard_checkpoint, time_block}</code> so partial scans can resume without repeating all index expansion.</p>
+<hr />
+<h2 id="4-data-flow-5-min">4. Data Flow (~5 min)</h2>
+<p>Host agent batches metrics every 10 s → ingest → write to time-series store (sharded by series_id + time) → downsampling rolls up old data → query layer reads from the right tier → alerts run scheduled queries.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Host agent.</strong> Lightweight daemon collects from local exporters, batches, ships every 10 s. Backoff on ingest failure; local disk buffer (limited).</li>
+<li><strong>Ingest tier.</strong> Stateless ingest fleet behind a load balancer. Validates, normalizes tags, looks up/creates <code>series_id</code> (in a Redis-backed cardinality cache), forwards to Kafka.</li>
+<li><strong>Kafka.</strong> Partitioned by <code>series_id</code> (or <code>hash(metric_name + tags)</code>). Long enough retention to replay on storage failure (24 h).</li>
+<li><strong>Time-series storage.</strong> Custom or off-the-shelf (Prometheus' TSDB, InfluxDB, M3, Cortex). Storage layout:
+   - <strong>Hot tier:</strong> recent 24 h on SSDs, fine-grained (10 s).
+   - <strong>Warm tier:</strong> 1 min downsamples for 15 days.
+   - <strong>Cold tier:</strong> 1 h downsamples for 1 year+ in cheaper storage (object store).</li>
+<li><strong>Index.</strong> Inverted index per shard: <code>tag=value → set of series_ids</code>. Powers tag-filtered queries.</li>
+<li><strong>Downsampler.</strong> Stream job consumes raw Kafka, writes 1-min and 1-h aggregates to warm/cold tiers.</li>
+<li><strong>Query engine.</strong> Parses PromQL, expands tag filters via the index, scans relevant blocks, aggregates. Pushes down filters/aggregates into shards.</li>
+<li><strong>Alert evaluator.</strong> Cron-driven worker that periodically runs each rule's query, applies threshold, fires notifications. Out of scope: notification delivery.</li>
+</ol>
+<p>End-to-end narration: host emits <code>http_latency{service=checkout, host=web-42, route=/buy} = 0.230</code> → ingest assigns series_id S99 → writes to Kafka partition for S99. Storage node consumes, appends datapoint to S99's block in the hot tier. An engineer queries <code>avg by service of http_latency{service=checkout}</code> over last 5 min → query engine looks up tag <code>service=checkout</code> in the index → gets ~500 series → scans last 5 min of each → aggregates avg → returns in 300 ms.</p>
+<p>Concrete stores:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Series registry</td>
+<td><code>series:{tenant}:{fingerprint}</code> -&gt; <code>series_id + tags</code></td>
+<td style="text-align: right;">~200 B</td>
+<td>while series active + tombstone</td>
+<td>tenant + fingerprint</td>
+</tr>
+<tr>
+<td>Raw blocks</td>
+<td><code>raw/{tenant}/{shard}/{series_id}/{2h_block}</code> columnar samples</td>
+<td style="text-align: right;">~2-3 B/sample compressed</td>
+<td>15 days</td>
+<td><code>series_id</code></td>
+</tr>
+<tr>
+<td>Downsampled blocks</td>
+<td><code>rollup/{tier}/{series_id}/{day}</code> min/max/sum/count/pXX</td>
+<td style="text-align: right;">~50-200 B/window</td>
+<td>1 year</td>
+<td><code>series_id</code></td>
+</tr>
+<tr>
+<td>Inverted index</td>
+<td><code>tag:{tenant}:{key}:{value}</code> -&gt; compressed posting list</td>
+<td style="text-align: right;">~8 B/posting raw</td>
+<td>follows block TTL</td>
+<td>tag hash + tenant</td>
+</tr>
+<tr>
+<td>Alert state</td>
+<td><code>alert:{tenant}:{rule_id}</code> -&gt; OK/alerting/resolved + last eval</td>
+<td style="text-align: right;">~500 B</td>
+<td>rule lifetime</td>
+<td>tenant + rule_id</td>
+</tr>
+<tr>
+<td>Ingest buffer</td>
+<td>topic <code>metrics.{tenant_shard}</code></td>
+<td style="text-align: right;">~batch size</td>
+<td>24 h replay</td>
+<td>tenant + series_id</td>
+</tr>
+</tbody>
+</table>
+<p>Capacity by store:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Math</th>
+<th>Dominant knob</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Raw blocks</td>
+<td>50M points/s * 24 B ~= 100 TB/day naive; 10x compression -&gt; ~10 TB/day; 15 d * RF=3 ~= 450 TB</td>
+<td>raw retention and compression</td>
+</tr>
+<tr>
+<td>Kafka ingest buffer</td>
+<td>same payload with 24 h retention * RF=3 ~= up to 300 TB/day before compression</td>
+<td>retention window and batch compression</td>
+</tr>
+<tr>
+<td>Series registry</td>
+<td>500M series * 200 B * RF=3 ~= 300 GB</td>
+<td>tombstone TTL and cardinality caps</td>
+</tr>
+<tr>
+<td>Inverted index</td>
+<td>500M series * 6 postings * 8 B * RF=3 ~= 72 GB raw before overhead</td>
+<td>tag explosion control</td>
+</tr>
+<tr>
+<td>1-min rollups</td>
+<td>roughly 1/6 raw sample count but wider rows, ~5-15 TB/day compressed</td>
+<td>rollup fields and retention</td>
+</tr>
+<tr>
+<td>Alert state</td>
+<td>1M rules * 500 B * RF=3 ~= 1.5 GB</td>
+<td>negligible; evaluator QPS matters</td>
+</tr>
+</tbody>
+</table>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">     +------------------+        +---------------------+
+     | Host agents      |        | Dashboard / API     |
+     +--------+---------+        +-----+----------+----+
+         |                        |          |
+        POST /ingest             GET /query   POST /alerts
+         |                        |          |
+         v                        v          v
+     +----------------+        +----------------+ +----------------+
+     | Ingest LB +    |        | Query planner  | | Alert API /    |
+     | normalizer     |        | / engine       | | evaluator      |
+     +-------+--------+        +-------+--------+ +-------+--------+
+        | series lookup           | tag expansion    | eval query
+        v                         v                  |
+     +----------------+        +----------------+          |
+     | Kafka          |        | Shard scan +   |&lt;---------+
+     | metrics.*      |        | merge/aggregate|
+     +-------+--------+        +-------+--------+
+        |                         ^
+        v                         |
+     +----------------+                |
+     | Storage        |                |
+     | consumers      |                |
+     +-------+--------+                |
+        | raw samples             |
+        v                         |
+   +----------------------------------------------------------------+
+   | Stores / Caches                                                |
+   | series:{tenant}:{fingerprint} -&gt; series_id + tags              |
+   | tag:{tenant}:{key}:{value} compressed posting list             |
+   | raw/{tenant}/{shard}/{series_id}/{2h_block} samples            |
+   | rollup/{tier}/{series_id}/{day} min/max/sum/count/pXX          |
+   | alert:{tenant}:{rule_id} state + last evaluation               |
+   | metrics.{tenant_shard} ingest buffer, 24h replay               |
+   +----------------------+---------------------------+-------------+
+           | shard miss / long range   | eval result
+           v                           v
+      +-------------------+        +-------------------+
+      | Downsampler       |        | Notifications     |
+      | warm/cold rollups |        | async fanout      |
+      +---------+---------+        +-------------------+
+           |
+           | raw tier unavailable
+           v
+      +-------------------+
+      | Serve rollups     |
+      | lower resolution  |
+      +-------------------+
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Cardinality — the silent killer.</strong> Putting <code>request_id</code> or <code>user_id</code> into tags blows up series count. Defenses:
+- <strong>Cardinality limits</strong> per-metric (refuse new series past threshold).
+- <strong>Quarantine</strong> suspicious tag keys (auto-detect explosion, alert).
+- <strong>Schema:</strong> treat tags as bounded sets; high-cardinality data belongs in logs/traces, not metrics.</p>
+<p><strong>Storage layout.</strong> Series rows are columnar by time. Layout in a single block:
+- Time column (delta-encoded, then varint).
+- Value column (Gorilla XOR encoding — sub-byte/datapoint typically).
+- Compression yields 10× over naive layout.
+Per-series blocks sealed and immutable after their time window; written once, read many.</p>
+<p>Why a time-series database rather than generic Cassandra rows: Cassandra can ingest high write volume, but query-time scans over tag filters and time windows need columnar compression, block pruning, downsampling, and a purpose-built inverted index. Prometheus alone is excellent per-cluster, but at 500M series I would use a horizontally sharded system like M3/Cortex/Thanos-style architecture.</p>
+<p>Why Kafka in the middle: direct writes from ingest to TSDB minimize hops, but they make replay and zone failure recovery harder. Kafka gives a 24 h shock absorber, partitions by <code>tenant + series_id</code>, and lets downsampling consume the same stream. The tradeoff is a very expensive transient buffer, so retention must be short and compressed. Be ready for "why not ClickHouse only?" -- ClickHouse is strong for analytics scans, but alerting on fresh per-series data and high-cardinality tag indexes usually need a TSDB-shaped hot tier.</p>
+<p><strong>Sharding.</strong> Hash <code>series_id</code> to a shard. Each shard owns a slice of series. Replication factor 3 across zones for HA. Query fans out across shards; per-shard work is parallel.</p>
+<p><strong>Hot writes vs immutable reads.</strong> Recent data goes to a memtable; sealed every few minutes into immutable on-disk blocks (LSM-tree pattern). Query layer reads memtable + blocks, deduping.</p>
+<p><strong>Downsampling.</strong> Tumbling 1-min windows aggregate raw points → min/max/avg/count/sum/p50/p95/p99 per series per minute. Same again to 1-h. Aggregates retain enough statistical signal for most queries but are much smaller.</p>
+<p><strong>Query optimization.</strong> Push aggregations down to shards: instead of returning raw datapoints, shards return per-series aggregates. Reduces network bytes. For large tag-filter results, parallelize the per-series scan.</p>
+<p>Query path trace: query engine parses PromQL -&gt; expands tag filters through the inverted index -&gt; intersects posting lists to get <code>series_id</code>s -&gt; groups by shard -&gt; parallel shard RPCs scan only matching time blocks -&gt; shard returns partial aggregates -&gt; root merges and down-samples for chart resolution. For a 1-year query, the planner uses 1h rollups instead of raw blocks.</p>
+<p>Hot dashboard path, step by step:
+1. Client sends a PromQL-style query; the planner hashes <code>{tenant, query_text, time_range}</code> and checks a short query cache.
+2. Planner expands tag filters through <code>tag:{tenant}:{key}:{value}</code> posting lists, intersects them, and caps the resulting series set against tenant limits.
+3. It groups series IDs by TSDB shard (<code>series_id</code> shard key) and sends parallel RPCs for only the requested time blocks.
+4. Shards read memtable plus sealed raw blocks for the last hour, compute partial aggregates locally, and return compact vectors.
+5. Root merges partials and returns chart-resolution points; cursor state for huge table views carries <code>{tenant, query_hash, shard_checkpoint, time_block}</code>.</p>
+<p>Cold long-range path: for windows beyond raw retention, the planner skips raw blocks and reads <code>rollup/{tier}/{series_id}/{day}</code>. If a user asks for more series than the cap, the API returns a partial result with a continuation cursor instead of expanding an unbounded posting list.</p>
+<p>Ingest path trace: agent sends a compressed batch -&gt; ingest validates tenant budget and normalizes tags -&gt; looks up or creates <code>series_id</code> in the registry -&gt; appends the batch to Kafka keyed by <code>series_id</code> -&gt; storage consumers write memtable entries -&gt; sealed blocks update the inverted index and object storage manifest.</p>
+<p><strong>Alerts.</strong> Each rule has an evaluation period (e.g., every 60 s). Worker queries metric store with the same engine. State machine per rule (OK / alerting / resolved) with hysteresis to avoid flapping. Notification fan-out is async via a separate queue.</p>
+<p><strong>High-cardinality "ad-hoc" labels.</strong> If users insist on putting URLs in tags, route those metrics to a separate higher-cost store with cardinality caps, not the main TSDB.</p>
+<p><strong>Multi-tenant.</strong> Per-tenant namespacing on metric names; per-tenant cardinality budgets; rate-limit ingest per tenant.</p>
+<p><strong>Cross-region.</strong> Each region runs its own TSDB cluster for local ingest + dashboards. Cross-region queries (global dashboards) federate across regions at the query layer.</p>
+<p><strong>Two-view framing.</strong> The same metric stream is stored as raw per-series blocks for fresh troubleshooting and downsampled rollup blocks for long-range trend queries. The inverted index is a pointer view into those blocks, not another copy of metric content; protecting that pointer view from cardinality explosions is as important as compressing samples.</p>
+<p>Query degradation state machine:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Transition</th>
+<th>Latency target</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot raw</td>
+<td>last minutes/hours</td>
+<td>memtable + raw blocks</td>
+<td>normal dashboard</td>
+<td>&lt; 1 s typical</td>
+</tr>
+<tr>
+<td>Warm rollup</td>
+<td>days/weeks</td>
+<td>1-min rollups</td>
+<td>range exceeds raw/detail budget</td>
+<td>&lt; 1-2 s</td>
+</tr>
+<tr>
+<td>Cold rollup</td>
+<td>months/year</td>
+<td>1-h object-store blocks</td>
+<td>long range</td>
+<td>seconds, async ok</td>
+</tr>
+<tr>
+<td>Partial</td>
+<td>too many series</td>
+<td>capped posting expansion</td>
+<td>series cap hit</td>
+<td>return partial + cursor</td>
+</tr>
+<tr>
+<td>Degraded</td>
+<td>raw shard down</td>
+<td>replicated shard or rollup</td>
+<td>shard timeout</td>
+<td>lower resolution, explicit warning</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Edge stress tests.</strong> A hot dashboard should hit cached partial aggregates for 10-30 s. Dormant series keep tombstones so recycled <code>series_id</code>s do not corrupt old blocks. A tenant that adds <code>user_id</code> as a tag gets new series rejected before the inverted index explodes. Burst writes are absorbed by Kafka and then shed by tenant budget if the buffer crosses a threshold. Cross-region drift is visible as per-region lag metadata; global dashboards should not pretend all regions are equally fresh.</p>
+<p><strong>Replay / disaster.</strong> Kafka retention covers a few hours; in catastrophe, hosts also retain a local disk buffer of recent points to replay.</p>
+<p><strong>Graceful degradation.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th>User-visible behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ingest burst</td>
+<td>Shed over-budget tenants first</td>
+<td>tenant rate limits</td>
+<td>partial data with explicit drops</td>
+</tr>
+<tr>
+<td>New-series explosion</td>
+<td>Quarantine tag key / reject series</td>
+<td>cardinality cache</td>
+<td>existing metrics continue</td>
+</tr>
+<tr>
+<td>Hot dashboard</td>
+<td>Cache query result and partial aggregates</td>
+<td>query cache + rollups</td>
+<td>slightly stale chart</td>
+</tr>
+<tr>
+<td>Raw tier unavailable</td>
+<td>Serve downsampled data</td>
+<td>warm rollups</td>
+<td>lower resolution</td>
+</tr>
+<tr>
+<td>Alert evaluator lag</td>
+<td>Keep last state, mark delayed</td>
+<td>alert state</td>
+<td>no false resolve</td>
+</tr>
+</tbody>
+</table>
+<p>Interview punch line: "Metrics systems fail from cardinality before they fail from bytes; the design has to protect the index as aggressively as the storage tier."</p>
+<p><strong>Cost levers.</strong> Most cost is storage. Aggressive downsampling, columnar compression, and short raw retention are the big wins.</p>
+<p><strong>What I'd defer.</strong> Logs and traces (separate problems with similar shapes), exemplar tracking (linking metric points to traces), per-tenant cost attribution and billing, anomaly detection beyond static thresholds.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

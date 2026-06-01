@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Amazon Shopping Cart — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Amazon Shopping Cart</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Amazon's shopping cart is a deceptively-simple-looking feature: it's the canonical example used to motivate the original Dynamo paper. The hard part is keeping the cart available — every "add to cart" must succeed even during partitions — while reconciling conflicting concurrent updates from multiple devices.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every "add to cart" action eventually appears in the user's cart on every device; deletes do not reappear unless re-added; concurrent updates from multiple devices merge without losing items; the cart is available even when some replicas are unreachable.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can articulate the Dynamo-style "always writable" tradeoff, design conflict resolution via vector clocks or CRDTs, handle multi-device cart merging, and reason about cart abandonment, inventory checks, and conversion to order.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design the cart around an always-writable Dynamo-style KV store keyed by user_id. Adds and removes are merged via vector clocks or CRDT semantics so concurrent updates from multiple devices never silently lose items. The interesting decisions are conflict resolution semantics (favor preservation), inventory check timing, and the cart-to-order conversion flow at checkout.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Add item to cart with quantity.</li>
+<li>Update quantity.</li>
+<li>Remove item.</li>
+<li>View cart from any device.</li>
+<li>Persistent cart (survives session).</li>
+<li>Apply coupons / promotions.</li>
+<li>Save for later (separate list).</li>
+<li>Checkout: convert cart to order.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>High availability: cart writes must succeed even during partial outages.</li>
+<li>Eventually consistent across devices.</li>
+<li>Sub-second response.</li>
+<li>Scale to hundreds of millions of users.</li>
+<li>Conflict resolution: never silently lose items.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Inventory enforcement at cart-add (hold inventory only at checkout).</li>
+<li>Tax calculation (separate service).</li>
+<li>Recommendation insertion (separate).</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>300M+ Prime; 1B+ accounts.</td>
+</tr>
+<tr>
+<td>Active carts</td>
+<td>Tens of millions concurrent.</td>
+</tr>
+<tr>
+<td>Adds/sec</td>
+<td>100k+ peak.</td>
+</tr>
+<tr>
+<td>Cart size</td>
+<td>Average 3 items; long tail 100s.</td>
+</tr>
+<tr>
+<td>Devices per user</td>
+<td>2-5.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Add &lt; 200 ms.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is multi-device merge correctness; throughput is moderate.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Experience</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cart</td>
+<td>List of items + quantities.</td>
+<td>Always writable.</td>
+</tr>
+<tr>
+<td>Save for later</td>
+<td>Wishlist-like.</td>
+<td>Same.</td>
+</tr>
+<tr>
+<td>Checkout</td>
+<td>Cart → order.</td>
+<td>Strong; inventory check.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Multiple devices --add/update/remove--&gt; Cart API
+                                            |
+                                            v
+                                  +------------------+
+                                  | Cart Service     |
+                                  | always writable  |
+                                  +--------+---------+
+                                            |
+                                            v
+                                  +------------------+
+                                  | Dynamo-style KV  |
+                                  | per-user cart    |
+                                  | vector clocks    |
+                                  +--------+---------+
+                                            |
+                              Conflict resolution: client merge
+                                            |
+                                            v
+                                  +------------------+
+                                  | Checkout Service |
+                                  +--------+---------+
+                                            |
+                                            v
+                                  +------------------+
+                                  | Order Service    |
+                                  +------------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cart API</td>
+<td>Stateless; routes requests.</td>
+<td>Standard.</td>
+</tr>
+<tr>
+<td>Cart store</td>
+<td>Per-user always-writable KV.</td>
+<td>Dynamo-style replication.</td>
+</tr>
+<tr>
+<td>Conflict resolver</td>
+<td>Merge concurrent versions.</td>
+<td>Vector clocks or CRDT.</td>
+</tr>
+<tr>
+<td>Save-for-later store</td>
+<td>Separate list per user.</td>
+<td>Similar pattern.</td>
+</tr>
+<tr>
+<td>Inventory service</td>
+<td>Check stock at checkout.</td>
+<td>Strong consistency.</td>
+</tr>
+<tr>
+<td>Pricing</td>
+<td>Compute totals with promos.</td>
+<td>Stateless.</td>
+</tr>
+<tr>
+<td>Checkout</td>
+<td>Convert cart to order.</td>
+<td>State machine.</td>
+</tr>
+<tr>
+<td>Order service</td>
+<td>See payment / order design.</td>
+<td>Strong.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="cart">Cart</h4>
+<pre><code class="language-text">Cart(
+  user_id,
+  items: { sku_id: {quantity, added_at, ...} },
+  version_vector,         // for conflict resolution
+  last_updated,
+  status                  // active, abandoned, converted
+)
+</code></pre>
+<p>Stored in Dynamo-style KV keyed by <code>user_id</code>. Replicated across multiple nodes.</p>
+<h4 id="cart-item">Cart Item</h4>
+<pre><code class="language-text">CartItem(
+  sku_id,
+  quantity,
+  added_at,
+  source,                 // browse, recommendation, list, ...
+  promo_code?,
+  notes?
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">POST   /cart/add               { sku_id, quantity }
+PATCH  /cart/{sku_id}          { quantity }
+DELETE /cart/{sku_id}
+GET    /cart                   -&gt; { items, total }
+POST   /save-for-later         { sku_id }
+POST   /checkout/start         -&gt; { order_id }
+</code></pre>
+<h3 id="conflict-resolution-the-dynamo-story">Conflict Resolution: The Dynamo Story</h3>
+<p>Scenario: User adds book A on phone, adds book B on laptop, simultaneously (or with one device offline).</p>
+<p><strong>Vector clock approach:</strong></p>
+<p>Each write carries a vector clock. The cart store accepts both writes; on read, if multiple versions exist (siblings), the client merges them.</p>
+<p>For a cart, the natural merge is <strong>union</strong>: take all items from both versions. If both versions modify the quantity of the same item, take the max (preserve more, avoid loss).</p>
+<p>Result: cart contains both A and B. User never "loses" an add.</p>
+<p>For deletes, this is harder. If A was in the cart, then deleted on device 1, then device 2 (with stale state) adds quantity to A, naive union resurrects A.</p>
+<p><strong>Fix:</strong> use tombstones. Delete records a tombstone with version; later adds with older versions are merged but the tombstone wins.</p>
+<p><strong>CRDT approach:</strong></p>
+<p>Model the cart as a CRDT (e.g., OR-Set or 2P-Set):</p>
+<ul>
+<li>OR-Set: each add has a unique tag; remove only tags it knows about.</li>
+<li>Result: an add that didn't see the delete still appears in the merged set.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Dynamo's design favors availability over consistency. The cart is always writable; concurrent updates produce siblings that the client merges. The natural merge for a cart is set union with tombstones — favoring preservation over deletion.</p>
+</blockquote>
+<h3 id="write-path">Write Path</h3>
+<ol>
+<li>User adds item on a device.</li>
+<li>Cart API writes to cart store with W (write quorum) replicas.</li>
+<li>Returns success once W replicas ack.</li>
+<li>Replicas propagate asynchronously to others.</li>
+<li>Read on another device may see eventually consistent state; if multiple versions exist, merge.</li>
+</ol>
+<p>For high availability: <code>W + R &gt; N</code> for strict consistency, or <code>W &lt; N</code> and <code>R &lt; N</code> for availability with eventual consistency.</p>
+<h3 id="read-path">Read Path</h3>
+<ol>
+<li>User opens cart on a device.</li>
+<li>Cart API reads from R replicas.</li>
+<li>If versions diverge, client (or merge service) reconciles via vector clock.</li>
+<li>Return merged cart.</li>
+</ol>
+<p>Optionally, write back the merged version to repair divergence (read repair).</p>
+<h3 id="multi-device-sync">Multi-Device Sync</h3>
+<p>When user opens cart on a different device:</p>
+<ol>
+<li>Read from cart store.</li>
+<li>Display merged state.</li>
+<li>User's actions (add, remove, update) write back.</li>
+</ol>
+<p>Push update: when a write commits, notify subscribed devices to refresh. Optional; pull-on-open is sufficient.</p>
+<h3 id="inventory-at-cart-time">Inventory At Cart Time</h3>
+<p>Amazon historically does NOT hold inventory at cart add. Reasons:</p>
+<ul>
+<li>Cart abandonment is high; reserving inventory blocks others.</li>
+<li>Inventory becomes a shopping-mall pre-purchase land grab.</li>
+<li>The expensive coordination is moved to checkout.</li>
+</ul>
+<p>So at cart-add, no inventory check. At checkout, inventory is verified and reserved. If out of stock by then, user sees "no longer available."</p>
+<p>For very scarce items (flash sale-style), this changes — see Flash Sale design. But normal cart: lazy inventory.</p>
+<h3 id="checkout">Checkout</h3>
+<ol>
+<li>User initiates checkout.</li>
+<li>Cart frozen for this checkout session.</li>
+<li>For each item, inventory check + reservation.</li>
+<li>Pricing computed (with current promos).</li>
+<li>Order created (state machine).</li>
+<li>Payment captured.</li>
+<li>Cart marked converted; items removed.</li>
+</ol>
+<p>If any item is out of stock, surface error and let user adjust. Cart remains active.</p>
+<h3 id="save-for-later">Save For Later</h3>
+<p>Similar to cart but separate list. Same KV pattern; same conflict resolution.</p>
+<p>Move between cart and save-for-later are atomic operations.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cart</td>
+<td><code>user_id</code> hash</td>
+<td>Per-user data.</td>
+</tr>
+<tr>
+<td>Save for later</td>
+<td><code>user_id</code> hash</td>
+<td>Per-user.</td>
+</tr>
+<tr>
+<td>Inventory</td>
+<td><code>sku_id</code> hash</td>
+<td>Per-item.</td>
+</tr>
+<tr>
+<td>Orders</td>
+<td><code>order_id</code> hash</td>
+<td>Per-order.</td>
+</tr>
+<tr>
+<td>Cart events</td>
+<td><code>user_id</code> hash</td>
+<td>History.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cart writes</td>
+<td>High availability, eventually consistent</td>
+<td>Never lose adds.</td>
+</tr>
+<tr>
+<td>Cart reads</td>
+<td>Quorum + sibling resolution</td>
+<td>Convergence.</td>
+</tr>
+<tr>
+<td>Inventory at checkout</td>
+<td>Strong</td>
+<td>Real money.</td>
+</tr>
+<tr>
+<td>Order creation</td>
+<td>Strong</td>
+<td>Authoritative.</td>
+</tr>
+<tr>
+<td>Pricing</td>
+<td>Strong at checkout</td>
+<td>Final total.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>User's home region for cart writes.</li>
+<li>Cross-region replication asynchronous.</li>
+<li>For users traveling, cross-region read with eventual consistency; merge if divergent.</li>
+<li>Failover region warm.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Multi-device race adds.</td>
+<td>Merge as union; max quantity.</td>
+<td>Sibling rate.</td>
+</tr>
+<tr>
+<td>Delete-then-add race.</td>
+<td>Tombstones; OR-Set semantics.</td>
+<td>Resurrection bug count.</td>
+</tr>
+<tr>
+<td>Cart store partition.</td>
+<td>Sloppy quorum + hinted handoff.</td>
+<td>Partition events.</td>
+</tr>
+<tr>
+<td>Replica down.</td>
+<td>Continue with remaining.</td>
+<td>Replica health.</td>
+</tr>
+<tr>
+<td>Checkout race (two devices).</td>
+<td>Last-writer or explicit conflict.</td>
+<td>Concurrent checkout count.</td>
+</tr>
+<tr>
+<td>Inventory mismatch at checkout.</td>
+<td>Surface gracefully.</td>
+<td>Out-of-stock rate.</td>
+</tr>
+<tr>
+<td>Promotion expires mid-cart.</td>
+<td>Recompute at checkout.</td>
+<td>Promo expiry race.</td>
+</tr>
+<tr>
+<td>User abandons cart for months.</td>
+<td>Retention policy; soft expire.</td>
+<td>Cart age.</td>
+</tr>
+<tr>
+<td>Cart merge produces unwanted items.</td>
+<td>Tombstones; merge UI clarity.</td>
+<td>User complaints.</td>
+</tr>
+<tr>
+<td>Bot adds bulk items.</td>
+<td>Rate limit; CAPTCHA.</td>
+<td>Per-user add rate.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Lost-add rate (must be ~zero).</li>
+<li>Resurrection rate (deleted items reappear).</li>
+<li>Sibling rate during reads.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Cart writes per second.</li>
+<li>Read QPS.</li>
+<li>Merge operations per second.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Cart-to-checkout conversion.</li>
+<li>Cart abandonment rate.</li>
+<li>Average cart size.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>High availability sacrifices strict consistency; trade is acceptable for cart.</li>
+<li>Set-union merge preserves items but may resurrect deletes; tombstones fix at cost of metadata.</li>
+<li>No inventory hold at cart add saves coordination but disappoints users at checkout.</li>
+<li>Tombstone GC requires deciding when it's safe to forget.</li>
+<li>Per-user state simplifies partitioning.</li>
+<li>CRDT design is more complex than vector clocks but compositional.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Strong consistency on cart writes.</td>
+<td>Always-writable with eventual merge.</td>
+</tr>
+<tr>
+<td>Last-writer-wins.</td>
+<td>Vector clock siblings + union merge.</td>
+</tr>
+<tr>
+<td>Hold inventory at cart-add.</td>
+<td>Lazy check at checkout.</td>
+</tr>
+<tr>
+<td>No tombstones (delete loses to stale add).</td>
+<td>Tombstones with version.</td>
+</tr>
+<tr>
+<td>Single replica.</td>
+<td>N replicas with W/R quorums.</td>
+</tr>
+<tr>
+<td>Strict ordering.</td>
+<td>Concurrent OK; merge resolves.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Conflict resolution</td>
+<td>Vector clocks + union; tombstones; OR-Set CRDT.</td>
+</tr>
+<tr>
+<td>Multi-device sync</td>
+<td>Pull on open + push notification.</td>
+</tr>
+<tr>
+<td>Inventory timing</td>
+<td>Lazy check at checkout.</td>
+</tr>
+<tr>
+<td>Cart-to-order flow</td>
+<td>State machine; idempotent.</td>
+</tr>
+<tr>
+<td>Dynamo principles</td>
+<td>Sloppy quorum; hinted handoff; vector clocks.</td>
+</tr>
+<tr>
+<td>Abandonment</td>
+<td>Retention; soft expiry.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Dynamo-style always-writable cart store.</li>
+<li>Vector clock or CRDT conflict resolution.</li>
+<li>Union merge with tombstones for deletes.</li>
+<li>No inventory at cart-add; check at checkout.</li>
+<li>Cart-to-order flow as state machine.</li>
+<li>Multi-device pull + push.</li>
+<li>Multi-region with user home.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Amazon's cart is the canonical Dynamo use case. Availability is paramount — every "add to cart" must succeed, even during partitions. Concurrent updates from multiple devices produce siblings that the client merges as a union with tombstones. The interesting tradeoff is favoring item preservation (never silently lose an add) over strict consistency. Inventory is lazy: checked at checkout, not at add.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Amazon's shopping cart.</p>
+<p><strong>Candidate:</strong> Dynamo-style always-writable KV store keyed by user_id. Cart writes succeed even during partial outages; reads resolve siblings via vector clocks. The natural merge for cart items is set union with max quantity per item; deletes use tombstones to prevent resurrection. No inventory hold at cart-add; inventory is checked and reserved at checkout. The invariant is that every add is preserved even under network partitions and concurrent device updates.</p>
+<p><strong>Interviewer:</strong> Walk me through a multi-device race.</p>
+<p><strong>Candidate:</strong> User has phone and laptop both online. Phone adds book A; laptop adds book B simultaneously, both based on a previous cart state. Cart store writes both with their respective vector clocks. Neither write knows about the other. When the user opens cart on either device, the read sees two siblings (concurrent versions). Merge: union the item sets, take max quantity per item. Result: cart has A and B. User never loses an add.</p>
+<p><strong>Interviewer:</strong> What if user deletes A on phone, then adds quantity to A on laptop with stale state?</p>
+<p><strong>Candidate:</strong> Tombstones. The delete writes a tombstone with version V. The laptop's add has version V' but doesn't know about the tombstone. On merge, the tombstone takes precedence per CRDT semantics (or per merge rule that tracks deletes). A stays deleted. The user's laptop refresh shows the cart without A. The alternative — naive union — would resurrect A, which is the "silent delete" bug.</p>
+<p><strong>Interviewer:</strong> Why no inventory hold at cart-add?</p>
+<p><strong>Candidate:</strong> Cart abandonment is the norm — most carts never check out. Holding inventory at cart-add reserves it from real buyers; under high traffic, you'd reserve more than you have actual buyers for. Coordination cost across hundreds of millions of carts is high. Amazon's choice: lazy inventory at checkout. If the item is out of stock by then, surface gracefully. The exception is flash sales, where scarcity is the point and the system holds inventory at add.</p>
+<p><strong>Interviewer:</strong> Checkout flow.</p>
+<p><strong>Candidate:</strong> State machine. User initiates → cart frozen for this checkout (lock optimistically) → for each item, inventory check + reservation → pricing computed with current promos → order created with idempotency key → payment captured → cart marked converted; items removed. If any inventory check fails, surface error and let user adjust; cart remains active.</p>
+<p><strong>Interviewer:</strong> What if a user checks out from two devices simultaneously?</p>
+<p><strong>Candidate:</strong> Idempotency. The checkout starts with a <code>checkout_session_id</code>. Two simultaneous starts produce two sessions; whichever commits first creates the order. The second session fails with "cart already checked out." UI on the second device refreshes. Alternatively, use a single CAS on cart state to <code>checkout_in_progress</code>.</p>
+<p><strong>Interviewer:</strong> A user adds 100 items rapidly.</p>
+<p><strong>Candidate:</strong> Per-user rate limit on adds. Reasonable thresholds. Bot detection if pattern looks automated. Cart still works for normal heavy users (e.g., bulk shopper) but flagged for review at extreme rates.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> User home region for cart writes. Cross-region replication asynchronous. Travel: user accesses cart from another region — replica may have slight lag; read returns possibly-stale state; on write, merge resolves. Failover region warm.</p>
+<p><strong>Interviewer:</strong> Cart abandonment?</p>
+<p><strong>Candidate:</strong> Cart retained indefinitely by default (or per policy — many e-commerce sites keep 90 days). Marketing systems may email reminders about abandoned carts. Soft expiry (mark abandoned after N days) for metrics; hard expiry rare.</p>
+<p><strong>Interviewer:</strong> Promotions in cart?</p>
+<p><strong>Candidate:</strong> Promo codes recorded on cart items or cart-level. At checkout, validated and applied (eligibility, expiry, redemption count). Cart total computed at checkout; cart-display shows estimated total. Promo expired between cart-add and checkout: surface; let user adjust.</p>
+<p><strong>Interviewer:</strong> Save for later?</p>
+<p><strong>Candidate:</strong> Separate list, same pattern. Moving between cart and save-for-later is a tombstone in one + add in the other. Same conflict resolution applies.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Dynamo-style always-writable cart store, keyed by user_id, replicated N ways. Vector clocks resolve concurrent writes; merge is set union with tombstones for deletes, max quantity for collisions. No inventory at cart-add; checked at checkout. Cart-to-order is a state machine with idempotency. Multi-region with user home. The hardest correctness problem is preserving every add while not resurrecting deletes; tombstones solve it.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: scale, multi-device, inventory timing, conflict.</li>
+<li>Invariant: never lose adds; deletes stay deleted.</li>
+<li>Dynamo-style always-writable store.</li>
+<li>Vector clock or CRDT for conflict resolution.</li>
+<li>Union merge with tombstones.</li>
+<li>No inventory at add; lazy check at checkout.</li>
+<li>Cart-to-order state machine with idempotency.</li>
+<li>Multi-region with user home.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Amazon's cart is the canonical Dynamo paper use case. Availability is paramount; concurrent updates from multiple devices merge via vector clocks with set-union semantics and tombstones. No inventory hold at cart-add; checked lazily at checkout. The hardest correctness issue is preserving every add without resurrecting deletes — tombstones handle it. Multi-region with user home.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Cart is always writable; concurrent updates merge as union with tombstones."</li>
+<li>"Set union preserves all adds; tombstones prevent delete resurrection."</li>
+<li>"No inventory at cart-add; checked lazily at checkout."</li>
+<li>"Vector clocks tell us when versions are concurrent; merge tells us how to combine."</li>
+<li>"This is the Dynamo paper's canonical example."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hadoop Distributed File System (HDFS / GFS) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Hadoop Distributed File System (HDFS / GFS)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a>. HDFS is the open-source reimplementation of Google File System (GFS); the design is essentially the same.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>HDFS / GFS is the canonical distributed file system for large data: petabyte-scale storage, batch read/write of large files, commodity hardware tolerance. The hard part is achieving durability and high throughput on cheap, failure-prone hardware while keeping the metadata service simple.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every file written to HDFS is stored as a sequence of blocks; each block is replicated across multiple datanodes (typically 3); reads can come from any replica; the namespace and block locations are tracked by a namenode; the system tolerates routine datanode failure without data loss.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can articulate the namenode/datanode split, block replication strategy, write pipelining, the original single-namenode bottleneck and how HA / federation address it, and the workload assumptions (append-mostly, large files).</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would describe HDFS as a namenode plus a fleet of datanodes. Files are split into large blocks (128 MB typical); each block is replicated to three datanodes across racks. The namenode owns the filesystem namespace and block-to-datanode mapping. Datanodes store and serve blocks. Writes pipeline through replicas. The design assumes append-mostly large-file workloads. The interesting decisions are block size, replication placement, the namenode bottleneck, and HA via standby namenode.</p>
+</blockquote>
+<h3 id="requirements-the-paper-sets">Requirements The Paper Sets</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Hierarchical filesystem namespace.</li>
+<li>Files are sequences of blocks; large files dominant.</li>
+<li>Read and append (no random write in original GFS / HDFS).</li>
+<li>High throughput batch reads/writes.</li>
+<li>Replication for durability.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Petabytes of data.</li>
+<li>Thousands of datanodes.</li>
+<li>Commodity hardware (frequent disk/server failures).</li>
+<li>High aggregate throughput.</li>
+<li>Simple coherence model.</li>
+</ul>
+<p>Out of scope of the original design:</p>
+<ul>
+<li>Low-latency small reads.</li>
+<li>Random in-place writes.</li>
+<li>POSIX compliance.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Files</td>
+<td>Millions to billions.</td>
+</tr>
+<tr>
+<td>Average file size</td>
+<td>Hundreds of MB to TBs.</td>
+</tr>
+<tr>
+<td>Block size</td>
+<td>64-128 MB (vs 4 KB on Unix).</td>
+</tr>
+<tr>
+<td>Replication</td>
+<td>3x typical.</td>
+</tr>
+<tr>
+<td>Datanodes</td>
+<td>Thousands.</td>
+</tr>
+<tr>
+<td>Disk capacity per node</td>
+<td>TBs each.</td>
+</tr>
+<tr>
+<td>Cluster capacity</td>
+<td>Petabytes.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="core-concepts">Core Concepts</h3>
+<h4 id="blocks">Blocks</h4>
+<p>A file is split into blocks of fixed size (default 128 MB in HDFS).</p>
+<ul>
+<li>Large block size reduces metadata pressure on namenode.</li>
+<li>Each block stored as a Unix file on a datanode's local disk.</li>
+<li>Blocks are first-class objects in HDFS.</li>
+<li>Replication factor specified per file (default 3).</li>
+</ul>
+<h4 id="namenode-master">Namenode (Master)</h4>
+<p>Single namenode (originally; HA later) holds the metadata:</p>
+<ul>
+<li>Namespace: directory tree, file metadata, permissions.</li>
+<li>Block-to-datanode mapping (constructed at startup from datanode heartbeats).</li>
+<li>Operations log (EditLog) and image of the namespace (FsImage).</li>
+</ul>
+<p>All metadata is in memory for speed. EditLog persists changes; FsImage is periodic checkpoint.</p>
+<p>Single namenode is a SPOF and a scale ceiling. HDFS HA via standby; HDFS Federation splits namespaces across multiple namenodes.</p>
+<h4 id="datanodes-workers">Datanodes (Workers)</h4>
+<p>Each datanode:</p>
+<ul>
+<li>Stores blocks on local disk (one file per block).</li>
+<li>Reports stored blocks to namenode periodically (block reports).</li>
+<li>Heartbeats to namenode regularly.</li>
+<li>Serves reads and writes from clients.</li>
+</ul>
+<h4 id="replication-placement">Replication Placement</h4>
+<p>For replication factor 3:
+- Replica 1: usually on the writer's local node (if datanode) or a random node.
+- Replica 2: on a different rack from replica 1.
+- Replica 3: on the same rack as replica 2 (different node).</p>
+<p>This balances:
+- Durability (rack failure tolerated).
+- Write bandwidth (one rack-crossing write).
+- Read locality (most blocks reachable in one rack).</p>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                Client
+                  |
+        +---------+----------+
+        |                    |
+        v                    v
+  Namenode              Datanodes
+  - namespace            - blocks
+  - block map            - heartbeat
+                         - block reports
+       Datanode pipeline for writes
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Namenode</td>
+<td>Filesystem namespace + block locations.</td>
+<td>Single (in original); HA via standby.</td>
+</tr>
+<tr>
+<td>Datanode</td>
+<td>Stores and serves blocks.</td>
+<td>Many; commodity hardware.</td>
+</tr>
+<tr>
+<td>Client</td>
+<td>File I/O API.</td>
+<td>Talks to namenode for metadata, datanodes for data.</td>
+</tr>
+<tr>
+<td>Secondary namenode</td>
+<td>Checkpoints FsImage from EditLog.</td>
+<td>Not a hot standby.</td>
+</tr>
+<tr>
+<td>Standby namenode (HA)</td>
+<td>Hot standby.</td>
+<td>Replays journal.</td>
+</tr>
+<tr>
+<td>JournalNodes (HA)</td>
+<td>Shared edit log across namenodes.</td>
+<td>Quorum-based.</td>
+</tr>
+<tr>
+<td>BlockScanner</td>
+<td>Verify block integrity.</td>
+<td>Periodic checksum.</td>
+</tr>
+<tr>
+<td>Rebalancer</td>
+<td>Move blocks to balance disk usage.</td>
+<td>Background.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="file-metadata">File Metadata</h4>
+<pre><code class="language-text">File(
+  path,
+  replication_factor,
+  block_size,
+  blocks: [block_id],
+  owner,
+  group,
+  permissions,
+  created_at,
+  modified_at,
+  size
+)
+</code></pre>
+<h4 id="block">Block</h4>
+<pre><code class="language-text">Block(
+  block_id,
+  size,
+  replicas: [datanode_id],
+  generation_stamp,        // increments on each write update
+  checksum
+)
+</code></pre>
+<h4 id="datanode-heartbeat">Datanode Heartbeat</h4>
+<pre><code class="language-text">Heartbeat(
+  datanode_id,
+  capacity,
+  used,
+  remaining,
+  recent_blocks_received,
+  recent_blocks_invalidated
+)
+</code></pre>
+<h3 id="write-path">Write Path</h3>
+<ol>
+<li>Client requests to create a file: <code>create(/path/to/file)</code>.</li>
+<li>Namenode creates file metadata, returns lease to client.</li>
+<li>Client writes data; buffered locally until a block-size chunk is ready.</li>
+<li>Client requests <code>addBlock</code> from namenode.</li>
+<li>Namenode picks 3 datanodes (per placement policy), returns to client.</li>
+<li>Client opens a pipeline: client → datanode 1 → datanode 2 → datanode 3.</li>
+<li>Data flows through the pipeline as small packets (~64 KB).</li>
+<li>Each datanode persists locally and forwards to next.</li>
+<li>Acks flow back through the pipeline.</li>
+<li>Once all three ack, block is committed.</li>
+<li>Repeat for subsequent blocks.</li>
+<li>On close: client tells namenode; namenode finalizes file.</li>
+</ol>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Writes pipeline through datanodes so we only consume one cross-rack bandwidth per replica trio. No central coordinator on the data path.</p>
+</blockquote>
+<h3 id="read-path">Read Path</h3>
+<ol>
+<li>Client opens file: namenode returns block IDs + replica locations.</li>
+<li>For each block, client picks the closest replica (rack-aware).</li>
+<li>Reads directly from that datanode.</li>
+<li>If datanode unreachable or block corrupt, try next replica.</li>
+</ol>
+<p>Reads bypass the namenode entirely after the initial metadata fetch.</p>
+<h3 id="append">Append</h3>
+<p>HDFS supports append after a file is closed: re-open in append mode; namenode grants lease; new data pipelined to the file's last block (or new block).</p>
+<p>Original GFS supports atomic record append: many writers can concurrently append; system serializes. HDFS append is single-writer.</p>
+<h3 id="replication-and-failure-handling">Replication And Failure Handling</h3>
+<p>Each datanode periodically heartbeats. Namenode flags a datanode dead if no heartbeat for ~10 minutes.</p>
+<p>On datanode death:
+- All blocks that datanode held are under-replicated.
+- Namenode schedules re-replication: pick another datanode, copy the block.
+- Targets per-block replication factor.</p>
+<p>Block integrity:
+- Datanode periodically scans blocks for checksum failures.
+- Bad blocks reported to namenode; namenode triggers re-replication.</p>
+<h3 id="namenode-ha">Namenode HA</h3>
+<p>Original single namenode is a SPOF.</p>
+<p>HDFS HA solution:
+- Active + standby namenodes.
+- Shared edit log via JournalNodes (Quorum-based).
+- Active writes to JournalNodes; standby reads and applies.
+- ZooKeeper or similar coordinates failover.
+- On active failure, standby promotes within seconds.</p>
+<h3 id="namenode-federation">Namenode Federation</h3>
+<p>Single namenode's memory caps the cluster scale (one entry per file + block).</p>
+<p>Federation:
+- Multiple namenodes, each owning a subset of the namespace.
+- Datanodes report to all namenodes.
+- Clients route requests to the right namenode based on path.
+- Linear namespace scaling.</p>
+<h3 id="secondary-namenode">Secondary Namenode</h3>
+<p>Despite the name, NOT a hot standby. It periodically merges EditLog into FsImage to keep checkpoint files small. Without it, EditLog grows unbounded, slowing startup.</p>
+<h3 id="rack-awareness">Rack Awareness</h3>
+<p>Datanodes are configured with rack info. The namenode uses rack info for:
+- Replica placement (across racks).
+- Read locality (prefer closer replicas).
+- Re-replication (avoid placing two replicas on same rack).</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Strategy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Namenode memory</td>
+<td>Larger block size (less metadata per byte stored); HDFS Federation.</td>
+</tr>
+<tr>
+<td>Datanode capacity</td>
+<td>Add more nodes; rebalancer redistributes.</td>
+</tr>
+<tr>
+<td>Network</td>
+<td>Pipeline writes; rack-aware placement.</td>
+</tr>
+<tr>
+<td>Hot file</td>
+<td>Increase replication; cache.</td>
+</tr>
+<tr>
+<td>Disk failure</td>
+<td>Re-replicate.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Namespace operations</td>
+<td>Strong (single namenode serializes)</td>
+</tr>
+<tr>
+<td>Block writes (during pipeline)</td>
+<td>Atomic per block — all 3 ack or fail</td>
+</tr>
+<tr>
+<td>Append</td>
+<td>Single writer; reads see committed data</td>
+</tr>
+<tr>
+<td>Reads</td>
+<td>See data as of last completed pipeline ack</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Datanode dies.</td>
+<td>Re-replicate from surviving replicas.</td>
+<td>Under-replicated block count.</td>
+</tr>
+<tr>
+<td>Disk failure.</td>
+<td>Block scanner detects; re-replicate.</td>
+<td>Bad block count.</td>
+</tr>
+<tr>
+<td>Network partition.</td>
+<td>Datanode marked dead; later re-discovered with stale blocks.</td>
+<td>Stale datanode count.</td>
+</tr>
+<tr>
+<td>Namenode dies (no HA).</td>
+<td>Cluster unavailable until restart.</td>
+<td>Namenode uptime.</td>
+</tr>
+<tr>
+<td>Namenode dies (HA).</td>
+<td>Standby promotes in seconds.</td>
+<td>Failover time.</td>
+</tr>
+<tr>
+<td>EditLog corruption.</td>
+<td>JournalNodes provide quorum-based safety.</td>
+<td>Journal node health.</td>
+</tr>
+<tr>
+<td>Slow datanode in pipeline.</td>
+<td>Pipeline blocks; client may retry.</td>
+<td>Slow write detection.</td>
+</tr>
+<tr>
+<td>Hot read.</td>
+<td>Cache; increase replication on the file.</td>
+<td>Per-file read rate.</td>
+</tr>
+<tr>
+<td>Block-report storm.</td>
+<td>Stagger; throttle.</td>
+<td>Block report rate.</td>
+</tr>
+<tr>
+<td>Imbalanced disk usage.</td>
+<td>Rebalancer.</td>
+<td>Disk usage spread.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Under-replicated blocks.</li>
+<li>Missing blocks (zero).</li>
+<li>Stale block reports.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Cluster used vs free.</li>
+<li>Per-datanode utilization.</li>
+<li>Namenode memory.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Files; total size.</li>
+<li>Read/write throughput.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Large block size reduces namenode load but wastes space for small files.</li>
+<li>Single namenode is simple but a SPOF/bottleneck; HA + federation fixes both.</li>
+<li>Append-only model simplifies coherence; random write would need locking.</li>
+<li>Cross-rack write costs bandwidth but provides rack-failure resilience.</li>
+<li>3x replication is durable but expensive; erasure coding offers space savings at compute cost.</li>
+<li>Strong consistency on namespace but eventual block-location knowledge.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Treating HDFS like a POSIX FS.</td>
+<td>Append-only; large files; no random writes.</td>
+</tr>
+<tr>
+<td>Many small files.</td>
+<td>Concatenate or use HAR/SequenceFile.</td>
+</tr>
+<tr>
+<td>Single namenode without HA.</td>
+<td>Standby namenode + JournalNodes.</td>
+</tr>
+<tr>
+<td>Random replica placement.</td>
+<td>Rack-aware.</td>
+</tr>
+<tr>
+<td>Single namespace forever.</td>
+<td>HDFS Federation as scale increases.</td>
+</tr>
+<tr>
+<td>No erasure coding for cold data.</td>
+<td>EC for cold tier; 3x for hot.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Block placement</td>
+<td>Rack-aware; 1+2+0 pattern.</td>
+</tr>
+<tr>
+<td>Write pipeline</td>
+<td>Sequential through replicas.</td>
+</tr>
+<tr>
+<td>Namenode HA</td>
+<td>Active/standby + JournalNodes + ZK.</td>
+</tr>
+<tr>
+<td>Federation</td>
+<td>Multiple namespaces; clients route.</td>
+</tr>
+<tr>
+<td>Small files problem</td>
+<td>Workarounds; HAR.</td>
+</tr>
+<tr>
+<td>Erasure coding</td>
+<td>Reed-Solomon for cold data.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Namenode + datanodes split.</li>
+<li>Large blocks (128 MB).</li>
+<li>Rack-aware 3x replication.</li>
+<li>Pipeline writes.</li>
+<li>Read from closest replica.</li>
+<li>Append-only.</li>
+<li>HA via standby + JournalNodes.</li>
+<li>Federation for scale.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>HDFS is a master + workers design: namenode owns the namespace and block map; datanodes store and serve blocks. Large blocks reduce namenode pressure. Rack-aware 3x replication balances durability with bandwidth. Writes pipeline through replicas. The append-only model keeps coherence simple. Single namenode is the historical SPOF; HA via standby fixes availability; federation fixes scale.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Describe HDFS.</p>
+<p><strong>Candidate:</strong> Master-slave design: namenode for metadata, datanodes for data. Files split into 128 MB blocks; each replicated 3x across racks. Namenode holds the namespace and block-to-datanode mapping in memory; datanodes heartbeat block reports periodically. Clients talk to namenode for metadata, then directly to datanodes for data. Writes pipeline through replicas. Reads come from closest replica. Append-only; designed for petabytes of large files on commodity hardware.</p>
+<p><strong>Interviewer:</strong> Walk me through a write.</p>
+<p><strong>Candidate:</strong> Client calls create on namenode; gets a lease. As the client fills a 128 MB block, it calls addBlock; namenode picks 3 datanodes (rack-aware: 1 local, 2 on a different rack). Client opens a pipeline — client → datanode 1 → datanode 2 → datanode 3. Data flows as small packets; each datanode persists locally and forwards. Acks flow back. Block committed once all 3 ack. Subsequent blocks repeat. Close finalizes the file with the namenode.</p>
+<p><strong>Interviewer:</strong> Block placement?</p>
+<p><strong>Candidate:</strong> Rack-aware. Replica 1 typically on the writer's local node (or random if writer isn't a datanode). Replica 2 on a different rack from replica 1. Replica 3 on the same rack as replica 2, different node. Balances durability (rack failure tolerated) with bandwidth (one cross-rack write) and read locality.</p>
+<p><strong>Interviewer:</strong> Why large blocks?</p>
+<p><strong>Candidate:</strong> Reduces namenode metadata. Namenode holds one entry per file + per block; with 4 KB blocks, namenode metadata explodes. With 128 MB blocks, a TB file is just 8000 blocks. Tradeoff: small files waste a block worth of metadata each. HDFS doesn't handle many small files well.</p>
+<p><strong>Interviewer:</strong> Namenode is a SPOF.</p>
+<p><strong>Candidate:</strong> Originally yes. HA solution: active + standby namenodes. Shared edit log via JournalNodes (Quorum-based — write to majority of journals before ack). Active writes EditLog entries to journals; standby reads them and replays. ZooKeeper or similar coordinates failover. On active failure, standby promotes within seconds.</p>
+<p><strong>Interviewer:</strong> Scaling namenode beyond memory.</p>
+<p><strong>Candidate:</strong> HDFS Federation. Split the namespace across multiple independent namenodes — e.g., <code>/user</code> on namenode 1, <code>/data</code> on namenode 2. Each namenode owns its subset; datanodes report to all namenodes. Clients route by path. Linear namespace scaling.</p>
+<p><strong>Interviewer:</strong> Read path.</p>
+<p><strong>Candidate:</strong> Client asks namenode for the file's block IDs and replica locations. For each block, client picks the closest replica (rack-aware), reads directly from that datanode. If unreachable or checksum fails, try next replica. The namenode is out of the data path entirely once metadata is fetched.</p>
+<p><strong>Interviewer:</strong> Datanode dies.</p>
+<p><strong>Candidate:</strong> Namenode flags it dead after missing heartbeats for ~10 minutes. All blocks on that datanode are now under-replicated. Namenode schedules re-replication: for each block, pick a healthy datanode, copy from a surviving replica. Continues until target replication factor restored. Background; doesn't block reads/writes.</p>
+<p><strong>Interviewer:</strong> Append?</p>
+<p><strong>Candidate:</strong> HDFS supports append after a file is closed: re-open in append mode; namenode grants a write lease; new data pipelined as if continuing the file. Single writer per file. Original GFS supports atomic record append — many concurrent appenders, system serializes — HDFS doesn't.</p>
+<p><strong>Interviewer:</strong> Small files problem.</p>
+<p><strong>Candidate:</strong> Each file + block takes namenode memory. Many small files explode the namenode metadata. Mitigations: HAR (Hadoop Archive) concatenates small files; SequenceFile or Avro container files store many records in one HDFS file; HBase as a layer above HDFS for many small records.</p>
+<p><strong>Interviewer:</strong> Erasure coding?</p>
+<p><strong>Candidate:</strong> Reed-Solomon style. Instead of 3x replication, encode each block into k+m chunks; tolerate m losses. E.g., 6+3 gives 1.5x overhead vs 3x. Used for cold data; hot data stays on 3x replication for read parallelism. Adds compute on writes (encoding) and reads (when reconstruction needed).</p>
+<p><strong>Interviewer:</strong> Block integrity.</p>
+<p><strong>Candidate:</strong> Each block has a checksum. Datanode's BlockScanner periodically reads blocks and verifies checksums. On corruption: report to namenode; trigger re-replication from another replica. Reads also verify checksums; on mismatch, try another replica.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Namenode (metadata) + datanodes (data). Large blocks reduce metadata. Rack-aware 3x replication. Pipeline writes. Read closest replica. Append-only. HA via standby + JournalNodes; federation for namespace scale. The strengths are scale, simplicity, and resilience to commodity hardware failure; the weaknesses are small files and the inherently single-writer model.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Namenode + datanodes.</li>
+<li>Large blocks (128 MB), 3x replication.</li>
+<li>Rack-aware placement.</li>
+<li>Pipeline writes; read closest replica.</li>
+<li>Append-only large files.</li>
+<li>Single namenode SPOF → HA via standby + journals.</li>
+<li>Federation for namespace scale.</li>
+<li>Small files problem; erasure coding for cold.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>HDFS is master + workers: namenode holds metadata, datanodes hold data. Large blocks (128 MB) and 3x rack-aware replication. Writes pipeline through replicas. Reads bypass namenode. Append-only model. Original namenode SPOF resolved by HA (standby + JournalNodes); namespace scale resolved by federation. The strengths are scale on commodity hardware and resilience to disk failure; the weaknesses are small files and lack of random writes.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Large blocks shrink namenode metadata; the tradeoff is small-file waste."</li>
+<li>"Rack-aware replication: durability across racks with one cross-rack write."</li>
+<li>"Writes pipeline through replicas; reads bypass the namenode."</li>
+<li>"HA via standby + JournalNodes; federation for namespace scale."</li>
+<li>"Append-only model is the simplifying assumption."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Facebook Live Comments — Live-Stream Chat Fan-Out (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Facebook Live Comments — Live-Stream Chat Fan-Out (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Medium · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build the live-comment system for a Facebook (FB) Live broadcast or Twitch-style stream. One streamer broadcasts, millions of viewers watch, and viewers post comments that everyone sees in near real-time. A popular live event has 1M concurrent viewers and 5k comments/sec; comments must appear within ~1 s.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Viewers post comments on a live stream.
+- All viewers see new comments within ~1 s, in roughly the order posted.
+- New viewers joining see the last few hundred comments as backfill.</p>
+<p>I'd defer reactions, polls, monetization, and moderator tools.</p>
+<p><strong>Non-functional</strong>
+- p95 comment-post-to-display &lt; 1 s.
+- Survive 1M+ concurrent connections per stream; many streams concurrent overall.
+- Eventual ordering is fine — strict global order across all viewers is not required.
+- Loss tolerance: dropping the rare comment is acceptable; failing to deliver any comment for 10 s is not.
+- Backpressure: when comments outpace fan-out, drop oldest rather than melt the system.</p>
+<p><strong>Capacity</strong>
+- A mega-stream: 1M viewers × 1 comment/min = 17k comments/sec write; read fan-out 1M × 5k = 5B msg/sec — unrealistic to send every comment to every viewer at high volume, see deep dives.
+- The system must cap displayed comments per viewer. If each viewer receives 5 batched updates/sec and each batch is ~2 KB, that is still ~10 GB/sec egress for one mega-stream.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Stream</strong> — <code>stream_id</code>, broadcaster, started_at, status.</li>
+<li><strong>Comment</strong> — <code>comment_id</code>, stream_id, user_id, text, ts.</li>
+<li><strong>Viewer connection</strong> — <code>connection_id</code>, stream_id, user_id.</li>
+</ul>
+<hr />
+<h2 id="3-api-protocol-5-min">3. API / Protocol (~5 min)</h2>
+<pre><code>WS  /v1/streams/{id}/comments
+  ← client sends:  { post: text }   (idempotency-key)
+  → server pushes: { comment }      (batched)
+
+HTTP:
+GET /v1/streams/{id}/comments/recent?limit=200    → backfill for join
+</code></pre>
+<p>User from token; rate-limit per user per stream.</p>
+<p>The WS connection carries a server-side cursor <code>{stream_id, last_comment_id, sample_policy}</code>. On reconnect, the client asks for recent comments after <code>last_comment_id</code>, then resumes live push.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Edge WS gateway.</strong> Holds the millions of viewer connections. Per-stream sharding: hash(stream_id) → set of edge gateways.</li>
+<li><strong>Comment ingestion.</strong> Comment hits any edge gateway → forwarded to the <strong>stream owner shard</strong> (the partition responsible for this stream) → ingestion service assigns server timestamp + comment_id, writes to persistent log (Kafka topic per stream or sharded by stream).</li>
+<li><strong>Fan-out tier.</strong> Each stream's comment topic is consumed by a fan-out service that pushes to all edge gateways holding viewers for that stream. Edge gateways then push to the local WS connections.</li>
+<li><strong>Persistent store.</strong> Append-only — Cassandra keyed by <code>(stream_id, ts)</code> or just the Kafka topic with long retention. Drives backfill and replay.</li>
+<li><strong>Backfill.</strong> When a viewer joins, edge gateway gives them the last ~200 comments via a separate HTTP call before opening the WS push.</li>
+<li><strong>Rate-limit / spam pipeline.</strong> Per-user token bucket on post. Profanity / blocklist filter pre-broadcast. Moderator actions go through the same pipeline.</li>
+</ol>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code>+-----------------------------+
+| VIEWER / COMMENTER CLIENTS  |
++-------------+---------------+
+        |
+        +-- GET /comments/recent
+        |   WS /streams/{id}
+        |        |
+        |        v
+        |   +----------------+
+        |   | Edge WS        |
+        |   | Gateways       |
+        |   +---+--------^---+
+        |       |        |
+        |       |        +-- batches from Fan-out Tier
+        |       v
+        |   +----------------+
+        |   | Registry       |
+        |   | stream_edges   |
+        |   | TTL 30s        |
+        |   +----------------+
+        |
+        +-- POST /comments
+       |
+       v
+  +----------------+
+  | Comment Ingest |
+  | owner shard    |
+  +-------+--------+
+    |
+    v
+  +----------------+
+  | Rate/Spam Svc  |
+  | moderation     |
+  +-------+--------+
+    |
+    | publish after validation
+    v
+  +----------------+
+  | Kafka/Pulsar   |
+  | comments_live  |
+  | key=stream_id  |
+  +-------+--------+
+    |
+    | consume by stream_id
+    v
+  +----------------+
+  | Fan-out Tier   |
+  | per region/AZ  |
+  +-------+--------+
+    |
+    +--&gt; Edge WS Gateways
+
++--------------------------------------------------------------------------+
+| Stores / Caches                                                          |
+| Redis: recent:{stream_id} LIST last 200-1000 comments                    |
+| Redis: stream_edges:{stream_id} SET edge_ids, heartbeat TTL 30s          |
+| Redis: rl:{stream_id}:{user_id} token bucket                             |
+| CommentStore: (stream_id,comment_id)-&gt;comment row                        |
+| Gateway local ring: last N batches per connection                        |
++-------------------------------+------------------------------------------+
+        | recent miss / reconnect outside cache
+        v
+           +------------------+
+           | Comment Store    |
+           | durable backfill |
+           +------------------+
+</code></pre>
+<p>End-to-end narration: Alice is watching → her phone has a WS to edge gateway G1 for stream S → Bob posts "🔥🔥🔥" → his edge gateway G3 forwards to stream owner shard for S → ingestion stamps it with <code>ts=…</code>, comment_id=C99 → publishes to Kafka topic <code>stream.S.comments</code> → fan-out service consumes, pushes to G1, G2, G3 (every gateway holding S viewers) → each gateway broadcasts to its local WS connections → within 500 ms Alice sees Bob's comment.</p>
+<p>Concrete stores and state:</p>
+<table>
+<thead>
+<tr>
+<th>Store / state</th>
+<th>Key pattern</th>
+<th>Value / data structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Live topic</td>
+<td><code>comments_live[{partition}]</code></td>
+<td>append-only comment event</td>
+<td style="text-align: right;">~200 B</td>
+<td>hours-7 days</td>
+<td><code>stream_id</code></td>
+</tr>
+<tr>
+<td>Comment store</td>
+<td><code>(stream_id, comment_id)</code></td>
+<td>text, user, timestamp, flags</td>
+<td style="text-align: right;">~300 B</td>
+<td>30-90 days</td>
+<td><code>stream_id</code></td>
+</tr>
+<tr>
+<td>Recent backfill</td>
+<td><code>recent:{stream_id}</code></td>
+<td>Redis LIST last 200-1000 comments</td>
+<td style="text-align: right;">~300 B/item</td>
+<td>stream lifetime + 1 h</td>
+<td><code>stream_id</code></td>
+</tr>
+<tr>
+<td>Connection registry</td>
+<td><code>stream_edges:{stream_id}</code></td>
+<td>set of edge gateway IDs</td>
+<td style="text-align: right;">~16 B/edge</td>
+<td>heartbeat TTL 10-30 s</td>
+<td><code>stream_id</code></td>
+</tr>
+<tr>
+<td>Per-connection buffer</td>
+<td>gateway-local</td>
+<td>ring buffer last N batches</td>
+<td style="text-align: right;">~100 KB/conn cap</td>
+<td>connection lifetime</td>
+<td>gateway-local</td>
+</tr>
+<tr>
+<td>Rate limit</td>
+<td><code>rl:{stream_id}:{user_id}</code></td>
+<td>token bucket</td>
+<td style="text-align: right;">~32 B</td>
+<td>stream lifetime</td>
+<td><code>user_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>Post path:</p>
+<ol>
+<li>Edge gateway validates auth, rate limit, and message size.</li>
+<li>It forwards to the stream owner shard keyed by <code>stream_id</code>, which assigns <code>comment_id = (stream_epoch, sequence)</code>.</li>
+<li>Ingest writes Kafka and recent-backfill Redis in parallel after moderation passes.</li>
+<li>Fan-out workers consume the stream partition and push batches to all edge gateways in <code>stream_edges:{stream_id}</code>.</li>
+<li>Each gateway writes to local WS ring buffers; slow clients drop old batches and keep the newest.</li>
+</ol>
+<p>Join/read path:</p>
+<ol>
+<li>Viewer calls <code>GET /comments/recent?limit=200</code>; edge first reads <code>recent:{stream_id}</code> from Redis.</li>
+<li>On Redis miss, edge falls back to <code>CommentStore[(stream_id, comment_id DESC)]</code>, over-fetches 300, filters deleted/moderated comments, and repopulates Redis.</li>
+<li>Viewer opens WS with <code>{stream_id, last_comment_id}</code>; gateway registers itself in <code>stream_edges:{stream_id}:{region}</code> with a 10-30 s heartbeat TTL.</li>
+<li>Live batches arrive from fan-out; gateway dedupes against <code>last_comment_id</code>, appends to the per-connection ring buffer, and advances the server-side cursor.</li>
+<li>On reconnect, the cursor asks for comments after <code>last_comment_id</code>; if the id is older than retention, the server returns <code>lossy_resume</code> plus the newest 200 comments.</li>
+</ol>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Fan-out at million-viewer scale.</strong> Single broker pushing to 1M connections falls over. Hierarchical fan-out: one broker per region/AZ; each broker holds a chunk of viewers (say 10k each); a Kafka topic with N partitions feeds N brokers. Brokers don't broadcast individual comments — they batch and broadcast every 200 ms with the accumulated comments. Trade off freshness for throughput.</p>
+<p>Capacity math: 17k comments/sec × 200 B is only ~3.4 MB/sec into Kafka for the mega-stream; fan-out is the monster. Sending every comment to 1M viewers would be 17B deliveries/sec. Capping each viewer to 5 batches/sec × 2 KB makes egress ~10 GB/sec, still large but feasible with regional edge gateways. Dominant cost is network fan-out and open connection memory, not comment storage.</p>
+<p>Store math for one sustained mega-stream: live-topic writes are ~3.4 MB/sec raw, ~900 GB/day with RF=3, so 7-day replay is ~6 TB. Durable comments at ~300 B/comment are ~440 GB/day raw, ~1.3 TB/day with RF=3; most streams are short, so retention policy matters more than peak size. <code>recent:{stream_id}</code> is tiny: 1,000 comments × 300 B is ~300 KB per stream, or ~30 GB raw for 100k active streams. Connection memory is the sharp edge: 1M viewers × a 100 KB ring cap is 100 GB spread across gateways, so the ring buffer must be bounded and batch objects should be shared per stream on each gateway instead of copied per connection. Rate-limit state for 1M active commenters is only ~32 MB.</p>
+<p><strong>Why Kafka, not Redis Pub/Sub.</strong> Redis Pub/Sub is fast but not replayable and makes backfill/reconnect awkward. Kafka/Pulsar give ordered partitions and replay from offsets. Cassandra is fine for <code>(stream_id, comment_id)</code> backfill because reads are recent range scans; MySQL would need heavy sharding for hot streams.</p>
+<p>Be ready for "why not push directly from Kafka to every gateway?" The answer is that Kafka is the durable stream, not the per-connection delivery system. A fan-out tier can batch, sample, prioritize streamer/mod lanes, and apply regional backpressure without turning Kafka partitions into connection managers.</p>
+<p><strong>Lossy delivery is OK.</strong> If a viewer's WS can't keep up, drop oldest comments rather than buffer. The newest 100 are what matters in a live stream. Per-connection ring buffer with a tail-drop policy.</p>
+<p><strong>Ordering.</strong> Strict per-stream order is impossible at multi-million scale without serializing through one machine. Approximate: ingestion assigns a server timestamp per comment, fan-out brokers batch in timestamp order. Clients display in arrival order with timestamps — small reorderings are visually fine. Don't promise totally-ordered.</p>
+<p><strong>Backpressure on hot streams.</strong> When comment rate exceeds display rate, sample. Show 1 in 5 comments to viewers (random sampling); show all to moderators. Mention "Twitch chat slow mode" as a precedent.</p>
+<p><strong>Two views of comments.</strong> The durable log <code>(stream_id, comment_id)</code> is the truth for replay, moderation, and post-stream archive. The recent Redis list <code>recent:{stream_id}</code> is the read-optimized window for joins and reconnects. The live fan-out batches are a third, lossy delivery view derived from the same log; losing a batch affects one viewer's experience but not the canonical comment record.</p>
+<p>Hot-stream degradation:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Viewer effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>normal</td>
+<td>full batch</td>
+<td>all comments in 200 ms batches</td>
+<td>near-complete chat</td>
+</tr>
+<tr>
+<td>hot</td>
+<td>sampled batch</td>
+<td>random/sample by score</td>
+<td>representative chat</td>
+</tr>
+<tr>
+<td>hotter</td>
+<td>slow mode</td>
+<td>per-user post bucket tightened</td>
+<td>fewer writes</td>
+</tr>
+<tr>
+<td>extreme</td>
+<td>priority lanes</td>
+<td>streamer/VIP/mod comments full fidelity; public sampled</td>
+<td>important comments survive</td>
+</tr>
+<tr>
+<td>edge slow</td>
+<td>tail drop</td>
+<td>per-connection ring buffer drops oldest</td>
+<td>latest chat remains live</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Backfill on join.</strong> Last 200 comments from Cassandra (keyed by stream_id) before WS opens. After WS opens, edge gateway begins live push, deduping any overlap by comment_id.</p>
+<p>Reconnect path: HTTP fetch <code>recent:{stream_id}</code> or Cassandra range where <code>comment_id &gt; last_seen</code>; WS opens only after the client has a new cursor. If the cursor is older than retention, return the last 200 and mark the stream as <code>lossy_resume</code>.</p>
+<p><strong>Hot streamer / VIP comments.</strong> Streamer's own comments and pinned messages are pushed at full fidelity regardless of sampling. Implemented as a separate channel viewers subscribe to.</p>
+<p><strong>Persistence.</strong> Kafka topic per popular stream with 7-day retention. For long tail, a single Kafka cluster handles many streams partitioned. Cold storage in object store after 7 days for compliance / replays.</p>
+<p><strong>Latency budget.</strong> Post→display 1 s budget: client→edge 50 ms, edge→shard 50 ms, ingest write 20 ms, fan-out batch window 200 ms, broker→edge 50 ms, edge→clients batched 200 ms. Fits.</p>
+<p><strong>Connection scaling.</strong> 1M concurrent WS connections on commodity gateways: ~50k-100k per box; ~20 gateway boxes per stream-region. Tuning kernel limits (file descriptors, ephemeral ports) is real work in practice.</p>
+<p><strong>Hot keys, regions, and cold starts.</strong> A mega-stream makes <code>stream_id</code> a hot key, so split <code>stream_edges:{stream_id}</code> by region and maybe by gateway bucket: <code>stream_edges:{stream_id}:{region}:{bucket}</code>. If one owner shard cannot stamp 17k comments/sec, split ingestion into lanes keyed by <code>(stream_id, lane)</code> and generate <code>comment_id = timestamp + lane + sequence</code>; clients display by timestamp and tolerate tiny reorderings. Regional viewers should receive local fan-out first; cross-region replication of comments can lag a few hundred milliseconds, which is acceptable for public chat but not for moderator deletes, so moderation/control events use a priority lane. At stream start, pre-create the live topic partitions, recent list, and edge registry entry when the broadcaster goes live; do not wait for the first million viewers to trigger cold allocation.</p>
+<p><strong>Moderation.</strong> Streamer-side block list + ML toxicity score. Flagged comments hidden from public broadcast but visible to mods.</p>
+<p><strong>What I'd defer.</strong> Reactions/emote bursts, super-chats / paid pins, multi-language translation, real-time analytics, persistent post-stream comment archive UI.</p>
+<p><strong>Interview punch line:</strong> comment writes are easy; fan-out is the product. I would design the system around bounded per-viewer delivery and make degradation intentional: sample public chat, never drop streamer/mod messages, and keep the stream feeling live.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

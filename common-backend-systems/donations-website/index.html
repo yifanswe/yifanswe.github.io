@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Donations Website — GoFundMe Style (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Donations Website — GoFundMe Style (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Easy · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build a donations site. Organizers create campaigns with a goal. Donors browse, contribute money, and a live progress bar updates. Spikes happen — a viral disaster campaign can attract 10k donations in an hour. Steady-state low, viral peaks the design driver.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Organizer creates a campaign: title, story, goal amount.
+- Donors view campaign, contribute via card.
+- Campaign page shows live total + recent donor list.</p>
+<p>I'd defer organizer payouts, identity verification, and refunds.</p>
+<p><strong>Non-functional</strong>
+- Correctness on money is the headline — no double-charge, no lost donations.
+- Campaign page p99 &lt; 500 ms even during virality (10k concurrent viewers).
+- Strong consistency on amount-raised counter.
+- Eventual consistency fine for the "recent donors" list (within a few seconds).</p>
+<p><strong>Capacity</strong>
+- Baseline: 10k active campaigns, 1k donations/day.
+- Viral campaign: 10k donations in an hour → ~3/sec on a single campaign, 100k viewers concurrent.
+- The read spike is the real scale driver: 100k viewers polling every 2 s is 50k live-widget QPS for one campaign. Cache the live block aggressively, but keep the money ledger strongly consistent.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Campaign</strong> — <code>campaign_id, organizer_id, title, story, goal_amount, raised_amount, status</code>.</li>
+<li><strong>Donation</strong> — <code>donation_id, campaign_id, donor_id, amount, message, anonymous, status</code>.</li>
+<li><strong>Payment</strong> — handled by a payment gateway (Stripe). We hold the reference.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST  /v1/campaigns             { title, story, goal }       → { campaign_id }
+GET   /v1/campaigns/{id}        → { campaign, recent_donations[] }
+POST  /v1/campaigns/{id}/donations    { amount, payment_method, anonymous? }    (Idempotency-Key)   → { donation_id, status }
+GET   /v1/campaigns/{id}/donations?cursor=...
+</code></pre>
+<p>User from token. Idempotency-Key required on donation.</p>
+<p>Donation responses are safe to retry because the idempotency key maps to a persisted donation attempt: <code>{donor_id, idempotency_key} -&gt; donation_id, status, gateway_charge_id}</code>.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Campaign service.</strong> CRUD on campaigns. Sharded MySQL by <code>campaign_id</code>.</li>
+<li><strong>Donation service.</strong> Receives donation request, creates <code>donation</code> row (status=<code>pending</code>), invokes payment gateway, on success transitions to <code>succeeded</code> and atomically increments the campaign's <code>raised_amount</code>.</li>
+<li><strong>Payment gateway integration.</strong> Stripe (or similar). We don't store PAN; we use Stripe tokens. Idempotency keys passed through.</li>
+<li><strong>Live counter.</strong> <code>raised_amount</code> cached in Redis with write-through from the donation service. Campaign page reads the cached value plus recent donations.</li>
+<li><strong>Recent donors list.</strong> Append-only per campaign — Redis list of last 50 donors, evicted to MySQL on overflow.</li>
+<li><strong>Campaign page.</strong> CDN-cacheable for static parts (story, images). Dynamic parts (total raised, recent donors) served from a tiny API call that hits Redis.</li>
+</ol>
+<p>End-to-end narration: Donor opens campaign page → static content from CDN; AJAX call to <code>/campaigns/123/live</code> → Redis returns <code>{raised: 47600, recent: [...]}</code> → progress bar renders. Donor donates $50 → API call (Idempotency-Key) → donation row created (pending) → Stripe charge succeeds → atomic update: campaign.raised += 50, donation.status = succeeded, recent list prepended → next page poll sees the new total.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">                +-------------------------------+
+                | CLIENTS                       |
+                | donor browser / organizer UI  |
+                +------+-----------+------------+
+                    |           |
+     GET /v1/campaigns/{id}  |           | POST /v1/campaigns/{id}/donations
+     GET /campaigns/{id}/live|           | Idempotency-Key
+                    |           |
+                    v           v
+    +----------------+  +----------------+  +------------------+
+    | CDN / Object   |  | Live API       |  | Donation Service |
+    | Storage static |  | campaign block |  | payment intent   |
+    +--------+-------+  +-------+--------+  +--------+---------+
+          |                  |                    |
+          |                  |                    v
+          |                  |          +-------------------+
+          |                  |          | Stripe API        |
+          |                  |          | idempotent charge |
+          |                  |          +---------+---------+
+          |                  |                    |
+          v                  v                    v
+    +-----------------------------------------------------------+
+    | STORE / CACHE GROUP                                      |
+    | Redis campaign_live:{campaign_id} raised/goal/status     |
+    | Redis recent_donors:{campaign_id} LIST last 50 snippets  |
+    | MySQL campaign_id row, donation_id row, ledger_entry_id   |
+    | MySQL unique idem:{donor_id}:{key}, donor page index      |
+    +------------------------+----------------------------------+
+                    ^
+                    | Redis miss / cold start
+                    | MySQL campaign + donation index
+                    | rebuilds Redis 1-5 s TTL
+                    |
+    +------------------------+-------------------+
+    | ASYNC / EVENT ROW                          |
+    | Stripe webhooks + sweeper repair pending   |
+    | donations; fraud checks observe ledger     |
+    +--------------------------------------------+
+</code></pre>
+<p>Donation write path:</p>
+<ol>
+<li>API gateway authenticates donor and checks <code>(donor_id, idempotency_key)</code> in MySQL.</li>
+<li>Donation service inserts <code>donation(status=pending)</code> and a ledger intent row in the same transaction.</li>
+<li>It calls Stripe with the same idempotency key; Stripe may return success, failure, or timeout.</li>
+<li>On success, a DB transaction marks donation <code>succeeded</code>, inserts immutable ledger credit, and increments <code>campaign.raised_amount</code>.</li>
+<li>After commit, it updates Redis <code>campaign_live:{campaign_id}</code> and <code>recent_donors:{campaign_id}</code>; if Redis fails, the DB remains correct and the cache is rebuilt on next read.</li>
+</ol>
+<p>Campaign live read path:</p>
+<ol>
+<li>Browser loads static campaign HTML/images from CDN using <code>campaign_id</code> as the cache key.</li>
+<li>It calls <code>/v1/campaigns/{id}/live</code>; the service reads Redis <code>campaign_live:{campaign_id}</code> and <code>recent_donors:{campaign_id}</code> in parallel.</li>
+<li>On cache miss, it reads MySQL campaign row by <code>campaign_id</code>, reads the most recent successful donations from the donation index, rebuilds Redis with a 1-5 s TTL, and returns.</li>
+<li>Cursor for donor pagination is <code>{campaign_id, last_created_at, last_donation_id}</code> rather than offset, so new donations do not shift page boundaries.</li>
+<li>If Redis is down during a viral event, the service serves a CDN/edge-cached live block for 1-2 s or falls back to MySQL with aggressive request coalescing per campaign.</li>
+</ol>
+<pre><code class="language-text">Donate:  Client -&gt; Donation Service -&gt; MySQL donation pending -&gt; Stripe
+                                      -&gt; MySQL ledger + raised_amount commit
+                                      -&gt; Redis live cache + recent donors
+
+Read:    Browser -&gt; CDN static page
+                 -&gt; Live API -&gt; Redis live/recent -&gt; MySQL rebuild on miss
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Counter consistency under spike.</strong> On viral campaigns, donations come in fast. The campaign row becomes a hot row. Two options:
+- <strong>Single-row CAS update:</strong> <code>UPDATE campaigns SET raised = raised + 50 WHERE id = X</code>. Fine up to a few hundred QPS on one row.
+- <strong>Sharded counter:</strong> N counter rows; sum on read. Scales further. For donations volumes (&lt; 100/sec even for the hottest), the simpler single-row CAS is enough; mention sharded as the scale-out.</p>
+<p>Concrete stores:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key pattern</th>
+<th>Value / data structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Campaign DB</td>
+<td><code>campaign_id</code></td>
+<td>campaign row + raised_amount</td>
+<td style="text-align: right;">~2 KB</td>
+<td>forever</td>
+<td><code>campaign_id</code></td>
+</tr>
+<tr>
+<td>Donation DB</td>
+<td><code>donation_id</code>; unique <code>(donor_id, idem_key)</code></td>
+<td>donation status row</td>
+<td style="text-align: right;">~1 KB</td>
+<td>forever / audit</td>
+<td><code>campaign_id</code> or <code>donor_id</code> by query need</td>
+</tr>
+<tr>
+<td>Ledger DB</td>
+<td><code>ledger_entry_id</code></td>
+<td>immutable debit/credit entries</td>
+<td style="text-align: right;">~200 B</td>
+<td>forever</td>
+<td><code>campaign_id</code></td>
+</tr>
+<tr>
+<td>Live cache</td>
+<td><code>campaign_live:{campaign_id}</code></td>
+<td>raised amount, goal, status</td>
+<td style="text-align: right;">~200 B</td>
+<td>1-5 s TTL, write-through</td>
+<td><code>campaign_id</code></td>
+</tr>
+<tr>
+<td>Recent donors</td>
+<td><code>recent_donors:{campaign_id}</code></td>
+<td>Redis LIST last 50 donor snippets</td>
+<td style="text-align: right;">~150 B/item</td>
+<td>1 h or refreshed</td>
+<td><code>campaign_id</code></td>
+</tr>
+<tr>
+<td>Donor page index</td>
+<td><code>(campaign_id, created_at, donation_id)</code></td>
+<td>successful donation IDs</td>
+<td style="text-align: right;">~40 B/index entry</td>
+<td>forever</td>
+<td><code>campaign_id</code></td>
+</tr>
+<tr>
+<td>Idempotency</td>
+<td><code>idem:{donor_id}:{key}</code></td>
+<td>donation_id, status, gateway_charge_id</td>
+<td style="text-align: right;">~200 B</td>
+<td>24 h+</td>
+<td><code>donor_id</code></td>
+</tr>
+<tr>
+<td>Webhook queue</td>
+<td><code>stripe_webhook:{event_id}</code></td>
+<td>durable event payload</td>
+<td style="text-align: right;">~1 KB</td>
+<td>30 days</td>
+<td><code>event_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>Capacity math: 1M donations/day at ~1 KB donation row + 200 B ledger row + 40 B donor index entry ~= 1.24 GB/day before indexes and replicas, tiny compared with media/story assets. Idempotency at 1M/day x 200 B is only hundreds of MB/day with TTL. The viral read cache is the hot path: 50k QPS hitting a 200 B Redis value is easy; 50k QPS hitting MySQL is self-inflicted pain. Recent donors for 10k active campaigns x 50 x 150 B ~= 75 MB before Redis overhead. Dominant correctness cost is operational, not storage: reconciling Stripe, ledger, and campaign totals.</p>
+<p>There are two views of donations. The immutable ledger is the money truth, keyed by <code>ledger_entry_id</code> and campaign. The campaign page is a serving view: <code>campaign.raised_amount</code>, <code>campaign_live:{campaign_id}</code>, and <code>recent_donors:{campaign_id}</code>. If the serving view is stale, rebuild it from the ledger/donation rows; never rebuild the ledger from the progress bar.</p>
+<p><strong>Idempotency.</strong> Donation submission idempotent on <code>(donor, key)</code>. Critical because slow networks during checkout cause retries. Cached response prevents double-charge.</p>
+<p><strong>Payment integration.</strong> We hand off the card to Stripe Elements (client-side), get a token, then call our API with <code>{token, amount}</code>. We never touch PAN — PCI scope minimized.</p>
+<p><strong>Why MySQL + Stripe + Redis.</strong> MySQL is the right default for money because we need transactions, unique idempotency constraints, and audit queries. A distributed NoSQL counter would scale writes but make reconciliation harder. Stripe owns card handling and idempotent charging; building a processor is out of scope and changes the compliance problem. Redis is only a serving cache for the campaign page, never the source of truth for money.</p>
+<p><strong>Failure between charge and ledger update.</strong> Stripe says "charged"; our DB update fails. Two paths:
+- Webhook from Stripe confirms; our reconciliation handler retries the ledger update.
+- Polling sweeper looks for <code>pending</code> donations older than 5 min, queries Stripe, transitions correctly.</p>
+<p>Donation state machine:</p>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Source of truth</th>
+<th>Transition</th>
+<th>User-visible result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>pending</code></td>
+<td>donation row</td>
+<td>request accepted, Stripe call in flight</td>
+<td>spinner / pending receipt</td>
+</tr>
+<tr>
+<td><code>succeeded_unposted</code></td>
+<td>Stripe charge</td>
+<td>DB update failed after charge</td>
+<td>hidden; webhook/sweeper repairs</td>
+</tr>
+<tr>
+<td><code>succeeded</code></td>
+<td>ledger + donation row</td>
+<td>ledger committed, counter incremented</td>
+<td>thank-you + progress update</td>
+</tr>
+<tr>
+<td><code>failed</code></td>
+<td>Stripe response</td>
+<td>card declined / fraud reject</td>
+<td>no counter change</td>
+</tr>
+<tr>
+<td><code>refunded</code></td>
+<td>ledger reversal</td>
+<td>refund committed</td>
+<td>raised amount decremented</td>
+</tr>
+</tbody>
+</table>
+<p>Live-page degradation state:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>User-visible behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>normal</td>
+<td>fresh live block</td>
+<td>Redis <code>campaign_live</code> + <code>recent_donors</code></td>
+<td>progress updates within seconds</td>
+</tr>
+<tr>
+<td>cache miss</td>
+<td>rebuild</td>
+<td>MySQL campaign + donation index</td>
+<td>one slower request, then refill</td>
+</tr>
+<tr>
+<td>viral spike</td>
+<td>edge coalescing</td>
+<td>CDN caches live JSON for 1-2 s</td>
+<td>many viewers share one origin read</td>
+</tr>
+<tr>
+<td>Redis down</td>
+<td>DB-safe fallback</td>
+<td>MySQL raised amount, recent list may hide</td>
+<td>progress lags, donations still accepted</td>
+</tr>
+<tr>
+<td>payment drift</td>
+<td>reconciliation</td>
+<td>Stripe webhook/sweeper -&gt; ledger repair</td>
+<td>user receipt may show pending</td>
+</tr>
+</tbody>
+</table>
+<p>For a viral campaign, if Redis is exhausted, serve the campaign story from CDN and show the last committed total from MySQL with a short "updating" state. Never accept a donation without an idempotency key, and never trust the cache for money.</p>
+<p>Edge stress tests:</p>
+<table>
+<thead>
+<tr>
+<th>Edge</th>
+<th>Design response</th>
+<th>Budget</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot campaign read storm</td>
+<td>CDN static page + 1-2 s cached live block + Redis origin</td>
+<td>campaign page p99 &lt;500 ms</td>
+</tr>
+<tr>
+<td>Burst donations on one campaign</td>
+<td>single-row increment is fine to ~hundreds/sec; switch to sharded counter rows if needed</td>
+<td>no lost increments</td>
+</tr>
+<tr>
+<td>Donor retries after timeout</td>
+<td>unique <code>(donor_id, idempotency_key)</code> returns same donation/gateway charge</td>
+<td>no double charge</td>
+</tr>
+<tr>
+<td>Cursor exhausts recent list</td>
+<td>donor pagination falls through to MySQL index <code>(campaign_id, created_at, donation_id)</code></td>
+<td>stable order</td>
+</tr>
+<tr>
+<td>Multi-region drift</td>
+<td>payments and ledger writes route to campaign home region; read replicas serve campaign page</td>
+<td>money ordered in one region</td>
+</tr>
+<tr>
+<td>Cold start after cache flush</td>
+<td>request coalescing lets one rebuild populate Redis while others serve stale edge JSON</td>
+<td>avoid DB stampede</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Interview punch line:</strong> the live page is a cached projection of the ledger, not a participant in the money transaction.</p>
+<p><strong>Recent donors list.</strong> Per-campaign Redis list (LPUSH + LTRIM to 50). Reads from Redis are sub-millisecond. Anonymous donors show as "Anonymous" with amount.</p>
+<p><strong>Campaign page caching.</strong> Static story rendered as HTML and CDN-cached (5 min TTL, purged on edit). Dynamic block (counter + recent) loaded via JS — cached for 1–2 s at CDN edge to absorb viral spikes.</p>
+<p><strong>Fraud and abuse.</strong> Heuristics: stolen-card velocity, donation-then-refund patterns, organizer-self-donation. Webhook listeners watch for chargebacks; surface to ops.</p>
+<p><strong>Refunds.</strong> Stripe Refund API + reverse the <code>raised_amount</code> increment. Done synchronously in the donation service; donation row status → <code>refunded</code>.</p>
+<p><strong>What I'd defer.</strong> Organizer KYC and payouts, currency conversion, comment moderation, recommendation of "campaigns like this."</p>
+<p><strong>Interview punch line:</strong> treat donations as a ledger first and a live counter second. The progress bar can lag by a second; a double charge or missing ledger entry is the real failure.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design a Payment System — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design a Payment System</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A payment system moves money. Every bug is a regulator complaint, a chargeback, or a missing dollar that some accountant has to find. The hard part is not throughput; it is correctness over the lifetime of every transaction across many external systems that may time out, return ambiguous responses, or change state without telling you.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>For every payment intent, the system records exactly one terminal outcome (settled, refunded, voided, declined), the money flow at each step is double-entry recorded in an immutable ledger, every external side effect uses idempotency, and reconciliation with provider statements detects drift that internal logs miss.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can model money as a state machine, design idempotent calls to providers, handle the "unknown state" outcome of timeouts, build a double-entry ledger, and run daily reconciliation against external sources of truth.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design the payment system around three things: a payment-intent state machine, a double-entry ledger as the source of truth for money movement, and idempotent integrations with payment providers wrapped in a reconciliation loop. The interesting decisions are how to handle provider timeouts, how to model refunds and chargebacks, how to enforce idempotency end-to-end, and how to reconcile when our records and the provider's disagree.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Customers pay via various methods: cards, ACH, wallets, BNPL, bank transfer.</li>
+<li>Merchants receive funds after settlement.</li>
+<li>Refunds, partial refunds, voids, chargebacks.</li>
+<li>Multi-currency.</li>
+<li>Recurring billing / subscriptions.</li>
+<li>Idempotent retries from clients and providers.</li>
+<li>Webhooks from providers (success, failure, chargeback, dispute).</li>
+<li>Reporting and reconciliation for finance teams.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Strong correctness: no double-charge, no lost transactions.</li>
+<li>Resilient to provider outages.</li>
+<li>Auditability: every state change traced.</li>
+<li>Compliance: PCI-DSS, regional regulations (PSD2 SCA, KYC, AML).</li>
+<li>Settlement may take seconds (cards) to days (ACH).</li>
+<li>High availability for the authorize step (in-band with checkout).</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Fraud scoring algorithms (treat as input from a fraud service).</li>
+<li>Tax calculation (separate system).</li>
+<li>Merchant onboarding KYC (separate system).</li>
+<li>Card vault / PAN storage (delegate to a vault).</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Volume</td>
+<td>Up to millions of transactions per day at peak; tens of millions across markets.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Authorize p99 under 2 seconds (provider round trip dominant).</td>
+</tr>
+<tr>
+<td>Settlement window</td>
+<td>Card capture same-day; ACH 1-5 business days.</td>
+</tr>
+<tr>
+<td>Refund window</td>
+<td>Up to 180 days post-charge.</td>
+</tr>
+<tr>
+<td>Chargeback window</td>
+<td>Up to 540 days for some networks.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Per-region issuers and acquirers; central ledger.</td>
+</tr>
+<tr>
+<td>Reconciliation cadence</td>
+<td>Daily for provider settlements; near-real-time for high-risk.</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Years of transaction history; immutable.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is provider integration reliability and reconciliation — not raw QPS. A payment system processing 1000 TPS is huge.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<p>Three layers:</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Payment intent state machine</td>
+<td>Owns the lifecycle of each payment from creation to terminal state.</td>
+<td>Strongly consistent; explicit state transitions.</td>
+</tr>
+<tr>
+<td>Money ledger</td>
+<td>Double-entry records of every credit/debit to internal accounts.</td>
+<td>Append-only, immutable, balanced.</td>
+</tr>
+<tr>
+<td>Provider integrations</td>
+<td>Calls to card networks, banks, wallets.</td>
+<td>Idempotent; reconciled with provider statements.</td>
+</tr>
+</tbody>
+</table>
+<p>The biggest design mistake is conflating the intent state with the ledger entries, or letting the application skip the ledger and trust the provider response directly.</p>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Merchant API  ----create intent---&gt;  Payment API
+                                         |
+                                         v
+                              +---------------------+
+                              | Payment Intent SM   |
+                              | states + audit      |
+                              +----------+----------+
+                                         |
+                       +-----------------+----------------+
+                       |                 |                |
+                       v                 v                v
+              +---------------+ +----------------+ +-------------+
+              | Risk / Fraud  | | Vault (tokens) | | Idempotency |
+              | scoring       | | for card data  | | Store       |
+              +-------+-------+ +----------------+ +-------------+
+                       |
+                       v
+              +---------------+
+              | Provider Adapter|
+              | per provider   |
+              +-------+-------+
+                       |
+                       v
+              +---------------+        +------------------+
+              | External      |&lt;------&gt;| Webhook Receiver |
+              | Payment Network|        | async updates    |
+              +-------+-------+        +-------+----------+
+                                                |
+                              +-------------------v-------+
+                              | Double-Entry Ledger        |
+                              | append-only journal        |
+                              +-----------+----------------+
+                                          |
+                              +------------+--------------+
+                              | Reconciliation Engine     |
+                              | provider files &amp; disputes |
+                              +---------------------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Payment API</td>
+<td>Receives intent creation, capture, refund requests from merchants.</td>
+<td>Idempotent on <code>Idempotency-Key</code>.</td>
+</tr>
+<tr>
+<td>Payment intent state machine</td>
+<td>Owns the lifecycle.</td>
+<td>Conditional transitions; every change audited.</td>
+</tr>
+<tr>
+<td>Risk service</td>
+<td>Returns fraud score and allowed action.</td>
+<td>Async or sync depending on latency budget.</td>
+</tr>
+<tr>
+<td>Card vault</td>
+<td>Stores tokenized card data.</td>
+<td>PCI-DSS isolated; returns tokens, not PANs.</td>
+</tr>
+<tr>
+<td>Idempotency store</td>
+<td>Caches request id → response for safe retries.</td>
+<td>Keyed by <code>(merchant_id, idempotency_key)</code>.</td>
+</tr>
+<tr>
+<td>Provider adapter</td>
+<td>Translates internal API to provider's API.</td>
+<td>One per provider; circuit breaker; retry policy.</td>
+</tr>
+<tr>
+<td>Webhook receiver</td>
+<td>Consumes async provider notifications.</td>
+<td>Verifies signatures; idempotent on event id.</td>
+</tr>
+<tr>
+<td>Double-entry ledger</td>
+<td>Records every credit/debit.</td>
+<td>Immutable; balanced; sole source of truth for money.</td>
+</tr>
+<tr>
+<td>Reconciliation engine</td>
+<td>Compares ledger to provider settlement files.</td>
+<td>Daily; flags drift.</td>
+</tr>
+<tr>
+<td>Settlement service</td>
+<td>Pays out merchants after capture clears.</td>
+<td>Holds funds; respects holding periods.</td>
+</tr>
+<tr>
+<td>Dispute handler</td>
+<td>Manages chargebacks and disputes.</td>
+<td>Provides evidence, updates intent state.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="payment-intent-state-machine">Payment Intent State Machine</h3>
+<pre><code class="language-text">                       created
+                          |
+                  +-------+-------+
+                  |               |
+                  v               v
+            requires_action    processing
+            (3DS, SCA)            |
+                  |               v
+                  +-----&gt;  authorized
+                              |
+                  +-----------+-----------+
+                  |                       |
+                  v                       v
+              captured                  voided
+                  |
+                  +-----+-----+
+                  |           |
+                  v           v
+              settled     refunded (full/partial)
+                  |
+                  v
+              charged_back
+</code></pre>
+<p>Allowed transitions are explicit; every transition is conditional on current state and idempotent on a transition key. The ledger is updated only on specific transitions:</p>
+<ul>
+<li><code>authorized</code>: hold but no money moves (depending on rail).</li>
+<li><code>captured</code>: ledger entry: debit merchant pending / credit acquirer.</li>
+<li><code>settled</code>: ledger entry: provider funds received.</li>
+<li><code>refunded</code>: ledger entry: reversal.</li>
+<li><code>charged_back</code>: ledger entry: reverse + fee.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Money never moves implicitly. Every ledger entry corresponds to an explicit state transition with a recorded reason and idempotency key.</p>
+</blockquote>
+<h3 id="idempotency-end-to-end">Idempotency End-to-End</h3>
+<p>Three layers of idempotency:</p>
+<ol>
+<li><strong>Client → Payment API:</strong> <code>Idempotency-Key</code> header. The idempotency store caches the response keyed by <code>(merchant_id, idempotency_key)</code> for 24-48 hours. Retries with the same key return the same response.</li>
+<li><strong>Payment API → Provider:</strong> Provider-specific idempotency mechanisms (Stripe's <code>Idempotency-Key</code>, others have request id). The adapter generates a deterministic key per attempt.</li>
+<li><strong>State machine transitions:</strong> Each transition is a CAS update on <code>(intent_id, from_state)</code>. Same transition request always produces same result.</li>
+</ol>
+<p>Critical case: a charge times out from the provider. We do not know if the charge succeeded.</p>
+<ul>
+<li>Mark the intent state <code>processing</code> with <code>provider_status_unknown</code>.</li>
+<li>A reconciliation worker queries the provider with the same idempotency key.</li>
+<li>If the provider confirms success, we transition to <code>authorized</code> or <code>captured</code> and write the ledger entry.</li>
+<li>If failure, we transition to <code>failed</code>.</li>
+<li>We never charge the customer twice for the same intent.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Timeouts are the central correctness problem. The system must treat "unknown" as a first-class state and resolve it via reconciliation, not by guessing.</p>
+</blockquote>
+<h3 id="double-entry-ledger">Double-Entry Ledger</h3>
+<p>Every money movement is two entries:</p>
+<pre><code class="language-text">debit  account_A   amount   transaction_id
+credit account_B   amount   transaction_id
+</code></pre>
+<p>Internal accounts:</p>
+<ul>
+<li>Merchant pending (between capture and settlement).</li>
+<li>Merchant available (after settlement).</li>
+<li>Provider in-transit.</li>
+<li>Fees collected.</li>
+<li>Refunds pending.</li>
+<li>Chargebacks owed.</li>
+</ul>
+<p>A charge of $100 by customer for merchant M:</p>
+<pre><code class="language-text">At capture:
+  debit  customer_funding             $100
+  credit merchant_M_pending           $97
+  credit platform_fee_revenue         $3
+
+At settlement (provider deposits):
+  debit  provider_in_transit          $97
+  credit merchant_M_available         $97
+</code></pre>
+<p>At every point, debits == credits per transaction (double-entry balanced), and the sum of all balances equals zero. Any drift means a missing entry, which the reconciliation engine detects.</p>
+<p>Properties:</p>
+<ul>
+<li>Append-only; no updates or deletes.</li>
+<li>Each entry has <code>transaction_id</code>, <code>account</code>, <code>amount</code>, <code>currency</code>, <code>direction</code>, <code>timestamp</code>, <code>reference_intent</code>.</li>
+<li>Indexed by account for balance queries, by intent for traceability.</li>
+</ul>
+<h3 id="data-model">Data Model</h3>
+<h4 id="payment-intent">Payment Intent</h4>
+<pre><code class="language-text">PaymentIntent(
+  intent_id,
+  merchant_id,
+  customer_id,
+  amount,
+  currency,
+  payment_method_token,
+  state,
+  state_history[],
+  idempotency_key,
+  risk_score,
+  provider,
+  provider_charge_id,
+  capture_method,                // automatic or manual
+  created_at,
+  authorized_at,
+  captured_at,
+  settled_at,
+  version
+)
+</code></pre>
+<h4 id="ledger-entry">Ledger Entry</h4>
+<pre><code class="language-text">LedgerEntry(
+  entry_id,
+  transaction_id,
+  account,
+  amount,
+  currency,
+  direction,                     // debit, credit
+  reference_intent_id,
+  reference_event_id,
+  posted_at
+)
+</code></pre>
+<h4 id="provider-event-webhook">Provider Event (Webhook)</h4>
+<pre><code class="language-text">ProviderEvent(
+  event_id,
+  provider,
+  provider_event_id,             // dedup key
+  payload_signature,
+  raw_payload,
+  processed_at,
+  outcome
+)
+</code></pre>
+<h4 id="settlement-record">Settlement Record</h4>
+<pre><code class="language-text">SettlementRecord(
+  settlement_id,
+  provider,
+  expected_amount,
+  actual_amount,
+  difference,
+  reconciled_at,
+  status                         // matched, mismatch, pending
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">POST /payment_intents
+Headers: Idempotency-Key
+Body:
+  amount
+  currency
+  payment_method_token
+  customer_id
+  capture_method
+  description
+
+POST /payment_intents/{intent_id}/capture
+POST /payment_intents/{intent_id}/refund?amount=
+POST /payment_intents/{intent_id}/cancel
+GET  /payment_intents/{intent_id}
+GET  /payment_intents/{intent_id}/events
+</code></pre>
+<p>Webhook (provider → us):</p>
+<pre><code class="language-text">POST /webhooks/{provider}
+  Headers: Signature
+  Body: event
+</code></pre>
+<h3 id="write-path-authorize-capture">Write Path: Authorize / Capture</h3>
+<ol>
+<li>Merchant POSTs intent with idempotency key.</li>
+<li>Payment API checks idempotency store; if cached response exists, return it.</li>
+<li>Validate amount, currency, method.</li>
+<li>Risk service scores; may decline upfront.</li>
+<li>Generate <code>intent_id</code>; persist with <code>state=created</code>.</li>
+<li>Call provider adapter with deterministic idempotency key.</li>
+<li>Provider response:
+   - Success: transition to <code>authorized</code>; write ledger entry if capture mode is automatic.
+   - Failure: transition to <code>failed</code>.
+   - Timeout: transition to <code>processing</code>, schedule reconciliation.
+   - SCA challenge: transition to <code>requires_action</code>; return challenge URL.</li>
+<li>Persist response in idempotency store.</li>
+<li>Return response to merchant.</li>
+</ol>
+<p>For manual capture, a separate <code>/capture</code> call later triggers the actual money movement.</p>
+<h3 id="webhook-path-async-updates">Webhook Path: Async Updates</h3>
+<p>Providers send webhooks for asynchronous events:</p>
+<ol>
+<li>Webhook receiver validates signature.</li>
+<li>Dedup by <code>provider_event_id</code>; ignore duplicates.</li>
+<li>Persist raw event.</li>
+<li>Look up affected intent; apply state transition with CAS.</li>
+<li>Write ledger entry if applicable.</li>
+<li>Notify merchant via merchant-side webhook.</li>
+</ol>
+<p>Webhooks may arrive out of order or duplicated. Both are handled by idempotency on <code>provider_event_id</code> and CAS on intent state.</p>
+<h3 id="reconciliation">Reconciliation</h3>
+<p>Daily reconciliation against provider settlement files:</p>
+<ol>
+<li>Pull settlement file from provider (CSV / SFTP / API).</li>
+<li>For each provider record, find matching intent and ledger entry.</li>
+<li>Match on <code>provider_charge_id</code> and amount.</li>
+<li>Mismatches go to a manual review queue.</li>
+<li>Drift between our ledger sum and provider expected sum triggers an alert.</li>
+</ol>
+<p>This catches:</p>
+<ul>
+<li>Webhooks we missed.</li>
+<li>Charges we recorded but provider didn't.</li>
+<li>Currency conversion errors.</li>
+<li>Fee discrepancies.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Reconciliation is the safety net for everything our event-based pipeline could miss. It is slow but authoritative. Drift between our ledger and the provider's settlement is the canary for systemic bugs.</p>
+</blockquote>
+<h3 id="refunds-voids-chargebacks">Refunds, Voids, Chargebacks</h3>
+<p><strong>Refund:</strong> money back to customer. New transition from <code>captured</code> or <code>settled</code> to <code>refunded</code>. Ledger entries reverse the original credits.</p>
+<p><strong>Void:</strong> cancel before capture. Transition <code>authorized</code> → <code>voided</code>. No ledger entry (no money moved).</p>
+<p><strong>Chargeback:</strong> customer dispute via card network. We receive a webhook; transition <code>captured</code> → <code>disputed</code> then to <code>charged_back</code> after resolution. Ledger entries reverse the original plus add chargeback fee. We engage dispute handler to provide evidence.</p>
+<h3 id="multi-currency">Multi-Currency</h3>
+<p>Each intent has a currency. Ledger entries record amounts in their native currency. Cross-currency conversion (e.g., USD merchant, EUR customer) involves a separate FX leg:</p>
+<pre><code class="language-text">debit  customer_funding_EUR        €100
+credit fx_holding_EUR              €100
+
+debit  fx_holding_USD              $108
+credit merchant_pending_USD        $108
+</code></pre>
+<p>The FX rate is locked at the time of capture; a separate FX service provides rates.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Payment intents</td>
+<td><code>merchant_id</code> hash</td>
+<td>Merchant-scoped queries.</td>
+</tr>
+<tr>
+<td>Ledger</td>
+<td>Date + account hash</td>
+<td>Balance queries and audits.</td>
+</tr>
+<tr>
+<td>Idempotency store</td>
+<td><code>(merchant_id, idempotency_key)</code> hash</td>
+<td>Cheap lookup.</td>
+</tr>
+<tr>
+<td>Webhook events</td>
+<td><code>provider_event_id</code> hash</td>
+<td>Dedup.</td>
+</tr>
+<tr>
+<td>Settlement records</td>
+<td>Date + provider</td>
+<td>Daily reconciliation.</td>
+</tr>
+</tbody>
+</table>
+<p>Throughput is moderate. The challenges are correctness, not raw scale.</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Intent state transitions</td>
+<td>Strong (CAS)</td>
+<td>Money correctness.</td>
+</tr>
+<tr>
+<td>Ledger writes</td>
+<td>Strong; transactional with state transition</td>
+<td>Double-entry balance.</td>
+</tr>
+<tr>
+<td>Idempotency store</td>
+<td>Strong; read-after-write</td>
+<td>Retry safety.</td>
+</tr>
+<tr>
+<td>Webhook dedup</td>
+<td>Strong</td>
+<td>Cannot apply twice.</td>
+</tr>
+<tr>
+<td>Reporting</td>
+<td>Eventually consistent</td>
+<td>Read replicas.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Provider timeout.</td>
+<td>Intent in <code>processing</code> state; reconciliation queries provider.</td>
+<td>Unknown-state count; reconciliation lag.</td>
+</tr>
+<tr>
+<td>Provider outage.</td>
+<td>Circuit breaker; queue intents; merchant-visible error.</td>
+<td>Provider availability; queue depth.</td>
+</tr>
+<tr>
+<td>Duplicate webhook.</td>
+<td>Dedup on <code>provider_event_id</code>.</td>
+<td>Duplicate event rate.</td>
+</tr>
+<tr>
+<td>Out-of-order webhooks.</td>
+<td>CAS on intent state; idempotent transitions.</td>
+<td>Out-of-order transition attempts.</td>
+</tr>
+<tr>
+<td>Ledger drift.</td>
+<td>Daily reconciliation; alerts; quarantine on mismatch.</td>
+<td>Drift per merchant/currency.</td>
+</tr>
+<tr>
+<td>Lost webhook.</td>
+<td>Reconciliation catches via settlement file.</td>
+<td>Missing intent updates.</td>
+</tr>
+<tr>
+<td>Refund without capture.</td>
+<td>State machine rejects invalid transition.</td>
+<td>Invalid transition attempts.</td>
+</tr>
+<tr>
+<td>Double-capture from retries.</td>
+<td>Idempotency at API; provider-side idempotency.</td>
+<td>Double-charge complaints.</td>
+</tr>
+<tr>
+<td>Currency mismatch in ledger.</td>
+<td>Schema enforcement; per-currency accounts.</td>
+<td>Cross-currency entry count.</td>
+</tr>
+<tr>
+<td>Dispute volume spike.</td>
+<td>Risk score tuning; manual review queue.</td>
+<td>Chargeback rate per merchant.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Ledger drift per account per day.</li>
+<li>Unknown-state intents older than threshold.</li>
+<li>Unmatched provider settlement entries.</li>
+<li>Duplicate webhook rate.</li>
+<li>Refund without prior capture (impossible, alert if seen).</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Intent creation rate.</li>
+<li>Provider call latency and error rate per provider.</li>
+<li>Reconciliation duration.</li>
+<li>Webhook queue depth.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Authorization success rate.</li>
+<li>Capture-to-settlement time.</li>
+<li>Chargeback ratio.</li>
+<li>Refund ratio.</li>
+<li>Revenue per provider, per currency.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Issuers and acquirers are regional; we maintain a provider per region.</li>
+<li>Intent state and ledger writes route to merchant's home region.</li>
+<li>Cross-region replication for read replicas and disaster recovery.</li>
+<li>Webhooks land in the region the provider sends them to; route to merchant's region.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Synchronous provider calls add latency but give immediate user feedback. Async webhooks add eventual updates.</li>
+<li>Aggressive risk declines reduce fraud but hurt conversion.</li>
+<li>Daily reconciliation is slow but authoritative; real-time reconciliation is fast but noisy.</li>
+<li>Per-merchant idempotency is safe but stores grow; TTL bounded retention.</li>
+<li>Single ledger gives auditability; sharded ledgers scale but complicate balance queries.</li>
+<li>Tokenizing cards in vault adds latency but is a PCI requirement.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Trusting provider success without writing ledger transactionally.</td>
+<td>Write ledger entry as part of state transition CAS.</td>
+</tr>
+<tr>
+<td>Ignoring timeouts.</td>
+<td>First-class <code>unknown</code> state; reconciliation worker.</td>
+</tr>
+<tr>
+<td>Single ledger row per transaction.</td>
+<td>Double-entry: every transaction has matched debit/credit.</td>
+</tr>
+<tr>
+<td>Treating refunds as new charges.</td>
+<td>Refund is a state transition with reverse ledger entries.</td>
+</tr>
+<tr>
+<td>Forgetting webhooks can be duplicated.</td>
+<td>Dedup on <code>provider_event_id</code>; idempotent transitions.</td>
+</tr>
+<tr>
+<td>No reconciliation.</td>
+<td>Daily provider settlement match; drift alerts.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Timeout handling</td>
+<td>Unknown state; reconciliation; never auto-retry charge without provider confirmation.</td>
+</tr>
+<tr>
+<td>Idempotency</td>
+<td>Three layers: client→API, API→provider, state CAS.</td>
+</tr>
+<tr>
+<td>Double-entry ledger</td>
+<td>Show balanced entries; account types; trial-balance check.</td>
+</tr>
+<tr>
+<td>Reconciliation</td>
+<td>Daily settlement file match; drift alerts; manual review.</td>
+</tr>
+<tr>
+<td>Disputes/chargebacks</td>
+<td>State transition; evidence flow; ledger reversal + fee.</td>
+</tr>
+<tr>
+<td>Multi-currency</td>
+<td>Per-currency accounts; FX leg via separate accounts.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Model payment as a state machine with explicit transitions.</li>
+<li>Double-entry ledger as source of truth for money movement.</li>
+<li>End-to-end idempotency: API, provider, state CAS.</li>
+<li>First-class unknown state for timeouts; reconciliation.</li>
+<li>Webhook dedup and idempotent transitions.</li>
+<li>Daily reconciliation against provider settlements.</li>
+<li>Multi-currency via per-currency accounts and FX legs.</li>
+<li>Compliance: PCI-DSS, SCA, KYC delegated appropriately.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>A payment system is correctness, not scale. Every charge is a state machine transition that writes a balanced double-entry ledger; idempotency is end-to-end; unknown outcomes from provider timeouts are a first-class state resolved by reconciliation. Reconciliation is the canary for any drift the event-based pipeline misses.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design a payment system.</p>
+<p><strong>Candidate:</strong> I will design three layers: a payment intent state machine, a double-entry ledger as the source of truth for money movement, and provider integrations wrapped in idempotency and reconciliation. The invariant is that every intent has exactly one terminal outcome, every money movement is two balanced ledger entries, and external timeouts resolve via reconciliation rather than retry-guess.</p>
+<p><strong>Interviewer:</strong> Walk me through a card charge.</p>
+<p><strong>Candidate:</strong> Merchant POSTs a payment intent with an idempotency key. The Payment API checks the idempotency store. If new, we create the intent in <code>created</code> state, run risk scoring, then call the card provider with a deterministic idempotency key. On success, transition to <code>authorized</code> and write a ledger entry (debit customer funding, credit merchant pending). If timeout, transition to <code>processing</code> and let a reconciliation worker query the provider. Webhook updates from the provider (capture confirmed, settlement) drive further transitions.</p>
+<p><strong>Interviewer:</strong> The provider times out. What now?</p>
+<p><strong>Candidate:</strong> This is the central correctness case. The intent state goes to <code>processing</code> with <code>provider_status_unknown</code>. A reconciliation worker queries the provider with the same idempotency key. If the provider says success, we transition to authorized and write the ledger entry. If failure, transition to failed. We never retry the charge blindly; that could double-charge. We never assume failure; that could leave the customer charged but our records empty.</p>
+<p><strong>Interviewer:</strong> Show me the double-entry ledger for a $100 charge.</p>
+<p><strong>Candidate:</strong> At capture, two entries: debit <code>customer_funding $100</code>, credit <code>merchant_X_pending $97</code>, credit <code>platform_fee_revenue $3</code>. At settlement: debit <code>provider_in_transit $97</code>, credit <code>merchant_X_available $97</code>. Every transaction is balanced; the sum of all balances is zero. A daily trial-balance check ensures no entry is missing.</p>
+<p><strong>Interviewer:</strong> How does reconciliation work?</p>
+<p><strong>Candidate:</strong> Daily, we pull the provider's settlement file. For each line, we find the matching intent and ledger entry by provider_charge_id. Mismatches go to a review queue. Aggregate drift between our ledger and the provider's expected sum triggers an alert. This catches anything our webhook pipeline missed — duplicates, lost events, fee discrepancies. The ledger is internal truth; the provider settlement is external truth; reconciliation makes them agree or escalates.</p>
+<p><strong>Interviewer:</strong> A webhook arrives twice.</p>
+<p><strong>Candidate:</strong> Dedup on <code>provider_event_id</code>. The webhook receiver stores each event id; duplicates are ignored after the first is processed. The state transition itself is also idempotent: CAS on <code>(intent_id, from_state)</code>. Even if dedup is bypassed, the second transition fails because the state has already advanced.</p>
+<p><strong>Interviewer:</strong> A refund — how do you process it?</p>
+<p><strong>Candidate:</strong> The merchant calls <code>/refund</code> on a captured or settled intent. We transition state to <code>refunded</code> (or <code>partial_refunded</code>). The ledger entries reverse the original: credit customer funding, debit merchant pending or available. We call the provider's refund API with a new idempotency key. On confirmation, the refund completes. The original capture remains in the ledger; the refund is a new transaction referencing the original intent.</p>
+<p><strong>Interviewer:</strong> How do you prevent double-charging?</p>
+<p><strong>Candidate:</strong> Idempotency at every layer. Client → Payment API uses an <code>Idempotency-Key</code> header; the idempotency store caches the response. Payment API → provider uses provider-specific idempotency. Intent state transitions are CAS on current state. So a retried API call returns the same response without re-charging; a retried provider call lands on the same charge id; a retried state transition fails because the state already advanced. No path leads to two ledger entries for the same intent.</p>
+<p><strong>Interviewer:</strong> Chargebacks?</p>
+<p><strong>Candidate:</strong> A customer disputes a charge through their bank, which sends a chargeback to the card network. We receive a webhook. The intent transitions from <code>settled</code> to <code>disputed</code>, then to <code>charged_back</code> if we lose, or back to <code>settled</code> if we win. Ledger entries reverse the original plus add the chargeback fee. Dispute handlers gather evidence (delivery confirmation, customer communication) and submit through the provider's dispute API.</p>
+<p><strong>Interviewer:</strong> Multi-currency?</p>
+<p><strong>Candidate:</strong> Each ledger entry has a currency. We never mix currencies in one account; instead, FX is an explicit leg. A USD merchant capturing from a EUR customer: debit <code>customer_funding_EUR €100</code>, credit <code>fx_holding_EUR €100</code>, then in a paired transaction: debit <code>fx_holding_USD $108</code>, credit <code>merchant_pending_USD $108</code>. The FX rate is locked at capture time from an FX service. Reconciliation per currency.</p>
+<p><strong>Interviewer:</strong> How do you do high availability?</p>
+<p><strong>Candidate:</strong> Stateless API in multiple regions. Database is multi-region with the merchant's home region as primary. Cross-region read replicas for reporting. Provider integrations are inherently external; circuit breakers and retries handle provider blips. Webhooks land in any region and route to the merchant's home region for processing.</p>
+<p><strong>Interviewer:</strong> PCI?</p>
+<p><strong>Candidate:</strong> We never store raw card data. The card vault is a separate isolated system with PCI-DSS scope. Customers tokenize their card; we store only the token. Our broader systems are PCI-DSS-out-of-scope or limited scope. Compliance for SCA (PSD2) is handled by triggering the provider's 3DS flow when needed and transitioning the intent to <code>requires_action</code>.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Payment intent state machine with explicit transitions; double-entry ledger as source of truth for money; idempotency at every layer; first-class unknown state for provider timeouts resolved by reconciliation; webhook dedup; daily settlement reconciliation. Multi-currency uses per-currency accounts with explicit FX legs. Compliance via card vault and provider-native SCA. The hardest correctness problem is timeouts; the safety net is daily reconciliation.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: intent, capture, refund, chargeback; idempotency; compliance.</li>
+<li>Invariant: one terminal outcome per intent; balanced double-entry ledger.</li>
+<li>State machine: created → authorized → captured → settled, with branches for void/refund/dispute.</li>
+<li>Idempotency end-to-end: client → API → provider → state CAS.</li>
+<li>Double-entry ledger; per-currency accounts.</li>
+<li>Unknown state for timeouts; reconciliation worker.</li>
+<li>Webhook dedup; CAS state transitions.</li>
+<li>Daily reconciliation against provider settlement files.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>A payment system is a state machine over a double-entry ledger. Every money movement is two balanced ledger entries triggered by an explicit state transition. End-to-end idempotency makes retries safe; first-class <code>unknown</code> state for provider timeouts is resolved by reconciliation rather than guessing. Webhooks deduplicate on event id; settlement reconciliation each day catches anything the event pipeline missed. Multi-currency is per-currency accounts with explicit FX legs. The hardest correctness problem is timeouts.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Money never moves implicitly; every ledger entry corresponds to a state transition with an idempotency key."</li>
+<li>"Timeouts are a first-class state, not a retry decision."</li>
+<li>"Double-entry ledger means trial balance is a daily sanity check."</li>
+<li>"Reconciliation against the provider's settlement is the safety net for everything our event pipeline could miss."</li>
+<li>"Three layers of idempotency: client, provider, state machine."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

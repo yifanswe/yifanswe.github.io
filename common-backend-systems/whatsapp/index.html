@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp — Messaging (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">WhatsApp — Messaging (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Medium · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build WhatsApp. Two billion users send 100B messages/day. One-on-one and group chats, end-to-end encrypted, with delivery and read receipts, across flaky mobile networks and offline devices. Multiple devices per user.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Send a text message in a one-on-one chat.
+- Send a message in a group (up to ~1000 members).
+- See delivery and read receipts (✓ sent, ✓✓ delivered, blue ✓✓ read).
+- Receive messages while offline, see them when device wakes up.</p>
+<p>I'd defer voice/video calling and media-storage deep-dive.</p>
+<p><strong>Non-functional</strong>
+- End-to-end encryption — server stores only ciphertext.
+- Delivery is exactly-once <strong>per recipient</strong> semantically (no dupes shown to user).
+- Per-conversation message order preserved.
+- p99 message-send-to-recipient &lt; 1 s on healthy networks.
+- Survive offline; deliver on reconnect.
+- Multi-device per user (phone + web + desktop) — message must reach all devices.</p>
+<p><strong>Capacity</strong>
+- 100B msgs/day → ~1.2M msgs/sec average, 3–5M peak. Each msg ~500 bytes ciphertext.
+- 2B users; assume 3 devices each → 6B active session tokens.
+- Ciphertext volume: 100B/day × 500 B ≈ 50 TB/day before replication. If offline queues retain 30 days, that is ~1.5 PB primary, ~4.5 PB with 3 replicas; the offline queue is the dominant storage cost.
+- Connection map is much smaller: 600M online devices × ~64 B mapping ≈ 38 GB primary, but it needs very low-latency lookups and constant churn handling.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>User</strong> — <code>user_id</code>, phone_number, devices.</li>
+<li><strong>Device</strong> — <code>device_id</code>, public key, last seen.</li>
+<li><strong>Chat</strong> — one-on-one (implicit, derived from user pair) or group (<code>chat_id</code>, members).</li>
+<li><strong>Message</strong> — <code>msg_id, chat_id, sender_device_id, ciphertext, ts, server_ts</code>.</li>
+<li><strong>DeliveryReceipt</strong> — <code>msg_id, recipient_device_id, state (sent/delivered/read)</code>.</li>
+</ul>
+<hr />
+<h2 id="3-api-protocol-5-min">3. API / Protocol (~5 min)</h2>
+<p>Mostly a custom protocol over a persistent connection. Sketch:</p>
+<pre><code>WS  /v1/connect                   // long-lived, auth via token + device_id
+  → server pushes: { msg, receipt, presence }
+  ← client sends:  { send_msg, ack_received, mark_read }
+
+HTTP fallback for media:
+POST /v1/media/upload             → { media_id }
+GET  /v1/media/{id}               → bytes
+</code></pre>
+<p>Each message carries a client-generated UUID for idempotency.</p>
+<p>The reconnect cursor is server-issued per device and encodes the last acknowledged per-device queue sequence; clients do not ask for arbitrary offsets.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Edge connection servers.</strong> Long-lived WebSocket (or XMPP-like) terminations, sharded by device_id. A device is "online" iff a connection server holds its WS. Connection-server-to-device map kept in a Redis cluster.</li>
+<li><strong>Routing service.</strong> When user A's connection server receives a send, it looks up each recipient's <code>device_id → connection_server</code> and forwards. If a device is offline, write the message to its <strong>offline queue</strong>.</li>
+<li><strong>Message store / offline queue.</strong> Per-device FIFO queue (Kafka topic per shard, or a sharded Cassandra/HBase table) for messages a device hasn't yet ACK'd. On reconnect, the device drains its queue.</li>
+<li><strong>Group fan-out service.</strong> For groups, expand <code>chat_id → member device_ids</code>, enqueue one entry per device. Server never decrypts — it just routes ciphertext.</li>
+<li><strong>Key directory.</strong> Per-device public keys (Signal-style identity + signed prekey + one-time prekeys). Senders pull keys to establish sessions.</li>
+<li><strong>Media service.</strong> End-to-end encrypted media is uploaded as encrypted bytes; the chat message carries the media URL + decryption key in the encrypted payload.</li>
+<li><strong>Presence / receipts.</strong> Receipt updates flow back over the same connection — <code>delivered</code> on device receipt, <code>read</code> on user view. Sender's clients are updated by the same routing path.</li>
+</ol>
+<p>End-to-end narration: Alice's phone sends <code>{msg_id: U1, chat: A-B, ciphertext}</code> over her WS → her connection server looks up Bob's device list and connection servers → Bob's phone is online (one connection server), Bob's web is offline. Forward to phone connection server, which delivers; phone returns <code>delivered</code> receipt. Web device's offline queue gets the message ciphertext; when web reconnects in 3 hours, it drains the queue. Bob's phone shows the message; tapping the chat sends a <code>read</code> receipt back through the routing service to Alice's devices.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">Sender Device -&gt; Edge Connection Server -&gt; Routing Service
+  ^                    |                    |
+  |                    v                    v
+Receipts/acks       Redis Connection Map   Device/Group Directory
+  ^                                         |
+  |                                         v
+Recipient Edge Servers &lt;---- Online Push ---- Fanout Workers
+  ^                                         |
+  |                                         v
+Recipient Devices &lt;------ Offline Drain ---- Per-Device Inbox Store
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete store contracts.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / data structure</th>
+<th style="text-align: right;">Entry size + TTL</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Connection map</td>
+<td><code>conn:{device_id}</code> → <code>{edge_id, session_id}</code> in Redis</td>
+<td style="text-align: right;">~64 B, TTL heartbeat 60s</td>
+<td><code>device_id</code></td>
+</tr>
+<tr>
+<td>Offline inbox</td>
+<td>wide-column <code>inbox(device_id, seq)</code> → ciphertext envelope</td>
+<td style="text-align: right;">~600 B/message, TTL 30d or until ACK</td>
+<td><code>device_id</code></td>
+</tr>
+<tr>
+<td>Dedupe</td>
+<td><code>dedupe:{device_id}:{msg_uuid}</code></td>
+<td style="text-align: right;">~32 B, TTL 30d</td>
+<td><code>device_id</code></td>
+</tr>
+<tr>
+<td>Group membership</td>
+<td><code>group:{chat_id}</code> → member user/device ids + version</td>
+<td style="text-align: right;">10 KB–1 MB, retained</td>
+<td><code>chat_id</code></td>
+</tr>
+<tr>
+<td>Key directory</td>
+<td><code>keys:{device_id}</code> identity/signed/one-time prekeys</td>
+<td style="text-align: right;">~1–5 KB, retained/rotated</td>
+<td><code>device_id</code></td>
+</tr>
+<tr>
+<td>Receipts</td>
+<td><code>receipt:{msg_id}:{device_id}</code> state + ts</td>
+<td style="text-align: right;">~32 B, TTL or compacted</td>
+<td><code>msg_id</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Capacity by store.</strong> Offline inbox is the dominant cost: <code>100B messages/day × 600 B</code> is ~60 TB/day primary, and 30 days at 3 replicas is ~5.4 PB if every message waits out the TTL. In practice ACK compaction deletes most entries earlier, but the design must budget for mobile devices being offline. Connection map is large but manageable: <code>600M online devices × 64 B × 3</code> is ~115 GB. Dedupe cannot naively keep every message UUID for 30 days in memory; keep short hot dedupe for delivered messages and align longer dedupe with inbox retention for undelivered devices. Group membership is read-hot but small compared with inbox bytes; receipt streams are append/compact, not permanent per-message rows forever.</p>
+<p><strong>Send path trace.</strong> Alice's edge server receives <code>{msg_uuid, chat_id, ciphertexts}</code> → idempotency check on Alice device → chat service reads recipient devices/group membership version → routing looks up <code>conn:{device_id}</code> for online devices in parallel → online devices get pushed over WS → offline devices get appended to <code>inbox(device_id, seq)</code> → each receiving device ACKs <code>seq</code> → receipt event routes back to Alice's devices. Group fan-out parallelizes by recipient-device shard; message ordering is per <code>chat_id</code> sequence, while storage delivery is per-device FIFO.</p>
+<p><strong>Hot and cold protocol paths.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Hot path</th>
+<th>Cold/fallback path</th>
+<th>Cursor/session state</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One-on-one send</td>
+<td>Edge → routing → parallel <code>conn:{device_id}</code> lookups → online push; offline append</td>
+<td>If online route is uncertain, append to inbox first, then push to avoid loss</td>
+<td>client msg UUID, per-chat sequence</td>
+</tr>
+<tr>
+<td>Device reconnect</td>
+<td>Edge auth → read cursor → drain <code>inbox(device_id, seq &gt; cursor)</code></td>
+<td>Dormant &gt; TTL gets no queued message; optional encrypted history sync handles supported cases</td>
+<td>signed cursor <code>{device_id,last_seq,inbox_epoch}</code></td>
+</tr>
+<tr>
+<td>Group send</td>
+<td>Read membership version → shard fan-out by recipient device → enqueue/push progressively</td>
+<td>Large/hot group accepts send then async fan-out; sender sees sent before all delivered</td>
+<td>group version, fan-out job id</td>
+</tr>
+<tr>
+<td>Receipt update</td>
+<td>Device ACK/read → receipt event → sender devices</td>
+<td>If sender offline, receipt enters sender devices' inboxes</td>
+<td>receipt state version per <code>(msg_id,device_id)</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Multi-device fan-out.</strong> A user with N devices means N copies of every message. Sender encrypts independently for each recipient device using the Signal Double-Ratchet protocol (or Sender Keys for groups). Server treats each <code>(message, device)</code> as an independent routing target. Sender's own devices also receive copies (so phone and web stay in sync).</p>
+<p><strong>Group messages without quadratic blowup.</strong> For a 1000-member group, naive per-device encryption gives sender 1000+ ciphertexts to upload. Signal's Sender Keys: sender encrypts the message once with a symmetric chain key, distributes the chain key per-recipient out-of-band when needed (when membership changes or initially). Tradeoff: forward-secrecy is weaker than per-message keys, but it makes 1000-person groups feasible.</p>
+<p><strong>Per-conversation ordering.</strong> Server assigns a monotonic per-chat sequence number on receipt (timestamp + tiebreaker). Recipient devices order by that. Sender's client-side timestamp is shown but server seq is the source of truth.</p>
+<p><strong>Two-index framing.</strong> Message order is chat-keyed, while delivery is device-keyed. The server assigns a per-chat sequence so every participant sees the same conversation order, then writes per-device inbox entries so each phone/web client can reconnect independently. Those are two indexes over encrypted envelopes, not two competing message stores.</p>
+<p><strong>Offline delivery.</strong> Per-device offline queue is the contract. Capped at a TTL (e.g., 30 days). On reconnect, the device pulls everything since its last ACK'd offset. Once the device ACKs delivery, server drops from the queue.</p>
+<p>Why a wide-column inbox instead of Kafka per device: Kafka is excellent for service-to-service streams, but 6B devices need random per-device replay, TTL, and independent ACK offsets. A Cassandra/HBase-style inbox keyed by <code>device_id</code> makes reconnect cheap. Kafka still fits for internal receipt and analytics streams.</p>
+<p>Compared with Redis-only queues, a wide-column inbox survives long offline windows and regional restarts without keeping petabytes in memory. Compared with a relational table, the access pattern is almost always <code>device_id + increasing seq</code>, so wide-column storage keeps writes and reconnect scans predictable.</p>
+<p><strong>At-most-once vs at-least-once.</strong> Server delivers at-least-once; client deduplicates by <code>msg_id</code> (UUID from sender). Net effect: exactly-once shown to user.</p>
+<p><strong>Connection scaling.</strong> 2B devices × 30% online = 600M concurrent WS connections. Each connection server holds ~500k connections; we need 1200+ machines just for edges. Use efficient async I/O (epoll/kqueue) and minimal per-connection memory.</p>
+<p><strong>End-to-end encryption — server's role.</strong> Server never sees plaintext. Server stores <code>(ciphertext, recipient_device_id)</code>. Receipt metadata (delivered/read flags) is plaintext server-side. Acknowledge that abuse moderation is therefore client-side reports plus metadata signals.</p>
+<p>Interview punch line: "The server is a durable encrypted router; it owns delivery semantics, not message meaning."</p>
+<p><strong>Hot-shard mitigation.</strong> Famous user broadcast lists. Cap broadcast list size; rate-limit per-sender; for businesses, use a separate API tier.</p>
+<p><strong>Graceful degradation state machine.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th style="text-align: right;">Latency budget</th>
+<th>Fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Recipient online</td>
+<td>Push</td>
+<td>Connection map + WS</td>
+<td style="text-align: right;">&lt;1s</td>
+<td>Store then push if routing uncertain</td>
+</tr>
+<tr>
+<td>Recipient offline</td>
+<td>Queue</td>
+<td><code>inbox(device_id, seq)</code></td>
+<td style="text-align: right;">Reconnect-dependent</td>
+<td>Retain 30d, notify sender only as sent</td>
+</tr>
+<tr>
+<td>Device dormant &gt; TTL</td>
+<td>Expired</td>
+<td>Inbox TTL</td>
+<td style="text-align: right;">N/A</td>
+<td>Sender sees sent, not delivered; client may request history sync if allowed</td>
+</tr>
+<tr>
+<td>Edge server fails</td>
+<td>Reconnect</td>
+<td>Connection map heartbeat expires</td>
+<td style="text-align: right;">Seconds</td>
+<td>Device reconnects to another edge and resumes from cursor</td>
+</tr>
+<tr>
+<td>Group fan-out hot</td>
+<td>Async fan-out</td>
+<td>group membership version + inbox shards</td>
+<td style="text-align: right;">Seconds for large groups</td>
+<td>Accept send, enqueue fan-out job, deliver progressively</td>
+</tr>
+<tr>
+<td>Duplicate retry</td>
+<td>Dedupe</td>
+<td><code>msg_uuid</code> per device</td>
+<td style="text-align: right;">&lt;50 ms</td>
+<td>Return prior ACK; client shows one bubble</td>
+</tr>
+</tbody>
+</table>
+<p><strong>What I'd defer.</strong> Voice/video calls (WebRTC), status/stories, business APIs, backup encryption to iCloud/Google Drive, machine learning on metadata for spam.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

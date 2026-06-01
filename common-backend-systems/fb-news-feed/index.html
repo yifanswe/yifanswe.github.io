@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Facebook News Feed (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Facebook News Feed (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Medium · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build the Facebook (FB) News Feed. A user opens the app and sees a ranked, personalized feed of posts from friends and pages they follow. 2B daily active users (DAU), average user follows ~300 entities, sessions are short and frequent.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Post text/photo/video updates (write side).
+- Open the app and see a ranked feed (read side — the focus).
+- Like/comment/share on a post; basic engagement signals back to ranking.</p>
+<p>I'd defer chat, Marketplace, Stories, and groups.</p>
+<p><strong>Non-functional</strong>
+- Feed open p99 &lt; 500 ms.
+- Read-heavy: ~100:1 reads to writes.
+- Ranking should incorporate fresh signals — a post your best friend just made should rise quickly.
+- Eventual consistency is fine — a like takes a second to count, no one notices.
+- Survive celebrity asymmetry — a poster with 50M followers vs. a poster with 50.</p>
+<p><strong>Capacity</strong>
+- 2B DAU × 10 feed opens = 20B feed loads/day → ~230k QPS average, ~1M peak.
+- Average user posts 0.5/day → 1B posts/day → ~12k writes/sec average.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>User</strong> — <code>user_id</code>, follows.</li>
+<li><strong>Post</strong> — <code>post_id</code>, author_id, content, media, created_at, signals (likes, comments).</li>
+<li><strong>Edge (follow)</strong> — <code>follower_id, followee_id</code>.</li>
+<li><strong>FeedEntry</strong> — <code>user_id, post_id, score, inserted_at</code>.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST  /v1/posts                       { content, media }     → { post_id }
+GET   /v1/feed?cursor=...&amp;limit=20    → { posts[], next_cursor }
+POST  /v1/posts/{id}/like
+POST  /v1/posts/{id}/comments         { text }
+</code></pre>
+<p>User from token; pagination by cursor (server-issued opaque cursor, not offset).</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<p>The central question: <strong>fan-out on write vs. fan-out on read.</strong> I'd default to <strong>hybrid</strong>.</p>
+<ol>
+<li><strong>Post service.</strong> Write the post to a primary store (sharded by <code>post_id</code>). Publish a <code>post.created</code> event.</li>
+<li><strong>Fan-out service.</strong> For most authors (≤10k followers), push the post_id into each follower's feed list (Redis sorted set, score = ranking time). For celebrities, skip fan-out — leave their posts in a global "celebrity recent posts" cache.</li>
+<li><strong>Feed assembly service.</strong> On feed open:
+   - Pull the user's precomputed feed list from Redis (sorted set keyed by <code>user_id</code>) — this is ~300 candidate <code>post_id</code>s only, not post bodies.
+   - Merge in <code>post_id</code>s from celebrity authors this user follows, read at request time from per-author <code>posts_by:{author_id}</code> Redis lists.
+   - Hydrate post bodies via batched <code>MGET post:{post_id}</code> against the post-body cache; cache misses fall through to the source-of-truth store.
+   - Rerank with the live ranking model.
+   - Return top 20 with cursor.</li>
+<li><strong>Ranking service.</strong> Online inference. Features include freshness, author affinity, engagement velocity, post type. Model server (e.g., TensorFlow Serving) with a feature store fetch in parallel with feed pull.</li>
+<li><strong>Engagement pipeline.</strong> Likes/comments → Kafka → counter aggregation (Redis + ClickHouse for analytics) + ranking signal updates.</li>
+</ol>
+<p>Concrete stores in the hot path:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key pattern</th>
+<th>Value / data structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reader feed index</td>
+<td><code>feed:{user_id}</code></td>
+<td>Redis ZSET of post_id + score</td>
+<td style="text-align: right;">~64 B/entry</td>
+<td>7 days / cap 200-300</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Author recent index</td>
+<td><code>posts_by:{author_id}</code></td>
+<td>Redis LIST of recent post_ids</td>
+<td style="text-align: right;">~8-16 B/entry</td>
+<td>7 days / cap 20-100</td>
+<td><code>author_id</code></td>
+</tr>
+<tr>
+<td>Post body cache</td>
+<td><code>post:{post_id}</code></td>
+<td>content pointer + metadata</td>
+<td style="text-align: right;">~1-5 KB</td>
+<td>1-7 days LRU</td>
+<td><code>post_id</code></td>
+</tr>
+<tr>
+<td>Source of truth</td>
+<td><code>posts.post_id</code></td>
+<td>durable post row/media refs</td>
+<td style="text-align: right;">~1-5 KB</td>
+<td>forever</td>
+<td><code>post_id</code></td>
+</tr>
+<tr>
+<td>Dedupe set</td>
+<td><code>recently_shown:{user_id}</code></td>
+<td>Redis SET / compact ids</td>
+<td style="text-align: right;">~8 B/id + overhead</td>
+<td>24 h</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Active users</td>
+<td><code>active_users:{day}</code></td>
+<td>Bloom filter / set</td>
+<td style="text-align: right;">~10 bits/user</td>
+<td>7 days</td>
+<td>user hash</td>
+</tr>
+</tbody>
+</table>
+<p>Feed read trace: <code>ZREVRANGE feed:{user}</code> and feature-store reads run in parallel. Celebrity <code>LRANGE posts_by:{author}</code> calls are pipelined by Redis shard. Hydration is a batched <code>MGET post:{id...}</code>; only misses hit TAO/MySQL. Ranking runs after hydration because the model needs content type and fresh counters. The cursor stores <code>{mode, score_watermark, last_seen_ts, seen_set_id}</code>.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code>                       ┌──────────────────────────┐
+                       │         CLIENT           │
+                       └──┬──────────┬──────────┬─┘
+                          │          │          │
+                     POST /post  GET /feed  POST /like
+                          │          │          │
+                          ▼          ▼          ▼
+                     ┌────────┐ ┌────────┐ ┌──────────┐
+                     │  Post  │ │  Feed  │ │Engagement│
+                     │Service │ │Assembly│ │ Pipeline │
+                     └───┬────┘ └───┬────┘ └────┬─────┘
+                         │          │           │
+              ┌──────────┘          │           ▼
+              ▼                     │      ┌─────────┐
+        ┌─────────┐                 │      │counters │
+        │ Kafka   │                 │      │+ClickH. │
+        │post.cr. │                 │      └─────────┘
+        └────┬────┘                 │
+             ▼                      │
+        ┌─────────┐                 │
+        │Fan-out  │                 │
+        │Service  │                 │
+        └──┬──┬───┘                 │
+           │  │                     │
+           ▼  ▼                     ▼
+       ┌─────────────────────────────────────────────┐
+       │                  REDIS                      │
+       │                                             │
+       │  feed:{user}        posts_by:{author}       │
+       │  ZSET, ~300         LIST, ~20 post_ids,     │
+       │  post_ids (push)    per author (pull)       │
+       │                                             │
+       │  post:{post_id}     active_users (bloom)    │
+       │  body cache         recently_shown:{user}   │
+       └────────────────────────────┬────────────────┘
+                                    │ miss
+                                    ▼
+                          ┌────────────────────┐
+                          │   MySQL / TAO      │
+                          │   source of truth  │
+                          │   sharded by       │
+                          │   post_id          │
+                          └────────────────────┘
+                                    ▲
+                                    │
+                          ┌─────────┴────────┐
+                          │ Ranking Service  │◀── Feed Assembly
+                          │ + Feature Store  │
+                          └──────────────────┘
+</code></pre>
+<p>End-to-end narration: Alice posts. Fan-out service pushes the <code>post_id</code> into the Redis feed-lists of her 200 friends, and also LPUSHes it onto <code>posts_by:alice</code> (the per-author index, used for pull-mode reads). Bob opens FB → assembly fetches <code>feed:bob</code> (300 candidate post_ids), reads <code>posts_by:{celeb_id}</code> for the celebrities Bob follows (5 more post_ids), batch-hydrates all 305 post bodies from the post cache, sends them to the ranker, returns the top 20.</p>
+<p><strong>Two indexes, one dataset.</strong> Push and pull aren't different stores — they're the same posts indexed two ways. <code>feed:{reader_id}</code> pre-joins on the <em>reader</em> side (push). <code>posts_by:{author_id}</code> pre-joins on the <em>writer</em> side (pull). Hybrid keeps both indexes and chooses which to query based on whether the reader's feed list is hot.</p>
+<h3 id="write-path">Write path</h3>
+<pre><code>   Alice (author, 200 friends, not a celebrity)
+        │
+        │  1. POST /v1/posts { content }
+        ▼
+   ┌──────────────┐
+   │ Post Service │
+   └──────┬───────┘
+          │
+          ├──▶ 2a. INSERT into MySQL/TAO  (sharded by post_id)
+          ├──▶ 2b. SET post:{post_id} in post-body cache (write-through)
+          └──▶ 2c. publish post.created → Kafka
+                                  │
+                                  ▼
+                          ┌─────────────────┐
+                          │ Fan-out Service │
+                          └────┬────────┬───┘
+                               │        │
+        for each of Alice's    │        │ for the author's own index
+        ~200 active followers F│        │
+                               ▼        ▼
+            ZADD feed:{F}            LPUSH posts_by:alice {post_id}
+              {score} {post_id}      LTRIM posts_by:alice 0 19
+            (skip F if not in
+             active_users bloom)
+
+   Cost per normal post: 1 DB + 1 cache + ~200 ZADDs + 1 LPUSH.
+
+   Celebrity branch (&gt;10k followers): skip the per-follower ZADDs entirely;
+   only LPUSH posts_by:{celeb} runs. Followers pull at read time.
+</code></pre>
+<p>Write-side capacity: 1B posts/day is ~12k <code>post.created</code> events/sec average; at a 200 B event payload, Kafka is only ~2.4 MB/sec raw, ~7 MB/sec with RF=3, so the event log is not the cost center. Fan-out writes are. If a normal author fans out to 200 active followers, the average is ~2.4M Redis <code>ZADD</code>s/sec; at peak this can be 5-10x, so workers batch by target Redis shard and pipeline writes. Each fan-out task carries <code>{author_id, post_id, follower_page_token}</code> so retries resume from a follower-page boundary and do not duplicate <code>feed:{user_id}</code> entries.</p>
+<p>Fan-out mode state:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Trigger</th>
+<th>Index written</th>
+<th>Read behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>normal author</td>
+<td>push</td>
+<td>follower count &lt;= ~10k</td>
+<td><code>feed:{reader_id}</code> + <code>posts_by:{author_id}</code></td>
+<td>fast Redis feed read</td>
+</tr>
+<tr>
+<td>large author</td>
+<td>active-only push</td>
+<td>10k-1M followers</td>
+<td>active followers only + author index</td>
+<td>inactive readers pull later</td>
+</tr>
+<tr>
+<td>celebrity</td>
+<td>pull-only</td>
+<td>&gt;1M followers or burst detected</td>
+<td><code>posts_by:{author_id}</code> only</td>
+<td>merge at read time</td>
+</tr>
+<tr>
+<td>dormant reader</td>
+<td>rebuild</td>
+<td><code>feed:{reader_id}</code> missing</td>
+<td>async rebuild after pull-mode read</td>
+<td>first open slower, next open hot</td>
+</tr>
+<tr>
+<td>exhausted reader</td>
+<td>pull-back/cold</td>
+<td>cursor past feed cap</td>
+<td>no new feed write required</td>
+<td>cursor moves to author/cold indexes</td>
+</tr>
+</tbody>
+</table>
+<pre><code>
+     Same post, two indexes:
+
+          post_id P ──push──▶ feed:{reader_id}      (reader-keyed view)
+                     └──pull──▶ posts_by:{author_id}   (author-keyed view)
+
+     The fan-out decision only chooses which index to rely on first.
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Why hybrid push/pull.</strong> Pure push falls over on celebrities (one post → 50M Redis writes). Pure pull doesn't scale either — on every feed open, do a query like "give me top 300 recent posts from the 300 people I follow" which is hot-key heaven. Hybrid: push for normals, pull-on-read for celebrities. The cutoff is a tuning knob (~10k followers).</p>
+<p>Be ready for "why not pure precompute?" The honest answer is asymmetry: the median author makes push cheap, but the largest author turns one write into tens of millions of writes. Hybrid keeps the cheap case fast and makes the pathological case a read-time merge.</p>
+<p><strong>The Redis feed list.</strong> Per-user sorted set keyed by <code>user_id</code>, capped at ~300 entries. Each entry ≈ 64 bytes (8B post_id + 8B score + skiplist overhead). Per user ~20 KB. Reads are O(log N) range reads via <code>ZREVRANGE</code>. Time-to-live (TTL) on individual entries (~7 days) so the set self-trims.</p>
+<p><strong>Capacity — this is the dominant cost.</strong> 3B monthly active users (MAU) × 20 KB ≈ <strong>60 TB</strong> of feed lists before replication. Replicated ×3 across regions → ~1 PB of Redis RAM. The post-body cache is a rounding error by comparison (~2 TB for the hot window), because most feed reads serve posts &lt;24h old and post bodies are small.</p>
+<p>The author index is cheaper: 1B active authors × 50 ids × 8 B is ~400 GB raw, a few TB with Redis overhead/replication. <code>recently_shown</code> can become sneaky: 2B daily active users × 200 ids × ~16 B physical is several TB, so keep TTL short and cap hard. Dominant cost remains <code>feed:{user_id}</code> RAM and fan-out writes.</p>
+<p><strong>Knobs to cut footprint:</strong> (a) maintain an <strong>active set</strong> (Redis set or bloom filter of users active in the last ~7 days) and only pre-fan-out to members — drops live working set to ~30 TB; (b) per-entry TTL ~7 days so dormant lists evict; (c) compact encoding (int64 post_ids, not strings); (d) smaller cap (200) if the pull-mode fallback is cheap enough.</p>
+<p><strong>When a dormant user opens the app,</strong> their list is gone — assembly falls back to <strong>pull mode</strong> (see below) and an async job rebuilds <code>feed:{user_id}</code> + adds the user back to the active set. Their next open hits the fast push path.</p>
+<p><strong>Ranking at sub-300 ms.</strong> Pre-fetch candidate features into a feature store keyed by <code>user_id</code> and <code>post_id</code>. Two parallel calls from assembly: feed list fetch + feature fetch. Model inference is a single batch call. Cache the user's feed result for 5–10 seconds so refresh-spamming is cheap.</p>
+<p><strong>Ranking signal freshness.</strong> Engagement events stream into a "recent signals" online feature store (Redis or a key-value cache) with second-level latency. Velocity (likes per minute since post) is the strongest freshness signal.</p>
+<p><strong>Post storage.</strong> The workload is pure point-lookup by <code>post_id</code> at high write throughput with uniform sharding — any horizontally sharded store works. The canonical FB answer is <strong>sharded MySQL behind TAO</strong> (FB's graph-aware caching layer): strong per-shard consistency, well-understood ops, and the actual production architecture. Cassandra, HBase, Bigtable, or DynamoDB also fit — reach for them if you want multi-DC active-active writes and can tolerate eventual consistency.</p>
+<p>A write-through <strong>post-body cache</strong> (Redis/Memcached keyed by <code>post_id</code>) sits in front and absorbs the ~230k QPS read path. Hit rate is very high in practice — most feed reads are &lt;24h old. Misses fall through to the source-of-truth store; the back end sees a tiny fraction of read traffic.</p>
+<p>In the interview, naming Cassandra reflexively is fine, but be ready for "why not sharded MySQL?" The honest answer: this workload doesn't use any of Cassandra's interesting features (wide rows, tunable consistency). Pick it for write throughput and multi-DC active-active, not because it's a wide-column store.</p>
+<p><strong>Multi-region drift.</strong> Writes land in the author's home region, then <code>post.created</code> replicates to reader regions. For normal authors, fan-out can happen in the reader's home region once the event arrives; a 1-3 second delay is acceptable. For celebrities, only <code>posts_by:{author_id}</code> needs cross-region replication, so the blast radius is smaller. The feed cursor should include a <code>feed_epoch</code> or <code>region_watermark</code> so page 2 does not mix candidates from two ranking snapshots after a failover. Engagement counts are explicitly eventually consistent; visibility and blocks are checked against the freshest graph cache available and fail closed if stale.</p>
+<p><strong>Edge stress tests.</strong> A celebrity post is handled by pull-only indexing, not by trying to push to 50M lists. A dormant user's missing <code>feed:{user_id}</code> triggers pull-mode and async rebuild, not a cold 500 ms miss on every request. A power scroller carries the cursor into pull-back and cold-history stages instead of asking Redis for entries it no longer has. Burst writes from a highly active author are coalesced into fan-out batches by follower shard; if the queue lags, newest posts win and old low-score candidates can be skipped because ranking would bury them anyway. A cold start of a new Redis cluster is handled by serving pull-mode reads while fan-out workers lazily repopulate active users.</p>
+<p><strong>Interview punch line for reliability:</strong> the feed should be stale before it is slow. If Redis is cold or fan-out lags, I fall back to the author index and ranking can still produce a reasonable page.</p>
+<p><strong>Celebrity reads.</strong> Per-author "recent posts" Redis list at <code>posts_by:{author_id}</code> — last ~20 post_ids, TTL ~7 days. For celebrities, fan-out service skips writing into followers' feed lists and only updates this list; assembly reads it at request time. Cap a single user's celebrity fan-in to the most-followed N to avoid pathological reads. This per-author index isn't celebrity-only — it exists for <em>every</em> author and is the foundation of pull-mode fallback (below).</p>
+<p>Why Redis ZSET/LIST instead of only the DB: the feed open has a 500 ms p99 and needs hundreds of tiny ordered reads. Redis gives predictable memory-resident range reads; MySQL/TAO stays the source of truth for post bodies and cold history. A pure Cassandra wide-row feed also works, but then every feed open pays storage read latency and compaction costs instead of RAM cost.</p>
+<p><strong>Pull-mode fallback.</strong> When a dormant user opens the app and <code>feed:{user_id}</code> is empty, assemble at read time by fanning <em>in</em> from the same <code>posts_by:{author_id}</code> index used for celebrities:</p>
+<ol>
+<li><strong>Check the active set</strong> (bloom filter) — miss → pull mode.</li>
+<li><strong>Get top-K followees by affinity</strong> (precomputed, cap to ~500) rather than scanning all 3000.</li>
+<li><strong>Scatter-gather</strong> pipelined <code>LRANGE posts_by:{author_id} 0 20</code> across those 500 author shards in parallel.</li>
+<li><strong>Merge</strong> ~10,000 candidate post_ids, take top 300 by timestamp, hydrate post bodies, rank, return top 20.</li>
+<li><strong>Async rebuild</strong>: enqueue a job to populate <code>feed:{user_id}</code> with the top-ranked post_ids and re-add the user to the active set. Their next open is fast.</li>
+</ol>
+<p>Cost: ~75-125 ms for the cold path (still under the 500ms p99 budget). The trick is the per-author index — it converts "scan posts where author IN (300 followees)" (hot-key heaven) into 300 O(1) Redis reads.</p>
+<pre><code>   HOT PATH — Bob, active, feed:bob populated
+   ─────────────────────────────────────────────
+   Bob ─▶ GET /feed
+            │
+            ▼
+       Feed Assembly         (parallel calls)
+            ├──▶ ZREVRANGE feed:bob 0 299        ──▶ ~300 post_ids
+            ├──▶ for each celeb Bob follows:
+            │      LRANGE posts_by:{celeb} 0 N   ──▶ ~5 post_ids
+            └──▶ feature store (user + post)     ──▶ ranking features
+            │
+            ▼
+       merge ~305 candidates
+            │
+            ▼
+       MGET post:{id1}, post:{id2}, ...  (post-body cache)
+            │ misses
+            ▼
+       MySQL/TAO batch get (rare)
+            │
+            ▼
+       Ranking ──▶ top 20 + cursor ──▶ Bob
+
+
+   COLD PATH — Carol, dormant, feed:carol gone
+   ─────────────────────────────────────────────
+   Carol ─▶ GET /feed
+            │
+            ▼
+       Feed Assembly
+            │
+            ▼
+       BF.EXISTS active_users carol  ──▶  MISS → pull mode
+            │
+            ▼
+       affinity:carol  ──▶  top-K=500 followees by affinity
+            │
+            ▼
+       scatter-gather (parallel, pipelined Redis):
+         for each author A in top-500:
+           LRANGE posts_by:{A} 0 20
+            │
+            ▼
+       merge ~10,000 candidates → top-300 by timestamp
+            │
+            ▼
+       MGET post:{id...} ─▶ post cache ─▶ MySQL/TAO on miss
+            │
+            ▼
+       Ranking ──▶ top 20 + cursor ──▶ Carol
+            │
+            ▼
+       async: rebuild feed:carol from top-ranked ids,
+              add carol to active_users bloom
+</code></pre>
+<p><strong>Pagination beyond the feed list cap.</strong> <code>feed:{user_id}</code> is a <em>cache of the top-of-feed</em>, capped at ~300. When a power-scroller exhausts it, the cursor walks a state machine:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Latency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>feed_list</code></td>
+<td><code>feed:{user_id}</code> Redis sorted set</td>
+<td>&lt;100 ms</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>pull_back</code></td>
+<td><code>posts_by:{author_id}</code> scatter-gather with time watermark</td>
+<td>~150 ms</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>cold_history</code></td>
+<td>Source-of-truth store with index on <code>(author_id, created_at DESC)</code></td>
+<td>200-500 ms</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>discovery</code></td>
+<td>Precomputed trending / friends-of-friends / suggested</td>
+<td>~50 ms</td>
+</tr>
+</tbody>
+</table>
+<p>The cursor is an opaque blob: <code>{mode, last_seen_ts, seen_set_id}</code>. The <code>seen_set_id</code> points to <code>recently_shown:{user_id}</code> (Redis set, TTL ~24h, capped) so dedupe happens server-side across pages. Discovery fill is typically <em>interleaved</em> before stage 3 in production — pure personal feed thins out fast and ads/suggested keep the app sticky.</p>
+<pre><code>   Cursor: { mode, last_seen_ts, seen_set_id }
+
+      ┌──────────────────────────┐
+      │  Stage 1: feed_list      │  Read feed:{user} ZSET,
+      │  &lt;100ms  ·  Redis only   │  paginate by score. Cap ~300.
+      └────────────┬─────────────┘
+                   │ feed list exhausted
+                   ▼
+      ┌──────────────────────────┐
+      │  Stage 2: pull_back      │  Scatter-gather posts_by:{author}
+      │  ~150ms  ·  Redis        │  with `last_seen_ts` watermark.
+      │                          │  Hot history window ~7 days.
+      └────────────┬─────────────┘
+                   │ Redis history exhausted
+                   ▼
+      ┌──────────────────────────┐
+      │  Stage 3: cold_history   │  MySQL/TAO with composite index
+      │  200-500ms  ·  DB        │  (author_id, created_at DESC).
+      │                          │  Scatter across author shards.
+      └────────────┬─────────────┘
+                   │ fatigue, or interleaved at any stage
+                   ▼
+      ┌──────────────────────────┐
+      │  Stage 4: discovery      │  Precomputed lists: trending,
+      │  ~50ms  ·  precomputed   │  friends-of-friends, suggested,
+      │                          │  ads. Always available.
+      └──────────────────────────┘
+
+   At every stage, filter candidates against
+   recently_shown:{user_id} to dedupe across pages.
+</code></pre>
+<p>Stage 3 needs a secondary index on <code>(author_id, created_at DESC)</code>. In Cassandra that's a natural clustering key; in sharded MySQL/Vitess it's a composite index on each author shard. Reads are scatter-gather across author shards — slow but rare enough to tolerate.</p>
+<p><strong>Punch line for the interview:</strong> the feed list is a cache of the top of the feed, not the whole feed. Push and pull are two indexes of the same dataset. The cursor decides which tier to query, and the system degrades gracefully through them instead of cliffing when Redis runs out.</p>
+<p><strong>Backfill for new users.</strong> A new follow doesn't backfill historical posts into the feed list — too expensive. Instead, the assembly path pulls recent posts from the new followee at read time for the next few hours, then the steady-state hybrid takes over.</p>
+<p><strong>Consistency on engagement counts.</strong> Approximate counts shown immediately from a Redis counter; exact counts reconciled from ClickHouse hourly. Users never notice an off-by-3 like count.</p>
+<p><strong>What I'd defer.</strong> Ranking model training pipeline, ads injection, story/short video unification, integrity (spam/hate), notifications.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

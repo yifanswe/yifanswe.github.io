@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design a Distributed Lock Manager Like Chubby — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design a Distributed Lock Manager Like Chubby</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A distributed lock manager looks simple — "give me the lock for key X" — but the system that backs it is one of the few pieces of infrastructure that must be both highly available and strictly consistent. The hard part is correctness when clients crash holding locks and when the network partitions the lock manager from those clients.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>At any moment, for any lock identifier, at most one client believes it holds the lock in an action-permitting state, and the lock manager and downstream services agree on that belief through fencing tokens, not through wall-clock timeouts alone.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can build mutual exclusion on top of a replicated state machine, defend against the "client paused for 30 seconds" failure that breaks naive lock managers, and explain why Chubby chose coarse-grained locks plus session leases rather than fine-grained mutexes.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would build a Chubby-like service as a small cluster of replicas running Paxos or Raft. Clients open sessions with a TTL lease; locks are reified as files in a tiny hierarchical namespace; every lock acquisition returns a monotonically increasing fence token. Downstream services must check the token. The interesting decisions are session expiry handling, fencing tokens versus pure TTLs, and why this is built for infrequent coarse-grained locks, not microsecond mutexes.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Clients acquire and release named locks with optional exclusive or shared mode.</li>
+<li>Clients maintain a session with the lock service via heartbeats.</li>
+<li>A tiny file system supports small configuration files (Chubby's original use case).</li>
+<li>Clients receive notifications on file or lock state changes.</li>
+<li>The service supports leader election as a primary use case.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Strong consistency: a granted lock is not also granted to anyone else.</li>
+<li>High availability: tolerates minority replica failures.</li>
+<li>Survive client crashes without leaking locks.</li>
+<li>Survive network partitions without dangerous double grants.</li>
+<li>Latency in tens of milliseconds for acquisition; cheap heartbeats.</li>
+<li>Auditability for every grant, release, and session expiry.</li>
+</ul>
+<p>Out of scope unless interviewer asks:</p>
+<ul>
+<li>High-throughput fine-grained per-row locking (use database transactions instead).</li>
+<li>Application-level lock semantics like reentrancy beyond simple counter-style support.</li>
+<li>Cross-cluster lock federation.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Clients</td>
+<td>10,000-100,000 per Chubby cell.</td>
+</tr>
+<tr>
+<td>Active locks</td>
+<td>Tens of thousands at steady state, primarily for leader election and ownership claims.</td>
+</tr>
+<tr>
+<td>Acquisition rate</td>
+<td>Tens to hundreds per second; this is intentionally low.</td>
+</tr>
+<tr>
+<td>Session heartbeat rate</td>
+<td>Per client every few seconds.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Acquisition 10-100 ms; heartbeat under 10 ms.</td>
+</tr>
+<tr>
+<td>Availability</td>
+<td>Five replicas; tolerate two failures.</td>
+</tr>
+<tr>
+<td>Throughput</td>
+<td>Not a high-QPS system; coarseness is by design.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is not throughput; it is the Raft/Paxos commit latency and the heartbeat fan-in from many clients.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Use case</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Leader election</td>
+<td>A pool of replicas elects a single primary; loser stays warm.</td>
+<td>At-most-one-leader; failover within seconds.</td>
+</tr>
+<tr>
+<td>Service discovery / ownership</td>
+<td>"Which node owns shard 42?"</td>
+<td>Single writer per shard; readers see consistent ownership.</td>
+</tr>
+<tr>
+<td>Configuration store</td>
+<td>Small files for cluster config.</td>
+<td>Strong consistency, watch-based change notifications.</td>
+</tr>
+<tr>
+<td>Distributed coordination</td>
+<td>Barriers, queues, fences.</td>
+<td>Built on top of file primitives plus sequence numbers.</td>
+</tr>
+</tbody>
+</table>
+<p>This is intentionally coarse-grained. Chubby's design philosophy: applications acquire a lock for an entire role (e.g., master of the shard), not for each operation.</p>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">+---------------------+        +---------------------+
+| Client Library      |&lt;------&gt;| Lock Cell           |
+| - session mgr       |        | - 5 replicas        |
+| - cache + watches   |        | - Paxos/Raft consensus|
+| - fence token       |        | - one leader serves writes|
++---------+-----------+        +---+-----------------+
+          |                        |
+          | session heartbeat      | replicate log
+          |                        v
+          |              +--------------------+
+          |              | Replicated Log     |
+          |              | + KV state machine |
+          |              +--------------------+
+          v
++---------------------+
+| Application logic   |
+| - uses fence token  |
++---------+-----------+
+          |
+          v
++---------------------+
+| Downstream Storage  | &lt;-- checks fence token before serving writes
++---------------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Replica node</td>
+<td>Participates in Paxos/Raft; one leader processes writes.</td>
+<td>Five replicas typical; majority quorum required.</td>
+</tr>
+<tr>
+<td>Consensus layer</td>
+<td>Replicated log of state-machine operations.</td>
+<td>Operations are file/lock CRUD and session events.</td>
+</tr>
+<tr>
+<td>State machine</td>
+<td>Hierarchical namespace, lock state, session state.</td>
+<td>Deterministic; all replicas converge to identical state.</td>
+</tr>
+<tr>
+<td>Session manager</td>
+<td>Tracks client sessions, leases, and heartbeats.</td>
+<td>Session expiry triggers automatic lock release.</td>
+</tr>
+<tr>
+<td>Watch dispatcher</td>
+<td>Sends change notifications to subscribers.</td>
+<td>Fired after the change commits.</td>
+</tr>
+<tr>
+<td>Client library</td>
+<td>Maintains session, caches reads, validates fence tokens.</td>
+<td>Most production bugs are caught here.</td>
+</tr>
+<tr>
+<td>Fencing infrastructure</td>
+<td>Monotonic counters per lock; downstream verifies.</td>
+<td>Without this, a paused client can corrupt state.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="file-lock-node">File / Lock Node</h4>
+<pre><code class="language-text">Node(
+  path,                  // /ls/cell/service/lock
+  type,                  // file or directory
+  data,                  // small content, KB-range
+  metadata,
+  lock_state,            // exclusive_owner_session, shared_owners[], free
+  lock_generation,       // monotonic counter, used as fence token
+  acl,
+  version,               // for compare-and-swap operations
+  created_at,
+  modified_at
+)
+</code></pre>
+<h4 id="session">Session</h4>
+<pre><code class="language-text">Session(
+  session_id,
+  client_address,
+  lease_expires_at,
+  jeopardy_state,        // healthy, jeopardy, expired
+  held_locks,
+  watches
+)
+</code></pre>
+<h4 id="replicated-log-entry">Replicated Log Entry</h4>
+<pre><code class="language-text">LogEntry(
+  index,
+  term,
+  operation,             // create, delete, acquire, release, session_keepalive, session_expire
+  args,
+  client_session_id,
+  commit_token
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">Open(path, mode, flags) -&gt; handle           // create or open a file
+Acquire(handle, mode) -&gt; fence_token        // exclusive or shared
+Release(handle)
+GetContents(handle) -&gt; data, version
+SetContents(handle, data, expected_version) // CAS
+ReadDir(path)
+Delete(path, expected_version)
+SetWatch(handle, event_mask)                // change/delete notification
+KeepAlive(session_id) -&gt; session_status     // heartbeat
+</code></pre>
+<p>Acquire response includes the fence token (sometimes called sequencer): a monotonically increasing integer that downstream services check before honoring writes attributed to that lock holder.</p>
+<h3 id="session-lease-and-the-jeopardy-state">Session Lease And The Jeopardy State</h3>
+<p>Sessions are leases with a TTL (e.g., 12 seconds typical Chubby default).</p>
+<p>Lifecycle:</p>
+<ol>
+<li>Client opens session; server grants a lease until <code>T</code>.</li>
+<li>Client periodically sends <code>KeepAlive</code>. Server extends lease.</li>
+<li>If a <code>KeepAlive</code> does not arrive before <code>T</code>, the server marks the session <strong>expired</strong>.</li>
+<li>On expiry, all locks held by the session are released, all watches removed, all ephemeral nodes deleted.</li>
+<li>The client may be unable to reach the server but is still up. It enters <strong>jeopardy</strong> state and pauses application activity until it confirms it still holds the session.</li>
+</ol>
+<p>Critical detail: the client enforces a local conservative deadline that is <em>earlier</em> than the server's. If the client cannot reach the server before its conservative deadline, it stops using the lock (rather than waiting until it might have expired server-side). This asymmetry prevents the "client thinks it holds the lock, server already gave it away" window.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Lease timeouts alone cannot make mutual exclusion safe across the network. The client must apply a conservative bound earlier than the server's, and downstream services must check a fence token rather than trusting the client's claim.</p>
+</blockquote>
+<h3 id="fencing-tokens-the-crucial-mechanism">Fencing Tokens — The Crucial Mechanism</h3>
+<p>Without fencing, this scenario breaks mutual exclusion:</p>
+<ol>
+<li>Client A acquires lock; server grants until T=10.</li>
+<li>Client A pauses (GC, network) until T=12.</li>
+<li>Server expires A's session at T=10; grants lock to Client B at T=11.</li>
+<li>A resumes at T=12 unaware, sends write to storage.</li>
+<li>B also sends a write.</li>
+<li>Storage serves both — corruption.</li>
+</ol>
+<p>Fencing fix:</p>
+<ul>
+<li>Each grant increments a per-lock monotonic counter and returns it.</li>
+<li>A gets token 7; B gets token 8.</li>
+<li>Storage tracks the highest token it has seen for the resource; rejects writes with lower tokens.</li>
+<li>A's stale write fails downstream.</li>
+</ul>
+<p>This requires downstream cooperation. Lock services that don't fence — or services that don't check the token — cannot safely use lock-protected critical sections across the network.</p>
+<h3 id="consensus-layer">Consensus Layer</h3>
+<p>All write operations go through Paxos or Raft:</p>
+<ul>
+<li>Five replicas; one elected leader processes client writes.</li>
+<li>Leader appends to local log, replicates to majority, applies to state machine, replies to client.</li>
+<li>Reads default to the leader (linearizable); optional stale reads at replicas.</li>
+<li>On leader failure, a new leader is elected; uncommitted entries from the previous term either commit or are overwritten according to the protocol.</li>
+</ul>
+<p>Heartbeats and session keepalives also go through the leader so the state machine reflects current session liveness.</p>
+<h3 id="read-caching-in-the-client-library">Read Caching In The Client Library</h3>
+<p>Most operations are reads. To keep load down:</p>
+<ul>
+<li>Client library caches file contents, indexed by path, with the server-provided version.</li>
+<li>The server tracks which clients hold which cached entries.</li>
+<li>When data changes, the server invalidates the relevant clients before completing the write.</li>
+<li>This effectively makes reads strongly consistent from the application's view, while offloading work to clients.</li>
+</ul>
+<p>This is the Chubby caching design. It is one of the major reasons Chubby can serve thousands of clients with five replicas.</p>
+<h3 id="watches-and-notifications">Watches And Notifications</h3>
+<ul>
+<li>Clients register watches on file paths.</li>
+<li>After a change commits, the dispatcher pushes a one-shot notification.</li>
+<li>The client re-reads to learn the new state.</li>
+<li>Notifications carry no payload; the read is the truth, and avoids race conditions where the watch and the read disagree.</li>
+</ul>
+<p>Watches are how leader election clients learn that the previous leader's lock has been released.</p>
+<h3 id="leader-election-pattern">Leader Election Pattern</h3>
+<p>The canonical use case:</p>
+<pre><code class="language-text">1. Each candidate opens session.
+2. Each tries to acquire lock at /service/election.
+3. The winner sets the file contents to their address; remaining candidates set watches.
+4. Winner periodically heartbeats its session.
+5. If winner's session expires, the lock is released; watches fire.
+6. A new election begins.
+7. Every successful acquire returns a higher fence token than the previous leader's.
+</code></pre>
+<p>Downstream services check the fence token on every write they receive; a delayed write from the previous leader fails.</p>
+<h3 id="scaling-strategy">Scaling Strategy</h3>
+<p>Chubby is intentionally not high-throughput. To scale across many tenants:</p>
+<ul>
+<li>Run many independent Chubby cells per data center, sharded by application.</li>
+<li>Each cell handles a few thousand clients.</li>
+<li>Latency-sensitive applications use cells in their own region; cross-cell coordination is avoided.</li>
+<li>Heartbeats are aggregated and batched on the client side when many sessions originate from one process.</li>
+</ul>
+<p>If throughput becomes an issue, the typical answer is "you are using it wrong" — Chubby is for coarse coordination, not for serializing writes.</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Acquire/Release</td>
+<td>Linearizable via consensus</td>
+<td>Mutual exclusion requires total order.</td>
+</tr>
+<tr>
+<td>Get/Set with version</td>
+<td>Linearizable</td>
+<td>Reads through the leader plus cache invalidation.</td>
+</tr>
+<tr>
+<td>Stale read</td>
+<td>Eventually consistent</td>
+<td>Used only when explicit.</td>
+</tr>
+<tr>
+<td>Watch notification</td>
+<td>After-commit delivery</td>
+<td>Application re-reads for truth.</td>
+</tr>
+<tr>
+<td>Session events</td>
+<td>Linearizable</td>
+<td>Lock release on expiry must be a committed log event.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Client paused with lock held; lease expires.</td>
+<td>Fencing tokens checked downstream; client conservative deadline.</td>
+<td>Stale fence-token rejections at storage; jeopardy session count.</td>
+</tr>
+<tr>
+<td>Leader replica fails.</td>
+<td>Raft election picks new leader; outage of a few seconds.</td>
+<td>Leader-change rate, election duration.</td>
+</tr>
+<tr>
+<td>Network partition isolates minority replicas.</td>
+<td>Minority cannot commit; clients connected to it lose ability to acquire.</td>
+<td>Quorum size, partition detection.</td>
+</tr>
+<tr>
+<td>Network partition isolates a client from the cell.</td>
+<td>Client enters jeopardy, then stops using the lock; server expires session.</td>
+<td>Jeopardy duration distribution.</td>
+</tr>
+<tr>
+<td>Heartbeat storm.</td>
+<td>Client batching; conservative TTL; server rate limit.</td>
+<td>Heartbeat QPS, response latency.</td>
+</tr>
+<tr>
+<td>Watch storm on popular file.</td>
+<td>Fan-out throttling; client-side debounce.</td>
+<td>Watch fire rate, dispatcher queue depth.</td>
+</tr>
+<tr>
+<td>Replica clock skew.</td>
+<td>Use server-only clocks for lease decisions; do not rely on client time.</td>
+<td>Cross-replica clock drift.</td>
+</tr>
+<tr>
+<td>Storage of replicated log fills.</td>
+<td>Snapshot + log compaction.</td>
+<td>Log size, snapshot age.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Fence token violations at downstream (must be zero or auditable).</li>
+<li>Sessions expired with locks held — duration and count.</li>
+<li>Double-grant alerts.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Consensus commit latency p99.</li>
+<li>Active session count and heartbeat rate.</li>
+<li>Active watch count.</li>
+<li>Cache hit ratio at client.</li>
+</ul>
+<p>Service health:</p>
+<ul>
+<li>Leader stability; election frequency.</li>
+<li>Quorum availability.</li>
+<li>Log size and snapshot age.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Strong consistency requires consensus, capping write throughput in the hundreds per second per cell.</li>
+<li>Coarse-grained locks reduce frequency but require applications to design around longer critical sections.</li>
+<li>TTL leases are conservative; setting them too short causes spurious failovers, too long delays recovery.</li>
+<li>Fencing tokens require downstream cooperation; applications that ignore them cannot be safe.</li>
+<li>Client-side caching offloads load but requires server-tracked invalidations.</li>
+<li>Five replicas tolerate two failures; more replicas increase commit latency for limited extra safety.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Treating it as a high-throughput mutex service.</td>
+<td>Frame it as coarse-grained coordination; locks per role, not per operation.</td>
+</tr>
+<tr>
+<td>Trusting lease TTL alone.</td>
+<td>Fence tokens checked downstream.</td>
+</tr>
+<tr>
+<td>Symmetric client/server expiry deadlines.</td>
+<td>Client uses an earlier conservative deadline.</td>
+</tr>
+<tr>
+<td>Forgetting cache invalidation in the design.</td>
+<td>Server tracks cache holders and invalidates before commit.</td>
+</tr>
+<tr>
+<td>Using Chubby as a config DB at scale.</td>
+<td>Small files only; for bigger config, point to external storage.</td>
+</tr>
+<tr>
+<td>Cross-cell global locks.</td>
+<td>Avoid; partition the lock space by application/region.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fencing tokens</td>
+<td>Show the GC-pause scenario; explain monotonic counter and downstream check.</td>
+</tr>
+<tr>
+<td>Session jeopardy</td>
+<td>Client-conservative deadlines; recover via session reattach window.</td>
+</tr>
+<tr>
+<td>Consensus mechanics</td>
+<td>Paxos or Raft; leader election; log replication; snapshots.</td>
+</tr>
+<tr>
+<td>Watch semantics</td>
+<td>One-shot, payload-free, after-commit; application re-reads.</td>
+</tr>
+<tr>
+<td>Coarse vs fine grain</td>
+<td>Why Chubby is for roles, not request-scoped mutex.</td>
+</tr>
+<tr>
+<td>Multi-cell strategy</td>
+<td>Independent cells per application; no global coordination.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>State the invariant: at-most-one-holder plus fencing token correctness.</li>
+<li>Build on a consensus replicated state machine.</li>
+<li>Explain sessions, leases, heartbeats, and jeopardy.</li>
+<li>Always mention fencing tokens.</li>
+<li>Explain client-side caching with server invalidations.</li>
+<li>Position the system as coarse-grained, not fine-grained.</li>
+<li>Discuss watch semantics.</li>
+<li>Identify multi-cell as the scaling strategy.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>A distributed lock manager is correctness-first infrastructure. The lock is not the safe primitive; the lock plus a fencing token is. Sessions, leases, and the jeopardy protocol prevent leaked locks, but the safety net is the monotonic token enforced by every service that honors the lock.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design a distributed lock manager.</p>
+<p><strong>Candidate:</strong> I would build a Chubby-style cell of five replicas running Raft, exposing a tiny hierarchical namespace where files double as locks. Each client opens a session with a lease; acquiring a lock returns a monotonically increasing fence token. The invariant is at-most-one-holder, and the downstream services must check the fence token before honoring writes.</p>
+<p><strong>Interviewer:</strong> Why do I need fencing tokens? Aren't lease TTLs enough?</p>
+<p><strong>Candidate:</strong> No. Suppose client A holds the lock, then pauses for 20 seconds (GC, network blip). Its lease expires; the server grants the lock to client B. Then A resumes, still thinks it has the lock, and writes to storage. Without fencing, storage cannot tell A's write from B's. With fencing, A's token is 7, B's is 8; storage tracks the max token it has accepted and rejects A's stale write. Lease TTLs alone leave a window of unsafety; fencing closes it.</p>
+<p><strong>Interviewer:</strong> How big should the lease TTL be?</p>
+<p><strong>Candidate:</strong> A balance. Too short and minor pauses cause spurious failovers and re-elections. Too long and recovery from a real failure is slow. Chubby's default is around 12 seconds. The client uses a more conservative local deadline — maybe 8 seconds — so it stops using the lock before the server might revoke it. That asymmetry is critical.</p>
+<p><strong>Interviewer:</strong> Walk me through leader election.</p>
+<p><strong>Candidate:</strong> Each candidate opens a session and attempts <code>Acquire</code> on the election file. One wins, gets a fence token, writes its address into the file. Losers register watches. The winner heartbeats periodically. If the winner's session expires, the lock is released; watches fire on losers; the next acquire returns a higher token. Any writes the deposed leader sends downstream after expiry are rejected by token comparison.</p>
+<p><strong>Interviewer:</strong> How does the consensus layer work?</p>
+<p><strong>Candidate:</strong> Raft. Five replicas, one leader, majority quorum required to commit. Every write — acquire, release, file edit, session keepalive — is appended to the log, replicated to a majority, then applied to the deterministic state machine. Reads can go through the leader for linearizability or through replicas with explicit staleness.</p>
+<p><strong>Interviewer:</strong> Reads through the leader sound expensive.</p>
+<p><strong>Candidate:</strong> That is why the client library caches. The server tracks which clients hold which cached entries. When a write commits, the server sends invalidations to all cache holders before the write completes. The next read from a holder is forced to refetch. This gives applications linearizable reads with most of the work offloaded to the client.</p>
+<p><strong>Interviewer:</strong> Why is this not a high-QPS service?</p>
+<p><strong>Candidate:</strong> Every write goes through consensus, which takes tens of milliseconds in the best case. That bounds you to hundreds of writes per second per cell. Chubby was designed for coarse-grained coordination — a service grabs the lock for its entire master tenure, not per-request. If you need fine-grained locks, you use a database transaction or a Redis-style optimistic system instead.</p>
+<p><strong>Interviewer:</strong> A client's network breaks but the client process is up. What happens?</p>
+<p><strong>Candidate:</strong> The client enters jeopardy: it failed to refresh its lease. It pauses application activity using the lock, expecting to recover before the lease expires. It keeps trying to reach any replica. If it reconnects within the lease window, it confirms the session is still alive and resumes. If the conservative client-side deadline passes without confirmation, it gives up the lock locally even if technically the server has not expired the session. This way, even if the network heals and the server still thinks the client has the lock, the client refuses to use it.</p>
+<p><strong>Interviewer:</strong> What if the consensus minority is partitioned?</p>
+<p><strong>Candidate:</strong> The minority cannot commit writes. Clients connected to minority replicas see acquire failures. The majority continues serving writes through its leader. When the partition heals, the minority replicas replay log entries and rejoin. Importantly, the minority replicas never granted a conflicting lock during the partition because they did not have quorum.</p>
+<p><strong>Interviewer:</strong> How do you handle watch storms?</p>
+<p><strong>Candidate:</strong> Watches are one-shot and payload-free; after firing, the client must re-register if it wants further notifications. The fan-out is bounded by the dispatcher's rate limit. For popular files, we either reduce notification frequency or push watchers to poll. The application reads after a notification to learn the truth, which avoids races where the watch fires but the cached value is stale.</p>
+<p><strong>Interviewer:</strong> Multi-region or just one cell?</p>
+<p><strong>Candidate:</strong> Multiple cells, partitioned by application and region. One cell per application per data center is typical. Global coordination is a non-goal; if two services need to coordinate across regions, they do so above this layer (and accept the latency). Trying to make one cell global blows up commit latency from milliseconds to hundreds of milliseconds.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> A small replicated state machine — five replicas, Raft — exposes a tiny file system where files act as locks. Sessions with leases plus a jeopardy protocol prevent leaked locks; fencing tokens close the GC-pause hole. Client-side caches with server-driven invalidations make reads cheap. The system is intentionally coarse-grained; we scale by adding cells, not by raising throughput per cell.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: coarse-grained, leader election main use, mutual exclusion.</li>
+<li>State invariant: at-most-one-holder + fence token correctness.</li>
+<li>Build on consensus (Raft or Paxos); five replicas.</li>
+<li>Show sessions, leases, jeopardy.</li>
+<li>Show fencing tokens and the GC-pause scenario.</li>
+<li>Explain client-side caching with invalidations.</li>
+<li>Explain watches; one-shot, payload-free.</li>
+<li>Close with multi-cell scaling.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>A distributed lock manager is correctness-first infrastructure. Locks live in a replicated state machine; sessions with TTL leases prevent permanent leaks; fencing tokens prevent stale clients from corrupting downstream state. Client-side caches with server-driven invalidations carry the read load. The system is coarse-grained by design; scale comes from running many cells, not from raising throughput per cell.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"The lock is not the safe primitive; the lock plus a fencing token is."</li>
+<li>"Lease TTLs alone leave a window of unsafety; the client must use a conservative local deadline."</li>
+<li>"Watches are one-shot and payload-free; the read is the truth."</li>
+<li>"This is intentionally coarse-grained — locks per role, not per operation."</li>
+<li>"Scale by adding cells; never try to raise throughput of a single cell."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

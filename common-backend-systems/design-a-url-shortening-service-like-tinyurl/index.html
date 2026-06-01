@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design a URL Shortening Service Like TinyURL — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design a URL Shortening Service Like TinyURL</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A URL shortener looks trivial — accept a long URL, return a short code, redirect on lookup. The hard part is keeping the system correct and fast at scale.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every short code maps to exactly one canonical long URL for its entire lifetime, and the same long URL can be re-used by many distinct short codes; lookups must be cheap, idempotent, and globally consistent enough that no two creators ever receive the same code.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can pick a code generation strategy that avoids collisions at scale, separate the write path from a read-mostly redirect path, and explain how analytics, abuse, and link expiry are layered on without slowing the hot redirect.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design TinyURL around two paths: a low-volume create path that allocates a globally unique short code, and an extremely high-volume redirect path that does a single key lookup. The interesting decisions are how I generate codes without collisions, how I cache the redirect path, and how I protect the system from malware and analytics-driven hot keys. I will clarify requirements, define the data model, walk the write and read paths, then go deeper on code generation and cache strategy.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Users can submit a long URL and receive a short code.</li>
+<li>Users can optionally request a custom alias.</li>
+<li>Visiting a short URL redirects to the long URL.</li>
+<li>Users can see basic analytics for their links: total clicks, recent clicks, geographic distribution.</li>
+<li>Links can optionally have an expiration time or a one-time-use flag.</li>
+<li>Admins can disable malicious links.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Redirect latency well under 100 ms at the edge.</li>
+<li>No two creators ever receive the same code for different long URLs.</li>
+<li>The same long URL submitted twice may produce different codes; deduping is optional.</li>
+<li>The redirect path must keep working even when the create path is degraded.</li>
+<li>Analytics may lag by seconds to minutes; redirects cannot lag.</li>
+<li>Auditability for who created which link and when, for abuse review.</li>
+</ul>
+<p>Out of scope unless interviewer asks:</p>
+<ul>
+<li>Branded vanity domains and per-tenant white labeling.</li>
+<li>Deep link routing into mobile apps.</li>
+<li>A/B testing or dynamic destinations.</li>
+<li>Full link-in-bio profile pages.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<p>State assumptions out loud so the design has a shape:</p>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Writes</td>
+<td>100M new links/day at peak, roughly 1k/s average, 10k/s spike.</td>
+</tr>
+<tr>
+<td>Reads</td>
+<td>100x to 1000x writes; ~100k-1M redirects/sec peak globally.</td>
+</tr>
+<tr>
+<td>Object size</td>
+<td>Long URL up to ~2 KB; short code 6–8 chars.</td>
+</tr>
+<tr>
+<td>Retention</td>
+<td>Default 5 years; some links never expire.</td>
+</tr>
+<tr>
+<td>Hot keys</td>
+<td>Viral links can dominate; one URL can receive most traffic for hours.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Redirect p99 under 50 ms from edge; create p99 under 300 ms.</td>
+</tr>
+<tr>
+<td>Consistency</td>
+<td>Strong uniqueness for code allocation. Eventual consistency for analytics.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is not write throughput. The bottleneck is the global uniqueness guarantee on code generation and the read-side cache hit rate for viral links.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<p>Think in terms of three separate surfaces:</p>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>User experience</th>
+<th>System requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Create</td>
+<td>Submit long URL, get short code.</td>
+<td>Strongly consistent code allocation, low write volume, idempotent on client retry.</td>
+</tr>
+<tr>
+<td>Redirect</td>
+<td>Visit short URL, land at long URL.</td>
+<td>Extreme read scale, cacheable, must work read-only during create outages.</td>
+</tr>
+<tr>
+<td>Analytics</td>
+<td>View click counts and trends.</td>
+<td>Eventually consistent, heavy aggregation, separate from the redirect hot path.</td>
+</tr>
+</tbody>
+</table>
+<p>The main design mistake is letting analytics or feature flags sit on the synchronous redirect path. The redirect should be a single key lookup plus a 301/302 response.</p>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                +-------------------+
+User clients -&gt; | CDN / Edge cache  |
+                +---------+---------+
+                          |
+            redirect      |       create
+        +-----------------+----------------+
+        |                                  |
+        v                                  v
++------------------+              +-------------------+
+| Redirect Service |              | API Gateway       |
+| edge replica RO  |              | auth, rate limit  |
++--------+---------+              +---------+---------+
+         |                                  |
+         v                                  v
++------------------+              +-------------------+
+| KV Cache         |              | Create Service    |
+| short -&gt; long    |&lt;-------------+ allocate + write  |
++--------+---------+              +---------+---------+
+         |                                  |
+         v                                  v
++------------------+              +-------------------+
+| Link Store       |              | Code Allocator    |
+| authoritative KV |&lt;-------------+ counter / hash    |
++--------+---------+              +---------+---------+
+         |
+         v
++------------------+      +-------------------+
+| Click Stream     +-----&gt;| Analytics Pipeline|
+| async pixel/log  |      | aggregation/OLAP  |
++------------------+      +-------------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Edge / CDN</td>
+<td>Cache 301/302 responses for hot short codes; absorb DDoS.</td>
+<td>Hot viral links should rarely reach origin.</td>
+</tr>
+<tr>
+<td>API gateway</td>
+<td>Authentication, rate limits, abuse checks on create path.</td>
+<td>Anonymous create may be allowed but heavily limited.</td>
+</tr>
+<tr>
+<td>Create service</td>
+<td>Validate long URL, allocate code, write to link store.</td>
+<td>Idempotent on <code>Idempotency-Key</code> header.</td>
+</tr>
+<tr>
+<td>Code allocator</td>
+<td>Produces a globally unique short code.</td>
+<td>The critical correctness component. Counter-based, hash-based, or pre-allocated pool.</td>
+</tr>
+<tr>
+<td>Link store</td>
+<td>Authoritative <code>short_code -&gt; long_url</code> mapping plus metadata.</td>
+<td>Read-heavy. Key-value or columnar store.</td>
+</tr>
+<tr>
+<td>Redirect service</td>
+<td>Resolves a short code to a long URL and emits a click event.</td>
+<td>Stateless; horizontally scalable; reads from cache then store.</td>
+</tr>
+<tr>
+<td>KV cache</td>
+<td>In-memory LRU for the hot working set.</td>
+<td>Short codes have a long-tail and a fat head — caching is very effective.</td>
+</tr>
+<tr>
+<td>Click stream</td>
+<td>Async pipeline for click events: timestamp, code, geo, referrer, agent.</td>
+<td>Never blocks the redirect response.</td>
+</tr>
+<tr>
+<td>Analytics service</td>
+<td>Aggregates clicks for dashboards and exports.</td>
+<td>OLAP store, hourly/daily rollups.</td>
+</tr>
+<tr>
+<td>Abuse and safety</td>
+<td>Scans newly created and lookup-time URLs against blocklists.</td>
+<td>Async on create, with a denylist consulted by redirect service.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="link">Link</h4>
+<pre><code class="language-text">Link(
+  short_code,         // primary key, 6-8 chars base62
+  long_url,
+  owner_user_id,      // nullable for anonymous
+  created_at,
+  expires_at,         // nullable
+  status,             // active, disabled, expired
+  is_custom_alias,    // bool
+  click_count_approx, // denormalized counter, eventually consistent
+  safety_status,      // unknown, safe, flagged, blocked
+  version
+)
+</code></pre>
+<p><code>short_code</code> is the partition and primary key. The store does not need a secondary index for <code>long_url</code> unless deduplication is required.</p>
+<h4 id="code-allocation-record">Code Allocation Record</h4>
+<p>For counter-based allocators:</p>
+<pre><code class="language-text">CounterRange(
+  region_id,
+  worker_id,
+  range_start,
+  range_end,
+  claimed_at
+)
+</code></pre>
+<p>A single counter does not need to be globally synchronous on every write; instead, each create node reserves a range of integers, then converts to base62 locally.</p>
+<h4 id="click-event-append-only">Click Event (append-only)</h4>
+<pre><code class="language-text">ClickEvent(
+  event_id,
+  short_code,
+  ts,
+  ip_hash,
+  geo_country,
+  referrer,
+  user_agent_family
+)
+</code></pre>
+<h4 id="abuse-decision">Abuse Decision</h4>
+<pre><code class="language-text">SafetyDecision(
+  short_code,
+  decided_at,
+  source,             // scanner_v1, manual_review, partner_feed
+  status,             // safe, suspicious, blocked
+  reason_code
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">POST /links
+Headers:
+  Idempotency-Key: client-key
+Body:
+  long_url
+  custom_alias?
+  expires_at?
+
+201 Created
+  short_code
+  short_url
+  expires_at
+
+GET /{short_code}
+  -&gt; 301 Location: long_url    (or 302 if you need fresh analytics per hit)
+
+GET /links/{short_code}/stats
+GET /links?owner=me
+DELETE /links/{short_code}     // soft-delete: status -&gt; disabled
+</code></pre>
+<p>Idempotency: the same <code>Idempotency-Key</code> for the same user returns the same <code>short_code</code>. This makes client retries safe and prevents allocating two codes for what the user perceives as one create.</p>
+<h3 id="code-generation-strategy">Code Generation Strategy</h3>
+<p>This is the core deep dive. Three viable approaches:</p>
+<p><strong>Approach A: Counter + base62 encoding</strong></p>
+<ul>
+<li>A central or per-shard counter increments on each create.</li>
+<li>Encode the integer to base62 (<code>0-9 a-z A-Z</code>); a 6-char code covers ~56 billion; 7 chars covers ~3.5 trillion.</li>
+<li>To avoid contention, each create node pre-claims a range (e.g. 10,000 integers) and serves locally until empty.</li>
+<li>The range claim is the only synchronous step; it uses a transactional counter or ZooKeeper-style sequencer.</li>
+</ul>
+<p>Pros: deterministic, no collision, predictable code length growth.
+Cons: codes are guessable and enumerable; competitors and bots can scrape sequentially.</p>
+<p><strong>Approach B: Random + collision check</strong></p>
+<ul>
+<li>Generate 7-8 random base62 characters.</li>
+<li>Conditional insert: <code>INSERT IF NOT EXISTS short_code = ?</code>.</li>
+<li>On collision, generate a new random code and retry.</li>
+</ul>
+<p>Pros: codes are unguessable; no coordination.
+Cons: collision rate rises as keyspace fills; bounded by birthday paradox; requires conditional writes.</p>
+<p><strong>Approach C: Hash of <code>(long_url, salt)</code> truncated</strong></p>
+<ul>
+<li>Hash with SHA-256, truncate to 7-8 base62 characters.</li>
+<li>Same long URL with same salt gives same code, so it provides automatic dedup.</li>
+<li>Collisions are still possible; resolve with extra bits or counter suffix.</li>
+</ul>
+<p>Pros: built-in dedup for the same submitter; no central counter.
+Cons: collision handling is awkward; the same long URL across users may yield the same code, which leaks information about other users' links.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>I would use a counter-with-range-claim approach by default for predictability, plus a random shuffle to mask the sequence so scraping does not reveal active codes. If the product requires unguessable codes, I switch to random with conditional insert and accept the retry cost.</p>
+</blockquote>
+<h3 id="write-path-create-link">Write Path: Create Link</h3>
+<ol>
+<li>Client <code>POST /links</code> with <code>Idempotency-Key</code>.</li>
+<li>Gateway enforces auth, rate limit, blocklist on the long URL host.</li>
+<li>Create service checks the idempotency table; if present, return the prior <code>short_code</code>.</li>
+<li>Allocate a code:
+   - If the local range has integers, take the next one and encode.
+   - If exhausted, claim a new range from the global allocator.</li>
+<li>Insert <code>(short_code, long_url, owner, ...)</code> into the link store. For random codes, use conditional insert and retry on collision.</li>
+<li>Write the idempotency record.</li>
+<li>Push the new link to safety scanners asynchronously.</li>
+<li>Return <code>short_code</code> and full <code>short_url</code>.</li>
+</ol>
+<p>The synchronous critical path is one counter increment plus one insert. Both are O(1).</p>
+<h3 id="read-path-redirect">Read Path: Redirect</h3>
+<ol>
+<li>Client visits <code>https://short.example/abc123</code>.</li>
+<li>Edge CDN checks its cached redirect. On hit, return 301 immediately and emit an edge click event.</li>
+<li>On miss, hit a regional redirect service.</li>
+<li>Redirect service checks KV cache.</li>
+<li>On cache miss, read from link store.</li>
+<li>Check <code>status</code> and <code>safety_status</code>. If disabled or blocked, return a safety interstitial, not a redirect.</li>
+<li>Respond with <code>301 Location: &lt;long_url&gt;</code> (or <code>302</code> to force analytics on every hit).</li>
+<li>Fire and forget a click event to the stream.</li>
+</ol>
+<p>The response wait is one cache lookup. Click writing is fully asynchronous.</p>
+<p>301 vs 302:</p>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Behavior</th>
+<th>Analytics impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>301 Permanent</td>
+<td>Browsers and intermediaries cache aggressively. Lowest latency.</td>
+<td>First click counted; subsequent clicks from same client may bypass origin.</td>
+</tr>
+<tr>
+<td>302 Found</td>
+<td>No caching by default.</td>
+<td>Every click reaches origin and is counted.</td>
+</tr>
+</tbody>
+</table>
+<p>Most production short link services choose 302 for analytics fidelity and tolerate the lost edge caching. If the system needs both, you can serve 301 with a short <code>Cache-Control: max-age=N</code> and accept bounded analytics loss.</p>
+<h3 id="caching-strategy">Caching Strategy</h3>
+<p>The redirect workload has extreme skew: a small percentage of links generate the majority of traffic.</p>
+<ul>
+<li>Multi-tier caching: browser HTTP cache, CDN edge cache, regional KV cache, in-process caches.</li>
+<li>Cache key is the short code. Cache value is the long URL plus status and safety flag.</li>
+<li>TTLs are long (hours to days) because mappings are immutable. The only invalidation cases are status changes (disable, expire, safety block) and updates.</li>
+<li>On status change, publish an invalidation event to a fan-out channel that each cache node listens to.</li>
+<li>For viral links, pre-warm caches when a sudden burst is detected.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Caching here is unusually effective because the mapping is immutable in the common case. The interesting question is invalidation when a link is disabled for safety, which should happen within seconds globally.</p>
+</blockquote>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Link store</td>
+<td><code>short_code</code> (hash partitioned)</td>
+<td>Even distribution; the natural lookup key.</td>
+</tr>
+<tr>
+<td>Counter range claims</td>
+<td>Single small table, conditional update</td>
+<td>Low volume, but must be transactional.</td>
+</tr>
+<tr>
+<td>Click events</td>
+<td><code>short_code</code> for short-window aggregation, then daily by date</td>
+<td>Hot-key spread for viral links uses sampling or sub-partitioning.</td>
+</tr>
+<tr>
+<td>Analytics rollups</td>
+<td><code>short_code + bucket</code></td>
+<td>Pre-aggregated counters.</td>
+</tr>
+<tr>
+<td>Owner index</td>
+<td><code>owner_user_id</code> secondary index or separate table</td>
+<td>For "my links" lookups.</td>
+</tr>
+</tbody>
+</table>
+<p>Hot-key handling:</p>
+<ul>
+<li>For a viral link generating millions of redirects per minute, cache near the user and serve from CDN.</li>
+<li>Sample click events to avoid overloading the click pipeline; sampled events are scaled up for aggregates.</li>
+<li>Per-IP and per-user-agent rate limits at the edge.</li>
+</ul>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Code allocation</td>
+<td>Strong (within allocator)</td>
+<td>Prevent duplicate codes.</td>
+</tr>
+<tr>
+<td>Link store insert</td>
+<td>Strong primary-key conditional write</td>
+<td>Prevent code reuse.</td>
+</tr>
+<tr>
+<td>Cache</td>
+<td>Eventually consistent with explicit invalidation events</td>
+<td>Acceptable lag for the immutable mapping; safety updates need fast propagation.</td>
+</tr>
+<tr>
+<td>Click counters</td>
+<td>Eventually consistent</td>
+<td>Dashboard freshness is per-minute or per-hour.</td>
+</tr>
+<tr>
+<td>Safety decisions</td>
+<td>Eventually consistent on create, strong on lookup once decided</td>
+<td>A link found malicious must stop redirecting quickly.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="expiry-and-lifecycle">Expiry And Lifecycle</h3>
+<ul>
+<li>Links may have <code>expires_at</code>. The redirect service checks the field on every miss read from the store; the cache record includes the expiry so it can self-invalidate.</li>
+<li>Soft delete on user request: set <code>status = disabled</code>, broadcast invalidation.</li>
+<li>Garbage collection of expired links runs as a slow background job; the rows can stay indefinitely but be marked.</li>
+<li>One-time-use links: redirect service performs a conditional <code>UPDATE status FROM active TO used</code> before responding; second visitor sees a "link already used" page.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<p>The redirect path is read-mostly and benefits from active-active across regions.</p>
+<ul>
+<li>Asynchronously replicate the link store globally. Stale replica reads are acceptable for redirects because the mapping is immutable after creation.</li>
+<li>Code allocation: each region claims independent counter ranges (e.g., region-tagged prefixes or interleaved integer ranges) so creates can be local without cross-region coordination.</li>
+<li>Invalidation events for <code>disabled</code> or <code>blocked</code> codes broadcast through a global pub/sub channel with low end-to-end latency target (seconds, not minutes).</li>
+<li>Failover: if a region loses its store, redirect traffic continues from cache; creates fail or fall back to a peer region.</li>
+</ul>
+<p>If active-active causes problems for custom aliases (two users picking the same alias in different regions), funnel custom-alias creates through a single region or take a global lock per alias.</p>
+<h3 id="abuse-safety-and-privacy">Abuse, Safety, And Privacy</h3>
+<p>URL shorteners are weaponized for phishing and malware.</p>
+<p>Controls:</p>
+<ul>
+<li>Blocklist check on submitted host at create time (known phishing domains, sanctioned hosts).</li>
+<li>Async deeper scan after create: fetch the destination, render in a sandbox, classify.</li>
+<li>Reputation scoring of submitter (account age, prior abuse).</li>
+<li>Rate limit anonymous creates aggressively.</li>
+<li>Interstitial warning page for newly scanned but unverified links.</li>
+<li>Manual review queue for user reports.</li>
+<li>Quick global takedown: a denylist that every redirect node consults; a redis-backed bloom filter for low-latency negative cache; explicit invalidation on add.</li>
+</ul>
+<p>Privacy:</p>
+<ul>
+<li>Hash IP addresses before storing click events.</li>
+<li>Honor Do Not Track and regional privacy regimes for analytics.</li>
+<li>Owner-only access to click streams; do not leak click info to third parties.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Two creators receive the same code.</td>
+<td>Conditional inserts on <code>short_code</code>; range allocator transactional; collision retry on random scheme.</td>
+<td>Insert-collision rate, duplicate-code alerts.</td>
+</tr>
+<tr>
+<td>Code generation contention storm.</td>
+<td>Per-node range pre-claim; lock-free allocator; multiple parallel sequencers.</td>
+<td>Allocator p99 latency, range-claim error rate.</td>
+</tr>
+<tr>
+<td>Cache poisoning with malicious redirect.</td>
+<td>Signed cache entries; invalidation requires write through the store.</td>
+<td>Mismatch between cache and store, unauthorized invalidation events.</td>
+</tr>
+<tr>
+<td>Viral link saturates origin.</td>
+<td>Aggressive edge caching; cache-as-301 with TTL; rate limit at edge.</td>
+<td>Origin QPS per code, edge cache hit ratio, top-N hot codes.</td>
+</tr>
+<tr>
+<td>Click pipeline backs up and loses events.</td>
+<td>Sampled ingest; durable buffer; replay from logs.</td>
+<td>Pipeline lag, drop count, replay coverage.</td>
+</tr>
+<tr>
+<td>Phishing link not blocked fast enough.</td>
+<td>Global denylist with pub/sub invalidation, cached negatively.</td>
+<td>Time-to-blocklist after report, false-positive rate.</td>
+</tr>
+<tr>
+<td>Store hot partition on <code>short_code</code>.</td>
+<td>Hash partition keyspace; pre-split ranges; check for sequential-code skew.</td>
+<td>Per-partition QPS distribution, p99 by partition.</td>
+</tr>
+<tr>
+<td>Counter region claim collisions across regions.</td>
+<td>Region-tagged prefix bits or non-overlapping integer ranges.</td>
+<td>Duplicate code rate per region pair.</td>
+</tr>
+<tr>
+<td>Analytics dashboard shows wrong numbers.</td>
+<td>Idempotent aggregation; periodic reconciliation from raw event store.</td>
+<td>Daily total mismatch between live dashboard and recompute.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness metrics:</p>
+<ul>
+<li>Duplicate short codes: must be zero.</li>
+<li>Inserts failing due to collision (should be very low for counter, bounded for random).</li>
+<li>Redirect responses with stale safety status.</li>
+<li>Disabled link still redirecting (cache invalidation lag).</li>
+</ul>
+<p>Capacity metrics:</p>
+<ul>
+<li>Redirect QPS by region, percentile latency.</li>
+<li>Edge cache hit ratio overall and for top-100 codes.</li>
+<li>Allocator range-claim rate and contention.</li>
+<li>Click pipeline lag.</li>
+</ul>
+<p>Business metrics:</p>
+<ul>
+<li>Creates per day, retention of created links, share rate.</li>
+<li>Abuse takedown time-to-block.</li>
+<li>Per-creator anomaly detection (sudden burst of submissions).</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Counter-based codes are predictable and easy; they leak link volume to attackers.</li>
+<li>Random codes are unguessable but require collision handling and waste keyspace.</li>
+<li>301 redirects are fast but lose per-click analytics; 302 captures every click but costs every hit at origin.</li>
+<li>Edge caching speeds redirects but slows safety takedowns; explicit invalidation is required.</li>
+<li>Dedup of the same long URL saves space but couples unrelated users; usually not worth it.</li>
+<li>Multi-region active-active for reads is easy; for custom alias creates it is risky.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single global atomic counter for every create.</td>
+<td>Range-claim allocator: amortize coordination across thousands of creates.</td>
+</tr>
+<tr>
+<td>Storing click counts in the same row as the link mapping.</td>
+<td>Separate counter store; aggregate from event stream.</td>
+</tr>
+<tr>
+<td>Treating the cache as the source of truth.</td>
+<td>Cache is a hint; the store is authoritative. Invalidations are explicit.</td>
+</tr>
+<tr>
+<td>Forgetting safety state in the redirect path.</td>
+<td>Each cached entry includes safety status; takedown publishes invalidation.</td>
+</tr>
+<tr>
+<td>Using base64 instead of base62.</td>
+<td>URL-safe charset matters: avoid <code>+</code>, <code>/</code>, and <code>=</code> padding.</td>
+</tr>
+<tr>
+<td>Letting custom aliases collide with auto-generated ones.</td>
+<td>Separate namespaces or reserved prefix; or check both spaces on create.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Code generation strategy</td>
+<td>Compare counter vs random vs hash, justify the choice, draw the allocator.</td>
+</tr>
+<tr>
+<td>Hot link absorption</td>
+<td>Multi-tier cache, edge 301 with TTL, hot-key telemetry, viral burst pre-warm.</td>
+</tr>
+<tr>
+<td>Multi-region writes</td>
+<td>Region-tagged ranges; show why custom aliases need different handling.</td>
+</tr>
+<tr>
+<td>Click analytics</td>
+<td>Sampling, idempotent aggregation, OLAP store, lambda or kappa pipeline.</td>
+</tr>
+<tr>
+<td>Safety and takedown</td>
+<td>Blocklist, async scan, pub/sub invalidation, interstitial page.</td>
+</tr>
+<tr>
+<td>Custom aliases</td>
+<td>Conditional insert; reservation API; conflict UX.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Start with the invariant: unique short code, immutable mapping.</li>
+<li>Distinguish the create path (low volume, strong consistency) from the redirect path (extreme reads, cacheable).</li>
+<li>Pick a code generation scheme and justify it.</li>
+<li>Show the cache hierarchy and how invalidation works.</li>
+<li>Explain idempotent create.</li>
+<li>Explain abuse handling and safety takedown.</li>
+<li>Show how multi-region works for reads and what gets harder for custom aliases.</li>
+<li>Include analytics as a non-blocking side path.</li>
+<li>Identify viral links as the hot-key risk and address it.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>For TinyURL the trick is to recognize the workload asymmetry. The create path is rare and needs correctness around uniqueness; the redirect path is the majority of traffic and needs to be a single cached key lookup. Everything else, from analytics to safety scanning, layers off the redirect path asynchronously.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design TinyURL.</p>
+<p><strong>Candidate:</strong> I will design it around two distinct paths: a low-volume create path that allocates a globally unique short code, and a very high-volume redirect path that is essentially a key lookup. The core invariant is that every short code maps to exactly one canonical long URL forever.</p>
+<p><strong>Interviewer:</strong> What are your scale assumptions?</p>
+<p><strong>Candidate:</strong> I would assume around 100 million creates per day, peak roughly 10,000 per second, but reads are 100 to 1000 times higher, so up to a million redirects per second globally. Most traffic concentrates on a small number of viral links.</p>
+<p><strong>Interviewer:</strong> How do you generate the short codes?</p>
+<p><strong>Candidate:</strong> I would use a counter-based allocator with range pre-claiming. Each create node reserves, say, 10,000 integers from a transactional counter, then encodes them to base62 locally. That makes the synchronous coordination one range claim per ten thousand creates, not one per create. If unguessability matters, I would switch to random 7-character codes with conditional insert, accepting a small retry rate due to collisions.</p>
+<p><strong>Interviewer:</strong> How long should the codes be?</p>
+<p><strong>Candidate:</strong> Base62 with 7 characters gives about 3.5 trillion codes, which is enough for many decades of growth at 100 million per day. Six characters covers about 56 billion and could last roughly two decades. I would start at 7 and reserve the option to grow.</p>
+<p><strong>Interviewer:</strong> What does the redirect path look like?</p>
+<p><strong>Candidate:</strong> Client hits the short URL at the edge. The CDN may have a cached 301 response; if so, it serves immediately. On a miss, the request reaches a regional redirect service that checks a KV cache and falls back to the link store. The response is a redirect to the long URL plus a fire-and-forget click event to an async stream.</p>
+<p><strong>Interviewer:</strong> 301 or 302?</p>
+<p><strong>Candidate:</strong> That is a real tradeoff. 301 is permanent and aggressively cached by browsers and intermediaries, which gives the lowest latency but loses analytics fidelity because repeat clicks bypass the origin. 302 is uncached by default and ensures every click is counted but pushes load to origin. Most production shorteners pick 302 for analytics and absorb the cost with caching at the redirect tier. I would go with 302 and a strong cache layer.</p>
+<p><strong>Interviewer:</strong> A link goes viral and gets 100,000 hits per second. How does the system survive?</p>
+<p><strong>Candidate:</strong> Edge cache absorbs most of it because the mapping is immutable. Each CDN PoP stores a 301-or-302-with-short-TTL for the hot code; the origin sees maybe a few thousand QPS instead of 100,000. We monitor top-N hot codes and pre-warm regional caches when burst detection fires. The click event stream uses sampling for hot codes and corrects with a scale factor during aggregation, so the analytics pipeline does not back up.</p>
+<p><strong>Interviewer:</strong> A link is reported as phishing. How fast can you stop redirects?</p>
+<p><strong>Candidate:</strong> A global denylist with pub/sub invalidation. The takedown writes status to the link store, publishes an invalidation event, and every cache node and CDN POP receives it within a few seconds. Each cached entry carries safety status, so on the next request after invalidation it shows the interstitial. Targeting under five seconds globally is realistic.</p>
+<p><strong>Interviewer:</strong> What about custom aliases?</p>
+<p><strong>Candidate:</strong> Custom aliases use a conditional insert on the short_code column. If the alias is taken, return a clear conflict. Custom aliases share the same namespace as auto-generated codes, so I would reserve a prefix or character pattern to keep allocator codes from accidentally producing something a user wanted. In multi-region, custom alias creates go through a single owner region or use a global lock to avoid two regions claiming the same alias.</p>
+<p><strong>Interviewer:</strong> How does idempotency work on create?</p>
+<p><strong>Candidate:</strong> The client sends an <code>Idempotency-Key</code> header. The create service has an idempotency table keyed by user plus key. If a duplicate arrives, it returns the previously allocated short code rather than allocating a new one. This makes client retries safe and prevents the user from getting two short codes for what they think is one create.</p>
+<p><strong>Interviewer:</strong> How do you partition the link store?</p>
+<p><strong>Candidate:</strong> Hash partition on <code>short_code</code>. The lookup pattern is exact-match on the key, so a hash partition gives even distribution. Sequential codes from the counter would create hot partitions if I used range partitioning, but hashing flattens that. Secondary indexes for owner queries go in a separate per-owner table.</p>
+<p><strong>Interviewer:</strong> What if a region goes down?</p>
+<p><strong>Candidate:</strong> Redirects continue from cache and from any healthy region's replica. Creates fail or are routed to a peer region. Because each region pre-allocates its own counter ranges or uses region-tagged prefix bits, there is no risk of two regions producing the same code during the outage. When the region recovers, replication catches up and we replay any safety invalidations through the pub/sub channel.</p>
+<p><strong>Interviewer:</strong> How do you handle the click event pipeline at scale?</p>
+<p><strong>Candidate:</strong> Click events go to a high-throughput append-only log. For viral codes, the edge samples events at a known rate and the aggregation pipeline multiplies by the sample factor. The pipeline batches events into hourly and daily rollups stored in an analytical store. The redirect path never blocks on writing a click; if the pipeline is degraded, redirects still work.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Two paths: rare creates that must produce unique codes, and frequent redirects that are key lookups. A range-claim counter allocator gives uniqueness without coordination on every write. The redirect path is dominated by cache; safety takedown rides a pub/sub invalidation. Analytics is async and sampled for hot keys. Custom aliases and multi-region creates need careful conflict handling, but everything else scales horizontally.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: short codes, redirect, analytics optional, abuse handling.</li>
+<li>State invariant: unique immutable mapping.</li>
+<li>Pick code generation: counter with range claim, base62, 7 chars.</li>
+<li>Draw two paths: create (rare, strong) and redirect (frequent, cached).</li>
+<li>Explain idempotent create and conditional insert.</li>
+<li>Explain edge cache, KV cache, store.</li>
+<li>Explain safety takedown with pub/sub invalidation.</li>
+<li>Close with multi-region (active-active reads, region-tagged code ranges).</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>TinyURL is workload-asymmetric: rare creates need correctness, frequent redirects need speed. I would use a range-claim counter for unique base62 codes, cache aggressively because mappings are immutable, separate the click pipeline from the redirect hot path, and use pub/sub invalidation for fast safety takedowns. The main tradeoff is 301 vs 302: I would pick 302 for analytics fidelity and absorb the cost with caching.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"The mapping is immutable; that is why caching is so effective."</li>
+<li>"I do not coordinate on every create; I pre-claim a range and serve locally."</li>
+<li>"The redirect path is a single key lookup. Everything else, including analytics, is asynchronous."</li>
+<li>"Safety takedown is the one case where stale caches matter; pub/sub invalidation gives me a few-second SLA."</li>
+<li>"Custom aliases and multi-region creates are where the simple design breaks; everything else is easy."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

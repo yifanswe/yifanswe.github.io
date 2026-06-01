@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design WhatsApp — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design WhatsApp</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>WhatsApp is similar to Facebook Messenger but with two-billion-user scale, mobile-first network conditions, and end-to-end encryption as a non-negotiable. The hard part is delivering every message exactly once to every device across flaky cellular networks worldwide, with E2E encryption that the server cannot read.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every sent message is persisted server-side as ciphertext, delivered at least once to every recipient device, displayed in the same order across devices, and remains available until acknowledged; end-to-end encryption is enforced so the server never sees plaintext; group sends fan out without leaking conversation content to the server.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design Signal-protocol-style E2E encryption, handle mobile network unreliability, support multi-device sync without sacrificing E2E security, and reason about group fan-out under encryption constraints.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design WhatsApp around per-user message inboxes on the server holding encrypted messages waiting for delivery, a long-poll or persistent push channel to mobile devices, and Signal Protocol for end-to-end encryption. The server stores and routes ciphertext but cannot read it. Multi-device sync requires key transfer between user devices. The interesting decisions are E2E with multi-device, group encryption via Sender Keys, mobile reliability, and offline delivery.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>1:1 and group messages (text, media, voice notes).</li>
+<li>Voice and video calls.</li>
+<li>Status updates (24-hour ephemeral).</li>
+<li>End-to-end encryption mandatory.</li>
+<li>Read receipts, delivery indicators, typing.</li>
+<li>Multi-device (phone primary + linked devices).</li>
+<li>Offline message delivery; queue server-side.</li>
+<li>Backup (encrypted) to cloud.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>2B+ users, hundreds of billions of messages/day.</li>
+<li>Mobile-first: poor cellular, intermittent connectivity.</li>
+<li>Low latency for online delivery (sub-second).</li>
+<li>E2E encryption non-negotiable.</li>
+<li>Survive carrier-level outages with local queueing.</li>
+<li>Multi-region; cross-country sends quick.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Voice/video call media servers (WebRTC; separate).</li>
+<li>WhatsApp Business API features.</li>
+<li>Payments.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>2B+ MAU.</td>
+</tr>
+<tr>
+<td>Messages/day</td>
+<td>100B+.</td>
+</tr>
+<tr>
+<td>Average peak</td>
+<td>Millions/sec.</td>
+</tr>
+<tr>
+<td>Group size</td>
+<td>Up to 1024 members.</td>
+</tr>
+<tr>
+<td>Devices per user</td>
+<td>1 primary phone + up to 4 linked devices.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Online delivery sub-second; offline pickup on reconnect.</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Server stores undelivered ciphertext only; cleared after delivery.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is the per-device inbox push throughput plus group fan-out under encryption.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Server inbox</td>
+<td>Holds ciphertext until delivered to all recipient devices.</td>
+<td>Durable; cleared on ack.</td>
+</tr>
+<tr>
+<td>Push channel</td>
+<td>Persistent connection to mobile device.</td>
+<td>Reliable on flaky networks.</td>
+</tr>
+<tr>
+<td>E2E encryption</td>
+<td>Signal Protocol; the server never sees plaintext.</td>
+<td>Per-device keys; forward secrecy.</td>
+</tr>
+<tr>
+<td>Multi-device</td>
+<td>Linked devices have their own keys; sender encrypts per device.</td>
+<td>Sync via primary phone or via independent identities.</td>
+</tr>
+<tr>
+<td>Backup</td>
+<td>Encrypted backup to user's cloud.</td>
+<td>User-key-protected.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Client A (Signal E2E sender)
+      |
+      | encrypted to each recipient device
+      v
++---------------------+
+| API Gateway / Auth  |
++---------+-----------+
+          |
+          v
++---------------------+
+| Send Service        |
+| stores ciphertext   |
++----+----------------+
+     |
+     +--&gt; Recipient Inbox (per device)
+              |
+              v
+        +-----------------+
+        | Push Channel    |
+        | (XMPP-like /    |
+        |  WS)            |
+        +-----------------+
+              |
+              v
+        Recipient Device decrypts
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Send service</td>
+<td>Receives encrypted message; routes to recipient inboxes.</td>
+<td>Idempotent on client_message_id.</td>
+</tr>
+<tr>
+<td>Inbox store</td>
+<td>Per-device ciphertext queue.</td>
+<td>Cleared after device acks.</td>
+</tr>
+<tr>
+<td>Push gateway</td>
+<td>Maintains persistent connection to online devices.</td>
+<td>Long-poll or WebSocket; mobile-optimized.</td>
+</tr>
+<tr>
+<td>Identity service</td>
+<td>Per-user identity key + per-device key bundles.</td>
+<td>Pre-keys for X3DH.</td>
+</tr>
+<tr>
+<td>Key directory</td>
+<td>Stores public keys for discovery.</td>
+<td>One per device per user.</td>
+</tr>
+<tr>
+<td>Group registry</td>
+<td>Group membership and metadata.</td>
+<td>Members' device list.</td>
+</tr>
+<tr>
+<td>Backup service</td>
+<td>Encrypted backup to user's cloud.</td>
+<td>User-derived key.</td>
+</tr>
+<tr>
+<td>Media service</td>
+<td>Encrypted media blobs; symmetric key shared via message.</td>
+<td>Server stores ciphertext only.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="encrypted-message">Encrypted Message</h4>
+<pre><code class="language-text">EncryptedMessage(
+  message_id,
+  client_message_id,
+  sender_device_id,
+  recipient_device_id,
+  conversation_id,
+  ciphertext,           // opaque to server
+  ratchet_meta,         // public info: ephemeral keys, counter
+  sent_at,
+  delivered_at?,
+  read_at?
+)
+</code></pre>
+<h4 id="device">Device</h4>
+<pre><code class="language-text">Device(
+  user_id,
+  device_id,
+  device_type,          // primary phone, linked desktop, etc.
+  identity_key,         // long-term
+  signed_pre_key,
+  one_time_pre_keys,    // refilled
+  last_seen,
+  push_token
+)
+</code></pre>
+<h4 id="group">Group</h4>
+<pre><code class="language-text">Group(
+  group_id,
+  name,
+  members: [user_id],
+  member_devices: [device_id],
+  group_version,
+  sender_keys              // per-sender symmetric key for the group
+)
+</code></pre>
+<h3 id="signal-protocol-basics">Signal Protocol Basics</h3>
+<p>Every user has:</p>
+<ul>
+<li>Identity key (long-term, public/private).</li>
+<li>Signed pre-key (medium-term).</li>
+<li>One-time pre-keys (uploaded in batches, consumed once each).</li>
+</ul>
+<p><strong>X3DH (start a conversation):</strong></p>
+<ol>
+<li>Alice fetches Bob's identity + signed pre-key + one one-time pre-key from server.</li>
+<li>Alice computes shared secret using all these keys.</li>
+<li>Alice sends initial message + her ephemeral key to Bob.</li>
+<li>Bob computes the same shared secret.</li>
+</ol>
+<p><strong>Double Ratchet (per message keys):</strong></p>
+<ul>
+<li>Each message uses a unique symmetric key derived from a ratchet.</li>
+<li>The ratchet advances with each message (chain key) and on receipt of new DH ephemeral (root key).</li>
+<li>Provides forward secrecy: compromise of current key doesn't reveal past messages.</li>
+</ul>
+<p><strong>Multi-device:</strong>
+- Each device has its own identity key and pre-keys.
+- Sender fetches each recipient device's bundle and encrypts the message N times, once per device.
+- For groups, this scales as <code>sender_devices × group_size × devices_per_member</code>.</p>
+<h3 id="sender-keys-for-groups">Sender Keys For Groups</h3>
+<p>Encrypting each message per recipient device for a 1000-member group is heavy. Sender Keys reduces this:</p>
+<ul>
+<li>Sender generates a symmetric key for the group.</li>
+<li>Sender encrypts the symmetric key to each recipient device via Double Ratchet (one-time setup or on member change).</li>
+<li>For each subsequent message, sender encrypts message with the symmetric key; sends ciphertext + ratchet step to all members.</li>
+<li>Each recipient decrypts using the previously received symmetric key.</li>
+</ul>
+<p>This reduces per-message work from O(N × devices) to O(1) once the key is established.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Per-device encryption scales poorly for groups. Sender Keys lets one ciphertext serve all members, with key setup amortized at member-change events.</p>
+</blockquote>
+<h3 id="send-flow">Send Flow</h3>
+<ol>
+<li>Sender's client generates message.</li>
+<li>For each recipient device, encrypts using Signal session (or group symmetric key).</li>
+<li>Sends bundle to send service: <code>{recipient_device: ciphertext}</code>.</li>
+<li>Send service writes each <code>(recipient_device, ciphertext)</code> to that device's inbox.</li>
+<li>If device is online (push channel connected), push immediately.</li>
+<li>Otherwise, the ciphertext waits in inbox.</li>
+<li>Sender receives ack from server (received).</li>
+<li>Recipient device decrypts on push, displays.</li>
+<li>Recipient sends delivered receipt; later sends read receipt.</li>
+<li>Server can delete delivered ciphertext (or retain briefly for cross-device sync).</li>
+</ol>
+<h3 id="mobile-reliability">Mobile Reliability</h3>
+<p>WhatsApp's secret weapon is mobile network engineering.</p>
+<ul>
+<li>Persistent push channel with adaptive heartbeats.</li>
+<li>Background notification triggers app wakeup.</li>
+<li>Aggressive compression and message batching.</li>
+<li>Network-quality-aware retry strategies.</li>
+<li>Bandwidth-efficient encoding (custom protocols).</li>
+</ul>
+<p>The client maintains a small local DB of recent messages; on send, queue locally; on connect, drain queue.</p>
+<h3 id="multi-device">Multi-Device</h3>
+<p>WhatsApp's multi-device is unusual: historically the phone was the primary; linked devices proxied through it. Modern multi-device:</p>
+<ul>
+<li>Each device has its own identity.</li>
+<li>Sender sends to all of recipient's devices.</li>
+<li>Per-device key bundles in the directory.</li>
+<li>New device must verify with primary (QR code or push notification).</li>
+</ul>
+<p>History sync to new device:</p>
+<ul>
+<li>On link, primary device sends historical message keys + ciphertext (or plaintext via E2E channel) to the new device.</li>
+<li>Subsequent messages are sent to the new device by senders directly.</li>
+</ul>
+<h3 id="group-messaging">Group Messaging</h3>
+<p>Same model as Messenger but with E2E:</p>
+<ul>
+<li>Group registry holds membership.</li>
+<li>Sender fetches member device list.</li>
+<li>Sender encrypts using Sender Keys (symmetric).</li>
+<li>Server fans out ciphertext to each member device.</li>
+<li>Member changes (add/remove): rekey the group (rotate sender key).</li>
+</ul>
+<p>For 1024-member groups, fan-out is 1024 inbox writes per message — still manageable.</p>
+<h3 id="voice-and-video-calls">Voice And Video Calls</h3>
+<p>Out of scope mostly, but: signaling via the messaging substrate, media via WebRTC peer-to-peer or through TURN relays. E2E for calls uses SRTP with keys exchanged via the same Signal session.</p>
+<h3 id="backup">Backup</h3>
+<p>User-encrypted backup to user's iCloud/Google Drive.</p>
+<ul>
+<li>Local backup file encrypted with a key derived from user's password or hardware-bound key.</li>
+<li>Cloud provider sees only ciphertext.</li>
+<li>Restore requires the user's password or device biometric.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inbox</td>
+<td><code>device_id</code> hash</td>
+<td>Per-device queue.</td>
+</tr>
+<tr>
+<td>Identity / key bundles</td>
+<td><code>user_id</code> hash</td>
+<td>Lookup on conversation start.</td>
+</tr>
+<tr>
+<td>Groups</td>
+<td><code>group_id</code> hash</td>
+<td>Group operations.</td>
+</tr>
+<tr>
+<td>Push connections</td>
+<td>Sticky to gateway by <code>device_id</code></td>
+<td>Long-lived connection.</td>
+</tr>
+<tr>
+<td>Messages in transit</td>
+<td>Mostly transient</td>
+<td>Cleared on ack.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inbox</td>
+<td>Strong (ciphertext durably stored before ack)</td>
+<td>Don't lose.</td>
+</tr>
+<tr>
+<td>Order per conversation</td>
+<td>Best-effort via timestamp + sender device id</td>
+<td>Strict order is hard with multi-sender groups; users tolerate.</td>
+</tr>
+<tr>
+<td>Key bundles</td>
+<td>Strong</td>
+<td>Required for secure setup.</td>
+</tr>
+<tr>
+<td>Receipts</td>
+<td>Eventually consistent</td>
+<td>UX.</td>
+</tr>
+<tr>
+<td>Group membership</td>
+<td>Strong on add/remove</td>
+<td>Avoid sending to removed members.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Recipient offline.</td>
+<td>Inbox retains ciphertext until delivered.</td>
+<td>Inbox age distribution.</td>
+</tr>
+<tr>
+<td>One-time pre-keys exhausted.</td>
+<td>Client uploads more periodically.</td>
+<td>Pre-key exhaustion rate.</td>
+</tr>
+<tr>
+<td>Device key compromise.</td>
+<td>Forward secrecy via Double Ratchet; re-key on detection.</td>
+<td>Reported compromises.</td>
+</tr>
+<tr>
+<td>Multi-device key sync failure.</td>
+<td>New device requires re-verification.</td>
+<td>Linking failure rate.</td>
+</tr>
+<tr>
+<td>Group fan-out lag.</td>
+<td>Parallel fan-out; backpressure.</td>
+<td>Per-message fan-out time.</td>
+</tr>
+<tr>
+<td>Push channel drops.</td>
+<td>Background reconnect; fallback to pull.</td>
+<td>Push reconnect rate.</td>
+</tr>
+<tr>
+<td>Server holds ciphertext indefinitely.</td>
+<td>Cleanup after delivery + TTL.</td>
+<td>Inbox storage growth.</td>
+</tr>
+<tr>
+<td>Sender Key rotation needed (member removed).</td>
+<td>Rekey on remove; all members get new key.</td>
+<td>Rekey frequency.</td>
+</tr>
+<tr>
+<td>Carrier-level outage.</td>
+<td>Local queueing on device; deliver when network returns.</td>
+<td>Per-region delivery rate.</td>
+</tr>
+<tr>
+<td>Spam/scam at scale.</td>
+<td>Reputation; rate-limit; community reports.</td>
+<td>Reported messages.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Lost message rate (target zero).</li>
+<li>Out-of-order delivery rate.</li>
+<li>Decryption failure rate.</li>
+<li>Receipt accuracy.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Send QPS by region.</li>
+<li>Push connection count.</li>
+<li>Fan-out latency for groups.</li>
+<li>Inbox storage.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>DAU; messages per user per day.</li>
+<li>Group size distribution.</li>
+<li>Multi-device adoption.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>User home region for inbox and identity.</li>
+<li>Push gateways regional; cross-region routing if user is roaming.</li>
+<li>Key directory replicated globally for fast bundle lookup.</li>
+<li>Failover regions warm.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>E2E encryption blocks server-side moderation; safety relies on reports and metadata analysis.</li>
+<li>Per-device encryption scales poorly for groups; Sender Keys amortize but add complexity.</li>
+<li>Strong order per conversation is hard with multi-device; rely on timestamps + tiebreakers.</li>
+<li>Aggressive mobile optimization reduces battery cost but requires custom protocols.</li>
+<li>Server holding ciphertext is necessary for offline delivery but adds storage and risk.</li>
+<li>Multi-device security requires careful linking and verification.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Treat as plain text messaging.</td>
+<td>E2E with Signal Protocol; server sees only ciphertext.</td>
+</tr>
+<tr>
+<td>Per-device encryption for large groups.</td>
+<td>Sender Keys to amortize.</td>
+</tr>
+<tr>
+<td>One identity per user.</td>
+<td>Per-device identities for multi-device.</td>
+</tr>
+<tr>
+<td>Trust the client list of recipients.</td>
+<td>Server-validated group membership at send time.</td>
+</tr>
+<tr>
+<td>Indefinite ciphertext retention.</td>
+<td>Clear after ack + TTL.</td>
+</tr>
+<tr>
+<td>Synchronous fan-out for groups.</td>
+<td>Parallel inbox writes with backpressure.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Signal Protocol</td>
+<td>X3DH, Double Ratchet, forward secrecy.</td>
+</tr>
+<tr>
+<td>Multi-device E2E</td>
+<td>Per-device keys; sender encrypts N times; linking + verification.</td>
+</tr>
+<tr>
+<td>Group encryption</td>
+<td>Sender Keys; rekey on membership change.</td>
+</tr>
+<tr>
+<td>Mobile reliability</td>
+<td>Persistent push; local queueing; adaptive heartbeats.</td>
+</tr>
+<tr>
+<td>Spam at scale</td>
+<td>Metadata analysis; reputation; community reports.</td>
+</tr>
+<tr>
+<td>Backup</td>
+<td>User-key-encrypted; cloud stores ciphertext.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>E2E via Signal Protocol; per-device keys.</li>
+<li>Server stores ciphertext only; clears on ack.</li>
+<li>Sender Keys for group efficiency.</li>
+<li>Per-device inbox + push channel.</li>
+<li>Mobile-network-resilient design.</li>
+<li>Multi-device with linking + verification.</li>
+<li>Encrypted backup to user's cloud.</li>
+<li>Spam handling via metadata (not content).</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>WhatsApp is per-device encrypted message queueing with Signal Protocol. The server is a router that sees ciphertext only. Sender Keys make groups feasible; per-device inboxes make multi-device work. The hard parts are mobile reliability, group encryption efficiency, and safety without server-side content access.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design WhatsApp.</p>
+<p><strong>Candidate:</strong> I will design around per-device ciphertext inboxes, Signal Protocol for E2E encryption, and persistent push channels for online delivery. The server stores and routes ciphertext; plaintext exists only on user devices. Multi-device is solved by per-device identities. Groups use Sender Keys to amortize encryption cost. The invariant is that every message is durably stored until delivered to all recipient devices, with E2E enforced.</p>
+<p><strong>Interviewer:</strong> Walk me through sending a 1:1 message.</p>
+<p><strong>Candidate:</strong> Sender's client gets the recipient device's pre-key bundle from the key directory. Runs X3DH to establish a shared secret, then Double Ratchet derives per-message keys. Encrypts the message. Sends to the server: <code>(recipient_device_id, ciphertext, ratchet_metadata)</code>. Server writes to the recipient device's inbox. If the recipient device is online (push channel connected), push immediately. Recipient device decrypts using its Double Ratchet state. Sends delivered receipt back; later read receipt. Server clears the ciphertext after delivered ack.</p>
+<p><strong>Interviewer:</strong> Multi-device E2E.</p>
+<p><strong>Candidate:</strong> Each device has its own identity key and pre-key bundle. When sender sends a message, they fetch all recipient devices' bundles and encrypt the message separately to each device. So if recipient has 3 devices, sender sends 3 ciphertexts. On the sender's side, their other devices also need a copy — they encrypt to themselves too. Server fans out to all relevant inboxes.</p>
+<p><strong>Interviewer:</strong> That's expensive for groups.</p>
+<p><strong>Candidate:</strong> Yes — for a 1000-member group with 2-3 devices each, naive per-device encryption is 2000-3000 encryptions per message. Sender Keys fix this. The sender generates a symmetric key for the group; once it's been established (via per-device encryption at group creation or on member change), all subsequent messages use the symmetric key. Per message: encrypt once symmetrically; ratchet step. Send ciphertext to all members. They decrypt with the shared symmetric key. Amortizes the cost.</p>
+<p><strong>Interviewer:</strong> When does the symmetric key change?</p>
+<p><strong>Candidate:</strong> On membership change. When someone is removed, we rekey so they cannot decrypt future messages. When someone joins, we either rekey or transfer the current key encrypted to them. Sender Keys typically rotate on member change events.</p>
+<p><strong>Interviewer:</strong> Recipient is offline for 3 days.</p>
+<p><strong>Candidate:</strong> Ciphertext sits in their device inbox on the server. When they come online, their device connects via push channel, gets all queued messages, decrypts. Server gets delivered acks for each, clears them. We retain undelivered ciphertext for a window (e.g., 30 days) per WhatsApp policy; after that, drop with a "message expired" indicator.</p>
+<p><strong>Interviewer:</strong> How do you handle flaky mobile networks?</p>
+<p><strong>Candidate:</strong> Persistent push channel with adaptive heartbeats — pings less often on stable WiFi, more often on cellular. Aggressive compression; bandwidth-efficient protocol. Client keeps a local DB of outgoing messages; queues them when offline; drains on reconnect. Server-side, we retry pushes with exponential backoff. Background push notifications wake the app for delivery.</p>
+<p><strong>Interviewer:</strong> Multi-device linking — how does a new linked device get history?</p>
+<p><strong>Candidate:</strong> User scans a QR code on the primary device. The primary derives a shared secret with the new device, then sends historical messages — keyed with derived encryption keys — via the messaging substrate. The new device gets recent history; very old messages may not transfer to keep linking fast. After linking, the new device is in the key directory; senders send to it directly for new messages.</p>
+<p><strong>Interviewer:</strong> Group of 1024 members. How does fan-out work?</p>
+<p><strong>Candidate:</strong> The sender encrypts the message symmetrically using the Sender Key. Sends one outgoing request to the server containing the ciphertext and the recipient list (group membership). The server fans out — writes the ciphertext to each member's inbox in parallel. 1024 inbox writes per message. Online members get push; offline get queued. Each member's client decrypts independently.</p>
+<p><strong>Interviewer:</strong> What about server-side spam moderation? E2E means you can't see content.</p>
+<p><strong>Candidate:</strong> Right; we cannot inspect content. We rely on metadata: send rates, recipient acceptance, reports. If user X sends thousands of messages per minute to strangers, we throttle and may suspend. Community reports surface spam patterns. Forwarded message indicators discourage chain-spreading. The tradeoff: stronger E2E privacy means weaker content moderation; we lean on behavioral signals.</p>
+<p><strong>Interviewer:</strong> Backup?</p>
+<p><strong>Candidate:</strong> Encrypted backup to user's cloud (iCloud/Google Drive). Local backup file is encrypted with a key derived from a user-set password or from a device-bound credential. The cloud sees ciphertext only. Restore requires the password. If the user forgets, backup is lost.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> User home region for inbox. Push gateways are regional; user roaming routes to their home region. Key directory replicated globally for fast bundle lookup. Failover regions warm. Cross-region message routing happens at the server layer; ciphertext goes from sender's region to recipient's region inbox.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> WhatsApp is per-device ciphertext inboxes with Signal Protocol E2E. Server routes ciphertext, never sees plaintext. Multi-device works via per-device identities and per-device encryption. Groups use Sender Keys to amortize fan-out. Mobile reliability via persistent push, local queueing, adaptive protocols. Spam moderation relies on metadata not content. Backup is user-key-encrypted to cloud. The hardest constraints are E2E with multi-device and group efficiency.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: 1:1, group, E2E mandatory, multi-device, mobile.</li>
+<li>Invariant: ciphertext to recipient device, server never plaintext.</li>
+<li>Signal Protocol: X3DH, Double Ratchet.</li>
+<li>Per-device inboxes + persistent push.</li>
+<li>Sender Keys for groups.</li>
+<li>Multi-device: per-device identities; sender encrypts N times.</li>
+<li>Mobile reliability via persistent push + local queueing.</li>
+<li>Spam moderation via metadata; user backups encrypted client-side.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>WhatsApp is Signal Protocol E2E messaging at planet scale. The server stores and routes ciphertext to per-device inboxes; the persistent push channel delivers when devices are online; the local queue absorbs flaky networks. Groups use Sender Keys to amortize per-device encryption. Multi-device is solved by per-device identities. Spam moderation relies on metadata, not content. Backups are user-key encrypted to cloud. The hardest constraints are E2E with multi-device and group efficiency.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Server stores ciphertext only; the plaintext lives on devices."</li>
+<li>"Sender Keys make groups feasible; without them, per-device encryption blows up."</li>
+<li>"Multi-device works by per-device identities, not one key per user."</li>
+<li>"Mobile reliability is custom protocols, not just better servers."</li>
+<li>"E2E privacy and content moderation are in tension; we rely on metadata."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

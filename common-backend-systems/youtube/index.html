@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube — Video Upload, Storage, Playback (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">YouTube — Video Upload, Storage, Playback (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Hard · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build YouTube. Creators upload videos; viewers search/discover and stream them at appropriate bitrate for their network. 500M creators, 2B daily active viewers, 500 hours of video uploaded per minute, hundreds of millions of concurrent streams. Storage and CDN-egress economics drive the design.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Upload a video.
+- Stream a video at a quality matched to the viewer's network (adaptive bitrate).
+- View counts and a watch page (title, thumbnail, owner, basic metadata).</p>
+<p>I'd defer recommendation algorithm, comments, live streaming depth, and monetization.</p>
+<p><strong>Non-functional</strong>
+- Playback start time &lt; 2 s — the dominant UX metric.
+- Cost-efficient at exabyte scale; storage and egress are the budget.
+- Multi-region, low-latency video serving via CDN.
+- Eventual consistency on view counts and metadata.
+- Durability — eleven nines for source videos.</p>
+<p><strong>Capacity</strong>
+- 500 hr/min × 60 min × 24 = 720k hr uploaded/day. At 1 GB/hour (post-encode, multi-bitrate ladder): ~720 TB/day uploaded; multi-ladder per video pushes this 5–10× → ~5 PB/day of stored bytes.
+- 2B viewers × 60 min × 5 Mbps avg = ~75 Pb/s aggregate egress.
+- Metadata is tiny beside media: even 10B video rows × 2 KB is ~20 TB primary. Media dominates: 5 PB/day of new ladder bytes means 150 PB/month before replication/tiering.
+- CDN egress is the business cost: a single popular 10-minute video at 5 Mbps watched 100M times is ~375 TB delivered. The design is mainly about avoiding origin reads and storing fewer bits per minute.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Video</strong> — <code>video_id</code>, owner, title, description, duration, status, source_url, ladder.</li>
+<li><strong>Ladder</strong> — set of <code>(resolution, bitrate, codec) → segment_url_list</code>. The streamable artifact.</li>
+<li><strong>Upload</strong> — multipart upload state.</li>
+<li><strong>Viewer event</strong> — view, watch-time ping. Drives ranking + analytics.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST  /v1/uploads                       → { upload_id, multipart_urls[] }
+PUT   &lt;multipart_url&gt;                   (binary chunks)
+POST  /v1/uploads/{upload_id}/complete  → { video_id, status: processing }
+GET   /v1/videos/{id}                   → metadata + ladder manifest URL
+GET   &lt;manifest_url&gt;                    → HLS/DASH manifest
+GET   &lt;segment_url&gt;                     → media segment
+</code></pre>
+<p>Manifest URLs are CDN-fronted; signed for private videos.</p>
+<p>The upload cursor is the multipart upload id plus completed part numbers; the playback cursor lives in the player manifest/segment sequence, not in the API server.</p>
+<hr />
+<h2 id="4-data-flow-5-min">4. Data Flow (~5 min)</h2>
+<p>Upload (multipart) → original stored in object store → transcoding pipeline produces ABR ladder → manifest published → CDN warmed → video listed.</p>
+<p>Viewer requests manifest → player picks bitrate → fetches segments via CDN → adapts up/down based on buffer health.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Upload service.</strong> Generates a multipart upload to object storage (S3). Client uploads directly. On complete, writes a Video row (<code>status=processing</code>) and publishes <code>video.uploaded</code>.</li>
+<li><strong>Transcoding pipeline.</strong>
+   - Job scheduler distributes segments of the source to a worker fleet (GPU-accelerated, ffmpeg or x264/x265/AV1).
+   - For each bitrate × resolution × codec combination in the ladder, produce HLS/DASH-compatible segments (typically 2–6 s segments).
+   - Segments and manifests stored in object store. Multi-CDN distribution.</li>
+<li><strong>Catalog / metadata.</strong> Video metadata in a sharded data store (Spanner or Cassandra). Search index in Elasticsearch.</li>
+<li><strong>Playback path.</strong> Viewer requests watch page → metadata service returns title, owner, manifest URL. Player loads HLS/DASH manifest from CDN → fetches segments.</li>
+<li><strong>CDN strategy.</strong> Multi-CDN with cache hierarchy: edge → regional shield → origin (object store). Pre-warm popular videos to edges; long-tail videos cold-fetch from origin on demand.</li>
+<li><strong>Recommendation / discovery (out of scope to design here).</strong> Mention it sits alongside as a separate ranking service.</li>
+<li><strong>View accounting.</strong> Player sends watch-time beacons → Kafka → counters aggregated in ClickHouse + Redis live counters.</li>
+</ol>
+<p>End-to-end narration: a creator uploads a 1 GB video → multipart upload to S3 → transcoder fans out, produces 1080p/720p/480p/240p × H.264 and AV1 ladders (~5× source size total) → manifest published → metadata <code>status=ready</code>. A viewer in Tokyo opens the watch page → metadata fetched from regional cache → manifest fetched from Tokyo CDN edge → player negotiates 720p initially (~3 Mbps) → segments served from Tokyo edge → after first 10s the buffer is healthy, player bumps to 1080p.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">Creator -&gt; Upload Service -&gt; Source Object Store -&gt; Transcode Queue/Workers
+                                              |              |
+                                              v              v
+                                      Video Metadata DB   Segment/Manifest Store
+                                              |              |
+Viewer -&gt; Watch API/Search Cache -------------+              v
+   |                                                    CDN Edge/Shield
+   v                                                         |
+Player HLS/DASH Manifest + Segments &lt;------------------------+
+   |
+   v
+View Beacons -&gt; Kafka -&gt; Redis Live Counts + ClickHouse Rollups
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete store contracts.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / data structure</th>
+<th style="text-align: right;">Entry size + TTL</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Upload state</td>
+<td><code>upload:{upload_id}</code> → part map, owner, expiry</td>
+<td style="text-align: right;">1–10 KB, TTL 7 days incomplete</td>
+<td><code>upload_id</code></td>
+</tr>
+<tr>
+<td>Source object</td>
+<td><code>s3://video-source/{video_id}</code> immutable original</td>
+<td style="text-align: right;">MB–GB, retained durable/cold</td>
+<td><code>video_id</code></td>
+</tr>
+<tr>
+<td>Segment object</td>
+<td><code>s3://video-segments/{video_id}/{codec}/{rendition}/{segment}</code></td>
+<td style="text-align: right;">0.5–4 MB/segment, tiered</td>
+<td><code>video_id, rendition</code></td>
+</tr>
+<tr>
+<td>Manifest</td>
+<td><code>manifest:{video_id}:{codec}</code> HLS/DASH text</td>
+<td style="text-align: right;">10–100 KB, immutable per version</td>
+<td><code>video_id</code></td>
+</tr>
+<tr>
+<td>Metadata</td>
+<td><code>video:{video_id}</code> row <code>{owner,title,status,manifest_version}</code></td>
+<td style="text-align: right;">~2 KB, retained</td>
+<td><code>video_id</code></td>
+</tr>
+<tr>
+<td>Transcode jobs</td>
+<td><code>transcode:{video_id}:{rendition}:{segment}</code> queue item</td>
+<td style="text-align: right;">~200 B, until completed</td>
+<td><code>video_id</code></td>
+</tr>
+<tr>
+<td>View counters</td>
+<td><code>views:{video_id}:{minute}</code> + rollups</td>
+<td style="text-align: right;">8–32 B/counter, TTL by granularity</td>
+<td><code>video_id</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Capacity by store.</strong> Upload state is small even for millions of incomplete uploads: <code>1M × 10 KB</code> is ~10 GB. Metadata is also small: if 500 hours/minute averages 10-minute videos, that is ~4.3M uploads/day; <code>4.3M × 2 KB × 3</code> is ~26 GB/day. Manifests at <code>100 KB</code> each are hundreds of GB/day. Media dominates: ~720 TB/day of originals and ~5 PB/day of encoded ladder bytes before origin replication/tiering. View events are big but not media-big: <code>2B viewers × 60 min/day × one beacon/10s × 100 B</code> is ~1.2 TB/day before replicas. The cost knob is bytes delivered and stored per watched minute, not rows.</p>
+<p><strong>Playback path trace.</strong> Viewer → watch API reads <code>video:{id}</code> and permission state → returns signed manifest URL → CDN edge serves manifest or fetches from regional shield → player requests first low/mid-bitrate segment → CDN edge/shield/origin lookup by immutable segment key → player adapts bitrate based on buffer. Metadata/profile/recommendation calls can run in parallel with manifest fetch; media segment serving should bypass app servers entirely.</p>
+<p><strong>Hot and cold playback paths.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Hot path</th>
+<th>Cold/fallback path</th>
+<th>Cursor/session state</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Watch page</td>
+<td>Regional metadata cache + permission check; manifest URL returned</td>
+<td>Metadata miss reads <code>video:{video_id}</code>; private video signs short-lived URL</td>
+<td>playback session id, manifest version</td>
+</tr>
+<tr>
+<td>First segment</td>
+<td>CDN edge hit on low/mid rendition</td>
+<td>Edge miss collapses at regional shield; shield miss reads origin object</td>
+<td>HLS/DASH segment number and byte range</td>
+</tr>
+<tr>
+<td>Adaptive bitrate switch</td>
+<td>Player chooses next rendition from same manifest based on buffer</td>
+<td>If high rendition stalls, player drops bitrate without API call</td>
+<td>player buffer state; manifest sequence</td>
+</tr>
+<tr>
+<td>Viral cold video</td>
+<td>Shield warms once; edges pull from shield</td>
+<td>First request pays origin latency; pre-warm after spike detection</td>
+<td>CDN cache key includes immutable segment version</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Transcoding economics.</strong> Most expensive infrastructure. Process video in parallel segments (split into 6 s chunks, transcode independently, recombine). Two key levers:
+- <strong>GPU pipelines</strong> (NVENC) for fast common ladders.
+- <strong>Software encoders</strong> (libx264, libaom-av1) for higher-quality / new codecs at long latency.
+- <strong>Per-title encoding</strong>: tune bitrate ladder based on content complexity (animation vs sports) — saves 20–40% storage.</p>
+<p><strong>Codec strategy.</strong> Maintain multiple codec ladders: H.264 for compatibility, VP9/AV1 for modern devices. Storage trade — AV1 saves ~30% bytes at the cost of compute. Compute amortizes over months/years of egress savings.</p>
+<p><strong>Storage tiering.</strong> Recently-uploaded and trending: hot object storage. Long-tail (years old, rarely watched): warm/cold. Re-promote to hot on demand spike.</p>
+<p>Why object storage over HDFS-style clusters: segments are immutable, massive, and CDN-origin friendly, so object storage gives durability and lifecycle tiering without managing storage nodes. HDFS can work for internal processing, but serving and retention want object semantics.</p>
+<p>For metadata, Spanner/sharded SQL is attractive when privacy state, ownership, and publish status need strong transitions; Cassandra is also plausible for global read scale if I keep state transitions simple and event-driven. I would not put media bytes in either one because the media access pattern is immutable object reads through CDN.</p>
+<p><strong>CDN cache hierarchy.</strong> Edge nodes (close to user) → regional shields → origin. Hot videos sit at the edge; long-tail cold-fetches from shield then origin. Cache key includes segment URL (immutable, content-hashed).</p>
+<p>Interview punch line: "The app server starts playback, but the CDN carries the product; every cache miss that reaches origin is a cost bug at YouTube scale."</p>
+<p><strong>Multi-CDN.</strong> YouTube runs its own CDN (Google's edge) but acknowledges: multi-CDN strategy for redundancy, with traffic-shifting based on health and cost.</p>
+<p><strong>Live streaming (touch lightly).</strong> Lower-latency pipeline: chunked CMAF segments (1–2 s), LL-HLS or DASH. Ingest via RTMP → live transcoder → CDN. Targets glass-to-glass &lt; 5 s. Different infrastructure path than VOD.</p>
+<p><strong>Search.</strong> Inverted index on title/description/tags. Stream new metadata into ES on publish. Combine with engagement signals at rank time.</p>
+<p><strong>Watch counts.</strong> Don't increment per view in a relational DB. Beacon → Kafka → aggregator → Redis counter + ClickHouse rollup. Counts shown approximate live, eventually consistent.</p>
+<p>Why Kafka + ClickHouse/OLAP instead of transactional counters: view events are append-only analytics, not user-facing ownership. Kafka absorbs bursty beacons; Redis gives live approximate counts; ClickHouse gives cheap rollups. A relational row per video would hot-spot on viral videos.</p>
+<p><strong>Two-index framing.</strong> Video has content-addressed media objects for playback, metadata rows for watch-page state, a search index for discovery, and analytics rollups for counters. Those are separate views over the same <code>video_id</code>; the media segment is immutable content, while metadata/search/counters are serving indexes that can lag or rebuild.</p>
+<p><strong>Recommendations (briefly).</strong> Two-tower model: video tower + user tower → embeddings → ANN search at serve time. Out of scope to design fully.</p>
+<p><strong>Resumable upload.</strong> Multipart uploads with chunk-level retries; long-lived uploads survive cell network drops. Server discards incomplete uploads after a TTL.</p>
+<p><strong>Failure modes.</strong> Transcoder dies mid-job: jobs are idempotent on segment; restart on a different worker. CDN edge unavailable: traffic shifts to next-nearest edge.</p>
+<p><strong>Video lifecycle state machine.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Transition trigger</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>uploading</code></td>
+<td>multipart</td>
+<td>upload state + source parts</td>
+<td>creator completes all parts</td>
+</tr>
+<tr>
+<td><code>processing</code></td>
+<td>transcode</td>
+<td>source object + job queue</td>
+<td>required ladder renditions complete</td>
+</tr>
+<tr>
+<td><code>partial_ready</code></td>
+<td>graceful publish</td>
+<td>low ladder + manifest version</td>
+<td>first playable rendition complete</td>
+</tr>
+<tr>
+<td><code>ready</code></td>
+<td>full playback</td>
+<td>metadata + immutable manifests</td>
+<td>all target ladders pass validation</td>
+</tr>
+<tr>
+<td><code>blocked_or_deleted</code></td>
+<td>terminal/hidden</td>
+<td>policy/owner state</td>
+<td>takedown, owner delete, policy action</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th style="text-align: right;">Latency budget</th>
+<th>Fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>New upload</td>
+<td>Processing</td>
+<td>source object + transcode jobs</td>
+<td style="text-align: right;">Minutes to hours</td>
+<td>Show <code>processing</code>; publish lower ladder first</td>
+</tr>
+<tr>
+<td>Viral cold video</td>
+<td>Shield warmup</td>
+<td>CDN shield + origin object</td>
+<td style="text-align: right;">First request slower</td>
+<td>Collapse requests at shield; pre-warm after spike detected</td>
+</tr>
+<tr>
+<td>Edge failure</td>
+<td>Multi-CDN/next edge</td>
+<td>health probes + DNS/traffic steering</td>
+<td style="text-align: right;">Seconds</td>
+<td>Shift traffic; player retries segment URL</td>
+</tr>
+<tr>
+<td>Origin slow</td>
+<td>Serve cached only</td>
+<td>CDN stale-if-error for immutable segments</td>
+<td style="text-align: right;">Immediate if cached</td>
+<td>Long-tail may buffer; do not route through app servers</td>
+</tr>
+<tr>
+<td>View beacon loss</td>
+<td>Approximate counts</td>
+<td>Kafka/aggregator</td>
+<td style="text-align: right;">1 min freshness</td>
+<td>Client retries; counts reconcile from logs later</td>
+</tr>
+</tbody>
+</table>
+<p><strong>What I'd defer.</strong> Live streaming chat (separate problem), recommendations (separate problem), monetization (ads insertion, revenue share), DRM and content protection depth, content fingerprinting and copyright (ContentID).</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

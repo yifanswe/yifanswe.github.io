@@ -1,0 +1,883 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design a Notification System — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design a Notification System</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A notification system delivers messages to billions of devices across push, email, SMS, and in-app channels, often with bursty fan-out and lots of third-party provider integration. The hard part is keeping correctness invariants (don't notify after unsubscribe, don't duplicate, respect quiet hours) while staying fast and surviving provider outages.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>For every triggered notification, the system attempts delivery on each eligible channel exactly once per user, honors current preferences and consent at the moment of send (not at the moment of trigger), and produces a durable delivery receipt that distinguishes "delivered," "failed," and "suppressed by policy."</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can separate triggering from delivery, design idempotent fan-out across channels, manage rate limits per provider per recipient, and handle the asymmetry that one event can yield millions of notifications.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design a notification system as three planes: an event ingestion layer that captures triggers, a policy and templating layer that resolves recipients and per-user preferences, and a channel-specific delivery layer that integrates with APNs, FCM, SMTP, SMS gateways, and in-app sockets. The interesting decisions are idempotency at fan-out, preference application at send time rather than trigger time, provider rate limiting, and how to handle bursts where one trigger creates millions of sends.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Triggers come from product services: a new message, a like, a deal alert.</li>
+<li>The system supports push (iOS/Android), email, SMS, in-app, webhook channels.</li>
+<li>Users have per-channel and per-category preferences.</li>
+<li>Quiet hours, frequency caps, and digest modes are supported.</li>
+<li>Delivery receipts are visible to product teams.</li>
+<li>Marketing campaigns can be scheduled and audience-targeted.</li>
+<li>Operators can quickly block notifications (kill switch) by template.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>High throughput: billions of notifications per day.</li>
+<li>Bursty fan-out: a single trigger can produce 100M+ sends.</li>
+<li>Low latency for transactional: under 5 seconds end-to-end.</li>
+<li>High delivery success ratio; retry on provider failures.</li>
+<li>Per-recipient consent must be honored at send time.</li>
+<li>Auditability for compliance (CAN-SPAM, TCPA, GDPR).</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Content authoring tools.</li>
+<li>Rich content rendering (videos, animations) in push.</li>
+<li>Deep personalization scoring (treat as input).</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>1B+ across regions.</td>
+</tr>
+<tr>
+<td>Devices</td>
+<td>2-3x users; one user has multiple devices.</td>
+</tr>
+<tr>
+<td>Daily volume</td>
+<td>10B notifications/day; ~100k/sec average, 1M/sec peak.</td>
+</tr>
+<tr>
+<td>Burst</td>
+<td>One marketing event sends to 100M users in minutes.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Transactional &lt; 5 s p95; marketing best-effort, minutes.</td>
+</tr>
+<tr>
+<td>Provider limits</td>
+<td>APNs allows thousands per connection; FCM batches up to 500; SMS providers have per-number TPS caps.</td>
+</tr>
+<tr>
+<td>Consistency</td>
+<td>Preferences at send time are strong; delivery receipts are eventually consistent.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is provider rate limits and the fan-out cost of mapping one trigger to many recipients.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Plane</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Trigger plane</td>
+<td>Captures events that may notify someone.</td>
+<td>Durable ingestion, idempotent.</td>
+</tr>
+<tr>
+<td>Audience and policy plane</td>
+<td>Resolves recipients; applies user preferences and rate caps.</td>
+<td>Strong consistency for preferences.</td>
+</tr>
+<tr>
+<td>Delivery plane</td>
+<td>Renders content; sends via channel-specific providers; tracks receipts.</td>
+<td>At-least-once delivery with per-recipient dedupe.</td>
+</tr>
+</tbody>
+</table>
+<p>The biggest mistake is treating the system as one pipeline. The product correctness (consent, frequency) is separate from the delivery mechanics (provider retries, rate limits).</p>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Product Services ----&gt; Event Bus
+                         |
+                         v
+                  +-----------------+
+                  | Trigger Service |
+                  | idempotent ingest|
+                  +--------+--------+
+                           |
+                           v
+                  +-----------------+        +-------------+
+                  | Audience Resolver|&lt;-----&gt;| User Prefs  |
+                  | recipients + filter|     | + Consent    |
+                  +--------+--------+        +-------------+
+                           |
+                           v
+                  +-----------------+
+                  | Template Engine |
+                  | personalize     |
+                  +--------+--------+
+                           |
+       +-----------+---------+--------+----------+
+       v           v         v        v          v
+  +--------+ +--------+ +--------+ +--------+ +--------+
+  |  Push  | | Email  | |  SMS   | | In-App | |Webhook |
+  | Worker | | Worker | | Worker | | Worker | | Worker |
+  +---+----+ +---+----+ +---+----+ +---+----+ +---+----+
+      |          |          |          |          |
+      v          v          v          v          v
+   APNs/FCM   SMTP/ESP    SMS GW   Websockets  HTTP
+
+       (each worker reports receipts -&gt; Delivery Ledger)
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Trigger service</td>
+<td>Accepts events, deduplicates by trigger_id, persists.</td>
+<td>Idempotent ingestion with trigger_id.</td>
+</tr>
+<tr>
+<td>Audience resolver</td>
+<td>Computes recipient list from event metadata.</td>
+<td>Reads from user/follower/segment service.</td>
+</tr>
+<tr>
+<td>Preference service</td>
+<td>Stores per-user per-channel per-category preferences and consent.</td>
+<td>Strongly consistent reads at send time.</td>
+</tr>
+<tr>
+<td>Frequency cap service</td>
+<td>Tracks recent notifications per user to enforce caps.</td>
+<td>Per-user counters; usually Redis.</td>
+</tr>
+<tr>
+<td>Template engine</td>
+<td>Renders content with personalization tokens; localization.</td>
+<td>Versioned templates; preview tooling.</td>
+</tr>
+<tr>
+<td>Channel workers</td>
+<td>Per-channel send logic: push, email, SMS, in-app, webhook.</td>
+<td>Each integrates with its provider's protocol.</td>
+</tr>
+<tr>
+<td>Provider rate limiter</td>
+<td>Throttles outbound calls to each provider.</td>
+<td>Per-app-id, per-IP, per-account TPS caps.</td>
+</tr>
+<tr>
+<td>Delivery ledger</td>
+<td>Stores send attempts, receipts, bounces, opens.</td>
+<td>Append-only; partitioned by date.</td>
+</tr>
+<tr>
+<td>Suppression list</td>
+<td>Hard bounces, unsubscribes, abuse complaints.</td>
+<td>Authoritative; checked at every send.</td>
+</tr>
+<tr>
+<td>Kill switch</td>
+<td>Per-template/per-category emergency block.</td>
+<td>Cached in workers; updates propagate in seconds.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="trigger">Trigger</h4>
+<pre><code class="language-text">Trigger(
+  trigger_id,            // dedupe key
+  source_service,
+  event_type,
+  payload,
+  audience_spec,         // user_id, follower_of, segment_id, ...
+  template_id,
+  channels,              // recommended set; final set after preferences
+  priority,              // transactional, marketing, digest
+  created_at,
+  scheduled_at,
+  status                 // queued, fanned_out, completed, killed
+)
+</code></pre>
+<h4 id="user-preference">User Preference</h4>
+<pre><code class="language-text">Preference(
+  user_id,
+  channel,               // push, email, sms, in_app
+  category,              // promotions, alerts, mentions, ...
+  enabled,
+  quiet_hours,           // local time window
+  frequency_cap,         // e.g., 5 per day per category
+  updated_at,
+  version
+)
+</code></pre>
+<h4 id="send-attempt">Send Attempt</h4>
+<pre><code class="language-text">SendAttempt(
+  attempt_id,            // deterministic: hash(trigger_id, user_id, channel)
+  trigger_id,
+  user_id,
+  channel,
+  provider,
+  status,                // queued, dispatched, delivered, failed, suppressed
+  provider_message_id,
+  error_code,
+  attempt_number,
+  enqueued_at,
+  delivered_at
+)
+</code></pre>
+<h4 id="suppression-entry">Suppression Entry</h4>
+<pre><code class="language-text">Suppression(
+  user_id,
+  channel,
+  contact,               // email or phone number for hard bounce
+  reason,                // unsubscribe, hard_bounce, complaint, regulator
+  created_at,
+  source
+)
+</code></pre>
+<h3 id="concrete-stores-and-queues">Concrete Stores And Queues</h3>
+<table>
+<thead>
+<tr>
+<th>Store / queue</th>
+<th>Key pattern</th>
+<th>Value</th>
+<th>Size / cap</th>
+<th>TTL / lifecycle</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Trigger store</td>
+<td><code>trigger:{trigger_id}</code></td>
+<td>source, audience spec, template, state</td>
+<td>1-4KB</td>
+<td>30-90 days hot; archive after</td>
+<td><code>trigger_id</code></td>
+</tr>
+<tr>
+<td>Send attempt store</td>
+<td><code>attempt:{yyyyMMdd}:{user_id}:{attempt_id}</code></td>
+<td>channel, status, provider id, attempts</td>
+<td>300-700B</td>
+<td>30 days hot; 13 months archive for audit</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Preference store</td>
+<td><code>pref:{user_id}</code></td>
+<td>channel/category prefs, quiet hours, version</td>
+<td>1-2KB</td>
+<td>Permanent until account delete; cache 5-30s</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Suppression store</td>
+<td><code>suppress:{channel}:{contact_hash}</code></td>
+<td>reason, source, created_at</td>
+<td>100-250B</td>
+<td>Permanent unless explicit resubscribe</td>
+<td><code>contact_hash</code></td>
+</tr>
+<tr>
+<td>Frequency cap</td>
+<td><code>freq:{user_id}:{category}:{yyyyMMdd}</code></td>
+<td>counters by priority/template</td>
+<td>50-200B</td>
+<td>32 days</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Channel queue</td>
+<td><code>queue:{channel}:{priority}:{partition}</code></td>
+<td>attempt id + render context pointer</td>
+<td>200-500B/message</td>
+<td>7-14 day retention or DLQ</td>
+<td><code>channel</code> + partition</td>
+</tr>
+<tr>
+<td>Provider limiter</td>
+<td><code>bucket:{provider}:{region}:{sub_key}</code></td>
+<td>token bucket state</td>
+<td>&lt;200B</td>
+<td>In memory; checkpoint every few seconds</td>
+<td><code>provider</code> + <code>sub_key</code></td>
+</tr>
+</tbody>
+</table>
+<p>Worked sizing:</p>
+<ul>
+<li>100M daily active users (DAU) * 20 attempted notifications/day = 2B attempts/day. At 500B/attempt, the hot attempt store writes about 1TB/day raw; with 3 replicas, about 3TB/day before archive compression.</li>
+<li>Average enqueue rate is 2B / 86,400 = about 23k attempts/second. A 10x product burst is 230k attempts/second; one hour of backlog at 500B/message is about 414GB raw, so queues need per-channel partitions and retention caps.</li>
+<li>Preferences are smaller but correctness-critical: 1B users * 1.5KB * 3 replicas is about 4.5TB. This is cheap enough to keep strongly consistent by user shard.</li>
+<li>Suppression lists grow slowly but must not expire automatically because legal opt-outs and hard bounces are durable records.</li>
+</ul>
+<p>Tech-choice defense:</p>
+<ul>
+<li>Use a durable queue/log for channel workers because provider outages can last hours. Redis-only queues are fast, but they make replay and audit weaker.</li>
+<li>Use a strongly consistent preference/suppression store because a stale unsubscribe is a correctness violation. Short caches are acceptable only when workers re-check before provider send.</li>
+<li>Use channel-specific queues instead of one global queue so SMS throttling or APNs errors do not block email or in-app delivery.</li>
+</ul>
+<blockquote>
+<p>The large store is not preferences; it is the per-user-per-channel attempt log. That is the audit trail and the idempotency surface.</p>
+</blockquote>
+<h3 id="apis">APIs</h3>
+<p>External (from product services):</p>
+<pre><code class="language-text">POST /triggers
+Body:
+  trigger_id              // idempotency key
+  event_type
+  audience_spec
+  template_id
+  priority
+  scheduled_at?
+
+GET /triggers/{trigger_id}
+GET /users/{user_id}/notifications      // for in-app history
+PUT /users/{user_id}/preferences
+POST /admin/templates/{template_id}/kill
+</code></pre>
+<h3 id="fan-out-pipeline">Fan-Out Pipeline</h3>
+<p>This is the hot path:</p>
+<ol>
+<li><strong>Trigger ingestion.</strong> Product service emits <code>(trigger_id, audience_spec, template_id, ...)</code>. The trigger service performs a conditional insert keyed on <code>trigger_id</code>. Duplicates return the same response.</li>
+<li><strong>Audience resolution.</strong> Resolver reads from user / follower / segment service. For very large audiences (millions), it streams the user_ids into the next stage in chunks rather than materializing all in memory.</li>
+<li><strong>Preference filter.</strong> For each user, look up preferences, check global suppression list, check kill switch, check frequency cap. Drop suppressed and emit a <code>suppressed</code> SendAttempt for audit.</li>
+<li><strong>Channel selection.</strong> Based on remaining preferences and the trigger's allowed channels, choose set of channels per user.</li>
+<li><strong>Per-channel enqueue.</strong> Emit a <code>SendAttempt(trigger_id, user_id, channel)</code> record with deterministic id; enqueue to channel-specific worker queue.</li>
+<li><strong>Channel worker.</strong> Pulls from queue, renders template with personalization, calls provider, awaits ack, writes receipt.</li>
+</ol>
+<p>The deterministic SendAttempt id makes fan-out idempotent: if a fan-out worker crashes mid-resolve and retries, the same attempt id is generated, and the conditional insert dedupes.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Idempotency lives at the per-user per-channel level, not at the trigger level. The trigger id and the user id together produce a deterministic attempt id, so retries at any stage of fan-out converge.</p>
+</blockquote>
+<p>Trigger write path:</p>
+<ol>
+<li>Product service calls <code>POST /triggers</code> with <code>trigger_id</code> as the idempotency key.</li>
+<li>Trigger service conditionally writes <code>trigger:{trigger_id}</code>. Duplicate insert returns the existing trigger state.</li>
+<li>Resolver expands <code>audience_spec</code> into user-id chunks. Chunk jobs are keyed by <code>(trigger_id, chunk_id)</code> so retries do not duplicate progress.</li>
+<li>Fan-out workers parallel read preferences <code>pref:{user_id}</code>, suppression <code>suppress:{channel}:{contact_hash}</code>, frequency cap <code>freq:{user_id}:{category}:{yyyyMMdd}</code>, and template kill state.</li>
+<li>For every allowed channel, worker conditionally writes <code>attempt:{date}:{user_id}:{attempt_id}</code> and enqueues <code>queue:{channel}:{priority}:{partition}</code> where partition is usually <code>hash(user_id)</code>.</li>
+<li>Channel worker pulls the queue, re-checks preference/suppression for compliance, renders the template, waits for provider token bucket, sends, then updates the attempt row.</li>
+</ol>
+<p>In-app read path:</p>
+<ol>
+<li>Client calls <code>GET /users/{user_id}/notifications?cursor=</code>; shard key is <code>user_id</code>.</li>
+<li>Hot read hits the per-user inbox table ordered by <code>(user_id, created_at desc, notification_id)</code>, with a cursor carrying last timestamp and notification id.</li>
+<li>Cache miss or dormant user falls back to the attempt/inbox store; first page can be slower but must still apply deleted-template and suppression state.</li>
+<li>Cursor exhaustion returns an empty page plus terminal cursor. Offset pagination is avoided because inboxes can mutate while the user scrolls.</li>
+</ol>
+<p>Write-path sketch:</p>
+<pre><code class="language-text">Product service -&gt; Trigger store -&gt; Audience resolver -&gt; Fan-out workers
+                |              |\
+                |              | +--&gt; Preference / suppression / frequency
+                |              +----&gt; Attempt store
+                v
+              Channel queues -&gt; Provider workers -&gt; APNs/FCM/Email/SMS
+</code></pre>
+<h3 id="preferences-at-send-time-not-trigger-time">Preferences At Send Time, Not Trigger Time</h3>
+<p>A scheduled marketing trigger may be enqueued hours before sending. A user could unsubscribe in between.</p>
+<ul>
+<li>Preferences and suppression lists are checked <strong>at send time</strong>, not at trigger time.</li>
+<li>The send worker reads from the strongly consistent preference store before calling the provider.</li>
+<li>A short cache is acceptable (seconds), but not longer; suppression list reads must reflect recent unsubscribes.</li>
+</ul>
+<p>This shifts more work to send time but is the only safe approach. Frequency caps and quiet hours similarly apply at send time.</p>
+<h3 id="channel-specific-concerns">Channel-Specific Concerns</h3>
+<p><strong>Push (APNs/FCM):</strong>
+- Maintain device token registry; tokens expire and must be refreshed.
+- Use HTTP/2 multiplexed connections to APNs; FCM has batched send API.
+- Track per-device delivery; one user with five devices yields five attempts.
+- On <code>Unregistered</code> from provider, mark device suppressed.</p>
+<p><strong>Email (SMTP / SendGrid / SES):</strong>
+- Honor SPF/DKIM/DMARC; reputation management is critical.
+- Hard bounces add to suppression; soft bounces retry with backoff.
+- Unsubscribe links must include signed tokens; one-click unsubscribe is required by major mailbox providers.
+- Per-domain reputation throttling.</p>
+<p><strong>SMS:</strong>
+- Per-country regulations (TCPA in US, opt-in requirements).
+- Per-number TPS caps from carrier.
+- Long-code vs short-code; pricing affects template choice.
+- DLT/regulatory templates in some countries (India, etc.).</p>
+<p><strong>In-app:</strong>
+- WebSocket fan-out or pub/sub fed from per-user notification inbox table.
+- Stored even if user is offline; client polls or subscribes on next session.</p>
+<p><strong>Webhook:</strong>
+- Customer-supplied URL with signed payload.
+- Retry policy; circuit breaker per destination URL.</p>
+<h3 id="rate-limiting-providers">Rate Limiting Providers</h3>
+<p>Each provider has its own constraints:</p>
+<ul>
+<li>APNs: thousands of concurrent streams per HTTP/2 connection; limited connections per token authority.</li>
+<li>FCM: 600 messages/second/project base; batch APIs amplify.</li>
+<li>SMS providers: per-number TPS, per-country MPS.</li>
+</ul>
+<p>Implementation:</p>
+<ul>
+<li>Provider-specific token bucket per <code>(provider, sub-key)</code>.</li>
+<li>Workers block on the bucket before calling provider.</li>
+<li>Excess load queues at the worker; if the queue is too deep, shed non-transactional triggers.</li>
+</ul>
+<p>Delivery degradation state:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Latency budget</th>
+<th>Transition</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Normal send</td>
+<td>Channel queue + provider</td>
+<td>Transactional &lt;5s, marketing minutes</td>
+<td>Provider healthy and bucket has tokens.</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Rate-limited</td>
+<td>Queue waits on token bucket</td>
+<td>Transactional &lt;30s, marketing hours</td>
+<td>Provider quota reached.</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Provider outage</td>
+<td>Retry queue + circuit breaker</td>
+<td>Depends on priority</td>
+<td>Error rate crosses threshold.</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Cross-provider failover</td>
+<td>Alternate provider if template/channel allows</td>
+<td>&lt;2 minutes for transactional</td>
+<td>Primary outage and policy permits failover.</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Dead-letter / suppress</td>
+<td>DLQ or suppression store</td>
+<td>Audit only</td>
+<td>Retry budget exhausted or hard bounce.</td>
+</tr>
+</tbody>
+</table>
+<p>Stress edges:</p>
+<ul>
+<li>Hot celebrity trigger: stream audience in chunks, cap per-trigger fan-out rate, and expose progress by completed chunk count.</li>
+<li>Dormant user: preference cache miss reads the strong store; in-app inbox first page can cold-read archive but send-time suppression still applies.</li>
+<li>Burst writes: transactional priority gets reserved queue capacity; marketing triggers are delayed or dropped before provider quotas are consumed.</li>
+<li>Multi-region drift: fan-out runs in the user's owner region, and remote regions forward trigger chunks instead of reading stale preference replicas.</li>
+</ul>
+<blockquote>
+<p>Graceful degradation is priority-aware: transactional alerts wait longer and may fail over; marketing notifications are the pressure-release valve.</p>
+</blockquote>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Triggers</td>
+<td><code>trigger_id</code> hash</td>
+<td>Even distribution; idempotent insert.</td>
+</tr>
+<tr>
+<td>Send attempts</td>
+<td><code>user_id</code> hash for current; date-partitioned archive</td>
+<td>Lookup by user; long-tail history.</td>
+</tr>
+<tr>
+<td>Preferences</td>
+<td><code>user_id</code> hash</td>
+<td>Read at every send.</td>
+</tr>
+<tr>
+<td>Suppression</td>
+<td><code>user_id</code> + <code>contact</code></td>
+<td>Lookup by recipient identity.</td>
+</tr>
+<tr>
+<td>Per-user frequency counter</td>
+<td><code>user_id</code> hash</td>
+<td>Atomic increment in Redis.</td>
+</tr>
+<tr>
+<td>Per-provider rate limiter</td>
+<td><code>provider</code> shard</td>
+<td>Token bucket per provider.</td>
+</tr>
+</tbody>
+</table>
+<p>For massive fan-out (one trigger -&gt; 100M users), the audience resolver streams to a parallel set of fan-out workers. The trigger record carries a counter of completed shards so progress is observable.</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Preferences</td>
+<td>Strong</td>
+<td>Consent at send time.</td>
+</tr>
+<tr>
+<td>Suppression list</td>
+<td>Strong</td>
+<td>Cannot notify after unsubscribe.</td>
+</tr>
+<tr>
+<td>Send attempt dedupe</td>
+<td>Strong (per-attempt CAS)</td>
+<td>At-least-once delivery, at-most-once user-visible.</td>
+</tr>
+<tr>
+<td>Delivery receipts</td>
+<td>Eventually consistent</td>
+<td>Used for analytics.</td>
+</tr>
+<tr>
+<td>In-app inbox</td>
+<td>Strong per-user (read your writes)</td>
+<td>Users see their own notifications immediately.</td>
+</tr>
+<tr>
+<td>Frequency cap</td>
+<td>Approximate (Redis counter)</td>
+<td>Slight over-count acceptable.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Provider outage</td>
+<td>Backoff + retry; circuit breaker per provider; cross-provider failover where possible.</td>
+<td>Provider error rate; queue backlog by channel.</td>
+</tr>
+<tr>
+<td>Audience explodes (followers count surge).</td>
+<td>Stream resolution; rate-limit fan-out per trigger.</td>
+<td>Per-trigger fan-out rate.</td>
+</tr>
+<tr>
+<td>Duplicate triggers from upstream.</td>
+<td>Trigger-id idempotency; deterministic attempt id.</td>
+<td>Duplicate insert rate.</td>
+</tr>
+<tr>
+<td>Unsubscribe after enqueue but before send.</td>
+<td>Send-time preference check.</td>
+<td>Suppressed send attempts count.</td>
+</tr>
+<tr>
+<td>Kill switch needed (broken template).</td>
+<td>Per-template kill flag in cache, checked at send.</td>
+<td>Kill propagation latency.</td>
+</tr>
+<tr>
+<td>Per-user spam from buggy product.</td>
+<td>Frequency caps; per-template per-user dedupe.</td>
+<td>Frequency cap rejections.</td>
+</tr>
+<tr>
+<td>Webhook customer endpoint fails.</td>
+<td>Retry + circuit breaker; dead-letter.</td>
+<td>Per-customer success rate.</td>
+</tr>
+<tr>
+<td>Quiet hours violated.</td>
+<td>Worker checks at send; defer to next allowed window.</td>
+<td>Quiet-hour violation count.</td>
+</tr>
+<tr>
+<td>In-app inbox grows unboundedly.</td>
+<td>Retention window per category; user can clear.</td>
+<td>Inbox size distribution.</td>
+</tr>
+<tr>
+<td>Dormant user cache miss.</td>
+<td>Read preference/inbox from authoritative store; accept slower first send or first page.</td>
+<td>Preference cache miss latency.</td>
+</tr>
+<tr>
+<td>Queue retention exhausted during provider outage.</td>
+<td>Shed marketing, extend transactional retention, alert before DLQ age limit.</td>
+<td>Oldest message age by queue.</td>
+</tr>
+<tr>
+<td>Multi-region preference drift.</td>
+<td>Route fan-out to user-owner region; worker re-checks before send.</td>
+<td>Cross-region forwarding lag.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness metrics:</p>
+<ul>
+<li>Notifications sent after unsubscribe (must be zero).</li>
+<li>Duplicate sends per (trigger_id, user_id, channel) (must be zero).</li>
+<li>Kill-switch propagation latency.</li>
+<li>Quiet-hour violations.</li>
+</ul>
+<p>Capacity metrics:</p>
+<ul>
+<li>End-to-end latency by priority class.</li>
+<li>Per-channel queue depth.</li>
+<li>Per-provider throughput vs cap.</li>
+<li>Fan-out workers utilization.</li>
+</ul>
+<p>Business metrics:</p>
+<ul>
+<li>Open/click rate by channel and template.</li>
+<li>Unsubscribe rate by template.</li>
+<li>Delivery success rate by provider.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>User preferences and suppression lists replicate globally with a single owner region per user (or per shard).</li>
+<li>Channel workers run in regions close to providers; APNs/FCM in US, SMS providers per country.</li>
+<li>Triggers may originate in any region; fan-out happens in the user's owner region for preference consistency.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Send-time preference check costs latency but is the only safe approach.</li>
+<li>Channel-specific workers increase complexity but allow per-channel optimization.</li>
+<li>At-least-once delivery is unavoidable; user-visible dedupe relies on attempt ids.</li>
+<li>Strong preference store consistency limits throughput; cache TTLs are short on purpose.</li>
+<li>Aggressive frequency capping protects users but reduces engagement; tune by category.</li>
+<li>Per-provider rate limiting trades absolute throughput for compliance.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single queue for all channels.</td>
+<td>Channel-specific queues so APNs flaking does not stall email.</td>
+</tr>
+<tr>
+<td>Checking preferences at trigger time.</td>
+<td>Check at send time; preferences are authoritative there.</td>
+</tr>
+<tr>
+<td>Trigger-level idempotency only.</td>
+<td>Per-user-per-channel deterministic attempt ids.</td>
+</tr>
+<tr>
+<td>Treating provider outage as a service-side problem.</td>
+<td>Circuit breaker, cross-provider failover, queue-up-and-drain.</td>
+</tr>
+<tr>
+<td>Forgetting suppression list.</td>
+<td>Authoritative store consulted on every send; hard bounces auto-add.</td>
+</tr>
+<tr>
+<td>Manual kill switches.</td>
+<td>Versioned, cached, in-worker check; propagation in seconds.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fan-out for 100M users</td>
+<td>Stream audience; parallel workers; deterministic attempt ids.</td>
+</tr>
+<tr>
+<td>Preferences at send time</td>
+<td>Strong consistency requirement; send worker reads preferences and suppression list.</td>
+</tr>
+<tr>
+<td>Provider rate limits</td>
+<td>Per-provider token bucket; backpressure into queue; circuit breaker.</td>
+</tr>
+<tr>
+<td>Compliance</td>
+<td>Suppression list as legal record; one-click unsubscribe; quiet hours.</td>
+</tr>
+<tr>
+<td>Push token lifecycle</td>
+<td>Token registration, refresh, unregister event handling.</td>
+</tr>
+<tr>
+<td>In-app inbox</td>
+<td>Per-user table with retention; client subscribes for live updates.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Three planes: trigger, audience+policy, delivery.</li>
+<li>Deterministic attempt id from (trigger_id, user_id, channel).</li>
+<li>Preferences and suppression at send time.</li>
+<li>Channel-specific workers and rate limits.</li>
+<li>Kill switch and template versioning.</li>
+<li>Fan-out streaming for massive audiences.</li>
+<li>Multi-region with preference-owner regions.</li>
+<li>Compliance: opt-in, unsubscribe, quiet hours.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>A notification system is fan-out plus policy. The fan-out problem is solved by deterministic attempt ids and per-channel queues; the policy problem is solved by reading preferences and suppression at send time, not at trigger time. The hardest case is one trigger producing 100M sends without violating per-user frequency caps or unsubscribes.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design a notification system.</p>
+<p><strong>Candidate:</strong> I will design it as three planes: trigger ingestion, audience and policy resolution, and channel-specific delivery. The invariant is that for every triggered notification, we attempt delivery once per user per channel, respect consent at send time, and produce a durable receipt. I will start with requirements, sketch the data flow, then dive into fan-out and provider rate limiting.</p>
+<p><strong>Interviewer:</strong> A trigger says "notify everyone who follows @user_x" and they have 50 million followers. How does that work?</p>
+<p><strong>Candidate:</strong> The trigger record is small — it carries an audience spec rather than the materialized list. The audience resolver streams follower ids from the social graph service in chunks. Each chunk is fanned out to per-channel workers in parallel. Each fan-out emits a SendAttempt with deterministic id <code>hash(trigger_id, user_id, channel)</code>. If a fan-out shard crashes and retries, the same ids regenerate and the conditional insert dedupes. The trigger progresses through <code>fanned_out_count</code> until complete.</p>
+<p><strong>Interviewer:</strong> What if a user unsubscribes while the fan-out is still running?</p>
+<p><strong>Candidate:</strong> Preferences and suppression are checked at send time, not trigger time. The per-channel send worker reads the current preference state and the suppression list before calling the provider. If the user unsubscribed in the last second, we emit a <code>suppressed</code> SendAttempt and skip the provider call. This means we accept some wasted fan-out work, but the user-visible behavior is correct.</p>
+<p><strong>Interviewer:</strong> How do you handle idempotency end-to-end?</p>
+<p><strong>Candidate:</strong> Three levels. First, the trigger has an idempotency key; duplicate triggers from upstream return the same trigger_id. Second, each SendAttempt has a deterministic id; retries at fan-out converge. Third, providers each support some form of message id or dedupe; we pass our attempt id as the provider's request id so we can correlate receipts. The user sees the notification at most once per channel.</p>
+<p><strong>Interviewer:</strong> APNs goes down. What happens?</p>
+<p><strong>Candidate:</strong> The push channel worker hits the circuit breaker after a threshold of errors. New push attempts queue up. We can route to a fallback (some products do APNs + in-app combo). The queue absorbs short outages; for longer outages, we shed non-transactional triggers based on priority. Transactional sends continue retrying as long as the queue holds.</p>
+<p><strong>Interviewer:</strong> A provider has a 1000-per-second cap. How do you not exceed it?</p>
+<p><strong>Candidate:</strong> Per-provider token bucket in front of the channel worker. Workers acquire a token before calling the provider; if the bucket is empty, they block. The bucket is replicated across worker shards using a Redis-backed counter so the global rate respects the cap. Excess load queues at the worker queue; if it grows beyond threshold, alerts fire and lower-priority traffic is shed.</p>
+<p><strong>Interviewer:</strong> How do you support quiet hours?</p>
+<p><strong>Candidate:</strong> Per-user preference: quiet_hours_start, quiet_hours_end, in their local timezone. At send time, the worker checks if "now in user's tz" falls inside quiet hours. If so, defer: re-enqueue the SendAttempt with a delay to the next allowed window, or send via a non-disruptive channel like in-app. Transactional categories can be exempt.</p>
+<p><strong>Interviewer:</strong> How do you handle frequency caps?</p>
+<p><strong>Candidate:</strong> A per-user-per-category counter in Redis. At send time, the worker increments and checks. If the user is over their cap, suppress and emit the audit record. Counters reset on a rolling window. For very high-volume systems, slight over-count is acceptable, so we use approximate counters rather than transactional ones.</p>
+<p><strong>Interviewer:</strong> How do you kill a bad template that's spamming users?</p>
+<p><strong>Candidate:</strong> Per-template kill switch. An operator sets a flag in the kill-switch store; the change propagates to workers via pub/sub within seconds. Workers check the flag before calling provider. In-flight sends already passed to providers cannot be recalled — that is why fast propagation matters. We monitor kill propagation lag as a correctness metric.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Preferences and suppression are owned per user — each user has a home region. Triggers ingest anywhere but route to the user's home region for fan-out. Channel workers run in regions close to providers: APNs/FCM in US, SMS in regions matching country regulations. Delivery receipts replicate back to the home region. This keeps preference reads cheap during fan-out while letting workers be close to providers.</p>
+<p><strong>Interviewer:</strong> How do you support in-app notifications?</p>
+<p><strong>Candidate:</strong> Per-user inbox table holding recent notifications. When a user is online, the worker writes to inbox and pushes via WebSocket / pub/sub. When offline, the inbox waits; the client fetches on next session. The inbox supports retention per category — promotions might keep 30 days, alerts maybe 90.</p>
+<p><strong>Interviewer:</strong> What about compliance?</p>
+<p><strong>Candidate:</strong> The suppression list is treated as a legal record. Hard bounces and unsubscribes from one-click unsubscribe (RFC 8058 for email) auto-add. We log every send for audit. For regulated channels like SMS, we enforce country-specific consent rules at the preference layer and refuse triggers that target non-consented numbers.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Trigger plane captures events idempotently. Audience and policy plane streams recipients, applies preferences and suppression at send time. Channel-specific workers integrate with providers and enforce rate limits per provider. Deterministic SendAttempt ids make end-to-end retries safe. Multi-region splits by user home region for preferences and by provider proximity for delivery. Compliance lives in the suppression list and the at-send-time preference check.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: channels, preferences, frequency, compliance.</li>
+<li>Invariant: one send per user per channel, consent at send time.</li>
+<li>Three planes: trigger, audience+policy, delivery.</li>
+<li>Deterministic SendAttempt id from (trigger_id, user_id, channel).</li>
+<li>Preferences checked at send time, not trigger time.</li>
+<li>Per-provider rate limiter with token bucket.</li>
+<li>Channel-specific workers; kill switch; multi-region.</li>
+<li>Close with metrics: suppressed/sent ratio, provider success rate.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>A notification system is fan-out plus policy. Triggers are ingested idempotently; audience is resolved streaming; preferences and suppression apply at send time. Per-channel workers integrate with providers under per-provider rate limits. Deterministic attempt ids prevent duplicates across retries. Compliance and kill switches live in the policy plane. The hardest scenario is 100M-user fan-out without violating per-user consent or frequency caps, solved by streaming resolution and send-time checks.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Preferences and suppression apply at send time, not trigger time."</li>
+<li>"Idempotency lives at per-user per-channel attempt level, not at the trigger."</li>
+<li>"Each provider gets its own token bucket and its own circuit breaker."</li>
+<li>"The suppression list is a legal record, not a cache."</li>
+<li>"Channel workers are bulkheaded so one provider outage does not stall the rest."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

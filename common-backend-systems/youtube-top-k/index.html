@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Top-K Videos (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">YouTube Top-K Videos (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Hard · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build a service that returns the Top-K most-viewed YouTube videos over a time window (last hour, last day, last 30 days). 100M videos in active circulation, 1B view events per hour at peak, K up to 1000. Response p99 &lt; 200 ms.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Query top-K videos for a given window: <code>1h</code>, <code>1d</code>, <code>7d</code>, <code>30d</code>. Plus "all time."
+- Optionally filter by category or region.</p>
+<p>I'd defer per-user personalization and trending algorithm tweaks beyond raw counts.</p>
+<p><strong>Non-functional</strong>
+- Query p99 &lt; 200 ms.
+- Ingestion sustains 1B events/h, ~280k events/s peak.
+- Eventual consistency — top-K reflects events within ~1 min (per-minute granularity is fine).
+- Approximate top-K acceptable; we'll use sketches if exact is too expensive.</p>
+<p><strong>Capacity</strong>
+- 100M active videos. Storing exact per-window counters for 4 windows = 400M counters in hot memory if all materialized.
+- View event ≈ 100 bytes; 1B/h × 24 = 2.4 TB/day raw before replication, but compressed minute counts are far smaller.
+- Exact bucket state can fit if we choose the right granularity: <code>1h</code> at 60 minute buckets × 100M × 4 B ≈ 24 GB; <code>1d</code> at 24 hourly buckets ≈ 9.6 GB; <code>30d</code> at 30 daily buckets ≈ 12 GB. Replication and category/region facets multiply this, so the dominant hot cost is state size in the stream processor, not API reads.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>ViewEvent</strong> — <code>video_id, user_id, ts, region, category</code>.</li>
+<li><strong>WindowCounter</strong> — <code>(video_id, window) → count</code>.</li>
+<li><strong>TopKList</strong> — <code>(window, [video_id]_K)</code>, the precomputed ranking.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>GET /v1/topk?window=1h&amp;k=100&amp;category=music&amp;region=us   → { videos[] }
+</code></pre>
+<p>Window is enumerated (<code>1h, 1d, 7d, 30d, all</code>); no arbitrary windows.</p>
+<p>The response cursor is only for paging within the precomputed list; it encodes <code>(window, facet, version, offset)</code> so every page comes from the same published snapshot.</p>
+<hr />
+<h2 id="4-data-flow-5-min">4. Data Flow (~5 min)</h2>
+<p>View events → Kafka → stream processor → updates per-window counters (sliding) → maintains a heap of top-K per window → publishes top-K list to a read store → served from Redis on read.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Event collection.</strong> YouTube player emits view events to an ingest layer. Events go to Kafka topic <code>views.raw</code>, partitioned by <code>video_id</code> (so all events for one video land on the same partition for easier aggregation).</li>
+<li><strong>Stream aggregator.</strong> Flink job consumes <code>views.raw</code>, maintains counters in multiple windows. Two flavors:
+   - <strong>Tumbling 1-min counters</strong> (always materialized).
+   - <strong>Sliding windows of 1h/1d/7d/30d</strong> computed by summing the right number of tumbling buckets.</li>
+<li><strong>Per-video state.</strong> Keyed state in Flink: <code>video_id → ring buffer of last N minute-buckets</code>. Memory cost = 100M videos × small constant.</li>
+<li><strong>Top-K maintenance.</strong> Within each task slot (which owns a hash range of <code>video_id</code>s), keep a min-heap of the local top-K per window. On every minute boundary, emit the local top-K to a merge stage.</li>
+<li><strong>Merge stage.</strong> Coordinator that takes local top-K from each task and computes the global top-K. With N partitions and K=1000, local top-K per partition can be larger (say 5K) to guarantee global correctness when items just below local-K could merge into global top-K.</li>
+<li><strong>Read store.</strong> Global top-K written to Redis (one list per <code>(window, region, category)</code> combination). Read service simply fetches the precomputed list.</li>
+<li><strong>Cold-storage backfill.</strong> Raw events also archived to S3 / a data warehouse for ad-hoc analytics.</li>
+</ol>
+<p>End-to-end narration: a video gets viewed → event lands in Kafka partition for that <code>video_id</code> → Flink task increments the current minute bucket → at minute boundary, slide the buffer (drop oldest, add newest) → recompute sliding counts for each window → if updated count enters the local top-K, update the local heap → every minute, local heaps merged → global top-K written to Redis → API serves it directly.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<p>Whiteboard flow:</p>
+<pre><code class="language-text">Player beacon -&gt; Ingest -&gt; Kafka views.raw partitioned by video_id/salt
+                         -&gt; Flink keyed counters in RocksDB
+                         -&gt; local topK heap per task/window/facet
+                         -&gt; merge coordinator
+                         -&gt; Redis topk:{window}:{facet}:{version}
+API read -&gt; Redis list -&gt; metadata MGET -&gt; client
+Archive -&gt; object store / warehouse by hour
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete store contracts.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / data structure</th>
+<th style="text-align: right;">Entry size + TTL</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Raw event stream</td>
+<td>Kafka <code>views.raw</code> event <code>{video_id, ts, region, category}</code></td>
+<td style="text-align: right;">~100 B, 24–72h retention</td>
+<td><code>video_id</code> or salted hot key</td>
+</tr>
+<tr>
+<td>Bucket state</td>
+<td>Flink/RocksDB <code>video_id → ring buffers</code></td>
+<td style="text-align: right;">~50–200 B/video per facet set</td>
+<td><code>video_id</code></td>
+</tr>
+<tr>
+<td>Local heaps</td>
+<td>per task <code>topk:{window}:{facet}</code> min-heap</td>
+<td style="text-align: right;">K' × ~16 B, refreshed each minute</td>
+<td>task partition</td>
+</tr>
+<tr>
+<td>Global lists</td>
+<td>Redis <code>topk:{window}:{facet}:{version}</code> list of video ids/counts</td>
+<td style="text-align: right;">K × ~24 B, TTL by window/version</td>
+<td><code>window+facet</code></td>
+</tr>
+<tr>
+<td>All-time counters</td>
+<td>KV/OLAP <code>views_total:{video_id}</code></td>
+<td style="text-align: right;">8–16 B/video, retained</td>
+<td><code>video_id</code></td>
+</tr>
+<tr>
+<td>Raw archive</td>
+<td>object/data warehouse partitioned by hour</td>
+<td style="text-align: right;">~2.4 TB/day raw, cold retention</td>
+<td><code>date/hour</code></td>
+</tr>
+</tbody>
+</table>
+<p>Capacity by store: Kafka hot retention at 2.4 TB/day × 3 replicas × 3 days is ~21.6 TB before compression. Exact active state is tens of GB for core windows but multiplies quickly with facets, so keep supported facets bounded. Redis serving lists are tiny: 400 facet/window lists × 1000 rows × 24 B is under 10 MB before overhead; the read path is not the cost center.</p>
+<p><strong>Ingest and query path trace.</strong> Player beacon → ingest validates and writes Kafka → Flink task keyed by <code>video_id</code> updates current bucket and total counter → at minute boundary it advances ring buffers and local heaps → merge stage combines local K' lists into global K → read store writes a new Redis version → API reads <code>topk:{window}:{facet}:{version}</code> and hydrates video metadata in parallel. Query path is intentionally a single Redis read plus metadata hydration; no scan happens on user request.</p>
+<p>Hot and cold read paths:</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Stores touched</th>
+<th>Parallelism</th>
+<th>Cursor/version</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot API read</td>
+<td>Redis top-K list + metadata cache</td>
+<td>metadata hydrate runs as one batch</td>
+<td><code>{window, facet, version, offset}</code></td>
+</tr>
+<tr>
+<td>Redis miss</td>
+<td>in-memory last snapshot, then previous Redis version</td>
+<td>metadata hydrate still batched</td>
+<td>same version if available</td>
+</tr>
+<tr>
+<td>Backfill query</td>
+<td>OLAP/object archive</td>
+<td>offline scan, not user-facing</td>
+<td>job id, not API cursor</td>
+</tr>
+</tbody>
+</table>
+<p>The cursor pins a published <code>version</code>; otherwise page 2 could come from a newer minute and duplicate or skip videos.</p>
+<p><strong>Exact vs approximate.</strong> Exact top-K at 100M keys/280k QPS is heavy but doable with proper sharding. Approximate alternatives:
+- <strong>Count-min sketch</strong> for counters with bounded error; saves memory but loses exactness.
+- <strong>Space-saving algorithm</strong> for streaming top-K: maintains <code>k×c</code> buckets, replacing the min when a new item dominates. Provably bounded error.
+- I'd default to exact (per-video state in Flink) since the question size fits, mention space-saving as the fallback if memory blows up.</p>
+<p>Why Flink/RocksDB instead of Spark micro-batches: we need minute freshness, keyed state, watermarks, and failure recovery with low continuous latency. Spark Structured Streaming can work, but Flink is the more natural fit for long-lived keyed state and event-time windows.</p>
+<p>Why Redis for serving instead of querying Flink state directly: Redis gives a stable, versioned snapshot with predictable p99 under 200 ms. Flink state is optimized for streaming updates and checkpointing, not thousands of API reads.</p>
+<p><strong>Top-K aggregation correctness.</strong> A naive "global top-K = union of local top-K" is wrong: an item just below K in every partition could globally exceed K. Solution: send local top-K' where K' &gt; K (e.g., 5K) so global merge sees enough candidates. Or include the global count via a second pass.</p>
+<pre><code class="language-text">Flink task 0 -&gt; local top 5K --\
+Flink task 1 -&gt; local top 5K ----&gt; merge coordinator -&gt; global top K + version
+Flink task N -&gt; local top 5K --/                         |
+                                                           v
+                                                Redis published snapshot
+</code></pre>
+<p><strong>Sliding window memory.</strong> For a 30-day window at minute resolution, that's 43200 buckets/video × 100M videos = 4.3 trillion entries. Too much. Mitigation: bucket coarsely for older windows — minute resolution for 1h, hour resolution for 1d, day resolution for 7d/30d. Trade precision at the tail of the window for memory.</p>
+<p>Interview punch line: "The trick is not computing top-K; the trick is refusing to store 30 days at minute granularity when the product only needs minute freshness near now."</p>
+<p><strong>Hot key skew.</strong> A viral video gets a disproportionate share of events. The Kafka partition that owns it backpressures. Mitigation: salted partitioning for hot keys, with a downstream merge to recombine. Detection: an upstream tracker watches partition lag.</p>
+<p><strong>Late events.</strong> A view event from a flaky network might arrive 5 min late. Flink handles with watermarking — events outside the watermark are dropped or sent to a side output for reconciliation. The trade-off is freshness vs completeness; for top-K, dropping 0.01% of events is fine.</p>
+<p><strong>Multi-region.</strong> Compute region-local top-K within each region; for global top-K, run a single global Flink job that consumes a global Kafka mirror — or merge regional top-K's at a coordinator. Latency cost on the global view.</p>
+<p><strong>Faceted top-K (per category / region).</strong> Each <code>(window, dimension)</code> combo is a separate precomputed list. Cardinality is small (e.g., 10 categories × 10 regions × 4 windows = 400 lists). Compute cost is linear in dimensions.</p>
+<p>This is another two-view pattern: counters are keyed by <code>video_id</code> for updates, while published lists are keyed by <code>(window, facet)</code> for reads. They are the same view data materialized two ways so writes and reads are both cheap.</p>
+<p><strong>Failure recovery.</strong> Flink with RocksDB-backed state and Kafka source replays from offsets on task failure. Exactly-once semantics via Flink's checkpoint + Kafka's transactional reads.</p>
+<p>The two-view pattern is explicit here: counters are update-keyed by <code>video_id</code>, while lists are read-keyed by <code>(window, facet, version)</code>. The merge stage is the only place that converts one view into the other.</p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th style="text-align: right;">Latency budget</th>
+<th>Fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Viral hot key</td>
+<td>Salted counting</td>
+<td>Kafka salted partitions + merge</td>
+<td style="text-align: right;">&lt;1 min</td>
+<td>Split <code>video_id</code> into salts, recombine before heap</td>
+</tr>
+<tr>
+<td>Late events</td>
+<td>Watermark mode</td>
+<td>Flink event time</td>
+<td style="text-align: right;">1–5 min lateness</td>
+<td>Drop/side-output very late events; reconcile offline</td>
+</tr>
+<tr>
+<td>Redis read store down</td>
+<td>Last snapshot</td>
+<td>in-memory API cache</td>
+<td style="text-align: right;">&lt;200 ms</td>
+<td>Serve previous version with stale age</td>
+</tr>
+<tr>
+<td>Flink lag</td>
+<td>Stale top-K</td>
+<td>last published Redis version</td>
+<td style="text-align: right;">Staleness visible internally</td>
+<td>Keep serving old list; alert on lag</td>
+</tr>
+<tr>
+<td>Facet explosion</td>
+<td>Exact core, approximate tail</td>
+<td>top facets exact, sketches for rare facets</td>
+<td style="text-align: right;">&lt;200 ms</td>
+<td>Limit supported filters; use sketch/OLAP for ad hoc</td>
+</tr>
+</tbody>
+</table>
+<p><strong>What I'd defer.</strong> Per-user "top-K I'd like" personalization, trending = velocity-based not raw counts, fraud filtering of bot views.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

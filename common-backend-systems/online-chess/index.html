@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Online Chess — Chess.com / Lichess Class (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Online Chess — Chess.com / Lichess Class (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Medium · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build an online chess platform. Players match into games by skill rating, play with a clock, see opponent's move within ~200 ms, and finished games update Elo. 10M monthly active users, ~500k concurrent during peak, ~50k games/min at peak.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Player enters matchmaking; pairs with someone close in rating.
+- Two players play moves in real-time with a clock per side.
+- On game end (checkmate, resign, timeout, draw), update ratings.</p>
+<p>I'd defer tournaments, anti-cheat depth (engine detection), tutorials, and stream viewing.</p>
+<p><strong>Non-functional</strong>
+- Move propagation &lt; 200 ms p95.
+- Clock fairness — both sides see the same elapsed time; no one loses on time due to lag.
+- Strong consistency on game state — both sides agree on the position.
+- Highly available — tournament games are real to people.</p>
+<p><strong>Capacity</strong>
+- 500k concurrent connections.
+- 50k games/min × 30 moves/game = 1.5M moves/min ≈ 25k moves/sec.
+- Move writes are modest: 25k moves/sec × ~80 B/move × 3 replicas ≈ 6 MB/sec at peak. Connection state and fan-out are the larger operational pressure.
+- If 5M games finish/day, game metadata at ~1 KB/game is ~5 GB/day; the long-term archive is cheap compared with video/social systems.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>User</strong> — <code>user_id</code>, rating, peak_rating.</li>
+<li><strong>Game</strong> — <code>game_id, white_id, black_id, moves[], clock_white, clock_black, status, result</code>.</li>
+<li><strong>Move</strong> — <code>(game_id, ply, uci_or_san, ts_server, time_left)</code>.</li>
+<li><strong>Matchmaking ticket</strong> — <code>user_id, rating, time_control, queued_at</code>.</li>
+</ul>
+<hr />
+<h2 id="3-api-protocol-5-min">3. API / Protocol (~5 min)</h2>
+<pre><code>POST  /v1/queue                       { time_control, rating_range }    → { ticket_id }
+WS    /v1/queue/{ticket_id}            → push: { matched: game_id }
+WS    /v1/games/{id}                   ← move: { uci }
+                                       → push: { move, clock_left }
+POST  /v1/games/{id}/resign
+</code></pre>
+<p>User from token.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Matchmaking service.</strong> Each time control has its own queue (10s blitz, 5+5, 15+10, classical). Within a queue, players are sorted by rating. A matcher process samples pairs whose ratings are within an expanding window (starts narrow, widens with wait time). On pair: create game row, push WS messages to both clients.</li>
+<li><strong>Game session service.</strong> All moves for one game funnel to one owner node (consistent hash on <code>game_id</code>). Owner holds the game state in memory + persists to durable storage.</li>
+<li><strong>Move validation.</strong> Server validates each move against the current position. Rejection on illegal move. Server is source of truth on position and clocks.</li>
+<li><strong>Clock authority.</strong> Server tracks clocks with monotonic time. Time decremented from the moving player's clock based on server timestamps. Client UI uses its own clock for display but server arbitrates timeout.</li>
+<li><strong>Move broadcast.</strong> Owner pushes the validated move to both clients over WS.</li>
+<li><strong>Game end + rating update.</strong> On terminal state, the owner runs Elo update, writes the final game record, pushes <code>game_over</code> to both clients.</li>
+<li><strong>Persistence.</strong> Move list appended per move (Cassandra keyed by <code>game_id</code>). Game metadata in MySQL (sharded by <code>game_id</code>).</li>
+<li><strong>Spectator path (optional).</strong> Other users can subscribe to a game's WS in read-only mode; owner fans out broadcast to them with the existing channel.</li>
+</ol>
+<p>End-to-end narration: Alice queues for 5-min blitz → matchmaker pairs her with Bob (within 50-rating window) → game G created → both clients open WS to game owner → Alice plays e4 → server validates, decrements her clock by 0.3 s (network), pushes e4 to Bob with <code>clock_white: 4:59.7</code>. Game proceeds for 30 moves; on Bob's checkmate, owner runs Elo, updates both users' ratings, writes the game record.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">                         +--------------------------------+
+                         | PLAYERS AND SPECTATORS        |
+                         +----------+-------------+-------+
+                                    |             |
+          POST /v1/queue            |             | WS /v1/games/{id}
+          WS /v1/queue/{ticket_id}  |             | POST /resign
+                                    v             v
+                         +----------+---+  +------+-------+
+                         | Matchmaking  |  | API / WS     |
+                         | Service      |  | Gateway      |
+                         +------+-------+  +------+-------+
+                                |                 |
+                                | matched         | route by game_owner
+                                v                 v
+                         +------+-------+  +------+-------+
+                         | Game Create  |  | Game Router  |
+                         +------+-------+  +------+-------+
+                                |                 |
+                                |                 v
+                                |          +------+-------+
+                                |          | Game Owner   |
+                                |          | board+clock  |
+                                |          +---+-----+----+
+                                |              |     |
+                                |          move|     | game_over
+                                v              v     v
+        +----------------------------------------------------------+
+        | STORE / CACHE                                            |
+        | queue:{time_control} Redis ZSET, score=rating            |
+        | game_owner:{game_id} owner_node + epoch                  |
+        | game:{game_id} metadata/status/result/clocks            |
+        | moves:{game_id} append-only ply-ordered move log         |
+        | state:{game_id}:{checkpoint_ply} FEN + clocks            |
+        | ack:{game_id}:{user_id} last acknowledged ply            |
+        | rating:{user_id} rating/provisional flags                |
+        +-----------+---------------------------+------------------+
+                    | owner miss / reconnect    ^ rating update
+                    v                           |
+          +-------------------+         +-------+-------+
+          | Replay checkpoint |         | Rating        |
+          | + moves tail      |         | Service       |
+          +-------------------+         +---------------+
+                                |
+                                v
+                   Player WS + Spectator Pub/Sub
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete stores and shard keys.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key pattern</th>
+<th>Data structure / entry</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Matchmaking queue</td>
+<td><code>queue:{time_control}</code></td>
+<td>Redis ZSET, score=<code>rating</code>, member=<code>ticket_id</code>, ~80 B</td>
+<td>10 min or until matched</td>
+<td><code>time_control</code></td>
+</tr>
+<tr>
+<td>Game owner map</td>
+<td><code>game_owner:{game_id}</code></td>
+<td>Redis string <code>{owner_node, epoch}</code>, ~60 B</td>
+<td>active game + 5 min</td>
+<td><code>game_id</code></td>
+</tr>
+<tr>
+<td>Game metadata</td>
+<td><code>game:{game_id}</code></td>
+<td>MySQL row, players/status/result/clocks, ~1 KB</td>
+<td>forever</td>
+<td><code>game_id</code></td>
+</tr>
+<tr>
+<td>Move log</td>
+<td><code>moves:{game_id}</code></td>
+<td>append-only list/partition ordered by ply, ~50–80 B/move</td>
+<td>forever, cold archive later</td>
+<td><code>game_id</code></td>
+</tr>
+<tr>
+<td>Position checkpoint</td>
+<td><code>state:{game_id}:{checkpoint_ply}</code></td>
+<td>FEN/clock snapshot, ~200 B</td>
+<td>active + 7 d hot</td>
+<td><code>game_id</code></td>
+</tr>
+<tr>
+<td>Reconnect cursor</td>
+<td><code>ack:{game_id}:{user_id}</code></td>
+<td>last acknowledged ply, ~40 B</td>
+<td>active + 1 h</td>
+<td><code>(game_id, user_id)</code></td>
+</tr>
+<tr>
+<td>Rating row</td>
+<td><code>rating:{user_id}</code></td>
+<td>rating/provisional flags, ~100 B</td>
+<td>forever</td>
+<td><code>user_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>The position itself is not stored as a separate authoritative blob on every move; it is derived in memory from the move log and checkpointed occasionally for fast reconnect/replay.</p>
+<p><strong>Capacity by store.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store / index</th>
+<th>Math</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Matchmaking queues</td>
+<td>500k waiting/concurrent users × 80 B × Redis overhead ≈ tens of MB</td>
+<td>split by time control</td>
+</tr>
+<tr>
+<td>Game owner map</td>
+<td>500k active games × 60 B × 3 ≈ 90 MB logical</td>
+<td>ephemeral routing index</td>
+</tr>
+<tr>
+<td>Game metadata</td>
+<td>5M games/day × 1 KB × 3 ≈ 15 GB/day</td>
+<td>long-term archive is still modest</td>
+</tr>
+<tr>
+<td>Move log</td>
+<td>25k moves/sec × 80 B × 86,400 × 3 ≈ 518 GB/day if peak sustained</td>
+<td>actual daily average lower</td>
+</tr>
+<tr>
+<td>Checkpoints</td>
+<td>500k active × 10 checkpoints × 200 B × 3 ≈ 3 GB</td>
+<td>speeds recovery, not source of truth</td>
+</tr>
+<tr>
+<td>Ratings</td>
+<td>10M users × 100 B × 3 ≈ 3 GB</td>
+<td>tiny but consistency-sensitive</td>
+</tr>
+</tbody>
+</table>
+<p>Why Redis ZSET for matchmaking instead of SQL or Kafka: the operation is "find nearby rating in this time-control queue" and remove two tickets atomically. SQL can do it, but row contention around hot rating bands is awkward; Kafka is ordered but not searchable by rating. For moves, Cassandra or an append-only SQL table both work because reads are single-game range scans; the important choice is serializing by <code>game_id</code>, not the brand of storage.</p>
+<p><strong>Move path.</strong>
+1. Client sends <code>{game_id, uci, client_seq}</code> over the player WebSocket.
+2. WS gateway routes by <code>game_owner:{game_id}</code>; if missing, it resolves owner via consistent hash and creates an epoch.
+3. Owner verifies it is that player's turn, validates the move against in-memory board state, and computes elapsed clock time from monotonic server timestamps.
+4. Owner appends <code>moves:{game_id}</code> with <code>(ply, move, server_ts, time_left)</code> and updates <code>game:{game_id}</code> status/clocks.
+5. Owner pushes the accepted move to both players; spectator broadcast runs on a separate channel so it cannot delay the player ACK.
+6. On terminal state, owner writes final result, updates <code>rating:{white_id}</code> and <code>rating:{black_id}</code> in one transaction or outbox-backed workflow, then emits <code>game_over</code>.</p>
+<p><strong>Reconnect / cold game path.</strong>
+1. Client reconnects with <code>{game_id, last_seen_ply}</code>; gateway routes by <code>game_owner:{game_id}</code> or elects a new owner if the map is absent.
+2. Hot owner returns an in-memory snapshot plus moves after <code>last_seen_ply</code>; it also updates <code>ack:{game_id}:{user_id}</code> so later reconnects know the cursor.
+3. Cold owner loads the latest <code>state:{game_id}:{checkpoint_ply}</code> and replays <code>moves:{game_id}</code> from that ply. If no checkpoint exists, replay starts at ply 0; that is still cheap for normal games.
+4. If the game is finished and archived, <code>GET /games/{id}</code> reads <code>game:{game_id}</code> plus the move archive; latency can be slower because it is no longer on the player move path.</p>
+<p><strong>Two-index framing.</strong> <code>moves:{game_id}</code> is the durable content log. <code>game_owner:{game_id}</code> is only a routing index, <code>ack:{game_id}:{user_id}</code> is a per-client replay cursor, and <code>rating:{user_id}</code> is a materialized view derived after terminal results. None of those indexes replace the legal move log.</p>
+<p><strong>Single-owner per game.</strong> All moves and clock decisions serialize at one node. Hash <code>game_id</code> to a session server. On failure, leader election + replay from durable log of moves. The owner enforces ordering, validates moves, and arbitrates clocks.</p>
+<p>Why single-owner instead of distributed locks around every move: chess has tiny per-game throughput and very strict ordering, so a colocated owner is simpler and faster. A DB row lock would be correct but adds latency to the hot path and makes clock fairness depend on storage tail latency. Be ready for "why not CRDT?" — collaborative merge semantics do not help because there is only one legal next move.</p>
+<p><strong>Clock under lag.</strong> Each player has a wall clock the server tracks. When a player's move arrives, server subtracts <code>(server_time - last_move_received)</code> from the player's clock. If clock would go negative, the player has flagged (lost on time).
+- Server includes <code>time_left</code> with each move push so the opponent UI shows accurate countdown.
+- Increment time-controls (e.g., +5 s per move) added on each move acknowledgment.
+- Anti-griefing: small grace window (~150 ms) before flagging to absorb network spikes.</p>
+<p><strong>Move validation.</strong> Server holds the position; validates each move against chess rules (legal squares, no leaving king in check, castling rights, en passant). On illegal move, reject with reason. Client should also validate locally to prevent obviously illegal submissions.</p>
+<p><strong>Disconnects.</strong> WS drops mid-game: client has a 30-second grace; on reconnect, server replays moves since the client's last ACK. Server's clock continues to run on the moving player during disconnect.</p>
+<p><strong>Matchmaking with rating bands.</strong> Maintain a Redis sorted set per time control, keyed by rating. Match scans for pairs within ±N rating; N starts at 50 and widens over time. Trade-off between fast match and fair match.</p>
+<p><strong>Rating update.</strong> Elo: <code>new = old + K × (actual - expected)</code>. K varies by player provisional status. Done in a transaction with the game record write.</p>
+<p><strong>Anti-cheat (touched).</strong> Move analysis: compare to top-engine moves; consistent agreement at high depth is suspicious. Out of scope to design fully; real platforms use offline batch jobs + human review.</p>
+<p><strong>Spectator scaling.</strong> A popular game (Carlsen vs Niemann) draws 100k spectators. Server's WS layer separates "player" connections (state-changing) from "spectator" (read-only). Hierarchical fan-out for spectators.</p>
+<p><strong>Region choice and cold starts.</strong> A game is assigned to one region at creation, usually closest to both players or to the tournament's home region. If players are far apart, both pay some latency, but clocks remain fair because the region's server timestamp is authoritative. After a full owner-pool restart, game owners rebuild active state from checkpoints + move logs and pause clocks briefly with pause credit so nobody flags during recovery.</p>
+<p><strong>Game storage.</strong> Move list in PGN-like format, compressed (~50 B/game on disk). Long-term retention is cheap — a billion-game archive is &lt; 100 GB.</p>
+<p><strong>Graceful degradation.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Latency budget</th>
+<th>Fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Player reconnect</td>
+<td>replay</td>
+<td><code>moves:{game_id}</code> after <code>ack</code> ply</td>
+<td>&lt; 1 s</td>
+<td>resend board snapshot + tail moves</td>
+</tr>
+<tr>
+<td>Owner failure</td>
+<td>cold owner</td>
+<td>move log + checkpoint</td>
+<td>1–3 s pause</td>
+<td>fence old epoch, replay, resume clocks with pause credit</td>
+</tr>
+<tr>
+<td>Spectator hot game</td>
+<td>latest-only fan-out</td>
+<td>regional pub/sub</td>
+<td>&lt; 500 ms latest</td>
+<td>drop spectator frames; player stream remains strict</td>
+</tr>
+<tr>
+<td>Matchmaking sparse</td>
+<td>expanding bands</td>
+<td><code>queue:{time_control}</code></td>
+<td>seconds</td>
+<td>widen rating window, then ask user to continue waiting</td>
+</tr>
+<tr>
+<td>Clock dispute</td>
+<td>server authority</td>
+<td>move log server timestamps</td>
+<td>immediate</td>
+<td>client clock is display only</td>
+</tr>
+</tbody>
+</table>
+<p>"The interview punch line: for chess I optimize around per-game correctness, not global write throughput; one game is a tiny serial log with a very demanding clock."</p>
+<p><strong>What I'd defer.</strong> Tournaments (Swiss/round-robin), analysis engine on demand, computer opponents (Stockfish integration), variant chess rules (960, three-check), club/league features.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

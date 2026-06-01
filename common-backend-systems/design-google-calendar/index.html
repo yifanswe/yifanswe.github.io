@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Google Calendar — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Google Calendar</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Calendar manages events across users, with invitations, RRULE recurrences, attendee responses, free/busy lookups, and notifications. The hard part is timezone correctness, recurring event handling (single instance edits within a series), conflict-free updates across attendees, and free/busy queries at scale.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every event is durably stored, visible to its organizer and invited attendees per their RSVP state; recurring events expand deterministically into individual occurrences accounting for timezone and DST; modifications to a single occurrence override the recurrence rule only for that instance; notifications fire at scheduled local time on every user's devices; free/busy queries reflect current event state.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can model recurring events with overrides, handle invitations and attendee responses, do free/busy at scale, integrate with reminders, and reason about cross-calendar sharing.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Google Calendar as an event store with RRULE recurrence, attendee management with RSVPs, free/busy queries, and a reminder pipeline. Events are stored as a master template plus per-instance overrides for exceptions. Free/busy is computed by occurrence materialization. The interesting decisions are recurrence storage, timezone handling, attendee invitation flow, and integration with the reminder system.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Create, edit, delete events.</li>
+<li>Recurring events (RRULE).</li>
+<li>Edit single occurrence vs entire series.</li>
+<li>Invite attendees; RSVP (yes, no, maybe).</li>
+<li>Find free/busy for a list of users.</li>
+<li>Multiple calendars per user (work, personal, holidays).</li>
+<li>Sharing calendars with permissions.</li>
+<li>Reminders before events.</li>
+<li>Sync with mobile clients (CalDAV-like).</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Sub-second event read.</li>
+<li>Reminder timing accurate to seconds.</li>
+<li>Multi-region support for global teams.</li>
+<li>Strong consistency on event edits.</li>
+<li>Bidirectional iCal sync.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Meeting room booking (Resource Calendar).</li>
+<li>Smart scheduling AI.</li>
+<li>Email integration beyond invites.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>1B+.</td>
+</tr>
+<tr>
+<td>Events</td>
+<td>Billions.</td>
+</tr>
+<tr>
+<td>Recurring expansions</td>
+<td>Tens of billions of occurrences.</td>
+</tr>
+<tr>
+<td>Free/busy queries</td>
+<td>Tens of thousands/sec.</td>
+</tr>
+<tr>
+<td>Notification rate</td>
+<td>Millions/sec at top-of-hour.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Event read sub-second; reminder fire within seconds.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is occurrence materialization for recurring events plus top-of-hour reminder bursts.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Experience</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Create event</td>
+<td>Title, time, attendees, recurrence.</td>
+<td>Strong write; idempotent.</td>
+</tr>
+<tr>
+<td>View calendar</td>
+<td>Day/week/month with events.</td>
+<td>Sub-second read.</td>
+</tr>
+<tr>
+<td>RSVP</td>
+<td>Accept/decline an invite.</td>
+<td>Strong write.</td>
+</tr>
+<tr>
+<td>Free/busy</td>
+<td>Show others' busy windows.</td>
+<td>Sub-second; bounded staleness.</td>
+</tr>
+<tr>
+<td>Reminders</td>
+<td>Alert before event.</td>
+<td>Reuse reminder system.</td>
+</tr>
+<tr>
+<td>Sharing</td>
+<td>Other users view/edit my calendar.</td>
+<td>ACL enforced.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Client --&gt; Calendar API
+              |
+       +------+--------+
+       |               |
+       v               v
++-------------+ +--------------+
+| Event Store | | Calendar     |
+| + Override  | | Metadata     |
++------+------+ +--------------+
+       |
+       +-----&gt; Invitation Service --&gt; Notification
+       |
+       +-----&gt; Free/Busy Service
+       |
+       +-----&gt; Reminder Pipeline (see reminder design)
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Calendar service</td>
+<td>CRUD on calendars and events.</td>
+<td>Per-user partitioned.</td>
+</tr>
+<tr>
+<td>Event store</td>
+<td>Persistent events with RRULE.</td>
+<td>Sharded by calendar_id.</td>
+</tr>
+<tr>
+<td>Override store</td>
+<td>Per-occurrence exceptions to recurrence.</td>
+<td>Linked to series.</td>
+</tr>
+<tr>
+<td>Invitation service</td>
+<td>Manages RSVPs, attendee state.</td>
+<td>Per-event.</td>
+</tr>
+<tr>
+<td>Free/busy service</td>
+<td>Computes busy windows from events.</td>
+<td>Materialized for fast read.</td>
+</tr>
+<tr>
+<td>Reminder pipeline</td>
+<td>Schedule notifications.</td>
+<td>Reuse reminder system.</td>
+</tr>
+<tr>
+<td>Sync service</td>
+<td>Push event changes to subscribed clients.</td>
+<td>WebSocket/push.</td>
+</tr>
+<tr>
+<td>Sharing service</td>
+<td>Calendar ACL.</td>
+<td>Per-calendar.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="event-series-master">Event (Series Master)</h4>
+<pre><code class="language-text">Event(
+  event_id,
+  calendar_id,
+  organizer_id,
+  title,
+  description,
+  start_time,            // first occurrence in user TZ
+  end_time,
+  timezone,
+  rrule,                 // RFC 5545 RRULE if recurring
+  exdates,               // exception dates excluded
+  attendees: [{user_id, response, role}],
+  location,
+  reminders: [{minutes_before, channel}],
+  visibility,            // default, public, private
+  created_at,
+  updated_at,
+  version
+)
+</code></pre>
+<h4 id="occurrence-override">Occurrence Override</h4>
+<pre><code class="language-text">EventOverride(
+  override_id,
+  series_event_id,
+  original_start,         // the recurring instance being overridden
+  modified_event,         // full event data for the override
+  is_cancelled,           // if true, this instance is removed
+  created_at
+)
+</code></pre>
+<h4 id="freebusy-window">Free/Busy Window</h4>
+<pre><code class="language-text">FreeBusyWindow(
+  user_id,
+  start_time_utc,
+  end_time_utc,
+  status                  // busy, tentative, free, oof
+)
+</code></pre>
+<p>Computed from active events.</p>
+<h4 id="calendar">Calendar</h4>
+<pre><code class="language-text">Calendar(
+  calendar_id,
+  owner_id,
+  name,
+  timezone,
+  color,
+  acl: [{user_or_group, role}],
+  created_at
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">POST   /events
+PATCH  /events/{id}
+DELETE /events/{id}                   # series
+DELETE /events/{id}?occurrence=ts      # single occurrence
+POST   /events/{id}/rsvp
+GET    /calendars/{id}/events?from=&amp;to=
+GET    /freebusy?users=&amp;from=&amp;to=
+POST   /reminders                     # custom reminders
+</code></pre>
+<h3 id="recurrence-model">Recurrence Model</h3>
+<p>Each recurring event has a single Event row with RRULE. Occurrences are not pre-materialized; they're computed on the fly for the requested view range.</p>
+<p>For exceptions:</p>
+<ul>
+<li>A single occurrence modified: create an EventOverride row pointing to the series, specifying the modified data.</li>
+<li>A single occurrence cancelled: EventOverride with <code>is_cancelled=true</code>.</li>
+<li>Edit "this and future": split the series — set RRULE END on the original, create a new Event series starting from the cutover.</li>
+<li>Edit "all": modify the master event (and possibly drop overrides for changed fields).</li>
+</ul>
+<p>Reading a date range:</p>
+<ol>
+<li>Fetch all Event rows where the series overlaps the range.</li>
+<li>Expand RRULE to get occurrences within range.</li>
+<li>Apply overrides: substitute or remove specific occurrences.</li>
+<li>Return materialized occurrence list.</li>
+</ol>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Recurring events store the rule, not the instances. Overrides for exceptions point back to the series. Expand at read time within the requested range.</p>
+</blockquote>
+<h3 id="timezone-handling">Timezone Handling</h3>
+<p>Master event stores <code>start_time</code> and <code>timezone</code> (e.g., "9 AM America/Los_Angeles"). Recurrence rule operates in the event's timezone.</p>
+<ul>
+<li>When user crosses timezones, displayed times shift but the event's local time stays.</li>
+<li>DST transitions: events at 2:30 AM on a fall-back day get the first occurrence (or per policy).</li>
+<li>All-day events have no timezone; they span "the day" in the user's local view.</li>
+</ul>
+<p>Free/busy: events are converted to UTC for cross-user queries.</p>
+<h3 id="invitations">Invitations</h3>
+<p>Organizer adds attendees to an event:</p>
+<ol>
+<li>Each attendee added with initial <code>response=needs_action</code>.</li>
+<li>Notification (email + in-app) sent.</li>
+<li>Attendee responds: yes, no, maybe.</li>
+<li>Event's attendee list updated; organizer notified.</li>
+<li>The event appears in the attendee's calendar with their RSVP status.</li>
+</ol>
+<p>For cross-organization invites (different Google Workspace orgs): iCal-based email invites for interop.</p>
+<p>Each attendee technically has their own view of the event (their RSVP). The "source of truth" event is in the organizer's calendar; attendees see a copy linked by event_id. Edits propagate via invitations.</p>
+<h3 id="freebusy-service">Free/Busy Service</h3>
+<p>For "show me when these 5 users are free this week":</p>
+<ol>
+<li>For each user, fetch events overlapping the time range.</li>
+<li>Expand recurrences.</li>
+<li>Apply privacy: free/busy doesn't reveal event titles (unless explicitly shared).</li>
+<li>Convert each event to a UTC busy window.</li>
+<li>Return the union per user.</li>
+</ol>
+<p>Optimization:</p>
+<ul>
+<li>Materialize per-user free/busy intervals for the next 30 days.</li>
+<li>Update on event create/edit.</li>
+<li>Query reads the materialized index.</li>
+</ul>
+<p>For scheduling assistant ("find a time that works for all 5"): intersect the inverse (free windows).</p>
+<h3 id="reminder-integration">Reminder Integration</h3>
+<p>Each event has reminders configured (e.g., 10 minutes before).</p>
+<ul>
+<li>When event is created/edited, compute the reminder times.</li>
+<li>Submit to the reminder pipeline (see reminder system design).</li>
+<li>Reminder pipeline materializes per-occurrence reminders, accounting for recurrence and timezone.</li>
+<li>On fire, notification system sends push/email/in-app alert.</li>
+</ul>
+<h3 id="sharing-and-acl">Sharing And ACL</h3>
+<p>Each calendar has an ACL: users/groups with roles (free/busy only, read, write, manage).</p>
+<ul>
+<li>Sharing a calendar grants read or write access.</li>
+<li>Edits by writers are visible to all viewers.</li>
+<li>ACL checked on every operation.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Events</td>
+<td><code>calendar_id</code> hash</td>
+<td>Per-calendar reads.</td>
+</tr>
+<tr>
+<td>Overrides</td>
+<td><code>series_event_id</code></td>
+<td>Linked to series.</td>
+</tr>
+<tr>
+<td>Calendars</td>
+<td><code>owner_id</code> hash</td>
+<td>User-scoped.</td>
+</tr>
+<tr>
+<td>Free/busy materialized</td>
+<td><code>user_id</code> hash</td>
+<td>Per-user index.</td>
+</tr>
+<tr>
+<td>Invitations</td>
+<td><code>event_id</code> for attendees, <code>user_id</code> for invitee</td>
+<td>Both.</td>
+</tr>
+<tr>
+<td>Reminders</td>
+<td>Time bucket</td>
+<td>See reminder design.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Event writes</td>
+<td>Strong</td>
+<td>Authoritative.</td>
+</tr>
+<tr>
+<td>Overrides</td>
+<td>Strong</td>
+<td>Linked to series.</td>
+</tr>
+<tr>
+<td>Free/busy materialization</td>
+<td>Eventually consistent</td>
+<td>Bounded.</td>
+</tr>
+<tr>
+<td>Notifications</td>
+<td>At-least-once</td>
+<td>See notification design.</td>
+</tr>
+<tr>
+<td>ACL</td>
+<td>Strong on edit</td>
+<td>Security.</td>
+</tr>
+<tr>
+<td>Sync to client</td>
+<td>Eventually consistent</td>
+<td>OK.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>User home region for events and free/busy.</li>
+<li>Events replicated globally for cross-organization viewing.</li>
+<li>Reminders fire in user's home region.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Override conflicts with edited series.</td>
+<td>Conflict resolution: prefer override or master per policy.</td>
+<td>Override conflict count.</td>
+</tr>
+<tr>
+<td>Timezone mismatch on travel.</td>
+<td>Display in user's current TZ; events stay in their TZ.</td>
+<td>TZ-display issues.</td>
+</tr>
+<tr>
+<td>DST ambiguity.</td>
+<td>Explicit policy at materialization.</td>
+<td>DST-ambiguity events.</td>
+</tr>
+<tr>
+<td>Free/busy lag.</td>
+<td>Re-materialize on event change; alert on stale.</td>
+<td>Free/busy freshness.</td>
+</tr>
+<tr>
+<td>Recurring event with many occurrences.</td>
+<td>Cap expansion range; lazy materialize.</td>
+<td>Expansion size.</td>
+</tr>
+<tr>
+<td>Invitation flood spam.</td>
+<td>Rate limit; sender verification.</td>
+<td>Invite spam reports.</td>
+</tr>
+<tr>
+<td>Reminder miss.</td>
+<td>Reminder system handles via expected-runs.</td>
+<td>Pending past-due reminders.</td>
+</tr>
+<tr>
+<td>Cross-org sync issue.</td>
+<td>iCal fallback; reconciliation.</td>
+<td>Cross-org sync errors.</td>
+</tr>
+<tr>
+<td>Calendar share revoked while user views.</td>
+<td>ACL revalidation on read; cache short TTL.</td>
+<td>Revoke propagation.</td>
+</tr>
+<tr>
+<td>Master event delete with overrides.</td>
+<td>Cascade-delete overrides.</td>
+<td>Orphan override count.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Reminder fire accuracy.</li>
+<li>Free/busy vs ground-truth events.</li>
+<li>Invitation delivery rate.</li>
+<li>Override resolution conflicts.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Event read QPS.</li>
+<li>Free/busy query QPS.</li>
+<li>Recurring expansion latency.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Events per user.</li>
+<li>Meeting RSVP rates.</li>
+<li>Cross-calendar shares.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Storing recurrence as rule vs materialized: rule is compact, materialized is fast for arbitrary queries.</li>
+<li>Per-occurrence reminders use storage but enable single-occurrence edits.</li>
+<li>Free/busy materialization speeds reads but adds write work.</li>
+<li>Calendar sharing per user vs per group: per-group simplifies but adds resolution lookups.</li>
+<li>Strong consistency on invitations vs propagation latency.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Materialize all recurrences.</td>
+<td>Store RRULE; expand at read with cap.</td>
+</tr>
+<tr>
+<td>Edit recurrence in place destroys overrides.</td>
+<td>Split-series approach for "this and future."</td>
+</tr>
+<tr>
+<td>Single global timezone.</td>
+<td>Store TZ per event; materialize UTC at occurrence.</td>
+</tr>
+<tr>
+<td>Free/busy from raw event scan.</td>
+<td>Materialize per-user intervals.</td>
+</tr>
+<tr>
+<td>Invite all attendees synchronously.</td>
+<td>Async notification queue.</td>
+</tr>
+<tr>
+<td>ACL check at write only.</td>
+<td>Strong ACL revalidation.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Recurrence</td>
+<td>RRULE + overrides; split-series for "this and future."</td>
+</tr>
+<tr>
+<td>Free/busy</td>
+<td>Materialized per-user index; UTC conversion.</td>
+</tr>
+<tr>
+<td>Timezone</td>
+<td>Per-event TZ; DST policy.</td>
+</tr>
+<tr>
+<td>Invitations</td>
+<td>Per-attendee RSVP; cross-org iCal.</td>
+</tr>
+<tr>
+<td>Reminders</td>
+<td>Integrate with reminder system.</td>
+</tr>
+<tr>
+<td>Sharing / ACL</td>
+<td>Per-calendar; revalidation.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Events with RRULE + per-occurrence overrides.</li>
+<li>Per-event timezone; UTC materialization for cross-user.</li>
+<li>Split-series for "this and future" edits.</li>
+<li>Attendee state per (event, user).</li>
+<li>Free/busy as materialized per-user index.</li>
+<li>Reminder system integration.</li>
+<li>ACL on calendars.</li>
+<li>Multi-region with user home.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Calendar is RRULE-based events with per-occurrence overrides. Recurrences are not materialized in storage; they're expanded at read for the requested range. Timezone is stored per event; UTC computed at each occurrence. Free/busy is a materialized per-user index. The hardest correctness problem is single-occurrence edits in a recurring series; the answer is overrides linking back to the master.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Google Calendar.</p>
+<p><strong>Candidate:</strong> I will design four core systems: event store with RRULE recurrence, override store for exceptions, free/busy service, and reminder integration. The invariant is durable events visible to attendees with correct RSVP state, recurrence expanded deterministically with timezone correctness, and reminders firing on time.</p>
+<p><strong>Interviewer:</strong> How do you store recurring events?</p>
+<p><strong>Candidate:</strong> Single Event row with the master fields plus an RRULE (RFC 5545 recurrence rule). I don't pre-materialize occurrences in storage. When reading a date range, I expand the rule on-demand to find occurrences. For exceptions — a single occurrence moved or cancelled — I store an EventOverride linked to the series; the override specifies the modified data or <code>is_cancelled=true</code>.</p>
+<p><strong>Interviewer:</strong> What about "edit this and future"?</p>
+<p><strong>Candidate:</strong> Split-series. Set an END on the original event's RRULE at the cutover date; create a new Event series starting from the cutover with the new properties. Past occurrences remain in the original series; future ones are in the new series. This preserves history and lets each series have its own RRULE.</p>
+<p><strong>Interviewer:</strong> Timezone handling?</p>
+<p><strong>Candidate:</strong> Each event stores <code>timezone</code> and a local-time <code>start_time</code>. The recurrence operates in that timezone. When materializing occurrences for free/busy or display, convert to UTC for the user's current viewing TZ. DST transitions are handled at materialization — "every day at 2:30 AM" on a fall-back day picks the first occurrence per policy.</p>
+<p><strong>Interviewer:</strong> Invitations?</p>
+<p><strong>Candidate:</strong> Organizer's event lists attendees with initial <code>response=needs_action</code>. Invitation service sends notification (email + in-app) to each attendee. Attendees respond; their RSVP is updated on the event's attendee list. Each attendee sees the event in their calendar with their RSVP. Cross-organization invites use iCal email for interop.</p>
+<p><strong>Interviewer:</strong> Free/busy — show me when 5 users are busy this week.</p>
+<p><strong>Candidate:</strong> Materialized per-user free/busy index. For each user, store the busy intervals for the next 30 days, derived from their events (with recurrence expansion). Free/busy query reads the materialized indices. For find-a-meeting-time: invert each user's busy intervals to free, intersect across users. Privacy: free/busy reveals only times, not titles.</p>
+<p><strong>Interviewer:</strong> Update the free/busy when an event is created.</p>
+<p><strong>Candidate:</strong> On event create/edit, compute the new busy intervals (expand recurrence for the next 30 days) and update the user's materialized index. Eventually consistent — a fresh event may take seconds to reflect in others' free/busy view. Strong consistency for the event itself; the index is a derived projection.</p>
+<p><strong>Interviewer:</strong> Reminders?</p>
+<p><strong>Candidate:</strong> Integrate with the reminder system. When event is created with <code>reminders=[{10 minutes before, push}]</code>, compute the reminder times per occurrence and submit to the reminder pipeline. Pipeline materializes per-occurrence reminders, accounts for timezone, fires via notification system at fire time. See reminder system design for details.</p>
+<p><strong>Interviewer:</strong> A user has a 5-year recurring meeting. How do you handle reminders?</p>
+<p><strong>Candidate:</strong> Don't materialize all reminders for 5 years. Materialize a rolling horizon — say, 30 days ahead. A nightly horizon-extension job materializes the next day's reminders. This bounds storage and lets edits to the series propagate cleanly to future reminders.</p>
+<p><strong>Interviewer:</strong> Sharing a calendar.</p>
+<p><strong>Candidate:</strong> Per-calendar ACL: users/groups with roles (free/busy only, read, write, manage). On every event op, check ACL. If a calendar is shared read-only, the user sees events but can't edit. Sharing a calendar lets the user see it merged into their views.</p>
+<p><strong>Interviewer:</strong> A meeting attendee changes the time of just their copy.</p>
+<p><strong>Candidate:</strong> Generally not allowed — attendees can RSVP but not modify the event. The organizer's event is the source of truth; attendees see a copy. If an attendee declines, the event is hidden from their calendar but remains in the organizer's. Some products allow attendee-side notes (visible to self only), but the event time is the organizer's.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Per-user home region. Events and overrides written there. Replicated globally for cross-org viewing and free/busy lookups by non-home users. Reminders fire in user's home region.</p>
+<p><strong>Interviewer:</strong> A single-occurrence cancel of a recurring event.</p>
+<p><strong>Candidate:</strong> Create EventOverride with <code>is_cancelled=true</code> pointing to the series and the specific occurrence date. When expanding the recurrence at read, this occurrence is skipped. Reminders for this occurrence are also cancelled (the reminder pipeline picks up the change).</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Events with RRULE + per-occurrence overrides. Each event has a timezone; UTC computed at materialization. Recurrence expanded at read, not stored materialized. Split-series for "this and future" edits. Attendee RSVPs are per (event, user). Free/busy materialized per-user. Reminders integrated with the reminder pipeline. Calendar sharing via ACL. The hardest correctness problem is single-occurrence overrides in a recurring series.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: events, recurrence, invitations, free/busy, reminders.</li>
+<li>Invariant: durable events; correct RRULE expansion; timezone correctness.</li>
+<li>Event with RRULE + EventOverride for exceptions.</li>
+<li>Per-event timezone; UTC materialization.</li>
+<li>Split-series for "this and future."</li>
+<li>Attendee RSVPs per (event, user).</li>
+<li>Materialized per-user free/busy.</li>
+<li>Reminder integration; ACL on calendars.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Calendar is RRULE-based events with per-occurrence overrides. Recurrences stored as rules, expanded at read. Per-event timezone with UTC materialization. Split-series for "this and future" edits. Attendee RSVPs per (event, user). Free/busy is a materialized per-user index. Reminders ride the reminder pipeline. Sharing via per-calendar ACL. The hardest correctness problem is single-occurrence overrides.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Recurrence is stored as RRULE; occurrences are expanded at read, not materialized."</li>
+<li>"Single-occurrence edits become overrides linked to the series."</li>
+<li>"Split-series for 'this and future' edits."</li>
+<li>"Timezone stored per event; UTC computed at each occurrence."</li>
+<li>"Free/busy is a materialized per-user index, updated on event change."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

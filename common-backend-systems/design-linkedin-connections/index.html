@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design LinkedIn Connections — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design LinkedIn Connections</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a>. For PYMK-style friend recommendations see <a href="../design-facebook-people-you-may-know/">Design Facebook People You May Know</a>; this doc focuses on LinkedIn's connection graph with 1st/2nd/3rd-degree distance queries.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>LinkedIn connections form a professional social graph with explicit distance semantics: 1st degree (direct), 2nd degree (friend-of-friend), 3rd degree (further). The hard part is computing distances on demand at billion-user scale (typical query: "how am I connected to X?") with low latency, while supporting connection invites, recommendations, and search filtered by distance.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>The connection graph is bidirectional (a connection is mutual); distance queries between any two users return their shortest-path distance up to a threshold or "out of network"; recommendations leverage 2nd/3rd-degree connections; invite acceptance creates an atomic bidirectional edge; the graph supports queries within tight latency.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design a sharded social graph store, support 1st/2nd/3rd-degree distance queries at scale (with bounded BFS), connection invite flows, and reason about graph storage tradeoffs.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design LinkedIn connections as a distributed graph store sharded by user_id, with bidirectional edges representing mutual connections. Distance queries use bounded BFS (limited to 3 hops). Per-user 1st-degree connection lists are cached. Invite acceptance creates atomic bidirectional edges. PYMK and search ride on this graph. The interesting decisions are graph storage, distance computation, edge-list caching, and the BFS bound.</p>
+</blockquote>
+<h3 id="requirements">Requirements</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Users connect with each other (bidirectional).</li>
+<li>Send / accept / decline invites.</li>
+<li>View 1st-degree connections list.</li>
+<li>Distance to any other user (1st, 2nd, 3rd, out of network).</li>
+<li>"Who can introduce me" via 2nd degree.</li>
+<li>Connection recommendations (see PYMK).</li>
+<li>Connection-aware search filters ("2nd degree only").</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Distance query &lt; 200ms.</li>
+<li>1B+ users; hundreds of avg connections.</li>
+<li>Some users have 30k+ connections (sales people, recruiters).</li>
+<li>High availability.</li>
+<li>Multi-region.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Premium features (InMail, advanced search depth).</li>
+<li>Profile / experience search.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>1B+.</td>
+</tr>
+<tr>
+<td>Avg connections</td>
+<td>100-500.</td>
+</tr>
+<tr>
+<td>Long-tail</td>
+<td>30k connections per power user.</td>
+</tr>
+<tr>
+<td>Distance queries / sec</td>
+<td>100k+.</td>
+</tr>
+<tr>
+<td>1st-degree reads</td>
+<td>High; cached.</td>
+</tr>
+<tr>
+<td>Invites / day</td>
+<td>Millions.</td>
+</tr>
+</tbody>
+</table>
+<p>Bottleneck: distance computation for power users + 2nd-degree expansion.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Connection graph</td>
+<td>Bidirectional edges.</td>
+<td>Strong on write.</td>
+</tr>
+<tr>
+<td>Distance service</td>
+<td>Compute shortest path bounded by 3.</td>
+<td>Sub-second.</td>
+</tr>
+<tr>
+<td>Invite service</td>
+<td>Pending invite state.</td>
+<td>Strong; per-pair atomic.</td>
+</tr>
+<tr>
+<td>Recommendation</td>
+<td>PYMK on this graph.</td>
+<td>Daily batch.</td>
+</tr>
+<tr>
+<td>Search filter</td>
+<td>"Only 2nd degree" etc.</td>
+<td>Online.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Client --request distance(U, V)--&gt; Distance Service
+                                          |
+                                          v
+                                +-------------------+
+                                | Connection Store  |
+                                | (per-user edge    |
+                                |  lists, sharded)  |
+                                +---------+---------+
+                                          |
+                                          v
+                                Bounded BFS up to 3 hops
+                                          |
+                                          v
+                                Return 1, 2, 3, or out
+
+
+Client --send invite--&gt; Invite Service --&gt; Pending Invite Store
+                                |
+                                v
+                          On accept:
+                                |
+                                v
+                          Connection Service
+                                |
+                                v
+                          Atomic bidirectional edge
+                                |
+                                v
+                          Both users' connection lists updated
+                          Caches invalidated
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Connection store</td>
+<td>Bidirectional edges.</td>
+<td>Sharded by user_id.</td>
+</tr>
+<tr>
+<td>Connection list cache</td>
+<td>Per-user 1st-degree connections.</td>
+<td>Hot.</td>
+</tr>
+<tr>
+<td>Distance service</td>
+<td>BFS up to depth 3.</td>
+<td>Per request.</td>
+</tr>
+<tr>
+<td>Invite service</td>
+<td>Pending invites.</td>
+<td>Sharded by recipient.</td>
+</tr>
+<tr>
+<td>2nd-degree cache</td>
+<td>Pre-computed 2nd-degree set per user.</td>
+<td>Optional; for power users.</td>
+</tr>
+<tr>
+<td>Recommendation pipeline</td>
+<td>PYMK-style daily batch.</td>
+<td>See PYMK design.</td>
+</tr>
+<tr>
+<td>Graph snapshot</td>
+<td>Periodic for offline jobs.</td>
+<td>Pipeline input.</td>
+</tr>
+<tr>
+<td>Search integration</td>
+<td>Filter results by distance.</td>
+<td>Uses graph.</td>
+</tr>
+<tr>
+<td>Block / restriction</td>
+<td>Users blocked from seeing each other.</td>
+<td>Strong.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="connection-edge">Connection Edge</h4>
+<pre><code class="language-text">Connection(
+  user_a,                  // smaller id (canonical order)
+  user_b,                  // larger id
+  connected_at,
+  visibility,              // public, connections, private
+  source                   // organic, suggested, import
+)
+</code></pre>
+<p>Bidirectional: stored once but indexed twice (in both A's and B's connection lists).</p>
+<h4 id="pending-invite">Pending Invite</h4>
+<pre><code class="language-text">Invite(
+  inviter_id,
+  invitee_id,
+  message,
+  state,                   // pending, accepted, declined, expired
+  sent_at,
+  responded_at?
+)
+</code></pre>
+<h4 id="per-user-connection-list">Per-User Connection List</h4>
+<pre><code class="language-text">ConnectionList(
+  user_id,
+  connections: [(user_id, connected_at, ...)],
+  count
+)
+</code></pre>
+<p>Stored in graph database or sharded KV.</p>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">POST   /invites           { invitee_id, message }
+POST   /invites/{id}/accept
+POST   /invites/{id}/decline
+GET    /connections                # my 1st degree
+GET    /connections/{user_id}      # their 1st degree (if visible)
+GET    /distance?user_id=          # to specified user
+GET    /shared-connections?with=
+</code></pre>
+<h3 id="distance-query">Distance Query</h3>
+<p>The classic LinkedIn query: "what's my distance to user X?"</p>
+<p>BFS bounded to depth 3:</p>
+<ol>
+<li>Start at U; check if X is in 1st degree → return 1.</li>
+<li>Otherwise, expand 1st degree to 2nd: union of friends of U's friends. Is X in the set? → return 2.</li>
+<li>Otherwise, expand to 3rd degree. Is X in the set? → return 3.</li>
+<li>Otherwise, return "out of network."</li>
+</ol>
+<p>For users with average connections (~500), 2nd degree is ~50k-100k users; 3rd degree explodes. Bounded BFS is essential.</p>
+<p>Implementation:</p>
+<ul>
+<li>Fetch U's 1st-degree list.</li>
+<li>Check membership of X.</li>
+<li>If not, fetch 2nd-degree set: union of friends of each of U's friends. Membership check.</li>
+<li>For 3rd, similar expansion.</li>
+</ul>
+<p>For power users with 30k connections, 2nd-degree expansion is heavy (30k friends × ~500 each = 15M edges). Pre-compute 2nd-degree sets.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Distance queries are bounded BFS to depth 3. For users with normal degree, on-demand BFS is fine. For power users, pre-compute 2nd-degree sets and use Bloom filters for fast "in network" tests.</p>
+</blockquote>
+<h3 id="pre-computed-2nd-degree-sets">Pre-Computed 2nd-Degree Sets</h3>
+<p>For high-degree users (&gt;1000 connections), pre-compute their 2nd-degree set as a Bloom filter or compressed bitmap.</p>
+<ul>
+<li>Updated incrementally on new connections.</li>
+<li>Used as fast "is X in my 2nd degree?" check.</li>
+<li>Avoids on-demand expansion for power users.</li>
+</ul>
+<p>For 3rd degree, even more aggressive caching; or accept "out of network" if not in cached set.</p>
+<h3 id="invite-flow">Invite Flow</h3>
+<ol>
+<li>User U sends invite to V.</li>
+<li>Invite service creates Pending Invite.</li>
+<li>V receives notification.</li>
+<li>V accepts: invite state → accepted.</li>
+<li>Atomic bidirectional connection creation:
+   - Write Connection(U, V) with canonical order.
+   - Update U's connection list cache.
+   - Update V's connection list cache.</li>
+<li>Invalidate distance caches involving U and V.</li>
+</ol>
+<p>Atomicity: use a transaction across both users' shards if needed, or a state machine that ensures both updates eventually happen with retry.</p>
+<h3 id="connection-list-cache">Connection List Cache</h3>
+<p>Per-user 1st-degree list cached. Refreshed on connection change.</p>
+<p>For power users with 30k connections, the list itself is large — paginate. The full list lives in storage; the cache may hold a compressed bitmap of connected user_ids.</p>
+<h3 id="recommendations">Recommendations</h3>
+<p>See PYMK design. Leverages 2nd-degree connections plus shared employer, school, interests.</p>
+<h3 id="search-integration">Search Integration</h3>
+<p>Search queries can filter "only my 2nd degree":</p>
+<ul>
+<li>Distance service called per result candidate.</li>
+<li>For batch result sets, batched distance queries.</li>
+<li>Pre-computed 2nd-degree set helps when the user is power-connected.</li>
+</ul>
+<h3 id="privacy">Privacy</h3>
+<ul>
+<li>Users can hide their connections from non-connections.</li>
+<li>"Visible to: My connections only" controls who sees the list.</li>
+<li>Distance queries respect privacy: if V hides connections, U can know V is at distance 2 (via a mutual) but can't list V's other connections.</li>
+<li>Blocked users excluded from queries.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition strategy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Connection edges</td>
+<td>user_id hash (both endpoints indexed)</td>
+</tr>
+<tr>
+<td>Connection list cache</td>
+<td>user_id</td>
+</tr>
+<tr>
+<td>Pending invites</td>
+<td>recipient_id</td>
+</tr>
+<tr>
+<td>2nd-degree pre-compute</td>
+<td>user_id (for power users)</td>
+</tr>
+<tr>
+<td>Search filter cache</td>
+<td>user_id</td>
+</tr>
+</tbody>
+</table>
+<p>For power users with huge connection lists, the partition can become hot. Mitigations: sub-partition the connection list; pre-aggregate.</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Connection edges</td>
+<td>Strong on write</td>
+</tr>
+<tr>
+<td>Connection list cache</td>
+<td>Eventually consistent (seconds)</td>
+</tr>
+<tr>
+<td>Distance queries</td>
+<td>Bounded staleness</td>
+</tr>
+<tr>
+<td>Invite state</td>
+<td>Strong (CAS transitions)</td>
+</tr>
+<tr>
+<td>2nd-degree pre-compute</td>
+<td>Eventually consistent (daily refresh)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>User home region for connection data.</li>
+<li>Connection edges replicated globally.</li>
+<li>Distance service per region.</li>
+<li>Pre-computed 2nd-degree sets per region.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2nd-degree expansion slow.</td>
+<td>Pre-compute for power users.</td>
+<td>Distance query p99.</td>
+</tr>
+<tr>
+<td>Power user hot partition.</td>
+<td>Sub-partition; aggregate.</td>
+<td>Per-shard QPS.</td>
+</tr>
+<tr>
+<td>Stale connection cache after accept.</td>
+<td>Invalidation events.</td>
+<td>Cache lag.</td>
+</tr>
+<tr>
+<td>Atomic bidirectional create race.</td>
+<td>Transaction or saga.</td>
+<td>Inconsistency count.</td>
+</tr>
+<tr>
+<td>Block bypass.</td>
+<td>Filter at query.</td>
+<td>Bypass count.</td>
+</tr>
+<tr>
+<td>Privacy leak.</td>
+<td>Visibility checks.</td>
+<td>Privacy reports.</td>
+</tr>
+<tr>
+<td>Spam invites.</td>
+<td>Rate limit; auto-detect.</td>
+<td>Per-user invite rate.</td>
+</tr>
+<tr>
+<td>Cross-region replication.</td>
+<td>Async; bounded.</td>
+<td>Lag.</td>
+</tr>
+<tr>
+<td>Bloom filter false positive (in 2nd degree).</td>
+<td>Confirm with actual lookup.</td>
+<td>False positive rate.</td>
+</tr>
+<tr>
+<td>Search filter slow.</td>
+<td>Pre-cache or batch distance.</td>
+<td>Search-filter latency.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Atomic bidirectional violation (zero).</li>
+<li>Privacy leaks.</li>
+<li>Stale distance results.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Distance QPS.</li>
+<li>BFS expansion size.</li>
+<li>Per-user connection growth.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Invite accept rate.</li>
+<li>Connections per DAU.</li>
+<li>Search-with-distance-filter usage.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>On-demand BFS is flexible but slow for power users; pre-compute trades storage for latency.</li>
+<li>Bidirectional storage means writes hit two partitions; atomicity is a concern.</li>
+<li>Bounded BFS at 3 hops misses long-distance connections; accept "out of network."</li>
+<li>More aggressive caching helps but adds invalidation complexity.</li>
+<li>Strict privacy reduces matchmaking utility.</li>
+<li>Invite rate limits prevent spam but frustrate legitimate networkers.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Unbounded BFS.</td>
+<td>Cap at 3 hops; pre-compute for power users.</td>
+</tr>
+<tr>
+<td>Edges as one-sided.</td>
+<td>Bidirectional with atomic creation.</td>
+</tr>
+<tr>
+<td>No power-user handling.</td>
+<td>Pre-compute 2nd-degree set; Bloom filter.</td>
+</tr>
+<tr>
+<td>Synchronous cache invalidation.</td>
+<td>Async via pub/sub.</td>
+</tr>
+<tr>
+<td>Trust client claims for distance.</td>
+<td>Server-computed distance.</td>
+</tr>
+<tr>
+<td>Ignore privacy in distance UI.</td>
+<td>Respect connection visibility settings.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Bounded BFS</td>
+<td>3-hop limit; pre-computed sets for power users.</td>
+</tr>
+<tr>
+<td>Power user handling</td>
+<td>Bloom filter; sub-partition; compressed bitmaps.</td>
+</tr>
+<tr>
+<td>Atomic bidirectional create</td>
+<td>Transaction or saga across partitions.</td>
+</tr>
+<tr>
+<td>Privacy</td>
+<td>Visibility tiers; redacted distance responses.</td>
+</tr>
+<tr>
+<td>Search integration</td>
+<td>Batched distance queries.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Per-user home; replicated edges.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Sharded graph store with bidirectional edges.</li>
+<li>Connection list cache per user.</li>
+<li>Distance service with bounded BFS.</li>
+<li>Pre-computed 2nd-degree for power users.</li>
+<li>Atomic bidirectional create on invite accept.</li>
+<li>Privacy and block filtering.</li>
+<li>Multi-region with user home.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>LinkedIn connections is a bidirectional social graph with 1st/2nd/3rd-degree distance queries. Bounded BFS at 3 hops handles the common case; for power users with 30k+ connections, pre-computed 2nd-degree sets (Bloom filters) keep queries fast. Bidirectional atomicity on invite accept ensures both sides see the connection. Privacy and blocks apply at every query.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design LinkedIn connections.</p>
+<p><strong>Candidate:</strong> Distributed graph store with bidirectional edges sharded by user_id. Connection list cached per user. Distance service performs bounded BFS up to 3 hops. For power users with huge connection counts, pre-compute 2nd-degree sets as Bloom filters or compressed bitmaps. Invite flow creates atomic bidirectional edges on accept. The invariant is bidirectional symmetric connections, distance queries within latency, privacy respected.</p>
+<p><strong>Interviewer:</strong> Distance query.</p>
+<p><strong>Candidate:</strong> Bounded BFS up to depth 3. Step 1: is X in U's 1st-degree list? Return 1 if yes. Step 2: expand 1st-degree friends' friends; is X in that set? Return 2 if yes. Step 3: similar for 3rd. Return "out of network" otherwise. The hard case is when U has many connections — 2nd-degree expansion of 500 friends × 500 each = 250k users, doable. For 30k-connection power users, expansion is heavy — pre-compute and use Bloom filter for membership check.</p>
+<p><strong>Interviewer:</strong> Power user with 30k connections.</p>
+<p><strong>Candidate:</strong> Pre-compute their 2nd-degree set as a Bloom filter. Updated incrementally on new connections (their friend's friends accumulate). Distance query consults Bloom filter for "is X in 2nd degree?" — sub-millisecond. Bloom filter false positives are confirmed by actual lookup. For 3rd degree, even larger; either pre-compute or accept "out of network" beyond a depth bound.</p>
+<p><strong>Interviewer:</strong> Invite accept — atomicity.</p>
+<p><strong>Candidate:</strong> Bidirectional edge must be created atomically. The Connection table stores once (canonical order: smaller id first). Both users' connection list caches must be updated. Options: transaction across both user's partitions, or saga with idempotent steps. Saga: create Connection record; on success, two events go to update each user's cache; if cache update fails, retry; eventually consistent within seconds.</p>
+<p><strong>Interviewer:</strong> Privacy.</p>
+<p><strong>Candidate:</strong> Several rules. Users can hide their connection list from non-connections. Distance queries respect this: U can know V is at distance 2 (via a mutual), but cannot list V's other connections. Blocked users are filtered out — appear as "out of network" even if technically connected via mutuals. Privacy filter applied at every query.</p>
+<p><strong>Interviewer:</strong> Hot partition for power user.</p>
+<p><strong>Candidate:</strong> Power user's edges + queries can saturate their partition. Mitigations: sub-partition the connection list (one row per N edges); pre-aggregate 2nd-degree state at update time so queries don't trigger full expansion; cache hot reads aggressively.</p>
+<p><strong>Interviewer:</strong> Invite spam.</p>
+<p><strong>Candidate:</strong> Per-user invite rate limits. Anti-spam detection: invites to many non-related people, low acceptance rate, account age signals. Block sending after exceeded thresholds. Manual review for severe cases. Visibility into invite-to-accept ratio per user.</p>
+<p><strong>Interviewer:</strong> Search with distance filter.</p>
+<p><strong>Candidate:</strong> Query: "find candidates with skill X within my 2nd degree." Search returns initial candidates; distance service called per candidate (or batched). For power user, pre-computed 2nd-degree set makes filter fast. For typical user, on-demand BFS works.</p>
+<p><strong>Interviewer:</strong> Stale connection cache.</p>
+<p><strong>Candidate:</strong> Connection list cache invalidated by pub/sub on connection change. Both users' caches updated. Distance caches that involved either user are invalidated. Eventual consistency in the seconds range; acceptable for distance display (users tolerate "1 hour ago you connected" lag).</p>
+<p><strong>Interviewer:</strong> Multi-region.</p>
+<p><strong>Candidate:</strong> User home region for connection data. Edges replicated globally. Distance service per region; uses local replicas. 2nd-degree pre-compute per region. Cross-region replication async.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Distributed graph with bidirectional edges sharded by user_id. Connection list cached per user. Distance queries via bounded BFS to depth 3; for power users, pre-computed 2nd-degree Bloom filters keep queries fast. Atomic bidirectional create on invite accept. Privacy and blocks apply at every query. Search integration uses the same distance service. Multi-region with user home. The hardest scaling problem is power users; the hardest correctness problem is bidirectional atomicity.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: bidirectional, distance, power users, privacy.</li>
+<li>Invariant: symmetric; distance to depth 3.</li>
+<li>Sharded graph store with bidirectional edges.</li>
+<li>Connection list cache per user.</li>
+<li>Bounded BFS for distance.</li>
+<li>Pre-compute 2nd-degree for power users.</li>
+<li>Atomic bidirectional on invite accept.</li>
+<li>Privacy and blocks at every query.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>LinkedIn connections is a bidirectional social graph with bounded distance queries (1st/2nd/3rd degree). Sharded graph store with per-user connection list cache. BFS handles normal users; pre-computed 2nd-degree Bloom filters handle power users with 30k+ connections. Invite accept creates atomic bidirectional edges. Privacy controls and blocks filter every query. Multi-region with user home.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Bounded BFS to 3 hops handles the common case; pre-compute for power users."</li>
+<li>"Bidirectional symmetric edges; atomic create on invite accept."</li>
+<li>"Pre-computed 2nd-degree Bloom filter avoids expensive expansion."</li>
+<li>"Privacy applies at every query; blocked users always 'out of network.'"</li>
+<li>"Power users hot partition handled by sub-partitioning + pre-aggregation."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

@@ -1,0 +1,840 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Twitter Search — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Twitter Search</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a>. For the broader system, see <a href="../design-twitter/">Design Twitter</a>; this doc focuses on real-time search over tweets.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Twitter Search is real-time search over a high-velocity stream — millions of tweets per day, indexed within seconds, queryable by text, hashtag, user, location. The hard part is keeping the index fresh enough that breaking news is searchable within seconds, while keeping queries sub-second over years of historical data.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every published tweet is indexed within bounded freshness (typically seconds for recent / minutes for the long tail); search queries return relevant tweets ordered by recency and engagement signals; visibility filters (blocks, deletes, privacy) applied at query time; the index scales with corpus size and query volume.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design a sharded inverted index over a high-write stream, real-time vs batch indexing tiers, scoring and ranking, and the read-side query planner.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Twitter Search as a two-tier inverted index: a live tier for breaking content indexed within seconds, and a main tier for historical content built in batch. Queries scatter-gather across both tiers, merge by score and time, hydrate tweet content from the tweet store, apply visibility filters, return. The interesting decisions are real-time indexing, sharding strategy, ranking, and visibility.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Search by text, hashtag, user, language, location.</li>
+<li>Sort by recency, popularity, or relevance.</li>
+<li>Filter by date range, language, media type.</li>
+<li>Real-time results for breaking news.</li>
+<li>Trending topics (related but separate).</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>New tweet indexed within seconds.</li>
+<li>Query p99 &lt; 500ms.</li>
+<li>Years of history searchable.</li>
+<li>Multi-region.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Tweet creation (see <a href="../design-twitter/">Design Twitter</a>).</li>
+<li>Personalization beyond basics.</li>
+<li>DM search.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tweets</td>
+<td>500M+/day.</td>
+</tr>
+<tr>
+<td>Queries</td>
+<td>100k+/sec.</td>
+</tr>
+<tr>
+<td>Indexed tweets</td>
+<td>Trillions over time.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>&lt; 500ms p99.</td>
+</tr>
+<tr>
+<td>Indexing lag</td>
+<td>Seconds for live tier.</td>
+</tr>
+</tbody>
+</table>
+<p>Bottleneck: index update rate + scatter-gather tail latency.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Live index</td>
+<td>Recent tweets indexed within seconds.</td>
+<td>High write throughput.</td>
+</tr>
+<tr>
+<td>Main index</td>
+<td>Historical content; batch built.</td>
+<td>Compressed; cheap query.</td>
+</tr>
+<tr>
+<td>Query engine</td>
+<td>Scatter-gather + merge.</td>
+<td>Sub-second.</td>
+</tr>
+<tr>
+<td>Ranking</td>
+<td>Score candidates.</td>
+<td>ML-driven.</td>
+</tr>
+<tr>
+<td>Hydration</td>
+<td>Tweet id → content.</td>
+<td>Batched.</td>
+</tr>
+<tr>
+<td>Visibility</td>
+<td>Filter at query time.</td>
+<td>Strong.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Tweet Stream --consumed by--&gt; Live Indexer
+                                      |
+                                      v
+                          +-------------------+
+                          | Live Index Shards |
+                          | (recent N hours)  |
+                          +---------+---------+
+                                    |
+                            tweets age out
+                                    |
+                                    v
+                          +-------------------+
+                          | Batch Indexer     |
+                          | (daily/hourly)    |
+                          +---------+---------+
+                                    |
+                                    v
+                          +-------------------+
+                          | Main Index Shards |
+                          | (long-term)       |
+                          +-------------------+
+
+
+Query --&gt; Frontend --&gt; Query Planner
+                            |
+                +-----------+-----------+
+                |                       |
+                v                       v
+        Live shards            Main shards
+                |                       |
+                +-----------+-----------+
+                            |
+                            v
+                  Merge by score / time
+                            |
+                            v
+                  Hydrate tweet content
+                            |
+                            v
+                  Visibility filter
+                            |
+                            v
+                  Return paginated
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tweet stream</td>
+<td>Source: every new tweet event.</td>
+<td>Kafka-style.</td>
+</tr>
+<tr>
+<td>Live indexer</td>
+<td>Builds searchable index of recent tweets.</td>
+<td>Real-time.</td>
+</tr>
+<tr>
+<td>Live index shards</td>
+<td>Recent N hours; in-memory / SSD.</td>
+<td>High write throughput.</td>
+</tr>
+<tr>
+<td>Batch indexer</td>
+<td>Builds compressed main index.</td>
+<td>Hourly / daily.</td>
+</tr>
+<tr>
+<td>Main index shards</td>
+<td>Long-term historical index.</td>
+<td>Compressed; query-optimized.</td>
+</tr>
+<tr>
+<td>Query frontend</td>
+<td>Parses query; routes.</td>
+<td>Stateless.</td>
+</tr>
+<tr>
+<td>Query planner</td>
+<td>Scatter to relevant shards.</td>
+<td>Latency-aware.</td>
+</tr>
+<tr>
+<td>Ranker</td>
+<td>Score candidates.</td>
+<td>ML model.</td>
+</tr>
+<tr>
+<td>Tweet hydration</td>
+<td>Tweet id → content.</td>
+<td>Batched.</td>
+</tr>
+<tr>
+<td>Visibility service</td>
+<td>Apply blocks, deletes, privacy.</td>
+<td>Strong.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="indexed-document">Indexed Document</h4>
+<pre><code class="language-text">IndexEntry(
+  tweet_id,
+  author_id,
+  text,                      // for analysis
+  tokens: [tokenized terms],
+  hashtags,
+  mentions,
+  language,
+  location?,
+  posted_at,
+  engagement_signals: {likes, retweets, replies}
+)
+</code></pre>
+<h4 id="posting-list">Posting List</h4>
+<p>For each term:</p>
+<pre><code class="language-text">PostingList(
+  term,
+  postings: [(tweet_id, position, score_signals)]
+)
+</code></pre>
+<h4 id="index-shard">Index Shard</h4>
+<p>Each shard owns a subset of the index. Sharding strategies:</p>
+<ul>
+<li><strong>By time:</strong> each shard holds tweets in a time range. Good for time-range queries; risk of hot recent shard.</li>
+<li><strong>By hash:</strong> distribute by hash of tweet_id. Balanced load; every query hits every shard.</li>
+<li><strong>Hybrid:</strong> time-tier + hash within tier.</li>
+</ul>
+<p>In practice, the live tier shards by hash for write throughput; main tier shards by time + hash for query patterns.</p>
+<h3 id="concrete-index-stores-and-session-state">Concrete Index Stores And Session State</h3>
+<table>
+<thead>
+<tr>
+<th>Store / index</th>
+<th>Key pattern</th>
+<th>Value</th>
+<th>Size / cap</th>
+<th>TTL / lifecycle</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tweet content</td>
+<td><code>tweet:{tweet_id}</code></td>
+<td>author, text, media refs, state</td>
+<td>1-2KB/tweet</td>
+<td>Permanent until delete/tombstone</td>
+<td><code>tweet_id</code></td>
+</tr>
+<tr>
+<td>Live posting list</td>
+<td><code>live:{term_hash}:{shard_id}</code></td>
+<td>recent <code>(tweet_id, timestamp, score)</code> postings</td>
+<td>20-32B/posting; memory capped by time</td>
+<td>3-7 days</td>
+<td><code>term_hash</code> + live shard</td>
+</tr>
+<tr>
+<td>Main index segment</td>
+<td><code>main:{time_bucket}:{term_hash}:{segment_id}</code></td>
+<td>compressed postings block</td>
+<td>4-16B/posting compressed</td>
+<td>Immutable; merge compacted</td>
+<td><code>time_bucket</code> + <code>term_hash</code></td>
+</tr>
+<tr>
+<td>Term stats</td>
+<td><code>term_stats:{term_hash}:{day}</code></td>
+<td>document frequency, language, spam prior</td>
+<td>100-300B/term/day</td>
+<td>30-90 days hot</td>
+<td><code>term_hash</code></td>
+</tr>
+<tr>
+<td>Visibility cache</td>
+<td><code>visibility:{viewer_id}</code></td>
+<td>block/mute/protected-author ids</td>
+<td>10k IDs cap, 80-160KB worst case</td>
+<td>30-60 second cache over strong store</td>
+<td><code>viewer_id</code></td>
+</tr>
+<tr>
+<td>Search cursor</td>
+<td>opaque <code>cursor_id</code> or signed blob</td>
+<td>query plan, last score, shard offsets, time window</td>
+<td>0.5-2KB</td>
+<td>10-30 minutes</td>
+<td><code>viewer_id</code> + query hash</td>
+</tr>
+</tbody>
+</table>
+<p>Worked sizing:</p>
+<ul>
+<li>If 500M tweets/day produce 20 indexed terms each and each live posting is 24B, live index growth is 240GB/day raw. Seven days with 3 replicas is about 5TB, which fits in memory only after compression and active-term filtering.</li>
+<li>The main index stores the same tweet corpus as immutable compressed segments. At 8B/posting compressed, one day is about 80GB raw; five years with 3 replicas is roughly 438TB before doc store and metadata.</li>
+<li>Tweet content is a separate hydrated store: 500M/day * 1.5KB = 750GB/day raw. Search indexes should return ids and scores, not full tweet bodies.</li>
+</ul>
+<p>This is a two-index pattern, not two sources of truth: live and main indexes are two views over the same tweet stream. The live view is mutable and recency-heavy; the main view is compact and historical.</p>
+<p>Tech-choice defense:</p>
+<ul>
+<li>Use an inverted index because the access pattern is term -&gt; candidate tweet ids; scanning a key-value store by tweet id would be the wrong direction.</li>
+<li>Use Lucene-style immutable segments for the main tier because segment merge and compression are first-class. A wide-column store can hold posting rows, but it makes scoring, compression, and top-K retrieval application work.</li>
+<li>Use an append stream for indexing because tweet writes should not block on every term index update. Synchronous indexing gives fresher results but couples post latency to the slowest index shard.</li>
+</ul>
+<blockquote>
+<p>Be ready for "why not Cassandra?" The answer is that Cassandra stores rows well, but search needs compressed posting blocks, skip lists, scoring, and segment merges.</p>
+</blockquote>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">GET /search?q=&amp;from=&amp;until=&amp;type=&amp;lang=&amp;geo=
+</code></pre>
+<h3 id="indexing-pipeline">Indexing Pipeline</h3>
+<p>For each new tweet:</p>
+<ol>
+<li>Tweet posted; event emitted to stream.</li>
+<li>Live indexer consumes event.</li>
+<li>Tokenize text: lowercase, normalize, split, stop words.</li>
+<li>Extract entities: hashtags, mentions, URLs, language.</li>
+<li>Update posting lists in live index shard(s).</li>
+<li>Tweet searchable in seconds.</li>
+</ol>
+<p>Periodically (hourly or daily):</p>
+<ol>
+<li>Live tier rolls off older content.</li>
+<li>Batch indexer processes rolled-off tweets.</li>
+<li>Builds compressed main index segment.</li>
+<li>Merge into main tier.</li>
+</ol>
+<h3 id="query-path">Query Path</h3>
+<p>For "italian restaurants near NYC":</p>
+<ol>
+<li>Frontend parses query: terms, operators, filters.</li>
+<li>Query rewriter expands: synonyms, spelling correction.</li>
+<li>Query planner identifies which shards to query (e.g., live + recent main shards for recency-sensitive queries).</li>
+<li>Scatter to selected shards.</li>
+<li>Each shard intersects posting lists for query terms.</li>
+<li>Returns top-K candidates with scoring data.</li>
+<li>Merger aggregates across shards, scores, returns top-K.</li>
+<li>Hydrate tweet content from tweet store.</li>
+<li>Visibility filter.</li>
+<li>Return.</li>
+</ol>
+<p>Latency budget:
+- Shard query: ~50-100ms.
+- Merge: ~20ms.
+- Hydration: ~50ms.
+- Visibility: &lt;10ms.
+- Total: under 500ms.</p>
+<p>Hot breaking-news query path:</p>
+<ol>
+<li>Client sends <code>q="#oscars"</code>, <code>viewer_id</code>, filters, and optional cursor. The gateway hashes the normalized query to check a 5-15 second result cache.</li>
+<li>Query planner chooses live shards plus the newest main time buckets. Shard key is <code>term_hash</code>; fan-out calls run in parallel.</li>
+<li>Each shard reads <code>live:{term_hash}:{shard_id}</code> from memory and recent <code>main:{time_bucket}:{term_hash}:{segment_id}</code> blocks from SSD cache.</li>
+<li>Shards return top 1k tweet ids and cheap scores. The merger keeps top 2k globally, then calls the ranker.</li>
+<li>Hydration batches <code>tweet:{tweet_id}</code> reads by tweet-id shard while visibility reads <code>visibility:{viewer_id}</code> in parallel.</li>
+<li>Slow shards are dropped after the per-shard timeout; the response carries <code>partial=true</code> and a cursor that records included tiers and shard offsets.</li>
+</ol>
+<p>Cold historical query path:</p>
+<ol>
+<li>Query planner narrows by <code>from/until</code>, then maps time buckets to main index segments.</li>
+<li>Segment cache miss loads compressed posting blocks from object/SSD store. This is the only path allowed to exceed the normal 100ms shard budget.</li>
+<li>If the user paginates beyond the hot top-K window, the cursor resumes with <code>(query_hash, time_bucket, shard_offsets, last_score, visibility_version)</code> instead of using offset pagination.</li>
+<li>Exhausted cursors return an empty page and a terminal cursor; they do not rescan from the beginning.</li>
+</ol>
+<p>Read-path sketch:</p>
+<pre><code class="language-text">Client -&gt; Gateway -&gt; Query Planner
+              |        |
+              |        +--&gt; live posting shards (memory)
+              |        +--&gt; main segment shards (SSD/object cache)
+              v
+            Merger/Ranker
+              |\
+              | +--&gt; Tweet hydration by tweet_id shard
+              +----&gt; Visibility by viewer_id shard
+              v
+            Results + cursor
+</code></pre>
+<p>Query degradation state:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Latency target</th>
+<th>Cursor behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Full hot results</td>
+<td>live + cached main segments</td>
+<td>&lt;300ms</td>
+<td>Cursor records shard offsets.</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Partial results</td>
+<td>live + successful main shards</td>
+<td>&lt;500ms</td>
+<td>Cursor marks missing shards for retry.</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Cold historical</td>
+<td>main segments from SSD/object</td>
+<td>&lt;1.5s</td>
+<td>Cursor pins time buckets.</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Exhausted window</td>
+<td>no more postings past cursor</td>
+<td>&lt;100ms</td>
+<td>Terminal cursor returned.</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>The search service can degrade relevance before it degrades correctness: drop slow shards or old tiers, but never skip hydration and visibility checks.</p>
+</blockquote>
+<h3 id="tail-latency">Tail Latency</h3>
+<p>Scatter-gather: slowest shard bounds latency.</p>
+<p>Mitigations:
+- Hedged requests to replicas.
+- Per-shard timeouts.
+- Tolerate partial results (drop slow 1%).
+- Capacity headroom.</p>
+<h3 id="ranking">Ranking</h3>
+<p>Multi-signal:
+- Term match relevance (BM25).
+- Author authority.
+- Engagement (likes, retweets).
+- Recency.
+- Personalization (viewer's interaction history).
+- Verified accounts boosted.</p>
+<p>Multi-stage: cheap per-shard scoring; expensive ranker on top.</p>
+<p>For real-time / breaking content: time-decay heavy.</p>
+<h3 id="trending-topics">Trending Topics</h3>
+<p>Related but separate pipeline:</p>
+<ul>
+<li>Aggregate hashtag mentions per region per minute.</li>
+<li>Compare to baseline (prior period).</li>
+<li>Top movers = trending.</li>
+<li>Personalized per region and user interest.</li>
+</ul>
+<h3 id="visibility-filter">Visibility Filter</h3>
+<p>Apply at query result time:</p>
+<ul>
+<li>Blocks: drop blocked authors.</li>
+<li>Mutes: drop muted accounts/keywords.</li>
+<li>Deletes: drop deleted tweets (hydration sees status).</li>
+<li>Privacy: protected accounts visible only to approved followers.</li>
+<li>Policy: removed tweets.</li>
+</ul>
+<p>Never bake visibility into the index; filter at read.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition strategy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Live index</td>
+<td>Hash on tweet_id</td>
+</tr>
+<tr>
+<td>Main index</td>
+<td>Time + hash</td>
+</tr>
+<tr>
+<td>Posting lists</td>
+<td>Term hash</td>
+</tr>
+<tr>
+<td>Trending state</td>
+<td>Region + time</td>
+</tr>
+<tr>
+<td>Engagement signals</td>
+<td>Tweet_id</td>
+</tr>
+<tr>
+<td>Visibility data</td>
+<td>Per-user; fast lookup</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Live index</td>
+<td>Eventually consistent (seconds)</td>
+</tr>
+<tr>
+<td>Main index</td>
+<td>Eventually consistent (hours)</td>
+</tr>
+<tr>
+<td>Query results</td>
+<td>Bounded staleness</td>
+</tr>
+<tr>
+<td>Hydration</td>
+<td>Strong (from tweet store)</td>
+</tr>
+<tr>
+<td>Visibility</td>
+<td>Strong</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Each region has its own live and main indexes.</li>
+<li>Tweet stream replicates globally.</li>
+<li>Queries served locally.</li>
+<li>Personalization data per-user home region.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Slow shard.</td>
+<td>Hedged + partial response.</td>
+<td>Per-shard p99.</td>
+</tr>
+<tr>
+<td>Live tier overload.</td>
+<td>Backpressure; scale up.</td>
+<td>Indexing lag.</td>
+</tr>
+<tr>
+<td>Trending storm.</td>
+<td>Pre-allocate capacity for popular topics.</td>
+<td>Per-term QPS.</td>
+</tr>
+<tr>
+<td>Stale delete in index.</td>
+<td>Visibility filter at read.</td>
+<td>Stale-delete display rate.</td>
+</tr>
+<tr>
+<td>Query result quality degrades.</td>
+<td>Auto-rollback model; offline eval.</td>
+<td>CTR.</td>
+</tr>
+<tr>
+<td>Indexing pipeline lag.</td>
+<td>Alert; scale.</td>
+<td>Indexing lag.</td>
+</tr>
+<tr>
+<td>Cross-region replication.</td>
+<td>Async; bounded.</td>
+<td>Lag.</td>
+</tr>
+<tr>
+<td>Hot term ("breaking").</td>
+<td>Posting list compression; sharding.</td>
+<td>Per-term shard QPS.</td>
+</tr>
+<tr>
+<td>Dormant term after cache eviction.</td>
+<td>Load compressed segment blocks from SSD/object and return slower first page.</td>
+<td>Segment cache miss rate.</td>
+</tr>
+<tr>
+<td>Cursor past cached top-K.</td>
+<td>Resume from per-shard offsets; do not use offset pagination.</td>
+<td>Deep-page latency.</td>
+</tr>
+<tr>
+<td>Multi-region drift.</td>
+<td>Local search may lag, but hydration/visibility from authoritative stores remove deleted/private tweets.</td>
+<td>Replication lag and stale-result rate.</td>
+</tr>
+<tr>
+<td>Visibility bypass.</td>
+<td>Defense in depth; audit.</td>
+<td>Bypass count.</td>
+</tr>
+<tr>
+<td>Spam in results.</td>
+<td>Spam scoring; ban accounts.</td>
+<td>Spam in top results.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Visibility violations.</li>
+<li>Stale-result rate.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Query QPS by region.</li>
+<li>Indexing lag.</li>
+<li>Shard p99.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>CTR on search results.</li>
+<li>Query patterns.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Live tier is fast to update but expensive memory-wise; rolling off is critical.</li>
+<li>Main tier is cheap but slower to update.</li>
+<li>Time-sharded queries are fast for recency-sorted but every shard hit for general queries.</li>
+<li>Hash-sharded balances load but every query hits every shard.</li>
+<li>Aggressive ranking improves relevance but adds latency.</li>
+<li>Personalization vs determinism.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single index tier.</td>
+<td>Live + main two-tier.</td>
+</tr>
+<tr>
+<td>Synchronous index update on tweet write.</td>
+<td>Async via stream.</td>
+</tr>
+<tr>
+<td>Time-only sharding.</td>
+<td>Hybrid time + hash.</td>
+</tr>
+<tr>
+<td>Apply visibility at index time.</td>
+<td>Apply at read.</td>
+</tr>
+<tr>
+<td>One-shot ranking.</td>
+<td>Multi-stage.</td>
+</tr>
+<tr>
+<td>No tail mitigation.</td>
+<td>Hedged requests + partial responses.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Live tier</td>
+<td>Real-time indexing; in-memory; rolling.</td>
+</tr>
+<tr>
+<td>Sharding</td>
+<td>Hash live; time+hash main.</td>
+</tr>
+<tr>
+<td>Query planning</td>
+<td>Scatter-gather; hedged; partial.</td>
+</tr>
+<tr>
+<td>Ranking</td>
+<td>Multi-stage; signals.</td>
+</tr>
+<tr>
+<td>Visibility</td>
+<td>Read-time gate.</td>
+</tr>
+<tr>
+<td>Trending</td>
+<td>Separate pipeline; aggregate.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Two-tier index: live + main.</li>
+<li>Async indexing from tweet stream.</li>
+<li>Sharded inverted index.</li>
+<li>Scatter-gather with tail mitigation.</li>
+<li>Read-time visibility filter.</li>
+<li>Multi-stage ranking.</li>
+<li>Multi-region per-region index.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Twitter Search is a two-tier inverted index: live for breaking content (seconds), main for historical (hours). Async pipeline indexes from the tweet stream. Queries scatter-gather across relevant shards, multi-stage rank, hydrate tweet content, apply visibility filters. Hedged requests handle tail latency. The hardest constraint is indexing latency for breaking news while sustaining trillions of historical tweets.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Twitter Search.</p>
+<p><strong>Candidate:</strong> Two-tier inverted index. Live tier indexes new tweets within seconds — in-memory or SSD, sharded by hash for write throughput, retains recent hours. Main tier is long-term: batch-built from rolled-off tweets, compressed, sharded by time + hash. Queries scatter to relevant shards (live + recent main for recency-sensitive; broader for general), merge by score, hydrate, apply visibility filter, return.</p>
+<p><strong>Interviewer:</strong> Why two tiers?</p>
+<p><strong>Candidate:</strong> Different optimization points. Live tier needs sub-second indexing; can't afford the batch process. Main tier needs efficient storage for trillions of tweets; batch processing compresses better. Combining one tier with both properties would be too expensive. The query merge is straightforward — recent results from live tier, older from main, sort.</p>
+<p><strong>Interviewer:</strong> Indexing latency for breaking news.</p>
+<p><strong>Candidate:</strong> Stream consumer (Kafka) feeds live indexer. Tokenize, extract entities, update posting lists in live shards. End-to-end seconds. For very-hot terms ("breaking"), shard the posting list further to handle high write rate.</p>
+<p><strong>Interviewer:</strong> Query path.</p>
+<p><strong>Candidate:</strong> Frontend parses, rewrites query (synonyms, spell correction). Planner picks shards: live + recent main for time-sensitive; broader for general. Scatter to shards. Each shard intersects posting lists for query terms, scores candidates with cheap features (BM25 + static), returns top-K. Aggregator merges, applies multi-stage ranking (cheap → expensive ML), hydrates tweet content, applies visibility filter, returns.</p>
+<p><strong>Interviewer:</strong> Tail latency from scatter-gather.</p>
+<p><strong>Candidate:</strong> Hedged requests: send to two replicas of the same shard, take first response. Per-shard timeout; on miss, drop slow shard but return partial results (with bounded quality loss). Capacity headroom around 60-70% so slow nodes don't cascade. Aggressive per-shard p99 monitoring.</p>
+<p><strong>Interviewer:</strong> Ranking?</p>
+<p><strong>Candidate:</strong> Multi-stage. Per-shard cheap scoring: BM25 + static signals (author authority, recency). Returns top-K per shard. Aggregator merges; expensive ML ranker scores top results with features (viewer affinity, engagement, recency, personalization). Final ordering.</p>
+<p><strong>Interviewer:</strong> Visibility — blocks and deletes.</p>
+<p><strong>Candidate:</strong> Read-time gate. After hydration, drop blocked authors' tweets, deleted tweets, protected accounts' tweets (if not approved follower), policy-removed tweets. Never bake visibility into the index — that would require massive re-indexing on every block change.</p>
+<p><strong>Interviewer:</strong> Trending topics.</p>
+<p><strong>Candidate:</strong> Related but separate pipeline. Aggregate hashtag mentions per region per minute. Compare to recent baseline; top movers are trending. Personalized per region and user interest. Independent of the search index.</p>
+<p><strong>Interviewer:</strong> A user follows 500 hashtags and queries for one.</p>
+<p><strong>Candidate:</strong> Search is general — anyone can query any term. The "follow hashtag" feature is more like a saved filter. The query path is the same; personalization for the user's follows can boost results in ranking.</p>
+<p><strong>Interviewer:</strong> Multi-region.</p>
+<p><strong>Candidate:</strong> Per-region live + main indexes. Tweet stream replicates globally so each region has the full corpus. Queries served locally. Personalization data per-user home region.</p>
+<p><strong>Interviewer:</strong> Scale of posting lists for hot terms ("the", "a").</p>
+<p><strong>Candidate:</strong> Stop words filtered. Common terms like "a" not indexed. Mid-frequency terms with huge posting lists are compressed (delta encoding on tweet_ids). For very-hot terms during events, the posting list can be sharded further so per-shard write rate stays manageable.</p>
+<p><strong>Interviewer:</strong> Spam in results.</p>
+<p><strong>Candidate:</strong> Spam scoring per tweet. Filtered or down-ranked. Author reputation feeds into static scoring. Pattern detection on suspicious clusters (similar text across many accounts). Manual review for severe cases.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Two-tier inverted index: live (seconds, in-memory, hash-sharded) + main (hours, compressed, time+hash-sharded). Async indexer consumes tweet stream. Queries scatter-gather, multi-stage rank with hedged requests for tail. Hydration from tweet store. Visibility filter at read. Multi-region per-region indexes. The hardest constraint is indexing latency for breaking news; the two-tier design isolates it from the long tail.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: scale, freshness, ranking.</li>
+<li>Invariant: bounded indexing lag; visibility correct.</li>
+<li>Two-tier inverted index: live + main.</li>
+<li>Async indexer from tweet stream.</li>
+<li>Hash-shard live; time+hash-shard main.</li>
+<li>Scatter-gather + hedged + partial.</li>
+<li>Multi-stage ranking.</li>
+<li>Read-time visibility filter.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Twitter Search is a two-tier inverted index: live for breaking content (seconds), main for historical (hours). Async pipeline consumes the tweet stream. Queries scatter-gather across relevant shards, multi-stage rank, hydrate, apply visibility filters. Hedged requests handle tail latency. Visibility at read prevents massive re-indexing. Multi-region per-region indexes. The hardest constraint is real-time indexing without sacrificing historical query speed.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Two tiers: live for seconds-freshness, main for compressed history."</li>
+<li>"Async indexing via stream; tweets searchable in seconds."</li>
+<li>"Scatter-gather with hedged + partial response for tail latency."</li>
+<li>"Visibility — blocks, deletes, privacy — applied at read, never baked in."</li>
+<li>"Multi-stage ranking: cheap per-shard, expensive ML on top."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

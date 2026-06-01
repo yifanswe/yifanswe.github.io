@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design an API Rate Limiter — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design an API Rate Limiter</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A rate limiter sits on the hot path of every request and must decide allow-or-deny in single-digit milliseconds. The hard part is keeping that decision globally consistent enough to protect downstreams while not becoming the bottleneck it is supposed to prevent.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>For any rate limit key (user, IP, API key, route, tenant, or combination), the number of allowed requests in any sliding window must not exceed the configured quota, even when traffic is distributed across many edge nodes and clients retry aggressively.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can pick the right counting algorithm for the freshness vs cost tradeoff, design a distributed counter that survives hot keys, and explain what happens when the limiter itself becomes unavailable.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design the rate limiter as a sidecar or inline middleware on every API node, backed by a fast distributed counter store. The interesting decisions are which counting algorithm to use (fixed window, sliding window, token bucket, leaky bucket), how to keep counts consistent across edges without paying a full round trip per request, and how the system fails open or closed when the counter store is degraded. I will clarify requirements, pick token bucket as default, walk the data path, then go deep on hot keys and consistency.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Limit requests per identity (user, API key, IP, tenant) and per route.</li>
+<li>Support multiple limit windows simultaneously (e.g., 100/sec, 1000/min, 10000/hour).</li>
+<li>Different identities may have different quotas; enterprise customers get higher limits.</li>
+<li>Return clear feedback: <code>429 Too Many Requests</code> with <code>Retry-After</code> and quota headers.</li>
+<li>Allow short bursts above sustained rate (burst allowance).</li>
+<li>Allow admins to configure, raise, or revoke quotas at runtime without redeploy.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Allow-or-deny decision latency in single-digit ms at p99.</li>
+<li>Must not become a single point of failure for the API.</li>
+<li>Must scale to millions of distinct keys.</li>
+<li>Must handle hot keys (one tenant or IP receiving disproportionate traffic).</li>
+<li>Auditability for denied requests and quota changes.</li>
+</ul>
+<p>Out of scope unless interviewer asks:</p>
+<ul>
+<li>DDoS at the network layer (handled before reaching API rate limiter).</li>
+<li>WAF rules and content-based blocking.</li>
+<li>Business-tier billing and metering.</li>
+<li>Concurrency limits (max in-flight) vs rate limits (per unit time) — clarify whether both are needed.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>API traffic</td>
+<td>1M requests/sec global peak.</td>
+</tr>
+<tr>
+<td>Distinct keys</td>
+<td>100M+ active rate limit keys (per user × per route combinations).</td>
+</tr>
+<tr>
+<td>Hot keys</td>
+<td>Top 1% of keys account for 50%+ of traffic.</td>
+</tr>
+<tr>
+<td>Quota updates</td>
+<td>Thousands per day; mostly automated tier changes.</td>
+</tr>
+<tr>
+<td>Limiter latency budget</td>
+<td>Under 5 ms p99 added to the API path.</td>
+</tr>
+<tr>
+<td>Accuracy tolerance</td>
+<td>Within 1-5% of the configured limit at the boundary, depending on algorithm.</td>
+</tr>
+<tr>
+<td>Fail mode</td>
+<td>Configurable per route: fail open (allow) for non-critical, fail closed (deny) for sensitive.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is not the count store; it is hot keys. A single user driving 100k requests per second pins one shard.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>User experience</th>
+<th>System requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>API caller</td>
+<td>Either request is served, or gets 429 with clear retry signal.</td>
+<td>Decision must be fast and correct enough that legitimate traffic is not blocked.</td>
+</tr>
+<tr>
+<td>Admin</td>
+<td>Configures quotas, tiers, overrides; views denial dashboards.</td>
+<td>Strong consistency for configuration; replicated to all limiter nodes.</td>
+</tr>
+<tr>
+<td>Downstream service</td>
+<td>Trusts that traffic is within agreed quota.</td>
+<td>Limiter must not over-allow under normal operation.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                +-------------------+
+Client    ---&gt;  | Edge / API Gateway|
+                +---------+---------+
+                          |
+                          v
+                +-------------------+
+                | Rate Limiter      |
+                | local cache +     |
+                | algorithm         |
+                +----+---------+----+
+                     |         |
+        sync/async   |         |
+        increment    v         v
+            +----------------+   +-------------------+
+            | Counter Store  |   | Quota Config      |
+            | sharded fast   |   | per identity/route|
+            | KV (Redis)     |   | replicated cache  |
+            +-------+--------+   +---------+---------+
+                    |                      ^
+                    v                      |
+            +----------------+    +-----------------+
+            | Persistence    |    | Admin API       |
+            | (optional WAL) |    | quota changes   |
+            +----------------+    +-----------------+
+
+         +-------------------+
+         | Denial Log Stream | -&gt; analytics, audit
+         +-------------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Edge / API gateway</td>
+<td>Terminates TLS, applies coarse IP rate limits before reaching the application.</td>
+<td>Cheap first-level filter; uses simple fixed-window counters in memory.</td>
+</tr>
+<tr>
+<td>Rate limiter middleware</td>
+<td>Per-request allow/deny decision; runs in API process or as sidecar.</td>
+<td>Local token bucket replicas for hot keys; falls back to counter store.</td>
+</tr>
+<tr>
+<td>Counter store</td>
+<td>Authoritative distributed counter for each <code>(key, window)</code>.</td>
+<td>Typically a sharded in-memory KV like Redis cluster; sub-ms reads/writes.</td>
+</tr>
+<tr>
+<td>Quota config service</td>
+<td>Stores per-identity and per-route quotas; supports updates.</td>
+<td>Pushes via pub/sub or polled with versioning.</td>
+</tr>
+<tr>
+<td>Algorithm</td>
+<td>Token bucket, leaky bucket, fixed window, or sliding window log/counter.</td>
+<td>Choose per route based on burst tolerance and accuracy needs.</td>
+</tr>
+<tr>
+<td>Denial log</td>
+<td>Captures every 429 with key, reason, quota, current count.</td>
+<td>Async; used for analytics and abuse detection.</td>
+</tr>
+<tr>
+<td>Admin API</td>
+<td>CRUD on quotas; emergency overrides.</td>
+<td>Audited, signed, role-restricted.</td>
+</tr>
+<tr>
+<td>Fallback decision</td>
+<td>What happens when counter store is unreachable.</td>
+<td>Configurable per route: fail open or fail closed.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="algorithms-pick-the-right-one">Algorithms (Pick The Right One)</h3>
+<table>
+<thead>
+<tr>
+<th>Algorithm</th>
+<th>How it works</th>
+<th>Pros</th>
+<th>Cons</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fixed window</td>
+<td>Count requests per fixed time bucket (e.g., per minute). Reset on bucket boundary.</td>
+<td>Simplest; one counter per key.</td>
+<td>Burst at window boundary can deliver 2x quota across two windows.</td>
+</tr>
+<tr>
+<td>Sliding window log</td>
+<td>Store timestamp of every request; count those within the window.</td>
+<td>Most accurate.</td>
+<td>Memory cost scales with traffic.</td>
+</tr>
+<tr>
+<td>Sliding window counter</td>
+<td>Weighted blend of current and previous fixed windows.</td>
+<td>Cheap; approximates sliding window well.</td>
+<td>Slight inaccuracy near limits.</td>
+</tr>
+<tr>
+<td>Token bucket</td>
+<td>Bucket of N tokens refilled at rate R; each request consumes a token.</td>
+<td>Allows controlled bursts up to bucket size; intuitive for "max sustained rate".</td>
+<td>Need atomic decrement plus refill calculation.</td>
+</tr>
+<tr>
+<td>Leaky bucket</td>
+<td>Queue with fixed leak rate; requests join queue or get dropped.</td>
+<td>Smooths outgoing rate; good for shaping.</td>
+<td>Adds latency by queueing.</td>
+</tr>
+</tbody>
+</table>
+<p>Default recommendation: <strong>token bucket</strong> for client-facing APIs because the policy is human-readable and burst is a first-class concept. Combine with multiple windows for the same key: e.g., a 100/sec bucket and a 10000/hour bucket, both must allow.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>I would use token bucket as the default because the policy is human-readable and burst is a first-class concept. I add multiple buckets at different windows for the same key when both short and long protections are needed.</p>
+</blockquote>
+<h3 id="data-model">Data Model</h3>
+<h4 id="quota-configuration">Quota Configuration</h4>
+<pre><code class="language-text">Quota(
+  scope,                // global, route, tenant, user, ip, api_key
+  key_pattern,          // route_id, tenant_id, user_id, ...
+  algorithm,            // token_bucket, sliding_window, ...
+  capacity,             // bucket size or window count
+  refill_rate,          // tokens per second
+  window_size,          // for window-based algorithms
+  priority,             // tie-break when multiple rules match
+  fail_mode,            // open, closed
+  version
+)
+</code></pre>
+<h4 id="token-bucket-state">Token Bucket State</h4>
+<p>Stored in the counter store, keyed by <code>bucket_key = hash(quota_id, identity)</code>:</p>
+<pre><code class="language-text">BucketState(
+  bucket_key,
+  tokens,               // float
+  last_refill_ts,       // milliseconds
+  version               // optional CAS token
+)
+</code></pre>
+<p>For sliding window counter:</p>
+<pre><code class="language-text">WindowState(
+  bucket_key,
+  current_window_id,
+  current_count,
+  previous_count
+)
+</code></pre>
+<h4 id="denial-record">Denial Record</h4>
+<pre><code class="language-text">DenialEvent(
+  ts,
+  key,
+  identity,
+  route,
+  quota_id,
+  reason,                // exceeded_burst, exceeded_sustained, ...
+  retry_after_ms
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<p>Internal limiter check (RPC or in-process):</p>
+<pre><code class="language-text">CheckRequest {
+  identities: [user_id?, api_key?, ip?, tenant_id?]
+  route_id
+  cost?            // default 1; expensive endpoints can charge more
+}
+
+CheckResponse {
+  decision: ALLOW | DENY
+  remaining: integer
+  reset_at: timestamp
+  retry_after_ms: integer  // when DENY
+  reason: string           // when DENY
+}
+</code></pre>
+<p>External response on deny:</p>
+<pre><code class="language-text">HTTP 429 Too Many Requests
+Headers:
+  Retry-After: 12
+  X-RateLimit-Limit: 100
+  X-RateLimit-Remaining: 0
+  X-RateLimit-Reset: 1700000000
+</code></pre>
+<p>Admin API:</p>
+<pre><code class="language-text">PUT /quotas/{scope}/{key}
+GET /quotas/{scope}/{key}
+GET /denials?identity=&amp;route=&amp;since=
+</code></pre>
+<h3 id="token-bucket-implementation-detail">Token Bucket Implementation Detail</h3>
+<p>The classic atomic operation:</p>
+<pre><code class="language-text">on each request:
+  state = read BucketState(bucket_key)
+  now = current_time_ms
+  elapsed = now - state.last_refill_ts
+  tokens_to_add = elapsed * refill_rate / 1000
+  state.tokens = min(capacity, state.tokens + tokens_to_add)
+  state.last_refill_ts = now
+  if state.tokens &gt;= cost:
+    state.tokens -= cost
+    write BucketState (CAS or atomic Lua)
+    return ALLOW
+  else:
+    return DENY with retry_after = (cost - state.tokens) / refill_rate
+</code></pre>
+<p>Two implementation choices:</p>
+<ul>
+<li><strong>Redis with Lua script</strong>: atomically read-modify-write the bucket in a single round trip. Each API node calls the script.</li>
+<li><strong>Local approximation + async sync</strong>: each node maintains a local token bucket per hot key and periodically syncs to the central counter store with a delta. Sacrifices accuracy for latency and counter store load.</li>
+</ul>
+<p>For hot keys: local approximation is essential. The synchronous central-store version cannot handle 100k QPS on one key.</p>
+<h3 id="hot-key-strategy">Hot Key Strategy</h3>
+<p>A single tenant burning their quota at 100k req/sec pins the Redis shard holding that key.</p>
+<p>Mitigations:</p>
+<ul>
+<li><strong>Local rate limiting first.</strong> Each API node holds a local token bucket per key. Sized as <code>local_capacity = total_capacity / N</code> where <code>N</code> is the number of nodes. Bursts allowed locally without coordinating.</li>
+<li><strong>Per-node sub-quotas.</strong> Pre-distribute quota across nodes statically or via gossip; nodes only contact the central store when their slice approaches exhaustion.</li>
+<li><strong>Hierarchical limiters.</strong> Edge node enforces 80% of the global quota locally; central enforces the last 20% for cross-node bursts.</li>
+<li><strong>Sharding the key.</strong> For a single very-hot key, split it into N sub-keys at the limiter; each sub-key carries <code>capacity/N</code>, and requests are hashed to a sub-key. Accept that one heavy client might be slightly throttled even when their global quota is not exhausted.</li>
+<li><strong>Replica reads.</strong> For algorithms tolerant of slight lag, read from local replicas and reconcile in the background.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The central counter store is a fallback for accuracy, not the inline path for hot keys. I push enforcement to the edge with local buckets and reconcile asynchronously, accepting bounded over-allow to protect availability.</p>
+</blockquote>
+<h3 id="write-and-read-path">Write And Read Path</h3>
+<p>Request path (every API call):</p>
+<ol>
+<li>API node receives request.</li>
+<li>Resolve identities: extract user from auth token, route, tenant, IP.</li>
+<li>Look up applicable quotas in local quota cache (refreshed from quota service every few seconds).</li>
+<li>For each quota, check the local token bucket; if any returns DENY, return 429.</li>
+<li>If all locals allow, optionally sync with central counter store for the high-priority quotas.</li>
+<li>Forward request to the API.</li>
+<li>Emit a denial event if denied; otherwise no log on the synchronous path.</li>
+</ol>
+<p>Quota config update path:</p>
+<ol>
+<li>Admin updates quota via admin API.</li>
+<li>Quota service writes to a strongly consistent store.</li>
+<li>Publishes a quota-version-bumped event on pub/sub.</li>
+<li>Limiter nodes pick up the new version on their next poll or push, with a version number, then atomically swap their local rules.</li>
+</ol>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Counter store buckets</td>
+<td>Hash of <code>bucket_key</code> across Redis cluster shards.</td>
+<td>Even distribution; supports atomic per-key operations.</td>
+</tr>
+<tr>
+<td>Quota config</td>
+<td>Replicated across all limiter nodes.</td>
+<td>Read-heavy, small, infrequent changes.</td>
+</tr>
+<tr>
+<td>Denial log</td>
+<td>Time-bucketed; partitioned by route or tenant.</td>
+<td>Volume can be huge under attack; useful for after-the-fact analysis.</td>
+</tr>
+<tr>
+<td>Hot key splits</td>
+<td>Logical key <code>bucket_key:shard_id</code> for known hot keys.</td>
+<td>Spreads load across shards.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Decision</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Allow/deny on a normal key</td>
+<td>Eventually consistent across nodes (drift of milliseconds to seconds)</td>
+<td>Acceptable to over-allow by a few percent.</td>
+</tr>
+<tr>
+<td>Allow/deny on a hot key</td>
+<td>Local-first; central as backstop</td>
+<td>Cannot afford a synchronous round trip per request.</td>
+</tr>
+<tr>
+<td>Quota configuration</td>
+<td>Strong via versioned config</td>
+<td>Operators expect changes to take effect predictably.</td>
+</tr>
+<tr>
+<td>Denial logging</td>
+<td>Eventually consistent</td>
+<td>Used for analytics, not decision making.</td>
+</tr>
+</tbody>
+</table>
+<p>Accept that distributed rate limiting is approximate by nature. The contract is "we will not allow significantly more than the configured rate," not "we will not allow exactly one more request."</p>
+<h3 id="failure-modes-and-fail-mode-choice">Failure Modes And Fail Mode Choice</h3>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Mitigation</th>
+<th>Failure mode default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Counter store unreachable</td>
+<td>Local buckets continue serving; central counts catch up on recovery.</td>
+<td>Fail open for low-tier routes; fail closed for billing/auth/security.</td>
+</tr>
+<tr>
+<td>Counter store hot shard</td>
+<td>Pre-shard hot keys; local approximation.</td>
+<td>Fail open with degraded accuracy.</td>
+</tr>
+<tr>
+<td>Quota config service down</td>
+<td>Limiters use last known config.</td>
+<td>Effectively frozen but functional.</td>
+</tr>
+<tr>
+<td>Clock skew between nodes</td>
+<td>Use server-time for refill; cap drift; rely on monotonic clock for local.</td>
+<td>Slight inaccuracy at refill boundaries.</td>
+</tr>
+<tr>
+<td>Limiter middleware crash</td>
+<td>Sidecar restart; in-process middleware fails as part of API.</td>
+<td>Same fate as API process.</td>
+</tr>
+<tr>
+<td>Coordinated burst at window boundary (fixed window flaw)</td>
+<td>Switch to sliding window or token bucket.</td>
+<td>Algorithm choice.</td>
+</tr>
+</tbody>
+</table>
+<p>Choosing fail open vs fail closed is a product policy decision: payment endpoints fail closed; status pages fail open.</p>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<p>For a global API, quota typically means a single global rate.</p>
+<p>Two patterns:</p>
+<ul>
+<li><strong>Per-region quota</strong> (split N ways): simple, no cross-region coordination, but a quiet region "donates" capacity to a busy region only if you reallocate.</li>
+<li><strong>Global quota with hierarchical enforcement</strong>: each region enforces its baseline share locally; a global reconciler tracks total usage. If one region's share is unused, others can request a temporary lease.</li>
+</ul>
+<p>For most APIs, per-region splits are good enough. Cross-region accuracy under bursts is hard and rarely required.</p>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness metrics:</p>
+<ul>
+<li>Actual rate vs configured limit per key (should hover at or under limit).</li>
+<li>Over-allow ratio: ratio of <code>actual / configured</code> during sustained traffic.</li>
+<li>Quota config version skew across limiter nodes.</li>
+</ul>
+<p>Capacity metrics:</p>
+<ul>
+<li>Counter store QPS, latency, shard distribution.</li>
+<li>Limiter middleware decision latency.</li>
+<li>Top-N hot keys by QPS and denial rate.</li>
+</ul>
+<p>Business and security metrics:</p>
+<ul>
+<li>Denial rate by route, tenant, identity.</li>
+<li>429-to-200 retry success rate.</li>
+<li>Spike detection: sudden increase in denials for one identity (possible bot or compromise).</li>
+<li>Quota change audit trail.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Sliding window log is most accurate but expensive; sliding window counter trades a few percent of accuracy for orders of magnitude less memory.</li>
+<li>Token bucket allows bursts; leaky bucket smooths them. Pick based on whether burstiness is welcome.</li>
+<li>Synchronous central counter is accurate but limits throughput; local approximation is fast but slightly over-allows.</li>
+<li>Aggressive limits protect downstream but generate user complaints; lenient limits protect UX but expose downstream.</li>
+<li>Per-IP limits hurt users behind NAT or large corporate proxies; per-API-key limits require authentication on the rate-limit path.</li>
+<li>Fail open is friendly but lets abuse through; fail closed protects downstream but causes incidents to widen.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Using fixed window only.</td>
+<td>Mention the boundary burst flaw; pick sliding window or token bucket.</td>
+</tr>
+<tr>
+<td>One Redis instance for all counters.</td>
+<td>Sharded cluster; treat the cluster itself as a tier and design for shard saturation.</td>
+</tr>
+<tr>
+<td>Synchronously round-tripping to Redis per request.</td>
+<td>Local buckets with async reconcile; hierarchical enforcement.</td>
+</tr>
+<tr>
+<td>Ignoring the quota update path.</td>
+<td>Versioned config with explicit propagation and audit.</td>
+</tr>
+<tr>
+<td>Forgetting failure modes.</td>
+<td>State fail open or closed per route and justify.</td>
+</tr>
+<tr>
+<td>Treating all keys equally.</td>
+<td>Recognize hot keys, pre-shard or use approximate local buckets.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Algorithm choice</td>
+<td>Compare token bucket, sliding window counter, fixed window. Justify token bucket as default.</td>
+</tr>
+<tr>
+<td>Hot key handling</td>
+<td>Local-first enforcement; pre-shard; gossip-based capacity reallocation.</td>
+</tr>
+<tr>
+<td>Distributed consistency</td>
+<td>Accept bounded inaccuracy; explain how local + central reconciliation works.</td>
+</tr>
+<tr>
+<td>Fail mode</td>
+<td>Fail open vs closed per route; how to detect and recover.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Per-region split vs hierarchical global; tradeoffs.</td>
+</tr>
+<tr>
+<td>Implementation</td>
+<td>Show Redis Lua script for atomic token bucket.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>State the invariant: do not exceed configured rate per key, even under retries.</li>
+<li>Pick an algorithm and justify it.</li>
+<li>Distinguish hot path enforcement from accurate central counting.</li>
+<li>Explain hot key handling with local buckets and pre-sharding.</li>
+<li>Cover the quota configuration plane separately from the data plane.</li>
+<li>State fail open or fail closed per route.</li>
+<li>Discuss multi-region quota splitting.</li>
+<li>Include denial logging as an async side channel for security.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>A distributed rate limiter is an approximation problem, not an exact-counting problem. I would accept a few percent over-allow in exchange for sub-millisecond decisions and resilience to counter-store failures, and I would pay for accuracy only where it matters: billing, security, and abuse blocking.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design an API rate limiter.</p>
+<p><strong>Candidate:</strong> I will design it around a per-request allow/deny middleware backed by a distributed counter. The invariant is that for any rate limit key — user, API key, IP, tenant, route, or combination — we do not significantly exceed the configured quota across the fleet. I will start by clarifying requirements, pick an algorithm, walk the data path, and dive into hot keys and consistency.</p>
+<p><strong>Interviewer:</strong> What algorithm would you use?</p>
+<p><strong>Candidate:</strong> Token bucket as the default. The product semantics are intuitive: a sustained refill rate and a burst capacity. For accuracy near the limit at long windows, I sometimes layer in a sliding window counter as a second bucket. Fixed window is simplest but has the boundary burst problem where you can get 2x the limit across the window boundary, so I avoid it for client-facing APIs.</p>
+<p><strong>Interviewer:</strong> Where does the counter live?</p>
+<p><strong>Candidate:</strong> Logically, in a sharded fast KV like Redis cluster, accessed via a Lua script that atomically performs the read-modify-write. Practically, each API node holds a local token bucket per active key, and the central counter is a backstop for accuracy. For hot keys, every node enforces from its local slice without round-tripping; otherwise, the central store would be the bottleneck.</p>
+<p><strong>Interviewer:</strong> What if a single tenant generates 100,000 requests per second?</p>
+<p><strong>Candidate:</strong> That is the hot key problem. A few mitigations: first, distribute the quota across API nodes so each node enforces its share locally. Second, split the key into sub-shards: hash the request to one of N logical buckets, each with capacity/N. The user might be slightly throttled even when not at global cap, which is an acceptable tradeoff. Third, if the central store starts saturating, the limiter falls back to local-only enforcement and accepts the over-allow.</p>
+<p><strong>Interviewer:</strong> How accurate is this?</p>
+<p><strong>Candidate:</strong> With local-first enforcement and asynchronous reconciliation, you can over-allow by a few percent during bursts, especially right after a sudden traffic spike. That is acceptable for almost all rate-limit use cases. If a route needs strict counting — billing meters, security blocks — I send those through a synchronous Redis Lua script and accept higher latency.</p>
+<p><strong>Interviewer:</strong> What if Redis goes down?</p>
+<p><strong>Candidate:</strong> The middleware falls back to local buckets. Configuration matters here: for non-critical routes, fail open and accept some over-allow; for billing and auth, fail closed. Each route has a fail-mode policy. The denial log captures the fallback so we can audit after the fact.</p>
+<p><strong>Interviewer:</strong> How do you handle quota updates?</p>
+<p><strong>Candidate:</strong> Quota config is a separate plane from the data plane. An admin API writes to a strongly-consistent store, bumps a version, and publishes a change event on pub/sub. Limiter nodes either subscribe or poll; they swap to the new quota atomically with the new version. Operators can verify propagation by querying the active version on each node.</p>
+<p><strong>Interviewer:</strong> What status code and headers do you return?</p>
+<p><strong>Candidate:</strong> <code>429 Too Many Requests</code> with <code>Retry-After</code>, <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>, and <code>X-RateLimit-Reset</code> headers. The retry-after is computed from the token bucket as <code>(cost - tokens) / refill_rate</code>. Clients can use it to back off precisely.</p>
+<p><strong>Interviewer:</strong> What about IPs behind NAT or corporate proxies?</p>
+<p><strong>Candidate:</strong> Per-IP limits unfairly hurt users behind NAT — a whole office gets one quota. So I would compose limits: a coarse per-IP guard for anonymous abuse protection, and a per-authenticated-identity limit for the real product quota. Inside the API, I prefer identity-keyed limits whenever possible.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Easiest is per-region quota splits: each region gets a slice of the global quota and enforces locally. No cross-region coordination, but a quiet region's unused capacity is wasted. If the product requires a single global quota, I add a global reconciler that tracks usage and reallocates leases across regions periodically — adds operational complexity for marginal accuracy gain. Most APIs are fine with per-region splits.</p>
+<p><strong>Interviewer:</strong> How do you support different tiers — free, pro, enterprise?</p>
+<p><strong>Candidate:</strong> The quota config matches identity attributes to algorithms and capacities. When a request comes in, the limiter resolves the tier from the auth context and looks up the applicable quotas. Tier changes are config changes; the next config refresh picks them up. For very high-volume enterprise customers, I might pre-shard their key to avoid pinning a single Redis shard.</p>
+<p><strong>Interviewer:</strong> How do you detect a customer abusing their quota?</p>
+<p><strong>Candidate:</strong> Denial events stream to an analytics pipeline. Patterns include sustained 100% denial rate (they are constantly at limit), sudden burst from a previously quiet identity (compromise), or denial concentration on suspicious routes. Alerts feed into security review and possibly auto-revoke API keys.</p>
+<p><strong>Interviewer:</strong> Summarize the design.</p>
+<p><strong>Candidate:</strong> Token bucket as the algorithm, local-first enforcement on every API node with a sharded Redis backstop for accuracy. Hot keys split into sub-buckets. Quota configuration is a separate versioned control plane. Fail-mode policy per route. Multi-region uses per-region quota splits by default. The whole design accepts that distributed rate limiting is approximate by nature and optimizes for fast decisions and survivability, not exact counts.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: limit per identity, per route, multiple windows, fail mode.</li>
+<li>State invariant: do not significantly exceed configured rate.</li>
+<li>Pick token bucket; justify vs fixed/sliding window.</li>
+<li>Show the data path: local bucket → optional central Redis check.</li>
+<li>Address hot keys with local-first and key sharding.</li>
+<li>Show quota config plane separate from data plane.</li>
+<li>Discuss fail-open vs fail-closed per route.</li>
+<li>Close with multi-region per-region split and denial logging.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>A rate limiter is an approximation system. I would use token buckets for human-readable quotas, push enforcement to local in-process buckets to keep the hot path fast, and use a sharded Redis cluster as a backstop. Hot keys get pre-sharded; quota config has its own versioned plane. Fail mode is route-specific. The main tradeoff is exact counting vs availability, and I optimize for availability with a few percent acceptable over-allow.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Distributed rate limiting is an approximation problem, not an exact-count problem."</li>
+<li>"Token bucket is the default because burst is a first-class concept."</li>
+<li>"Local-first enforcement; the central store is a backstop, not the inline path."</li>
+<li>"Hot keys break naive designs; pre-shard the key or split it logically."</li>
+<li>"Fail-mode is a per-route policy decision, not a system-wide setting."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

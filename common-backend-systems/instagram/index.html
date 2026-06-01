@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Instagram — Photo Sharing + Feed (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Instagram — Photo Sharing + Feed (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Hard · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build Instagram. Users upload photos and short videos, follow other users, and scroll a ranked feed of posts from people they follow. 500M daily active users (DAU), 100M new posts/day, average user opens the app 8× a day. Media-heavy + ranking-heavy.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Post photo/short video.
+- Follow other users.
+- Scroll a ranked feed of recent posts from people you follow.
+- Like and comment on posts.</p>
+<p>I'd defer Stories, Reels (algorithmic discovery), Direct Messages, and Shopping.</p>
+<p><strong>Non-functional</strong>
+- Feed open p99 &lt; 500 ms.
+- Media must serve globally with low latency — CDN-fronted.
+- Eventual consistency on feed and engagement counts.
+- Asymmetric: a few accounts have 100M+ followers (celebrity problem).
+- Read-heavy: ~100:1 reads to writes.</p>
+<p><strong>Capacity</strong>
+- 100M posts/day; avg 2 MB per post (after compression / multiple sizes) → 200 TB/day raw → ~73 PB/year.
+- 500M DAU × 8 opens × 20 posts = 80B post views/day → ~1M QPS at peak.
+- 1B follow relationships.
+- Dominant cost is media: even post metadata at ~1 KB × 100M/day × RF=3 is ~300 GB/day, while media is ~200 TB/day before replication/tiering. Feed Redis is large but bounded: 500M users × 500 post IDs × ~32 B × RF=2 is ~16 TB plus overhead.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>User</strong> — <code>user_id</code>, follows.</li>
+<li><strong>Post</strong> — <code>post_id, author_id, media_refs[], caption, created_at, like_count, comment_count</code>.</li>
+<li><strong>Media</strong> — <code>media_id, url_variants{sizes}, format, owner</code>.</li>
+<li><strong>Edge</strong> — <code>(follower_id, followee_id)</code>.</li>
+<li><strong>FeedEntry</strong> — <code>(user_id, post_id, score)</code>.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST  /v1/media/upload                     → { media_id, upload_url }
+POST  /v1/posts                            { media_ids[], caption }   → { post_id }
+GET   /v1/feed?cursor=...&amp;limit=20         → { posts[], next_cursor }
+POST  /v1/posts/{id}/like
+POST  /v1/posts/{id}/comments              { text }
+POST  /v1/follows                          { user_id }
+</code></pre>
+<p>Two-phase upload — request signed URL, upload to object store directly, then commit.</p>
+<p>Feed cursors are opaque and encode <code>{user_id, rank_session_id, last_score, last_post_id}</code>. A rank session stores the candidate set for a few minutes so page 2 does not reshuffle under the user.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Upload path.</strong>
+   - Client requests upload URL → media service signs an S3 URL.
+   - Client uploads directly to S3.
+   - On commit, media service kicks off image-processing pipeline: generate sizes (thumbnail, medium, large), optionally HEIF→JPEG, EXIF strip. For videos: transcode to multiple bitrates.
+   - Post is written to the post catalog (Cassandra, sharded by post_id) with refs to media variants. Publish <code>post.created</code> event.</li>
+<li><strong>Feed assembly.</strong> Same hybrid push/pull as the FB News Feed problem:
+   - Push fan-out for normal users (followers ≤ 10k): on <code>post.created</code>, append <code>post_id</code> to each follower's Redis feed list.
+   - Pull-on-read for celebrities (followers &gt; 10k): when assembling feed, also fetch recent celebrity posts from per-celebrity caches.
+   - Merge + rank at read time.</li>
+<li><strong>Ranking.</strong> Online model service. Features: recency, author affinity, post engagement velocity, media type, content category. Reranks the candidate set.</li>
+<li><strong>Media serving.</strong> CDN (CloudFront/Akamai) in front of S3. Aggressive caching by URL path; signed URLs for private accounts. Adaptive resolution served based on device class.</li>
+<li><strong>Engagement pipeline.</strong> Likes/comments → Kafka → counter aggregation (Redis for live counts, ClickHouse for analytics) + ranking signal updates.</li>
+<li><strong>Storage hierarchy.</strong> Recent posts and metadata hot (Cassandra + Redis caching). Old media in cheaper tiers (S3 Glacier-style) but still accessible via CDN with cache miss penalty.</li>
+</ol>
+<p>End-to-end narration: Alice posts a photo → upload to S3, commit triggers processing → media variants generated → post row in Cassandra → fan-out pushes post_id into the Redis feed lists of her 200 friends. Bob opens the app → feed assembly pulls Bob's feed list (300 candidate post_ids), merges in 5 celebrity-posts candidates → fetches post metadata in a batch → ranking service reranks → returns top 20. Bob sees Alice's photo, served from a CDN edge.</p>
+<p>Concrete stores:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Post catalog</td>
+<td><code>post:{post_id}</code> row with author, media refs, counters</td>
+<td style="text-align: right;">~1 KB</td>
+<td>forever, tier old rows</td>
+<td><code>post_id</code></td>
+</tr>
+<tr>
+<td>Author timeline</td>
+<td><code>author_posts:{author_id}</code> ZSET/list of recent <code>post_id</code>s</td>
+<td style="text-align: right;">~32 B/member</td>
+<td>cap 1k-5k</td>
+<td><code>author_id</code></td>
+</tr>
+<tr>
+<td>Feed index</td>
+<td><code>feed:{user_id}</code> Redis ZSET member=<code>post_id</code>, score=<code>rank_seed/time</code></td>
+<td style="text-align: right;">~32-80 B/member</td>
+<td>cap 500, 30 days</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Follow graph</td>
+<td><code>followers:{author_id}</code> / <code>following:{user_id}</code> adjacency lists</td>
+<td style="text-align: right;">~16 B/edge</td>
+<td>forever</td>
+<td><code>author_id</code> and <code>user_id</code></td>
+</tr>
+<tr>
+<td>Media object</td>
+<td><code>media/{post_id}/{variant}</code> immutable blob</td>
+<td style="text-align: right;">50 KB-10 MB</td>
+<td>forever, tier after age</td>
+<td>content hash/post_id</td>
+</tr>
+<tr>
+<td>Engagement counter</td>
+<td><code>counter:{post_id}:{shard}</code> like/comment shards</td>
+<td style="text-align: right;">~16 B/shard</td>
+<td>hot 30 days, roll up</td>
+<td><code>post_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>Capacity by store:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Math</th>
+<th>Dominant knob</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Media objects</td>
+<td>100M posts/day * 2 MB ~= 200 TB/day before replicas; 30 d hot ~= 6 PB</td>
+<td>compression variants, tiering, CDN hit rate</td>
+</tr>
+<tr>
+<td>Post catalog</td>
+<td>100M/day * 1 KB * RF=3 ~= 300 GB/day</td>
+<td>metadata compaction and old-row tiering</td>
+</tr>
+<tr>
+<td>Feed index</td>
+<td>500M users * 500 ids * 32-80 B * RF=2 ~= 16-40 TB plus Redis overhead</td>
+<td>cap length, TTL, active-user filtering</td>
+</tr>
+<tr>
+<td>Author timelines</td>
+<td>100M posts/day * 32 B/id * RF=2 ~= 6.4 GB/day</td>
+<td>cap per author and archive old ids</td>
+</tr>
+<tr>
+<td>Follow graph</td>
+<td>1B edges * 16 B * RF=3 ~= 48 GB before index overhead</td>
+<td>adjacency compression</td>
+</tr>
+<tr>
+<td>Hot counters</td>
+<td>3B hot posts * 20 shards * 16 B ~= 960 GB before overhead</td>
+<td>shard count and 30 d rollup</td>
+</tr>
+</tbody>
+</table>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">                              +------------------------+
+                              |      Mobile client     |
+                              +---+------+-------+-----+
+                                  |      |       |
+ POST /v1/media/upload------------+      |       +----GET /v1/feed
+ POST /v1/posts--------------------------+            POST /like/comment
+                                  v      v       v
+                 +--------------+ +------------+ +-------------+
+                 | Media        | | Post       | | Feed        |
+                 | service      | | service    | | service     |
+                 +------+-------+ +-----+------+ +------+------+
+                        |               |               |
+ signed URL + commit    |               | post.created  | candidates
+                        v               v               v
+                 +--------------+  +----------------+ +-------------+
+                 | S3 objects   |  | Kafka          | | Ranking +   |
+                 | + processing |  | post.created   | | feature svc |
+                 +------+-------+  +--------+-------+ +------+------+
+                        |                   |                |
+                        v                   v                |
+                     +------+        +-------------+         |
+                     | CDN  |        | Fanout      |         |
+                     | edge |        | workers     |         |
+                     +------+        +------+------+         |
+                                             |                |
+                                             v                v
+   +----------------------------------------------------------------+
+   | Stores / Caches                                                |
+   | feed:{user_id} Redis ZSET, cap 500 post_ids                    |
+   | author_posts:{author_id} ZSET/list, cap 1k-5k post_ids         |
+   | post:{post_id} Cassandra row, ~1 KB metadata                   |
+   | followers:{author_id} / following:{user_id} adjacency lists    |
+   | media/{post_id}/{variant} immutable S3 blob                    |
+   | counter:{post_id}:{shard} Redis live like/comment counters     |
+   +--------------------+----------------------------+--------------+
+                        | feed miss / exhausted      | metadata miss
+                        v                            v
+              +-------------------+          +----------------+
+              | Pull from         |          | Post catalog   |
+              | author_posts:*    |---------&gt;| source of truth|
+              | + rebuild feed    | async    +----------------+
+              +-------------------+
+                        ^
+                        |
+              +-------------------+
+              | Engagement Kafka  |
+              | + ClickHouse roll |
+              +-------------------+
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Media pipeline.</strong> Upload → S3 → SQS notification → image worker → generates 4 sizes (thumb 150², medium 600², large 1080², detail 2160²) and a CDN-warm preview. For videos: transcode to 480p/720p/1080p H.264, generate poster image, MP4 + HLS. Pipeline is async; the post can publish before full processing (use a fallback to the original until variants ready).</p>
+<p><strong>Why hybrid feed.</strong> Pure push breaks on celebs (Kim Kardashian post → 200M Redis writes). Pure pull breaks on average users (each feed open fans out across 300 friends' recent posts). Hybrid uses push for the 99.9% and pull for the 0.1% with the huge follower counts. Cutoff is a config knob.</p>
+<p>Why Redis for feed IDs rather than Cassandra-only: Cassandra can store durable timelines, but feed open needs a small, hot, ordered candidate set in &lt;50 ms. Redis stores IDs only; Cassandra remains the durable post catalog. If Redis is lost, rebuild from author timelines and recent <code>post.created</code> events.</p>
+<p><strong>Feed list maintenance.</strong> Redis sorted set per user, capped at last few hundred entries with a sliding TTL. On a new follow, don't backfill historical posts (too expensive). Instead, assembly augments with read-time pulls for new follows for the first few days.</p>
+<p>Feed write path: <code>post.created</code> -&gt; fan-out worker reads <code>followers:{author_id}</code>; for normal authors it batches <code>ZADD feed:{follower_id} score post_id</code> and trims with <code>ZREMRANGEBYRANK</code>; for celebrity authors it only writes <code>author_posts:{author_id}</code> and invalidates celebrity caches. The post catalog write and media processing are already committed before fan-out begins.</p>
+<p>Feed read path: client -&gt; feed service reads <code>feed:{user_id}</code> and <code>following_celeb:{user_id}</code> in parallel; pulls recent celebrity posts from <code>author_posts:{author_id}</code>; batch-fetches post metadata, counters, viewer like state, and media variants in parallel; ranking service reranks the candidate list; cursor stores the rank session.</p>
+<p>Hot feed page trace:
+1. Client calls <code>GET /v1/feed?cursor=C</code>; the feed service decodes <code>{user_id, rank_session_id, last_score, last_post_id}</code>.
+2. It reads <code>feed:{user_id}</code> from Redis using <code>user_id</code> as the shard key and, in parallel, reads <code>following_celeb:{user_id}</code> plus a cached viewer feature vector.
+3. For celebrity followees, it pulls recent ids from <code>author_posts:{author_id}</code> keyed by each celebrity <code>author_id</code>.
+4. It merges 300-800 candidate post IDs, drops ids already stored in the rank session, and batch-fetches <code>post:{post_id}</code>, <code>counter:{post_id}:*</code>, viewer-like state, and media variants in parallel.
+5. Ranking runs as one batch call; the service returns 20 hydrated posts and updates the rank session so page 2 is stable.</p>
+<p>Cold feed rebuild path: if <code>feed:{user_id}</code> is missing or exhausted, the service reads <code>following:{user_id}</code>, pulls the last N ids from each normal author's <code>author_posts:{author_id}</code> with a tight cap, merges with celebrity pulls, writes a fresh <code>feed:{user_id}</code> asynchronously, and serves a smaller page if the rebuild exceeds ~700 ms.</p>
+<p>Why the main stores: Cassandra/DynamoDB-style storage is a better fit for <code>post:{post_id}</code> than a single relational database because the workload is append-heavy, globally sharded, and mostly point reads. Redis is used only for bounded ID indexes; putting full posts there would multiply the media-adjacent metadata cost. Kafka separates upload commit from fan-out so a slow follower shard does not make posting slow. Be ready for "why not pure pull?" -- pure pull burns read latency for average users following hundreds of accounts.</p>
+<p><strong>Ranking model serving.</strong> Pre-fetch features into a feature store (<code>user_features</code>, <code>post_features</code>). On feed open, parallel calls: feed list fetch + feature fetch + media metadata fetch. Single batch inference call. Total budget &lt; 200 ms server-side.</p>
+<p><strong>CDN strategy.</strong> Multi-CDN to handle outages. Cache key includes size variant. TTL ~1 day for media (immutable URLs with content hash). Invalidation: when a post is deleted, purge its URLs.</p>
+<p><strong>Celebrity reads at scale.</strong> Per-celebrity "recent posts" Redis hash + per-feature precomputed in-process cache on assembly nodes (since the same celebrities show up in millions of feeds). Update on each new celebrity post.</p>
+<p><strong>Engagement count consistency.</strong> Approximate count from Redis incremented on each like; reconciled hourly from the Kafka-derived rollup in ClickHouse. Users never notice the slight inaccuracy mid-hour.</p>
+<p><strong>Storage cost.</strong> Photos are mostly cold after 30 days. Tier to S3 Infrequent Access after 30 d, Glacier after 1 y. Rehydrate on access — first hit pays the latency, subsequent hits CDN-cached.</p>
+<p><strong>Hot post bottleneck.</strong> Viral post → 10M views in an hour. CDN absorbs the media reads; post metadata is small, easily cached at the API gateway. The risk is the engagement counter — use multiple shard keys and sum on read.</p>
+<p><strong>Two-index framing.</strong> There is one post dataset and two indexes over it. <code>feed:{user_id}</code> is reader-keyed and optimized for normal authors; <code>author_posts:{author_id}</code> is writer-keyed and optimized for celebrities, new follows, and feed rebuilds. The read path merges both views and then ranks, so the product still feels like one feed.</p>
+<p><strong>Edge stress tests.</strong> Dormant users may have no warm feed list; they get a pull-based rebuild from author timelines with a slower first page. Users who paginate beyond the 500-id Redis window switch to author-timeline pull plus a new cursor rather than growing Redis unbounded. Burst writes from a celebrity never fan out to all followers; only the author timeline and celebrity cache update. Multi-region drift is acceptable for feed freshness, but post creation should write the catalog in the author's home region and replicate before cross-region ranking uses it. Cold media variants fall back to the original object while workers finish transcoding.</p>
+<p>Feed serving state machine:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Cursor/session state</th>
+<th>Latency target</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot</td>
+<td>pushed feed</td>
+<td><code>feed:{user_id}</code> + rank session</td>
+<td><code>rank_session_id</code>, last score/id</td>
+<td>&lt; 500 ms</td>
+</tr>
+<tr>
+<td>Mixed</td>
+<td>push + celebrity pull</td>
+<td>feed index + <code>author_posts:*</code></td>
+<td>same session, dedupe set</td>
+<td>&lt; 600 ms</td>
+</tr>
+<tr>
+<td>Cold</td>
+<td>rebuild on read</td>
+<td>follow graph + author timelines</td>
+<td>new session with partial candidates</td>
+<td>&lt; 800 ms first page</td>
+</tr>
+<tr>
+<td>Exhausted</td>
+<td>deep pagination</td>
+<td>author timelines by timestamp</td>
+<td>cursor stores author offsets</td>
+<td>slower, fewer posts ok</td>
+</tr>
+<tr>
+<td>Degraded</td>
+<td>ranking down</td>
+<td>recency/affinity heuristic</td>
+<td>same cursor shape</td>
+<td>&lt; 500 ms</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Graceful degradation.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th>User-visible behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Feed cache cold</td>
+<td>Pull from author timelines and rebuild async</td>
+<td>follow graph + author posts</td>
+<td>slower first feed open</td>
+</tr>
+<tr>
+<td>Celebrity fan-out</td>
+<td>Pull-on-read, no follower writes</td>
+<td>celebrity recent cache</td>
+<td>fresh within seconds</td>
+</tr>
+<tr>
+<td>Ranking service down</td>
+<td>Recency + affinity fallback rank</td>
+<td>feed index + cached features</td>
+<td>less personalized feed</td>
+</tr>
+<tr>
+<td>Media variant missing</td>
+<td>Serve lower-res/original variant</td>
+<td>object store/CDN</td>
+<td>quality drops, post still loads</td>
+</tr>
+<tr>
+<td>Counter hot key</td>
+<td>Sharded counters, approximate sum</td>
+<td>Redis shards + rollup</td>
+<td>counts may lag</td>
+</tr>
+</tbody>
+</table>
+<p>Interview punch line: "The feed is two indexes over the same posts: reader-keyed for normal authors and author-keyed for celebrities; the read path merges them into one ranked experience."</p>
+<p><strong>What I'd defer.</strong> Stories ephemeral 24-hour delivery, Reels recommendation algorithm, Direct Messages, Shopping product tagging, content moderation pipeline, Explore page personalization.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

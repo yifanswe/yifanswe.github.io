@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Apache Kafka — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Apache Kafka</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Kafka is a distributed log: an append-only, partitioned, replicated stream. The hard part is delivering ordered messages within a partition, surviving broker failures without loss, scaling to millions of writes per second, and supporting consumer groups that share work without duplicating processing.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every produced message that returns success is durably committed across a quorum of replicas, ordered within its partition, readable by any consumer at its assigned offset, and retained for the configured time; consumer groups divide partitions so that each partition is processed by at most one consumer in the group; rebalances are bounded and do not lose progress.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design a partitioned replicated log, explain leader election and ISR (in-sync replicas), reason about producer acks levels, consumer group rebalancing, and exactly-once semantics via transactions or idempotent producers.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Kafka as a cluster of brokers, each owning a subset of topic partitions. Each partition is a replicated append-only log with one leader serving reads and writes; followers replicate. Producers send batches to the partition leader; consumers track per-partition offsets. Consumer groups split partitions for parallelism. The interesting decisions are partition replication, ISR management, producer ack levels, consumer group rebalancing, and exactly-once.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Topics with partitioned, ordered message logs.</li>
+<li>Producers append messages; durable.</li>
+<li>Consumers read from offsets; resumable.</li>
+<li>Consumer groups: members share partitions.</li>
+<li>Retention: by time or size.</li>
+<li>Topic compaction (keep latest per key).</li>
+<li>Transactions across topics for exactly-once.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Millions of writes/sec per cluster.</li>
+<li>Petabytes of storage; weeks of retention.</li>
+<li>High availability: tolerate broker failures.</li>
+<li>Strong ordering per partition.</li>
+<li>Producer durability tunable (acks=0, 1, all).</li>
+<li>Consumer at-least-once or exactly-once.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Connectors and Kafka Connect.</li>
+<li>Streams processing API.</li>
+<li>KSQL.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Brokers</td>
+<td>10s to 1000s per cluster.</td>
+</tr>
+<tr>
+<td>Topics</td>
+<td>Thousands.</td>
+</tr>
+<tr>
+<td>Partitions</td>
+<td>10k-100k per cluster.</td>
+</tr>
+<tr>
+<td>Throughput</td>
+<td>Millions of msg/sec per cluster.</td>
+</tr>
+<tr>
+<td>Retention</td>
+<td>Hours to weeks.</td>
+</tr>
+<tr>
+<td>Replication factor</td>
+<td>3 typical.</td>
+</tr>
+<tr>
+<td>Message size</td>
+<td>1 KB typical; up to 1 MB.</td>
+</tr>
+<tr>
+<td>Consumer groups</td>
+<td>Hundreds to thousands.</td>
+</tr>
+</tbody>
+</table>
+<p>Bottlenecks: per-partition throughput (one leader), disk I/O on brokers, controller workload for metadata changes.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Broker</td>
+<td>Stores partition logs; serves producers and consumers.</td>
+<td>Disk-heavy; high I/O.</td>
+</tr>
+<tr>
+<td>Controller</td>
+<td>Owns cluster metadata; leader elections.</td>
+<td>One controller per cluster; replicated.</td>
+</tr>
+<tr>
+<td>Producer</td>
+<td>Appends messages to partitions.</td>
+<td>Batches; tunable durability.</td>
+</tr>
+<tr>
+<td>Consumer</td>
+<td>Reads messages from assigned partitions; commits offsets.</td>
+<td>At-least-once by default.</td>
+</tr>
+<tr>
+<td>Consumer group</td>
+<td>Membership protocol for partition assignment.</td>
+<td>Rebalances on member change.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Producers --batch--&gt; Broker (partition leader)
+                          |
+                          v
+                 +------------------+
+                 | Append-only Log  |
+                 | per partition    |
+                 +--------+---------+
+                          |
+                replicate to followers
+                          |
+                          v
+                 +------------------+
+                 | Follower brokers |
+                 | mirror log       |
+                 +------------------+
+
+
+Consumers --poll--&gt; Broker (partition leader/follower) -&gt; consume offsets
+
+Controller (metadata, leader election, ISR management)
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Broker</td>
+<td>Stores logs on local disk; handles produce/consume requests.</td>
+<td>Stateless config; data on disk.</td>
+</tr>
+<tr>
+<td>Partition leader</td>
+<td>Owns reads/writes for that partition.</td>
+<td>Replicates to followers.</td>
+</tr>
+<tr>
+<td>Partition follower</td>
+<td>Mirrors leader's log.</td>
+<td>Becomes leader on failure.</td>
+</tr>
+<tr>
+<td>Controller</td>
+<td>Tracks broker liveness; assigns partition leaders; manages metadata.</td>
+<td>Critical; HA.</td>
+</tr>
+<tr>
+<td>ZooKeeper / KRaft</td>
+<td>Stores cluster metadata.</td>
+<td>Replaced by KRaft (Raft) in modern Kafka.</td>
+</tr>
+<tr>
+<td>Log segments</td>
+<td>Files on disk; chunks of the partition log.</td>
+<td>Indexed for fast offset lookup.</td>
+</tr>
+<tr>
+<td>Producer client</td>
+<td>Batches messages; routes by partition key.</td>
+<td>Pluggable partitioners.</td>
+</tr>
+<tr>
+<td>Consumer client</td>
+<td>Polls partitions; manages offsets.</td>
+<td>Heartbeats; rebalance handler.</td>
+</tr>
+<tr>
+<td>Group coordinator</td>
+<td>Per-group broker that manages consumer membership.</td>
+<td>Assigns partitions.</td>
+</tr>
+<tr>
+<td>Compaction</td>
+<td>Per-key latest-value retention.</td>
+<td>Optional per topic.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="partition-log">Partition Log</h4>
+<p>Append-only log of records:</p>
+<pre><code class="language-text">Record(
+  offset,               // monotonic per partition
+  key?,
+  value,
+  headers,
+  timestamp,
+  producer_id?,
+  producer_epoch?,
+  sequence?             // for idempotent producer
+)
+</code></pre>
+<p>Stored in segment files on broker disk; an index maps offset to file position.</p>
+<h4 id="topic-metadata">Topic Metadata</h4>
+<pre><code class="language-text">Topic(
+  topic_name,
+  partition_count,
+  replication_factor,
+  retention_ms,
+  retention_bytes,
+  cleanup_policy,         // delete, compact
+  min_isr,
+  compression
+)
+</code></pre>
+<h4 id="partition-state">Partition State</h4>
+<pre><code class="language-text">Partition(
+  topic_partition,        // topic + partition_id
+  leader_broker,
+  replica_set,            // assigned brokers
+  isr,                    // in-sync replicas
+  leader_epoch,
+  high_water_mark,
+  log_start_offset
+)
+</code></pre>
+<h4 id="consumer-offset">Consumer Offset</h4>
+<pre><code class="language-text">Offset(
+  group_id,
+  topic_partition,
+  committed_offset,
+  metadata,
+  committed_at
+)
+</code></pre>
+<p>Stored in an internal Kafka topic (<code>__consumer_offsets</code>).</p>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">Produce(topic, partition?, key?, value, acks)
+Fetch(topic, partition, offset, max_bytes)
+JoinGroup(group_id, member_id, subscriptions)
+Heartbeat(group_id, member_id, generation)
+CommitOffsets(group_id, offsets)
+</code></pre>
+<h3 id="replication-and-isr">Replication And ISR</h3>
+<p>Each partition has a replication factor (e.g., 3). One replica is the leader; the others are followers.</p>
+<ul>
+<li>Leader receives produce requests; appends to local log.</li>
+<li>Followers fetch from leader and replicate.</li>
+<li>A follower is <strong>in-sync (ISR)</strong> if it's caught up within a threshold.</li>
+<li>The high-water mark (HW) is the highest offset replicated to all ISRs.</li>
+<li>Consumers can only read up to the HW.</li>
+</ul>
+<p>Producer acks levels:</p>
+<ul>
+<li><code>acks=0</code>: producer doesn't wait. Fastest, no durability.</li>
+<li><code>acks=1</code>: leader writes locally; doesn't wait for followers. Risk of loss if leader fails before replication.</li>
+<li><code>acks=all</code>: leader waits for all ISR members. Strongest durability.</li>
+</ul>
+<p>If a follower lags too much, it's removed from ISR; the partition continues with remaining ISR members. If ISR shrinks below <code>min.insync.replicas</code>, the partition refuses writes (with <code>acks=all</code>).</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The ISR is the dynamic set of replicas considered up-to-date. Writes commit when all ISR members ack; consumers see only committed offsets. This gives durability tunable to the cost.</p>
+</blockquote>
+<h3 id="leader-election">Leader Election</h3>
+<p>The controller monitors broker health. On broker failure:</p>
+<ol>
+<li>Controller detects via missed heartbeats.</li>
+<li>For each partition that broker led, controller picks a new leader from the ISR.</li>
+<li>New leader takes over; new leader_epoch issued.</li>
+<li>Producers retry against the new leader.</li>
+</ol>
+<p>If no ISR member is available, behavior depends on <code>unclean.leader.election.enable</code>:</p>
+<ul>
+<li>Default false: partition is unavailable until an ISR member returns.</li>
+<li>True: an out-of-sync replica may be elected (allows availability but risks data loss).</li>
+</ul>
+<p>Modern Kafka uses <strong>KRaft</strong> (Raft-based controller) instead of ZooKeeper, simplifying deployment.</p>
+<h3 id="producer-path">Producer Path</h3>
+<ol>
+<li>Producer creates record with optional key.</li>
+<li>Partitioner picks partition: hash(key) % num_partitions, or round-robin if no key.</li>
+<li>Producer batches records by partition.</li>
+<li>Sends batch to partition leader.</li>
+<li>Leader appends to local log, replicates.</li>
+<li>Once acks level satisfied, leader returns success.</li>
+</ol>
+<p>Idempotent producer:</p>
+<ul>
+<li>Each producer has a producer_id and per-partition sequence number.</li>
+<li>Broker dedupes by <code>(producer_id, sequence_number)</code>.</li>
+<li>Eliminates duplicates from retries.</li>
+</ul>
+<p>Transactional producer:</p>
+<ul>
+<li>Producer begins a transaction.</li>
+<li>Writes to multiple partitions / topics.</li>
+<li>Commits or aborts atomically.</li>
+<li>Consumers configured <code>read_committed</code> see only committed messages.</li>
+<li>Used to implement exactly-once semantics for read-process-write pipelines.</li>
+</ul>
+<h3 id="consumer-path">Consumer Path</h3>
+<ol>
+<li>Consumer polls broker for messages from assigned partitions.</li>
+<li>Broker returns batches up to high-water mark.</li>
+<li>Consumer processes messages.</li>
+<li>Consumer commits offset (synchronously or async).</li>
+<li>On restart or rebalance, consumer resumes from last committed offset.</li>
+</ol>
+<p>Default delivery: <strong>at-least-once</strong>. If consumer crashes after processing but before committing, it reprocesses on restart.</p>
+<p>For exactly-once: use transactional producer to commit offsets atomically with output writes.</p>
+<h3 id="consumer-group-rebalancing">Consumer Group Rebalancing</h3>
+<p>Members of a group share partitions: each partition assigned to one member.</p>
+<p>Membership protocol:</p>
+<ol>
+<li>New member joins; sends <code>JoinGroup</code> to group coordinator broker.</li>
+<li>Coordinator collects all members; selects a leader (one of the members).</li>
+<li>Leader computes assignment (e.g., range or round-robin).</li>
+<li>Coordinator broadcasts assignment to all members.</li>
+<li>Members start consuming their partitions.</li>
+</ol>
+<p>On member leave or crash, rebalance triggers. During rebalance:</p>
+<ul>
+<li>All members pause.</li>
+<li>New assignment computed.</li>
+<li>Members resume.</li>
+</ul>
+<p>Modern Kafka has <strong>incremental cooperative rebalancing</strong> to reduce stop-the-world impact: only affected partitions move; others continue.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Consumer group rebalancing is the most operationally tricky part. Members pause during rebalance; long rebalances stall processing. Cooperative rebalancing reduces the disruption.</p>
+</blockquote>
+<h3 id="storage-and-retention">Storage And Retention</h3>
+<p>Each partition is a sequence of log segments on disk.</p>
+<ul>
+<li>New writes append to the active segment.</li>
+<li>When segment reaches size limit, it's rolled; a new active segment starts.</li>
+<li>Old segments are retained per topic config (time or size).</li>
+<li>Cleanup deletes expired segments.</li>
+</ul>
+<p>Compaction (per-key retention):</p>
+<ul>
+<li>For a topic configured with <code>cleanup.policy=compact</code>.</li>
+<li>Older records with the same key as a newer record are eligible for deletion.</li>
+<li>Useful for changelog topics where only latest value matters.</li>
+</ul>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Aspect</th>
+<th>Guarantee</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Per-partition order</td>
+<td>Strong.</td>
+</tr>
+<tr>
+<td>Cross-partition order</td>
+<td>None.</td>
+</tr>
+<tr>
+<td>Producer ack</td>
+<td>Tunable (0, 1, all).</td>
+</tr>
+<tr>
+<td>Consumer read</td>
+<td>Up to high-water mark (committed).</td>
+</tr>
+<tr>
+<td>Idempotent producer</td>
+<td>Per-partition exactly-once.</td>
+</tr>
+<tr>
+<td>Transactional producer</td>
+<td>Atomic across partitions/topics.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Strategy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Throughput per topic</td>
+<td>Increase partition count.</td>
+</tr>
+<tr>
+<td>Throughput per partition</td>
+<td>Single-leader bottleneck; tune batch sizes.</td>
+</tr>
+<tr>
+<td>Broker disk</td>
+<td>Distribute partitions across brokers.</td>
+</tr>
+<tr>
+<td>Hot key</td>
+<td>Sub-partition by adding random suffix; consumers re-aggregate.</td>
+</tr>
+<tr>
+<td>Consumer scale</td>
+<td>Add members up to partition count; one partition per member max.</td>
+</tr>
+</tbody>
+</table>
+<p>Partition count is a key decision:</p>
+<ul>
+<li>More partitions = more parallelism, but more controller load and longer rebalance.</li>
+<li>Fewer partitions = less overhead, but consumer scale is capped.</li>
+</ul>
+<h3 id="multi-region-mirrormaker-cluster-linking">Multi-Region (MirrorMaker / Cluster Linking)</h3>
+<ul>
+<li>Primary cluster in one region.</li>
+<li>MirrorMaker replicates topics to a secondary cluster for DR or geo-locality.</li>
+<li>Cluster linking (Confluent): native cross-cluster replication preserving offsets.</li>
+<li>Bidirectional active-active is possible but requires careful conflict handling for the same topic.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Broker fails.</td>
+<td>Controller picks new leaders from ISR.</td>
+<td>Broker count; under-replicated partitions.</td>
+</tr>
+<tr>
+<td>All ISR members fail.</td>
+<td>Partition unavailable; alert.</td>
+<td>ISR size.</td>
+</tr>
+<tr>
+<td>Slow follower.</td>
+<td>Removed from ISR; rejoin on catch-up.</td>
+<td>ISR shrink frequency.</td>
+</tr>
+<tr>
+<td>Producer retries duplicate.</td>
+<td>Idempotent producer dedupes.</td>
+<td>Producer retry rate.</td>
+</tr>
+<tr>
+<td>Consumer lag growing.</td>
+<td>Add consumers; alert on lag.</td>
+<td>Consumer lag per partition.</td>
+</tr>
+<tr>
+<td>Long rebalance stalls work.</td>
+<td>Cooperative rebalancing; static membership.</td>
+<td>Rebalance frequency and duration.</td>
+</tr>
+<tr>
+<td>Disk full.</td>
+<td>Retention enforcement; alert on usage.</td>
+<td>Per-broker disk %.</td>
+</tr>
+<tr>
+<td>Hot partition (one producer key).</td>
+<td>Sub-partition; spread by adding random suffix.</td>
+<td>Per-partition write rate.</td>
+</tr>
+<tr>
+<td>Controller failure.</td>
+<td>KRaft consensus failover.</td>
+<td>Controller health.</td>
+</tr>
+<tr>
+<td>Cross-region replication lag.</td>
+<td>Monitor; backpressure source.</td>
+<td>Mirror lag.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Under-replicated partitions (must be near zero).</li>
+<li>Failed ISR shrinks.</li>
+<li>Producer errors per topic.</li>
+<li>Consumer commit failures.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Per-partition throughput.</li>
+<li>Per-broker disk I/O.</li>
+<li>Consumer lag.</li>
+<li>Rebalance duration.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Topic throughput by team.</li>
+<li>Retention compliance.</li>
+<li>End-to-end latency.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>More partitions = more parallelism but more metadata overhead.</li>
+<li><code>acks=all</code> is safest but slowest.</li>
+<li>Unclean leader election trades availability for potential data loss.</li>
+<li>Idempotent + transactional producer adds latency but gives exactly-once.</li>
+<li>Compaction saves space for keyed topics but adds complexity.</li>
+<li>ISR shrink risk vs requiring high <code>min.insync.replicas</code>.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Treat partitions as ordering across topic.</td>
+<td>Order is per partition; cross-partition is independent.</td>
+</tr>
+<tr>
+<td>Single partition for total order.</td>
+<td>Sacrifices parallelism; use per-key ordering instead.</td>
+</tr>
+<tr>
+<td><code>acks=1</code> everywhere.</td>
+<td><code>acks=all</code> for correctness-critical topics.</td>
+</tr>
+<tr>
+<td>Ignoring consumer lag.</td>
+<td>Alert on lag; auto-scale consumers.</td>
+</tr>
+<tr>
+<td>No idempotency.</td>
+<td>Enable idempotent producer for safe retries.</td>
+</tr>
+<tr>
+<td>Stop-the-world rebalances.</td>
+<td>Cooperative rebalancing; static membership.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ISR and replication</td>
+<td>Leader, follower, in-sync set, HW, acks.</td>
+</tr>
+<tr>
+<td>Leader election</td>
+<td>Controller; ISR; KRaft; unclean.</td>
+</tr>
+<tr>
+<td>Exactly-once</td>
+<td>Idempotent producer + transactions; consumer read_committed.</td>
+</tr>
+<tr>
+<td>Consumer groups</td>
+<td>Membership protocol; rebalance; cooperative.</td>
+</tr>
+<tr>
+<td>Compaction</td>
+<td>Log compaction; tombstones; key-based retention.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>MirrorMaker; cluster linking; active-active risk.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Partitioned replicated log model.</li>
+<li>Leader-follower per partition; ISR.</li>
+<li>Producer ack levels tunable for durability.</li>
+<li>Consumer offsets per partition per group.</li>
+<li>Group rebalance protocol.</li>
+<li>Idempotent and transactional producers.</li>
+<li>KRaft / ZooKeeper for metadata.</li>
+<li>Multi-region via MirrorMaker.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Kafka is a partitioned replicated append-only log. Per-partition strong ordering, leader-follower replication, and tunable durability via producer acks make it the workhorse of streaming. The hardest correctness problems are exactly-once (solved with transactions) and consumer group rebalances (mitigated with cooperative rebalancing).</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Kafka.</p>
+<p><strong>Candidate:</strong> Cluster of brokers; each topic partitioned across brokers; each partition replicated 3x typically with one leader and followers. Producers append; consumers poll from offsets. Consumer groups split partitions. Controller (KRaft these days) manages metadata. The invariant is per-partition strong ordering, durable to the configured ack level, with consumer groups dividing partitions for parallel processing.</p>
+<p><strong>Interviewer:</strong> Walk me through a produce.</p>
+<p><strong>Candidate:</strong> Producer batches records by partition. Picks partition via hash(key) % num_partitions if key set, else round-robin. Sends batch to partition leader. Leader appends to local log, replicates to followers. With <code>acks=all</code>, leader waits for all ISR members to ack, then returns success to producer. With <code>acks=1</code>, leader returns after local write. With <code>acks=0</code>, fire-and-forget.</p>
+<p><strong>Interviewer:</strong> A broker dies. What happens?</p>
+<p><strong>Candidate:</strong> Controller detects via missed heartbeats. For each partition that broker led, controller picks a new leader from the ISR — the in-sync replicas. New leader_epoch is issued; producers retry against the new leader. Followers continue replicating from the new leader. If the failed broker was also in followers of partitions led elsewhere, those partitions' ISRs shrink; if min.insync.replicas drops, those partitions refuse writes.</p>
+<p><strong>Interviewer:</strong> What's the ISR?</p>
+<p><strong>Candidate:</strong> In-Sync Replicas — the set of replicas considered up-to-date with the leader within a configured lag threshold. ISR is dynamic: slow followers are removed; recovering ones rejoin. The high-water mark is the highest offset replicated to all ISR members; consumers see only up to HW. <code>acks=all</code> waits for ISR ack, which gives strongest durability.</p>
+<p><strong>Interviewer:</strong> How does the consumer group know which partition to read?</p>
+<p><strong>Candidate:</strong> Membership protocol. Each consumer joins the group via JoinGroup to the group coordinator broker. Coordinator collects all members, picks one as leader, asks it for an assignment plan (range, round-robin, or sticky). Coordinator broadcasts the assignment. Each consumer starts reading its assigned partitions. On member change, rebalance triggers and a new assignment is computed.</p>
+<p><strong>Interviewer:</strong> Rebalances pause work?</p>
+<p><strong>Candidate:</strong> Traditionally yes — stop-the-world. All members pause, new assignment computed, members resume. For high-throughput consumers, this is painful. Modern Kafka has cooperative rebalancing: only partitions that move are paused; others keep flowing. Static membership lets a consumer rejoin without triggering rebalance if it crashes briefly.</p>
+<p><strong>Interviewer:</strong> Exactly-once?</p>
+<p><strong>Candidate:</strong> Two parts. First, idempotent producer: each producer has a producer_id; per-partition sequence numbers let the broker dedupe retries. Eliminates duplicates from a single producer's retries. Second, transactional producer: producer begins a transaction, writes to multiple partitions/topics, commits atomically. Consumers configured <code>read_committed</code> only see committed records. Combined with committing consumer offsets in the same transaction, you get exactly-once for read-process-write pipelines.</p>
+<p><strong>Interviewer:</strong> Compaction?</p>
+<p><strong>Candidate:</strong> Per-topic policy. For <code>cleanup.policy=compact</code>, the broker periodically rewrites segments to keep only the latest record per key. Older records with the same key are dropped. Useful for changelog topics where you only care about the current state. Tombstones (null values) signal deletion. Compaction runs in background; doesn't block writes.</p>
+<p><strong>Interviewer:</strong> A producer key generates 100,000 msg/sec, far more than one partition can handle.</p>
+<p><strong>Candidate:</strong> Single partition is the throughput ceiling for that key. Mitigation: add a sub-partition by appending a random suffix to the key, so the same logical key spreads across multiple partitions. Consumers must re-aggregate if they need per-key processing. The tradeoff: lose strict per-key ordering for higher throughput.</p>
+<p><strong>Interviewer:</strong> Storage?</p>
+<p><strong>Candidate:</strong> Each partition is a sequence of log segments on disk. The active segment receives writes; when it reaches size or time limit, it's rolled. Old segments are retained per retention policy (time or bytes). Cleanup deletes expired segments. Compaction (if enabled) keeps the latest per key. Brokers use page cache aggressively; sequential disk writes are very fast.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> MirrorMaker (or cluster linking) replicates topics to a secondary cluster. Primary in one region, secondary in another for DR or read locality. Bidirectional active-active is possible but each side writes to its own topics; cross-region writes to the same topic require careful conflict handling. Most setups are active-passive with failover.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Kafka is a partitioned replicated append-only log. Brokers store partitions on disk; leader-follower per partition with ISR. Producers tune durability via acks; idempotent producer dedupes retries. Consumers track per-partition offsets; consumer groups split partitions for parallelism. Controller (KRaft) manages metadata and leader elections. Compaction supports keyed-state topics. Multi-region via MirrorMaker. The hardest correctness problem is exactly-once; the hardest operational problem is rebalance impact.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: partitioned log, replicated, consumer groups, retention.</li>
+<li>Invariant: per-partition order; durable to ack level.</li>
+<li>Topic + partitions; each partition leader-follower replicated.</li>
+<li>ISR + acks levels for durability tuning.</li>
+<li>Consumer group rebalances assign partitions.</li>
+<li>Idempotent + transactional producers for exactly-once.</li>
+<li>Compaction for keyed-state topics.</li>
+<li>KRaft for metadata; MirrorMaker for multi-region.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Kafka is a partitioned replicated append-only log. Per-partition strong ordering; leader-follower per partition; tunable durability via producer acks. Consumer groups split partitions for parallel processing. Idempotent and transactional producers enable exactly-once. Compaction supports key-based retention. Controller (KRaft) manages metadata. MirrorMaker handles multi-region. The hardest correctness problem is exactly-once; the hardest operational problem is rebalances.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Per-partition strong ordering; cross-partition is independent."</li>
+<li>"ISR is the dynamic set of in-sync replicas; HW is the committed offset."</li>
+<li>"<code>acks=all</code> waits for ISR; tunable durability per topic."</li>
+<li>"Idempotent + transactional producers give exactly-once for read-process-write."</li>
+<li>"Cooperative rebalancing reduces stop-the-world impact."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

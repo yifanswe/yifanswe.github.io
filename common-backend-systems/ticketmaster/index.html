@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ticketmaster — Concert Ticket Sales (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Ticketmaster — Concert Ticket Sales (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Medium · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build Ticketmaster. An event goes on sale at 10 AM, 100k people hit the queue, and there are 20k seats. Each seat is unique — once sold, it's gone. We need fair queueing, no double-sells, and a snappy seat-picker UI. Steady-state load is small; flash-sale spikes are the whole interview.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Browse events and pick a seat from a visual map.
+- Hold a selected seat for ~10 minutes while the user enters payment.
+- Complete purchase; seat becomes permanently sold.</p>
+<p>I'd defer reselling, subscriptions, and venue-side admin.</p>
+<p><strong>Non-functional</strong>
+- <strong>No double-sells, ever.</strong> Stronger than "five nines" — it's a correctness contract.
+- Fairness during flash sales — first-in-queue, first-served.
+- Seat-map page p99 &lt; 500 ms even during a 100k-user surge.
+- Read-after-write on hold/purchase: the user must see their own hold immediately.
+- Eventual consistency is fine on availability counts shown to other users (slightly stale is OK; oversold is not).</p>
+<p><strong>Capacity</strong>
+- Baseline: 10k events live, 100 reads/sec average.
+- Flash sale: 100k concurrent users → 100k queue entries, seat-map polled or pushed at ~1Hz → 100k QPS spikes lasting minutes.
+- Storage is small compared with burst coordination: 10k events × 20k seats/event × ~200 B/seat row ≈ 40 GB primary seat data, ~120 GB with 3 replicas. A single 100k-person queue at ~80 B/member is only ~8 MB; the hard part is fairness and hot-event fan-out, not bytes.
+- The dominant live cost is the seat-map overlay channel: if 100k clients get a 2 KB diff every 2s, that is ~100 MB/s for one hot sale before CDN/edge fan-out.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Event</strong> — <code>event_id</code>, venue, start, sale_window.</li>
+<li><strong>Seat</strong> — <code>seat_id</code>, event_id, section/row/num, status (available/held/sold), price.</li>
+<li><strong>Hold</strong> — <code>seat_id</code>, user_id, expires_at. TTL-based.</li>
+<li><strong>Order</strong> — <code>order_id</code>, user_id, event_id, seat_ids[], payment_id.</li>
+<li><strong>QueueTicket</strong> — <code>event_id</code>, user_id, position.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>GET   /v1/events/{id}/map           → SeatMap (compressed)
+POST  /v1/events/{id}/queue         → { ticket_id, position }
+GET   /v1/queue/{ticket_id}         → { position, ready, allowed_until }
+POST  /v1/events/{id}/seats/{seat_id}/hold     (idempotency-key required) → { hold_id, expires_at }
+POST  /v1/orders                     { holds[], payment } → { order_id, status }
+DELETE /v1/holds/{hold_id}
+</code></pre>
+<p>Idempotency keys are mandatory on <code>hold</code> and <code>orders</code> — flaky networks during a sale will retry.</p>
+<p>The queue ticket is opaque and signed; it encodes <code>event_id</code>, <code>user_id</code>, <code>queue_epoch</code>, and <code>allowed_until</code>, so the seat service can reject users who skip the waiting room without a synchronous queue lookup on every click.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Static event catalog.</strong> Cached at the edge. Browsing events doesn't touch primary stores.</li>
+<li><strong>Seat map service.</strong> Renders the venue map. The map is mostly static; only the per-seat status overlay is dynamic. I'd serve the static skeleton from CDN and only fetch a compact <code>{seat_id: status}</code> diff from the API.</li>
+<li><strong>Queue service.</strong> When an event goes on sale, every arriving user gets a ticket and a position. Implemented as a Redis sorted set keyed by <code>event_id</code>, score = arrival timestamp. The service drips users into "allowed to purchase" state at a rate the seat service can handle (e.g., 1000/sec). Users hold a SSE/WS connection that pushes their position.</li>
+<li><strong>Seat inventory service.</strong> Owns seat status. Holds are TTL-keyed in Redis (<code>seat:{event}:{seat}</code> value = user_id, TTL 600s). Purchase converts the Redis hold + writes a permanent row in MySQL (sharded by event_id).</li>
+<li><strong>Order service.</strong> Coordinates payment + finalizes the seat status. Two-phase: reserve payment authorization → finalize seat row → capture payment. On payment failure, rollback the Redis hold.</li>
+<li><strong>Notification service.</strong> Hold-expiring soon, queue-ready, payment-confirmed.</li>
+</ol>
+<p>End-to-end narration: Alice opens the app at 9:59 AM. At 10:00 she taps "Buy tickets" → queue service issues ticket #4520 of 100k → SSE pushes her position every second. At ~10:03 she's allowed in → seat map renders → she picks seat A14 → <code>POST /hold</code> with idempotency key → Redis SETNX with TTL 600 succeeds → she enters payment → <code>POST /orders</code> → payment captured, MySQL row <code>seat A14 sold to Alice</code> committed, Redis key updated to terminal state. If she'd timed out, the Redis TTL would auto-release and the seat returns to available pool, broadcast via the seat-map push channel.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">+-------------------------------+
+| Browser / App Client          |
++------+----------+------+
+    |          |      |
+POST /v1/events/{id}/queue
+GET /v1/events/{id}/map
+POST /v1/events/{id}/seats/{seat_id}/hold
+POST /v1/orders
+    v          v      v
++--------------------------------------------------------------+
+| API Gateway / Auth + signed queue ticket validation          |
++-----------+---------------+------------------+---------------+
+         |               |                  |
+         v               v                  v
++----------------+  +----------------+  +----------------------+
+| Queue Service  |  | Seat Map Svc   |  | Seat Inventory Svc   |
+| drip allowed   |  | static+overlay |  | hold/unhold API      |
++-------+--------+  +-------+--------+  +----------+-----------+
+     |                   |                      |
+     | SSE position      | overlay diff         | hold_id
+     v                   v                      v
++----------------+  +----------------+      +------------------+
+| Queue WS/SSE   |  | CDN Static Map |      | Order Service    |
+| Gateway        |  | + SSE Fanout   |      | Payment auth/cap |
++----------------+  +-------+--------+      +--------+---------+
+                  ^                        |
+                  | seat updates           | finalize sold seat
++---------------------------------------------------v-----------+
+| Async / Event Row                                             |
+| hold expiry timer -&gt; release diff -&gt; event:{id}:seat_updates  |
+| payment result -&gt; seat update fanout/SSE                      |
++--------------------------+------------------------------------+
+                  |
+                  v
++----------------------------------------------------------------+
+| Stores / Caches                                                |
+| queue:{event_id} Redis ZSET score=arrival_ts                   |
+| allowed:{event_id} Redis SET TTL 15m                           |
+| hold:{event_id}:{seat_id} Redis SET NX EX 600                  |
+| seat_status:{event_id} Redis bitmap/hash + version             |
+| seats(event_id,seat_id,status,version) MySQL truth             |
+| order_seats(event_id,seat_id,order_id) unique ownership row    |
+| idem:{user_id}:{key} cached response TTL 24h                   |
++----------------------------+-----------------------------------+
+                 |
+                 | overlay miss / stale version
+                 v
+              +-------------------------+
+              | MySQL seat snapshot     |
+              | rebuild seat_status:*   |
+              +-------------------------+
+
+Primary write: queue -&gt; hold SET NX -&gt; payment auth -&gt; MySQL unique sold row.
+Primary read: CDN map skeleton -&gt; seat_status:{event_id} diff -&gt; SSE updates.
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete store contracts.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / data structure</th>
+<th style="text-align: right;">Entry size + TTL</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Queue</td>
+<td><code>queue:{event_id}</code> Redis sorted set, member=<code>ticket_id</code>, score=<code>arrival_ts</code></td>
+<td style="text-align: right;">~80 B/member, TTL sale + 24h</td>
+<td><code>event_id</code></td>
+</tr>
+<tr>
+<td>Allowed window</td>
+<td><code>allowed:{event_id}</code> Redis set of ticket_ids</td>
+<td style="text-align: right;">~32 B/member, TTL 15 min</td>
+<td><code>event_id</code></td>
+</tr>
+<tr>
+<td>Hold</td>
+<td><code>hold:{event_id}:{seat_id}</code> Redis string/json <code>{user_id, hold_id}</code> via <code>SET NX EX 600</code></td>
+<td style="text-align: right;">~120 B, TTL 10 min</td>
+<td><code>event_id</code></td>
+</tr>
+<tr>
+<td>Seat truth</td>
+<td>MySQL <code>seats(event_id, seat_id, status, version)</code></td>
+<td style="text-align: right;">~200 B, retained forever</td>
+<td><code>event_id</code>, optionally <code>section_id</code> for huge venues</td>
+</tr>
+<tr>
+<td>Sold uniqueness</td>
+<td>MySQL <code>order_seats(event_id, seat_id, order_id)</code> unique <code>(event_id, seat_id)</code></td>
+<td style="text-align: right;">~80 B, retained forever</td>
+<td><code>event_id</code></td>
+</tr>
+<tr>
+<td>Idempotency</td>
+<td><code>idem:{user_id}:{key}</code> → prior response</td>
+<td style="text-align: right;">~1 KB, TTL 24h</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Seat overlay</td>
+<td><code>seat_status:{event_id}</code> Redis bitmap/hash + version</td>
+<td style="text-align: right;">1–4 B/seat, TTL active sale + 1h</td>
+<td><code>event_id</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Capacity by store.</strong> The durable inventory is small: <code>10k events × 20k seats × 200 B × 3</code> is ~120 GB. A hot event queue is also small: <code>100k members × 80 B × 3</code> is ~24 MB. Holds for a sold-out 20k-seat event are ~2.4 MB primary. The live pressure is network and coordination: a <code>2 KB</code> seat diff every 2 seconds to 100k clients is ~100 MB/s before edge fan-out, so batching and per-event channels matter more than database bytes. Idempotency is bounded by sale traffic: <code>100k attempts × 1 KB</code> is ~100 MB for 24 hours on one hot event.</p>
+<p><strong>Hold and purchase path trace.</strong> Hold path: client → queue entitlement check using signed ticket → idempotency lookup → Redis <code>SET hold:{event}:{seat} NX EX 600</code> → update seat overlay version → publish batched diff on <code>event:{id}:seat_updates</code>. Purchase path: client → order service checks idempotency → payment authorization → MySQL transaction inserts <code>order_seats(event_id, seat_id)</code> with a unique key → updates <code>seats.status='sold'</code> → captures payment → deletes/marks Redis hold terminal. The Redis hold makes the UI fair; the MySQL unique insert is the correctness line.</p>
+<p><strong>Hot and cold API paths.</strong></p>
+<table>
+<thead>
+<tr>
+<th>API path</th>
+<th>Hot sale path</th>
+<th>Cold/fallback path</th>
+<th>Cursor/session state</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /queue</code></td>
+<td>Add signed ticket to <code>queue:{event_id}</code> sorted set; SSE streams position</td>
+<td>If SSE drops, client polls <code>GET /queue/{ticket_id}</code> with jitter</td>
+<td>ticket encodes <code>event_id,user_id,queue_epoch,allowed_until</code></td>
+</tr>
+<tr>
+<td><code>GET /map</code></td>
+<td>CDN static venue map + Redis overlay diff by version</td>
+<td>Dormant event lazily builds overlay from MySQL seat rows</td>
+<td><code>since_version</code> for overlay diffs</td>
+</tr>
+<tr>
+<td><code>POST /hold</code></td>
+<td>Signed entitlement → idempotency → Redis <code>SET NX EX</code> → overlay diff</td>
+<td>If overlay is stale, Redis/MySQL truth rejects unavailable seat; user picks again</td>
+<td>hold_id, 10-min TTL, idempotency key</td>
+</tr>
+<tr>
+<td><code>POST /orders</code></td>
+<td>Payment auth → MySQL unique insert/update → payment capture</td>
+<td>Payment slow extends hold once; DB conflict releases auth and returns sold-out seat</td>
+<td>order idempotency, payment auth id, seat version</td>
+</tr>
+</tbody>
+</table>
+<p>If clients paginate or zoom the seat map past the cached section overlay, they fetch a section-scoped snapshot from MySQL and resume diffs with the returned <code>overlay_version</code>.</p>
+<p><strong>Why Redis + MySQL, not only one store.</strong> Redis is the right fit for queue positions, expiring holds, and high-frequency overlay diffs because the data is short-lived and latency-sensitive. MySQL is the right fit for sold seats because we need durable transactions, row locks, and unique constraints. A pure Redis design is fast but scary for money; a pure MySQL design is correct but would melt under 100k users polling seat state. Be ready for: "Redis coordinates the sale; MySQL decides ownership."</p>
+<p>Compared with Spanner-only, Redis + MySQL keeps the hot, expiring interaction state cheap and close to users while leaving final ownership in a transactional store. Compared with ZooKeeper/etcd locks, Redis holds are simpler at sale scale because the lease is user-facing inventory state, not just a coordination primitive.</p>
+<p><strong>Preventing double-sell.</strong> The single source of truth is MySQL with a unique constraint on <code>(seat_id, sold=true)</code>. Holds are best-effort coordination in Redis to keep users from grabbing the same seat — they're an optimization, not the safety net. A correctly-implemented <code>INSERT ... ON DUPLICATE KEY</code> (or <code>SELECT ... FOR UPDATE</code>) at finalization is the actual guarantee.</p>
+<p>Interview punch line: "I don't trust a cache to sell a seat; Redis improves the buying experience, but the database constraint is what prevents the lawsuit."</p>
+<p><strong>Queueing at scale.</strong> A Redis sorted set per event is the simplest. For very large events, shard the queue into N sub-queues by hash(user_id); each sub-queue drips at rate/N. The seat service rate-limit is the actual bottleneck — the queue is the polite waiting room.</p>
+<p><strong>Hot rows in MySQL.</strong> Front-row seats are everyone's first click. Shard by event_id so all seats for one event land on the same shard; within the shard, the row-level lock per seat is brief (sub-ms). For the largest events, sharding further within an event by section is reasonable.</p>
+<p><strong>Hold expiration.</strong> Don't rely on a sweeper to clean up holds. Redis TTL handles it. The seat-map push channel publishes "seat A14 released" when the TTL expires (Redis keyspace notifications or an explicit unhold call from a timer service).</p>
+<p><strong>Seat-map updates without melting the network.</strong> Don't broadcast every status change to every user. Each open seat-map subscribes to a per-event channel that batches updates every 1–2s. Send compact diffs (only changed seats) not full maps.</p>
+<p><strong>Two-view framing.</strong> The venue map is static content plus a dynamic availability overlay. The same seat also has two state views: Redis hold state for temporary UX coordination and MySQL sold state for permanent ownership. The overlay is derived from those states; if it is wrong, the hold/purchase APIs still enforce truth.</p>
+<p><strong>Bot prevention.</strong> Captcha at queue entry; rate-limit by IP + device fingerprint; queue position is signed (HMAC) so it can't be forged; flag accounts that consistently hit the API faster than humans.</p>
+<p><strong>Idempotency.</strong> Idempotency keys on hold and order survive client retries during flaky cell connections. Server stores <code>(idempotency_key, response)</code> for 24h and returns the cached response on dupes.</p>
+<p><strong>Graceful degradation state machine.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source of truth</th>
+<th style="text-align: right;">Latency budget</th>
+<th>Fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot event</td>
+<td>Queue drip + batched overlays</td>
+<td>Redis queue + MySQL seat rows</td>
+<td style="text-align: right;">Queue updates 1s, seat holds &lt;100 ms</td>
+<td>Slow drip rate; show stale availability counts but reject invalid holds</td>
+</tr>
+<tr>
+<td>Cold/dormant event</td>
+<td>Direct seat map load</td>
+<td>MySQL snapshot + Redis overlay lazily populated</td>
+<td style="text-align: right;">&lt;500 ms</td>
+<td>Build overlay on first request and cache for sale window</td>
+</tr>
+<tr>
+<td>Seat-map channel exhausted</td>
+<td>Pull instead of push</td>
+<td><code>seat_status:{event_id}</code> versioned diff</td>
+<td style="text-align: right;">1–2s</td>
+<td>Clients poll <code>?since_version=</code> with jitter</td>
+</tr>
+<tr>
+<td>Payment provider slow</td>
+<td>Hold extension once</td>
+<td>Redis hold + payment auth state</td>
+<td style="text-align: right;">+2 min max</td>
+<td>Extend hold once, then release to avoid inventory hoarding</td>
+</tr>
+<tr>
+<td>Redis failure</td>
+<td>Stop new holds for affected event</td>
+<td>MySQL sold rows</td>
+<td style="text-align: right;">Fail closed</td>
+<td>Keep purchases for already-authorized holds; do not accept blind holds</td>
+</tr>
+<tr>
+<td>MySQL shard unavailable</td>
+<td>Queue pauses</td>
+<td>Durable seat truth unavailable</td>
+<td style="text-align: right;">N/A</td>
+<td>Keep users in queue; no final sales until shard recovers</td>
+</tr>
+</tbody>
+</table>
+<p><strong>What I'd defer.</strong> Resale market, dynamic pricing, season-ticket bundles, partial refunds, fan-club presales.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

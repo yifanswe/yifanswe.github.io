@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GitHub Actions — CI Runner Platform (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">GitHub Actions — CI Runner Platform (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Hard · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build GitHub Actions. Developers commit code; a workflow YAML defines jobs that run on ephemeral VMs/containers; results report back. 100M repos, ~10M jobs/day, peak ~100k jobs/min, jobs vary from 30 s to 6 hours, on hosted Linux/macOS/Windows VMs.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Developer pushes commit → matching workflows trigger jobs.
+- Each job runs in an isolated, ephemeral environment.
+- Stream logs in near-real-time; final status reported back to GitHub UI / API.
+- Support matrix jobs (multiple OS + version combos).</p>
+<p>I'd defer self-hosted runners, complex artifact storage, and advanced dependency caching beyond mentioning.</p>
+<p><strong>Non-functional</strong>
+- <strong>Isolation</strong> — running arbitrary user code; must not leak across jobs or to our infra.
+- Job start latency p95 &lt; 30 s (queue + provision).
+- Sustain 100k jobs/min peak, ~1500 concurrent VMs starting.
+- Durable logs and status; never lose a build result.
+- Multi-OS support.</p>
+<p><strong>Capacity</strong>
+- 10M jobs/day × avg 15 min = ~150M VM-minutes/day. With 24×60 = 1440 min/day, that's ~100k concurrent VMs at any time.
+- Logs: 10M jobs × ~5 MB ≈ 50 TB/day.
+- Metadata is small compared with logs: run/job rows at ~2 KB/job × 10M/day × RF=3 are ~60 GB/day, while compressed logs at 5 TB/day with 90-day retention are ~450 TB. Artifacts can dwarf both, so enforce TTL and quota early.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Workflow</strong> — YAML file in the repo.</li>
+<li><strong>WorkflowRun</strong> — <code>run_id, repo, commit, status, triggered_by</code>.</li>
+<li><strong>Job</strong> — <code>job_id, run_id, name, runs_on, status, started_at, ended_at</code>.</li>
+<li><strong>Step</strong> — sub-units within a job, log lines streamed.</li>
+<li><strong>Runner</strong> — VM/container available to execute a job.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>// Internal triggers:
+POST  /v1/runs                       { repo, commit, workflow }  → { run_id }
+
+// Runner protocol (long-poll / WS):
+GET   /v1/runner/jobs                 → { job_id, image, steps[] }  // pulls a job
+POST  /v1/runner/jobs/{id}/logs       (streaming)
+POST  /v1/runner/jobs/{id}/status     { state, exit_code }
+
+// User-facing:
+GET   /v1/runs/{id}                   → run + jobs + statuses
+WS    /v1/jobs/{id}/logs              → stream logs to UI
+</code></pre>
+<p>Runner status updates are idempotent on <code>{job_id, attempt, state_seq}</code>. Log upload chunks carry <code>{job_id, attempt, offset}</code> so retries do not duplicate log bytes.</p>
+<hr />
+<h2 id="4-data-flow-5-min">4. Data Flow (~5 min)</h2>
+<p>Commit event → workflow trigger → parse YAML → enqueue jobs → runner picks up → provision VM → execute steps → stream logs → write status → mark complete → emit checks back to GitHub.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Webhook ingestion.</strong> GitHub events (push, PR) arrive at our service. Parse the affected workflow YAML for the repo. Materialize one <code>WorkflowRun</code> and N <code>Job</code>s.</li>
+<li><strong>Job queue.</strong> Per-runner-class queues: <code>linux-ubuntu</code>, <code>linux-self-hosted</code>, <code>macos</code>, <code>windows</code>. Priority based on plan tier (paid &gt; free). Implemented as Kafka topics with shard keys per OS.</li>
+<li><strong>Runner provisioner.</strong> Manages a pool of ephemeral runners. For Linux: Firecracker/Kata microVMs spun from a pre-baked image. For macOS: dedicated Mac hardware (real machines), pooled. For Windows: pre-warmed VMs. Pre-warm to absorb start-time latency.</li>
+<li><strong>Runner agent.</strong> Inside each runner, a small agent polls the job queue, downloads job spec, executes steps, streams logs.</li>
+<li><strong>Log streaming.</strong> Agent batches log lines (~1 s windows), POSTs to log service. Log service writes to a streaming log store (object storage with append-style writes; or a logs cluster like ClickHouse).</li>
+<li><strong>Status service.</strong> Owns job state machine: <code>queued → in_progress → success | failure | canceled</code>. Emits events on transition (used by UI and back to GitHub Checks API).</li>
+<li><strong>Artifact storage.</strong> Optional artifacts produced by jobs uploaded to object storage with TTL.</li>
+<li><strong>Secrets injection.</strong> Per-repo encrypted secrets stored in a KMS-backed vault. Runner agent receives only the secrets the job needs, decrypted in-VM, redacted from logs.</li>
+<li><strong>Concurrency limits per org.</strong> Max concurrent jobs per plan tier; surplus queues.</li>
+</ol>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code>+------------------------------+
+| GITHUB WEBHOOKS / UI / API   |
++------------+-----------------+
+         |
+         +-- POST /webhooks push,PR --&gt; +----------------+
+         |                              | Workflow       |
+         |                              | Trigger        |
+         |                              | parse YAML     |
+         |                              +-------+--------+
+         |                                      |
+         |                                      v
+         |                              +----------------+
+         |                              | Scheduler      |
+         |                              | org limits     |
+         |                              +-------+--------+
+         |                                      | enqueue jobs.{os}.{priority}
+         |                                      v
+         |              +-----------------------------------------------+
+         |              | Async / Scheduling                            |
+         |              | Queue: jobs.{os}.{priority}, key=(os,prio,repo)|
+         |              | Lease: runner:{runner_id}-&gt;job, TTL 30s       |
+         |              | Tokens: org_concurrency:{org_id}-&gt;active      |
+         |              +--------+------------------------------+-------+
+         |                       | depth / scale signal        | GET /runner/jobs
+         |                       v                             v
+         |              +----------------+             +---------------+
+         |              | Provisioner    | assign VM    | Runner Agent  |
+         |              | Runner Pool    |------------&gt;| ephemeral VM  |
+         |              +-------+--------+             +---+-------+---+
+         |                      |                          |       |
+         |              secrets |                          |       | POST /logs, artifacts
+         |                      v                          v       v
+         |              +----------------+         +-----------------------------+
+         |              | KMS / Vault    |         | Stores / Caches             |
+         |              | repo secrets   |         | RunDB: run:{repo}:{run_id}  |
+         |              +----------------+         | JobDB: job:{run}:{job_id}   |
+         |                                       | LogHot: log:{job}:{try}:{n} |
+         +-- GET /runs/{id}/logs --------------&gt; | Archive: logs/{repo}/{run}/ |
+                             | Artifact: artifacts/{run}/  |
+                             | Cache: cache:{repo}:{key}   |
+                             +------+----------------------+
+                                | log hot miss
+                                v
+                             +---------------+
+                             | Object Archive|
+                             | source of logs|
+                             +---------------+
+</code></pre>
+<p>End-to-end narration: Alice pushes to main → webhook → workflow parsed, 4 jobs created (lint, test-linux, test-mac, build) → jobs enqueued in respective OS queues → runner provisioner spins up a Firecracker microVM with the Linux image, hands it the lint job → runner agent boots in 8 s, clones repo, runs steps, streams logs → on completion, status set to success, VM destroyed. Meanwhile, tests run in parallel on other VMs.</p>
+<p>Concrete stores:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Run DB</td>
+<td><code>run:{repo_id}:{run_id}</code> and <code>job:{run_id}:{job_id}</code> rows</td>
+<td style="text-align: right;">~2 KB/job</td>
+<td>90 days hot, archive after</td>
+<td><code>repo_id</code></td>
+</tr>
+<tr>
+<td>Job queue</td>
+<td>topic <code>jobs.{os}.{priority}</code> message=<code>job_id + image + attempt</code></td>
+<td style="text-align: right;">~1 KB</td>
+<td>24 h replay</td>
+<td>OS + priority</td>
+</tr>
+<tr>
+<td>Log hot store</td>
+<td><code>log:{job_id}:{attempt}:{chunk_no}</code> append chunks</td>
+<td style="text-align: right;">~64 KB/chunk</td>
+<td>24 h hot</td>
+<td><code>job_id</code></td>
+</tr>
+<tr>
+<td>Log archive</td>
+<td><code>logs/{repo}/{run}/{job}.gz</code> object</td>
+<td style="text-align: right;">~0.5 MB compressed/job</td>
+<td>90 days default</td>
+<td><code>repo_id/run_id</code></td>
+</tr>
+<tr>
+<td>Runner lease</td>
+<td><code>runner:{runner_id}</code> heartbeat + current job</td>
+<td style="text-align: right;">~200 B</td>
+<td>30 s TTL</td>
+<td><code>runner_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>Run creation path:</p>
+<ol>
+<li>Trigger service receives the push event, reads workflow YAML at the commit SHA, and expands matrix jobs.</li>
+<li>In one DB transaction, it writes <code>run:{repo_id}:{run_id}</code> and <code>job:{run_id}:{job_id}</code> rows in <code>queued</code> state.</li>
+<li>It publishes one queue message per job to <code>jobs.{os}.{priority}</code> with <code>{job_id, repo_id, image, attempt=1}</code>; queue partition key is <code>(os, priority, repo_id)</code> to spread large organizations.</li>
+<li>Status service emits the initial Checks API state and the UI can now read the run even before a runner exists.</li>
+</ol>
+<p>Runner claim path:</p>
+<ol>
+<li>Provisioner watches queue depth and idle pool size for each OS; if <code>jobs.linux.paid</code> grows, it boots or reserves Linux microVMs.</li>
+<li>Runner agent long-polls <code>/runner/jobs</code>; scheduler checks org concurrency tokens and assigns a job attempt.</li>
+<li>Scheduler writes <code>runner:{runner_id}</code> lease with 30 s TTL and moves the job to <code>in_progress</code> using compare-and-set on <code>{job_id, attempt}</code>.</li>
+<li>Runner fetches secrets, repo checkout metadata, and cache manifests in parallel; then steps execute and logs stream by chunk offset.</li>
+<li>Terminal status updates the Job DB, releases the org token, emits UI/Checks events, and destroys the VM.</li>
+</ol>
+<p>Capacity by store: Run DB is ~10M jobs/day × 2 KB × RF=3 = ~60 GB/day, or ~5.4 TB for a 90-day hot window. Queue traffic at 100k jobs/minute is ~1.7k messages/sec; at 1 KB/message and RF=3, that is only ~5 MB/sec, so queue throughput is not the dominant cost. Logs are: 50 TB/day raw, roughly 5-10 TB/day compressed, and 90 days is 450-900 TB in object storage. Runner leases are tiny, ~100k active runners × 200 B = 20 MB, but heartbeat correctness matters. Artifacts can dwarf logs; even 20% of jobs uploading a 50 MB artifact is 100 TB/day, so TTLs and per-org quotas are product requirements, not cleanup details.</p>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Isolation — the centerpiece.</strong> Each job runs in a fresh ephemeral VM, never reused. Firecracker (or Kata Containers) provides VM-class isolation with container-class startup time (~1–2 s). After the job, the VM is destroyed. No filesystem persistence between jobs.</p>
+<p>Why not plain containers: they start fastest, but arbitrary customer code makes kernel sharing a scary default. Why not full cloud VMs only: stronger isolation, but cold-start and cost are worse at 100k concurrent jobs. MicroVMs are the middle: hardware isolation boundary, image pre-warming, and fast teardown. For macOS, the alternative is not Firecracker; it is a finite pool of real Mac hardware, so scheduling policy matters more than virtualization cleverness.</p>
+<p><strong>Pre-warmed pool.</strong> Cold-boot of a runner is ~10–15 s. To hit p95 &lt; 30 s job start, keep a pool of N pre-warmed runners idle per OS class. Sized to absorb bursts; auto-scales on queue depth.</p>
+<p>Provisioning path trace: scheduler writes <code>job_id</code> to <code>jobs.linux.paid</code>; provisioner watches queue depth and keeps idle microVMs in <code>runner_pool:linux</code>; runner long-polls, receives the job spec, writes a lease heartbeat every 10 s, streams logs by chunk offset, then posts terminal status. Queue pull, secrets fetch, and repo checkout start metadata can run in parallel after the runner is assigned.</p>
+<p>Job state machine:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Persisted state</th>
+<th>Source of truth</th>
+<th>Timeout / fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>queued</td>
+<td><code>job.status=queued</code>, queue message</td>
+<td>Job DB + durable queue</td>
+<td>scheduler can replay message</td>
+</tr>
+<tr>
+<td>assigned</td>
+<td><code>attempt=N</code>, <code>runner_id</code> lease</td>
+<td>Job DB CAS + runner lease</td>
+<td>lease not confirmed → requeue</td>
+</tr>
+<tr>
+<td>in_progress</td>
+<td>heartbeat every 10 s</td>
+<td>runner lease + status row</td>
+<td>30-60 s miss → <code>lost_runner</code></td>
+</tr>
+<tr>
+<td>canceling</td>
+<td>cancel token set</td>
+<td>Job DB</td>
+<td>runner stops step; timeout kills VM</td>
+</tr>
+<tr>
+<td>terminal</td>
+<td>success/failure/canceled</td>
+<td>Job DB</td>
+<td>immutable for that attempt</td>
+</tr>
+<tr>
+<td>retry</td>
+<td>new attempt row/message</td>
+<td>Job DB</td>
+<td>idempotent by <code>{job_id, attempt}</code></td>
+</tr>
+</tbody>
+</table>
+<pre><code>
+ queued ──assign──▶ assigned ──heartbeat──▶ in_progress ──exit──▶ terminal
+    ▲                    │                         │
+    │                    └──lease timeout──────────┘
+    └──────────── requeue / retry with attempt+1
+</code></pre>
+<p><strong>Job scheduling.</strong> Per-OS queues; per-org concurrency limits enforced at dequeue. A runner that pulls a job checks "does the org still have capacity?" — if not, returns the job and picks another. Better: enforce at the scheduler before dequeue, with org-level token bucket.</p>
+<p>Why Kafka-like durable queues rather than Redis lists: Redis is simpler for a small worker pool, but this workload needs replay, per-OS partitioning, plan-tier priority, and auditability when a result is disputed. SQS/PubSub also work; Kafka is easiest to explain when ordering and replay matter.</p>
+<p><strong>macOS scarcity.</strong> Mac hardware is finite (legally required to run on Apple silicon). Smaller pool, longer queue times, often a tier surcharge. Acknowledge this is a real product constraint.</p>
+<p><strong>Log streaming and storage.</strong> Each step's stdout streams from the runner via batched POSTs (every 1 s). Logs land in a hot store for the live UI; after job completion, flushed to object storage with retention (e.g., 90 days). 50 TB/day raw → compressed ~10×.</p>
+<p>Live log read path: browser WS -&gt; log service subscribes to <code>log_tail:{job_id}</code>; in parallel it fetches existing chunks from the hot store starting at the requested offset; new chunks arrive from the runner and are pushed to all subscribers; after completion the same API reads from object storage by byte range.</p>
+<p><strong>Two views of logs and jobs.</strong> The Job DB is the durable status view; the queue is only the work-to-do view and may contain duplicates. The log hot store is the live-tail view; object storage is the durable archive. The UI should tolerate switching sources at completion by using <code>{job_id, attempt, offset}</code> as the cursor, so a browser refresh can continue from hot chunks or archived byte ranges without duplicate lines.</p>
+<p><strong>Live log fan-out.</strong> When a user is watching a running job, the UI WS subscribes to log events for that job. Log service holds the open connection and pushes new chunks as they arrive. Browser sees logs ~1 s after they happen.</p>
+<p><strong>Secrets handling.</strong> Repository secrets encrypted at rest (KMS). When provisioning a runner for a job, fetch only the secrets referenced by the job, send over TLS, decrypt in the VM's memory, never write to disk. Log scrubber masks secret values in stdout.</p>
+<p><strong>Cancel / re-run.</strong> Cancel sends a signal to the runner's job; agent stops the step, marks status. Re-run: same job spec re-enqueued; fresh VM; idempotent on re-run id.</p>
+<p><strong>Caching (touched).</strong> Dependency caches (node_modules, .gradle) are huge. Per-repo cache service stores key → blob in object storage. Jobs declare cache keys; on hit, runner downloads the blob before steps run. Cache eviction is age + size based.</p>
+<p><strong>Matrix jobs.</strong> YAML <code>strategy.matrix</code> expands into N jobs, scheduled independently. Failed jobs don't block siblings unless <code>fail-fast: true</code> is set.</p>
+<p><strong>Failure modes.</strong> Runner dies mid-job: status timer fires after lack of heartbeat → job marked <code>failed: lost runner</code> → user sees the failure with a clear cause. Optionally auto-retry once.</p>
+<p>Duplicate queue delivery is expected: the runner must acquire <code>{job_id, attempt}</code> with compare-and-set before executing. If two runners race, one wins and the loser drops the job. If a region fails, the scheduler replays queued jobs in another region, but in-progress jobs are marked <code>lost_runner</code> because their VM state is not portable. Cold image starts are handled by pre-warmed pools and image-layer caches; if those are empty, the job remains queued with an ETA rather than starting on a reused VM. Secrets-service degradation fails closed: jobs that need secrets stay queued or fail explicitly, while public jobs can continue.</p>
+<p><strong>Graceful degradation.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Latency / behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Linux burst</td>
+<td>Drain pre-warm pool, then cold-start</td>
+<td>runner pool + queue</td>
+<td>p95 may rise toward 30 s</td>
+</tr>
+<tr>
+<td>macOS exhausted</td>
+<td>Queue by plan tier, show ETA</td>
+<td>mac runner queue</td>
+<td>minutes, but explicit</td>
+</tr>
+<tr>
+<td>Log hot store down</td>
+<td>Buffer chunks on runner disk and Kafka</td>
+<td>runner local spool</td>
+<td>live logs lag, final logs durable</td>
+</tr>
+<tr>
+<td>Runner heartbeat lost</td>
+<td>Mark <code>lost_runner</code>, retry if policy allows</td>
+<td>runner lease + job DB</td>
+<td>no silent success</td>
+</tr>
+<tr>
+<td>Secrets service degraded</td>
+<td>Do not start secret-requiring jobs</td>
+<td>vault/KMS</td>
+<td>fail closed</td>
+</tr>
+</tbody>
+</table>
+<p>Interview punch line: "For CI, isolation and durable status beat raw scheduling cleverness; every optimization has to preserve the fact that hostile code ran in a disposable box and still produced an auditable result."</p>
+<p><strong>Self-hosted runners (briefly).</strong> Customers run our runner agent on their hardware. It long-polls our job queue with their token; runs jobs in their environment. Same protocol, their isolation responsibility.</p>
+<p><strong>What I'd defer.</strong> Reusable actions ecosystem and registry, full marketplace, organization billing, compliance certifications (SOC 2), advanced workflow composition (reusable workflows).</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

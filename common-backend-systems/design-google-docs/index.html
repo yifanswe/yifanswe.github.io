@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Google Docs — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Google Docs</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Google Docs is real-time collaborative editing: multiple users typing in the same document simultaneously, seeing each other's cursors, and never losing changes. The hard part is the concurrency-control algorithm — operational transformation (OT) or conflict-free replicated data types (CRDT) — combined with persistence, offline edits, and presence.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every editor's local view of a document converges to the same canonical state as everyone else's once they have seen the same set of operations; no operation is silently lost; the order of operations is causally consistent; offline edits merge correctly upon reconnection; document content has a durable version history.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can choose between OT and CRDT, design the synchronization protocol, handle presence and cursors, manage permissions, and reason about the per-document hot key (every editor pinned to the same doc).</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Google Docs around per-document operation logs serialized through a single authoritative service. Editors send operations; the server transforms them against concurrent operations using OT (or merges via CRDT), broadcasts to all peers, and persists. Presence and cursors ride alongside. The interesting decisions are OT vs CRDT, per-document scaling, offline handling, and permission enforcement.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Multiple users edit the same document simultaneously.</li>
+<li>See others' cursors and selections.</li>
+<li>Comments and suggestions.</li>
+<li>Edit history and revisions.</li>
+<li>Offline edits sync on reconnect.</li>
+<li>Permissions: view, comment, edit, owner.</li>
+<li>Rich text formatting.</li>
+<li>Share link or email-based invites.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Convergence: all editors see the same final state.</li>
+<li>Latency: own keystroke visible immediately; peers' within 100-300 ms.</li>
+<li>High availability per document.</li>
+<li>Survive editors disconnecting.</li>
+<li>Auditability: who changed what.</li>
+<li>Multi-region with reasonable cross-region latency.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Spreadsheet formulas (similar problem but specialized).</li>
+<li>Slides (specialized).</li>
+<li>Embedded media editing.</li>
+<li>Translation, accessibility tools.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Documents</td>
+<td>Billions.</td>
+</tr>
+<tr>
+<td>Active editing sessions</td>
+<td>Tens of millions concurrent.</td>
+</tr>
+<tr>
+<td>Editors per doc</td>
+<td>Usually 1-3; up to thousands for a popular doc.</td>
+</tr>
+<tr>
+<td>Operations</td>
+<td>Each keystroke is an operation; bursts of 10s/sec per user.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Own keystroke &lt;50 ms; peer &lt;300 ms.</td>
+</tr>
+<tr>
+<td>Persistence</td>
+<td>Operation log durable per doc.</td>
+</tr>
+<tr>
+<td>Retention</td>
+<td>Years of revision history.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is the per-document hot key: all editors of one doc must serialize through one logical sequencer.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Document state</td>
+<td>Authoritative current text + formatting.</td>
+<td>Convergent across all editors.</td>
+</tr>
+<tr>
+<td>Operation log</td>
+<td>Append-only history of operations.</td>
+<td>Per-document; ordered.</td>
+</tr>
+<tr>
+<td>Sync substrate</td>
+<td>Distribute operations to all online editors in real time.</td>
+<td>Sub-second.</td>
+</tr>
+<tr>
+<td>Presence</td>
+<td>Online cursors and selections.</td>
+<td>Best-effort, ephemeral.</td>
+</tr>
+<tr>
+<td>Permissions</td>
+<td>Who can read/edit.</td>
+<td>Checked at every op.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Editor 1 -- WS --+
+                 |
+Editor 2 -- WS --+--&gt; Doc Session Server (one per doc, leader)
+                 |       - sequencer
+Editor 3 -- WS --+       - OT transform / CRDT merge
+                 |       - presence
+                 v
+       +------------------------+
+       | Operation Log Store    |
+       | append-only per doc    |
+       +-----------+------------+
+                   |
+                   v
+       +------------------------+
+       | Document Snapshots     |
+       | periodic compaction    |
+       +------------------------+
+
+       Permissions Service (Drive)
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Editor client</td>
+<td>Local document model; apply ops optimistically; send to server.</td>
+<td>Operation generation; OT or CRDT support.</td>
+</tr>
+<tr>
+<td>Doc session server</td>
+<td>Per-document leader; sequences and broadcasts ops.</td>
+<td>Sticky to one server per doc.</td>
+</tr>
+<tr>
+<td>Sequencer</td>
+<td>Assigns monotonic seq to each op.</td>
+<td>Total order per doc.</td>
+</tr>
+<tr>
+<td>OT engine / CRDT merge</td>
+<td>Transforms or merges concurrent ops.</td>
+<td>Determines convergence.</td>
+</tr>
+<tr>
+<td>Operation log</td>
+<td>Persistent log of ops per doc.</td>
+<td>Append-only; replayable.</td>
+</tr>
+<tr>
+<td>Snapshot service</td>
+<td>Periodically materializes doc state from log.</td>
+<td>Avoids replaying full history.</td>
+</tr>
+<tr>
+<td>Permissions service (Drive)</td>
+<td>Owns sharing and access control.</td>
+<td>Checked on connect and per op.</td>
+</tr>
+<tr>
+<td>Presence service</td>
+<td>Cursor positions, selection highlights.</td>
+<td>Ephemeral, broadcast via WS.</td>
+</tr>
+<tr>
+<td>Comment service</td>
+<td>Anchored comments; threads.</td>
+<td>Separate from main text ops.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="document">Document</h4>
+<pre><code class="language-text">Document(
+  doc_id,
+  owner_id,
+  title,
+  current_seq,
+  snapshot_ref,
+  permissions_ref,
+  created_at,
+  modified_at,
+  size_bytes
+)
+</code></pre>
+<h4 id="operation">Operation</h4>
+<pre><code class="language-text">Operation(
+  doc_id,
+  op_id,
+  seq,                  // server-assigned
+  author_id,
+  client_op_id,         // for dedup
+  type,                 // insert, delete, format, comment
+  position?,
+  content?,
+  attributes?,
+  applied_at
+)
+</code></pre>
+<h4 id="snapshot">Snapshot</h4>
+<pre><code class="language-text">Snapshot(
+  doc_id,
+  seq,                  // operations up to this seq are baked in
+  content,              // serialized document
+  created_at
+)
+</code></pre>
+<h4 id="presence">Presence</h4>
+<pre><code class="language-text">Presence(
+  doc_id,
+  user_id,
+  cursor_position,
+  selection_range,
+  color,
+  last_heartbeat
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">GET    /docs/{doc_id}                # load: returns snapshot + ops since
+POST   /docs/{doc_id}/ops             # submit ops (also via WS)
+WS     /docs/{doc_id}                # bidirectional ops + presence
+GET    /docs/{doc_id}/revisions       # history
+POST   /docs/{doc_id}/revisions/{id}/restore
+POST   /docs/{doc_id}/share           # update permissions
+GET    /docs/{doc_id}/comments
+POST   /docs/{doc_id}/comments
+</code></pre>
+<h3 id="operational-transformation-ot">Operational Transformation (OT)</h3>
+<p>The classic approach.</p>
+<p>Concept: each op is rewritten ("transformed") to remain consistent in the presence of concurrent ops.</p>
+<p>Example: doc is <code>HELLO</code>. User A inserts "X" at position 3. User B inserts "Y" at position 1 concurrently.</p>
+<ul>
+<li>Without transform: A's op as-is yields <code>HELXLO</code>; B's op yields <code>HYELLO</code>. After both: depends on order.</li>
+<li>With OT: when A's op arrives at server after B's op of <code>Insert "Y" at 1</code>, transform A's position from 3 to 4 (shifted by Y). Result is <code>HYELXLO</code> regardless of order.</li>
+</ul>
+<p>Implementation:</p>
+<ul>
+<li>Server is the central sequencer.</li>
+<li>Each op carries the seq it was generated against.</li>
+<li>Server transforms incoming ops against any ops sequenced after that point.</li>
+<li>Broadcasts the transformed op to all peers with its new seq.</li>
+</ul>
+<p>Client side:</p>
+<ul>
+<li>Apply local op immediately (optimistic).</li>
+<li>Send to server.</li>
+<li>When server acks with the transformed version, reconcile if needed.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>OT requires a central sequencer because the transform function depends on knowing all ops in between. The server is the source of truth for ordering.</p>
+</blockquote>
+<h3 id="crdts-alternative">CRDTs (Alternative)</h3>
+<p>Conflict-free Replicated Data Types: ops carry enough metadata (timestamps, unique ids) to merge commutatively without coordination.</p>
+<p>For text, common CRDTs are RGA, Yjs, Logoot, Treedoc.</p>
+<p>Pros over OT:</p>
+<ul>
+<li>Don't need a central sequencer; peers can merge directly.</li>
+<li>Works offline; merge on reconnect.</li>
+</ul>
+<p>Cons:</p>
+<ul>
+<li>More metadata per op (can be expensive).</li>
+<li>Implementation is harder.</li>
+<li>Some CRDTs have "tombstone bloat" or non-trivial GC.</li>
+</ul>
+<p>For a system like Google Docs, OT with a central server is the historical choice. Modern systems often use CRDTs.</p>
+<h3 id="sync-protocol">Sync Protocol</h3>
+<p>Editor connects via WebSocket to the doc session server.</p>
+<ol>
+<li>Server returns the latest snapshot + ops since snapshot.</li>
+<li>Client materializes local state.</li>
+<li>Client makes a local edit; generates an op tagged with current seq.</li>
+<li>Client applies locally (optimistic UI).</li>
+<li>Client sends op to server.</li>
+<li>Server transforms against any concurrent ops; assigns new seq; persists to op log; broadcasts to all peers.</li>
+<li>Other peers receive op; transform their local state if needed.</li>
+<li>Originating client receives ack; reconciles if local seq differs.</li>
+</ol>
+<p>For offline edits:
+- Buffer ops locally with monotonic client_op_id.
+- On reconnect, send buffered ops to server.
+- Server transforms each in turn against the current state.</p>
+<h3 id="snapshots-and-history">Snapshots And History</h3>
+<p>Replaying millions of ops on doc open is expensive. Periodic snapshots:</p>
+<ul>
+<li>Every N ops or M minutes, write a snapshot containing the materialized doc + the seq it represents.</li>
+<li>On open, load snapshot + ops since snapshot.</li>
+<li>Old ops compactable but typically retained for history.</li>
+</ul>
+<p>Revisions:</p>
+<ul>
+<li>The op log is the history.</li>
+<li>"Revision points" can be marked at snapshots.</li>
+<li>Named revisions are user-created bookmarks.</li>
+</ul>
+<h3 id="presence-and-cursors">Presence And Cursors</h3>
+<p>Ephemeral; broadcast over the same WebSocket as ops.</p>
+<ul>
+<li>Client sends cursor position every few hundred ms or on selection change.</li>
+<li>Server forwards to all peers without persisting.</li>
+<li>Each peer is shown as a colored cursor + name.</li>
+</ul>
+<p>Cursor positions update as text shifts via OT/CRDT transformation.</p>
+<h3 id="comments">Comments</h3>
+<p>Anchored to a span of text by character offset + position id (so they survive edits).</p>
+<ul>
+<li>Stored separately from main text.</li>
+<li>Threaded replies.</li>
+<li>Resolve / unresolve state.</li>
+<li>Notification when @mentioned.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Documents</td>
+<td><code>doc_id</code> hash</td>
+<td>One doc, one session leader.</td>
+</tr>
+<tr>
+<td>Operation log</td>
+<td><code>doc_id</code> hash</td>
+<td>Per-doc append.</td>
+</tr>
+<tr>
+<td>Snapshots</td>
+<td><code>doc_id</code> hash</td>
+<td>Per-doc materialization.</td>
+</tr>
+<tr>
+<td>Permissions</td>
+<td><code>doc_id</code></td>
+<td>Checked per doc.</td>
+</tr>
+<tr>
+<td>Presence</td>
+<td>In-memory at session server</td>
+<td>Ephemeral.</td>
+</tr>
+</tbody>
+</table>
+<p>Hot doc (e.g., a town-hall edit-along with thousands of editors):</p>
+<ul>
+<li>The single session leader becomes the bottleneck.</li>
+<li>Mitigations:</li>
+<li>Read-only viewers don't go through the leader; they stream ops from a fan-out cache.</li>
+<li>Vertical scaling of the session server.</li>
+<li>Rate-limit ops per editor.</li>
+<li>For very large collaborative sessions, fall back to a "read-only with one editor" mode.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The hardest scalability case for a doc is not the long tail; it is the one viral doc that thousands of people are editing simultaneously. The session leader is the central serializer and cannot be horizontally split per document.</p>
+</blockquote>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Operation order per doc</td>
+<td>Strong (server sequenced)</td>
+<td>Convergence requirement.</td>
+</tr>
+<tr>
+<td>Document state across peers</td>
+<td>Eventually consistent (within sub-second)</td>
+<td>OT/CRDT guarantees convergence.</td>
+</tr>
+<tr>
+<td>Permissions</td>
+<td>Strong</td>
+<td>Security.</td>
+</tr>
+<tr>
+<td>Presence</td>
+<td>Eventually consistent</td>
+<td>Ephemeral.</td>
+</tr>
+<tr>
+<td>Comments</td>
+<td>Strong on write</td>
+<td>Avoid duplicates.</td>
+</tr>
+<tr>
+<td>Multi-region replication</td>
+<td>Bounded staleness</td>
+<td>Async between regions.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Session server dies.</td>
+<td>Failover to replica; ops re-broadcast from log.</td>
+<td>Session reconnection rate.</td>
+</tr>
+<tr>
+<td>Editor offline edits.</td>
+<td>Buffer ops; replay on reconnect with OT transform.</td>
+<td>Buffered op count distribution.</td>
+</tr>
+<tr>
+<td>Conflicting concurrent edits.</td>
+<td>OT transform / CRDT merge ensures convergence.</td>
+<td>Convergence-check failures.</td>
+</tr>
+<tr>
+<td>Op log shard hot for popular doc.</td>
+<td>Pre-shard; cap viewers via fan-out tier.</td>
+<td>Per-doc op rate.</td>
+</tr>
+<tr>
+<td>Permission change mid-session.</td>
+<td>Re-check on op; eject editor if revoked.</td>
+<td>Revoke propagation lag.</td>
+</tr>
+<tr>
+<td>Comment storm.</td>
+<td>Rate limit per user.</td>
+<td>Comment QPS per doc.</td>
+</tr>
+<tr>
+<td>Snapshot service falls behind.</td>
+<td>More frequent snapshots; alert.</td>
+<td>Snapshot lag.</td>
+</tr>
+<tr>
+<td>Cross-region editor on remote doc.</td>
+<td>Route to doc's home region; accept latency.</td>
+<td>Cross-region latency.</td>
+</tr>
+<tr>
+<td>Network glitch causes op duplicates.</td>
+<td>Idempotent on client_op_id.</td>
+<td>Duplicate op rate.</td>
+</tr>
+<tr>
+<td>Editor's local state diverges.</td>
+<td>Periodic state hash check; force re-sync on mismatch.</td>
+<td>Divergence-detection count.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>State divergence between client and server.</li>
+<li>Convergence delay distribution.</li>
+<li>Failed transforms.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Active editing sessions per server.</li>
+<li>Op QPS per doc.</li>
+<li>WebSocket connection count.</li>
+<li>Snapshot creation rate.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Concurrent editors distribution.</li>
+<li>Editing duration.</li>
+<li>Comments per doc.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Each doc has a home region (typically created in user's region).</li>
+<li>Session leader runs in home region.</li>
+<li>Remote editors connect via WebSocket to home region.</li>
+<li>Snapshots replicated globally for read-only access.</li>
+<li>Failover region warm.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>OT requires central sequencer; CRDT is more distributed but more complex.</li>
+<li>Central session leader is a per-doc bottleneck; scaling it is hard.</li>
+<li>Frequent snapshots reduce replay cost but use storage.</li>
+<li>Storing all keystrokes is huge but enables time-machine history.</li>
+<li>Optimistic local apply gives instant feedback but requires reconciliation on transform.</li>
+<li>Strong permission checks per op cost latency; cached checks risk staleness.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Last-writer-wins.</td>
+<td>OT or CRDT for convergence.</td>
+</tr>
+<tr>
+<td>Single op-log scan on every open.</td>
+<td>Snapshots + ops since.</td>
+</tr>
+<tr>
+<td>Direct DB write per keystroke.</td>
+<td>Append-only op log; periodic snapshots.</td>
+</tr>
+<tr>
+<td>Lock-based editing.</td>
+<td>Lock-free with transformation.</td>
+</tr>
+<tr>
+<td>Sync via polling.</td>
+<td>WebSocket with broadcast.</td>
+</tr>
+<tr>
+<td>Multi-region active session leader.</td>
+<td>Single-region per doc; cross-region read replicas.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OT vs CRDT</td>
+<td>Tradeoffs; central sequencer vs distributed merge.</td>
+</tr>
+<tr>
+<td>Offline editing</td>
+<td>Buffer ops locally; transform on reconnect.</td>
+</tr>
+<tr>
+<td>Per-doc hot key</td>
+<td>Session leader scaling; viewer fan-out tier.</td>
+</tr>
+<tr>
+<td>Snapshots</td>
+<td>Periodic materialization; bounded replay.</td>
+</tr>
+<tr>
+<td>Permissions</td>
+<td>Drive integration; per-op checks.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Per-doc home region; replicated snapshots.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>OT or CRDT chosen and justified.</li>
+<li>Per-doc session leader serializes ops.</li>
+<li>Append-only op log; periodic snapshots.</li>
+<li>Optimistic local apply with reconciliation.</li>
+<li>Offline edits buffer + transform on reconnect.</li>
+<li>Presence and comments separate from text ops.</li>
+<li>Permissions checked per op.</li>
+<li>Multi-region with per-doc home region.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Google Docs is fundamentally a per-document operation log serialized through a session leader. Operational transformation (or CRDT) keeps all editors convergent despite concurrent edits. Snapshots make load cheap; offline edits buffer and reconcile. Presence and comments ride alongside but don't go through the main op pipeline.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Google Docs.</p>
+<p><strong>Candidate:</strong> I will design around a per-document operation log serialized by a session leader. Editors connect via WebSocket; the leader sequences ops with OT, broadcasts to all peers, and persists. Snapshots periodically materialize the current state to avoid replaying full history. Presence and comments are separate. The invariant is that all editors converge to the same state and no op is silently lost.</p>
+<p><strong>Interviewer:</strong> OT or CRDT?</p>
+<p><strong>Candidate:</strong> Both are valid; I'll discuss OT since it's the historical choice for Google Docs. OT requires a central sequencer because transforming an op depends on knowing what ops came before. The server is the source of truth for order. CRDT is more peer-to-peer friendly because ops carry enough metadata (timestamps, unique ids) to merge commutatively without coordination. CRDTs are popular in modern systems but have more per-op overhead.</p>
+<p><strong>Interviewer:</strong> Walk me through a keystroke.</p>
+<p><strong>Candidate:</strong> User types "X" at position 5. Client generates an op <code>Insert("X", at=5, parent_seq=42)</code> and applies locally — UI shows X immediately. Sends op to server over WebSocket. Server sees current seq is 45 (three ops have arrived since the user's last sync). Transforms the user's op against ops 43, 44, 45: maybe their inserts shifted position 5 to 7. New op <code>Insert("X", at=7)</code> sequenced at 46. Server persists to op log, broadcasts to all peers. Originating client gets the ack with seq 46; reconciles if local position differs.</p>
+<p><strong>Interviewer:</strong> Two users edit the same line simultaneously.</p>
+<p><strong>Candidate:</strong> OT handles it. User A inserts "X" at position 3, parent_seq 42. User B inserts "Y" at position 3, parent_seq 42, concurrently. Server gets A first, assigns seq 43, broadcasts. Then gets B's op with parent_seq 42; transforms against op 43 (which is A's insert at 3); B's position shifts to 4. New op <code>Insert("Y", at=4)</code> sequenced at 44. All peers converge to "AB..." or "XY..." order depending on transform rule (typically based on author id tiebreak). The point: convergence is guaranteed.</p>
+<p><strong>Interviewer:</strong> A user goes offline, types 100 paragraphs, comes back online.</p>
+<p><strong>Candidate:</strong> Client buffers ops with monotonic client_op_id. On reconnect, sends the entire buffer in order. Server transforms each against the current state (which has moved forward), sequences them, broadcasts. The user's edits land at appropriate positions in the current doc. If parts of the doc the user edited offline were deleted by someone else, transform handles it: edits to deleted regions are either skipped or anchored to nearest surviving text per policy.</p>
+<p><strong>Interviewer:</strong> 5,000 people edit one doc at the same time.</p>
+<p><strong>Candidate:</strong> This is the hardest case. The session leader for the doc is the bottleneck. Mitigations: most of the 5,000 are likely viewers, not editors. Read-only viewers stream ops from a fan-out cache, not the leader. Among actual editors, rate-limit ops per editor. For truly viral edit sessions, we may degrade to one writer at a time (lock-mode) or limit editor count.</p>
+<p><strong>Interviewer:</strong> Permissions?</p>
+<p><strong>Candidate:</strong> Drive owns permissions. On connect, the session leader checks the user's access. Per op, a fast cached check confirms. On permission revoke, the leader receives a notification and ejects the user; further ops are rejected. The cache TTL is short for revoke propagation.</p>
+<p><strong>Interviewer:</strong> How is history stored?</p>
+<p><strong>Candidate:</strong> The op log itself is the history. Periodic snapshots compact: every N ops or M minutes, materialize the current state to a snapshot. On open, load snapshot + ops since. For named revisions ("Final draft"), users mark snapshots. The op log is retained indefinitely for time-machine restore.</p>
+<p><strong>Interviewer:</strong> Comments?</p>
+<p><strong>Candidate:</strong> Anchored to a text span by character offsets that survive edits. When the surrounding text shifts, the anchor moves with it (OT applies to anchors too). Comments are stored separately from text ops to avoid bloating the main log. Threaded replies. Resolve state.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Each doc has a home region. Session leader runs there. Editors from other regions connect via WebSocket, accepting the cross-region latency (a few hundred ms). Snapshots and op log replicate globally for fast read-only access. Failover region warm. We don't try to run active-active session leaders per doc because the serialization invariant breaks down.</p>
+<p><strong>Interviewer:</strong> Doc crashes during a save.</p>
+<p><strong>Candidate:</strong> Ops persist to the op log before being acked to the client. If the session leader dies, a replica takes over: it has the op log up to the last replicated op. Clients reconnect; replay any ops not yet acked. The append-only log is the recovery mechanism.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Per-doc session leader serializes ops via OT. Append-only op log per doc with periodic snapshots. Optimistic local apply, transform on server, broadcast to peers. Offline edits buffer and reconcile. Presence and comments separate. Permissions checked per op via Drive. Multi-region uses per-doc home with replicated snapshots. The hardest case is a single very-popular doc whose session leader is a serialization bottleneck.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: real-time collab, offline, history, permissions.</li>
+<li>Invariant: convergence; no lost ops.</li>
+<li>Per-doc session leader; OT or CRDT.</li>
+<li>Append-only op log; periodic snapshots.</li>
+<li>Optimistic local apply; transform on server.</li>
+<li>Offline buffer; reconcile on reconnect.</li>
+<li>Presence and comments separate.</li>
+<li>Permissions per op; multi-region per-doc home.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Google Docs is a per-document operation log serialized through a session leader. OT (or CRDT) keeps all editors convergent despite concurrent edits. Optimistic local apply gives instant feedback; server transforms reconcile differences. Snapshots make load cheap; offline edits buffer and reconcile on reconnect. Presence and comments are separate from the main op pipeline. Multi-region uses per-doc home regions. The hardest scaling case is one very-popular doc.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"OT requires a central sequencer; CRDT supports peer-to-peer merge."</li>
+<li>"The session leader for each doc is the central serializer for that doc."</li>
+<li>"Optimistic local apply gives instant feedback; transform on the server reconciles."</li>
+<li>"Offline edits buffer locally and replay through transform on reconnect."</li>
+<li>"Per-doc home region; replication across regions is read-only."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

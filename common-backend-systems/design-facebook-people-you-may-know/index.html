@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Facebook People You May Know — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Facebook People You May Know</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a>. For graph-based connection design see also <a href="../design-linkedin-connections/">Design LinkedIn Connections</a>.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>People You May Know (PYMK) suggests friend connections based on graph signals (shared friends, mutual schools/employers, shared interests). The hard part is computing personalized friend candidates for billions of users via expensive graph operations, refreshing as the graph changes, and balancing relevance with privacy.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>For every user, the system surfaces a personalized ranked list of candidate friends derived from the social graph and additional signals, refreshed regularly, respecting privacy controls and blocks; recommendations don't reveal hidden information (e.g., friend-of-friend should not leak a private friend).</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design offline batch graph processing for friend-of-friend computation, ranking, privacy enforcement, and reason about the scaling and freshness tradeoffs.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design PYMK as an offline batch pipeline that computes friend-of-friend candidates per user with shared-attribute signals, plus an online ranker for personalization. Privacy filters apply at delivery so we never reveal hidden friendships. Graph storage is sharded by user_id; pipeline scales via distributed graph computation. The interesting decisions are candidate computation, ranking, privacy enforcement, and freshness.</p>
+</blockquote>
+<h3 id="requirements">Requirements</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Surface a personalized list of candidate friends per user.</li>
+<li>Signals: friend-of-friend, mutual schools/employers, mutual interests, contacts imported.</li>
+<li>Filter: already-friends, blocked, hidden suggestions.</li>
+<li>Refresh as graph changes.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Daily refresh (or more frequent for high-activity users).</li>
+<li>3B+ users.</li>
+<li>Recommendations served in sub-second.</li>
+<li>Privacy: no leak of hidden info.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Phone book / email contact import privacy details.</li>
+<li>Detailed ranking model.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>3B.</td>
+</tr>
+<tr>
+<td>Average friends</td>
+<td>200-500.</td>
+</tr>
+<tr>
+<td>Friend-of-friend per user</td>
+<td>10k-100k typical.</td>
+</tr>
+<tr>
+<td>PYMK candidates surfaced</td>
+<td>10-50 per request.</td>
+</tr>
+<tr>
+<td>Refresh</td>
+<td>Daily; some signals real-time.</td>
+</tr>
+</tbody>
+</table>
+<p>Bottleneck: friend-of-friend computation at billion-user scale; expensive but parallelizable.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Social graph</td>
+<td>Friend edges, attributes.</td>
+<td>Strong on write.</td>
+</tr>
+<tr>
+<td>Candidate generation</td>
+<td>Friend-of-friend + signals.</td>
+<td>Batch.</td>
+</tr>
+<tr>
+<td>Ranker</td>
+<td>Per-user ordering.</td>
+<td>Sub-second.</td>
+</tr>
+<tr>
+<td>Privacy filter</td>
+<td>Strip hidden info.</td>
+<td>Strong.</td>
+</tr>
+<tr>
+<td>Engagement collection</td>
+<td>Accept / hide signals.</td>
+<td>Async.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Graph Store (friend edges, attributes)
+        |
+        v
++-------------------+
+| Offline Batch     |
+| Graph Processing  |
+| (Spark / Giraph)  |
++---------+---------+
+          |
+          v
++-------------------+
+| Per-user          |
+| Candidate Set     |
+| (top-K)           |
++---------+---------+
+          |
+          v
++-------------------+
+| PYMK Service      |
+| online ranker     |
+| privacy filter    |
++---------+---------+
+          |
+          v
+       Client (suggestions)
+          |
+          v
+   Accept / Hide events --&gt; Feedback to pipeline
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Social graph store</td>
+<td>Friend edges, attributes.</td>
+<td>Sharded by user_id.</td>
+</tr>
+<tr>
+<td>Batch processor</td>
+<td>Friend-of-friend, signal aggregation.</td>
+<td>Distributed graph compute.</td>
+</tr>
+<tr>
+<td>Candidate set store</td>
+<td>Top-K per user.</td>
+<td>Refreshed daily.</td>
+</tr>
+<tr>
+<td>PYMK service</td>
+<td>Serves the list.</td>
+<td>Stateless.</td>
+</tr>
+<tr>
+<td>Online ranker</td>
+<td>Re-ranks at request time.</td>
+<td>ML.</td>
+</tr>
+<tr>
+<td>Privacy filter</td>
+<td>Drops hidden / blocked.</td>
+<td>Strong.</td>
+</tr>
+<tr>
+<td>Hide store</td>
+<td>Users' "hide this person" choices.</td>
+<td>Per-user.</td>
+</tr>
+<tr>
+<td>Engagement</td>
+<td>Accept/decline/hide events.</td>
+<td>Async.</td>
+</tr>
+<tr>
+<td>Contact importer</td>
+<td>Optional: email/phone book candidates.</td>
+<td>Privacy-sensitive.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="friend-edge">Friend Edge</h4>
+<pre><code class="language-text">Friendship(
+  user_a,
+  user_b,
+  created_at,
+  visibility,         // public, friends_of_friends, hidden
+  source              // organic, imported, suggested
+)
+</code></pre>
+<h4 id="candidate-set">Candidate Set</h4>
+<pre><code class="language-text">CandidateSet(
+  user_id,
+  candidates: [{
+    candidate_user_id,
+    score,
+    signals: [shared_friends, shared_school, shared_employer, ...],
+    privacy_tier        // what can be displayed as &quot;why&quot;
+  }],
+  computed_at
+)
+</code></pre>
+<h4 id="hide-list">Hide List</h4>
+<pre><code class="language-text">Hidden(
+  user_id,
+  hidden_candidate_id,
+  hidden_at,
+  reason
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">GET    /pymk
+POST   /pymk/dismiss     { candidate_id }
+POST   /pymk/accept      { candidate_id }
+</code></pre>
+<h3 id="offline-pipeline">Offline Pipeline</h3>
+<p>Daily batch:</p>
+<ol>
+<li><strong>Load social graph snapshot.</strong></li>
+<li><strong>Compute friend-of-friend per user:</strong> for each friend of user U, take their friends. Aggregate counts (number of mutual friends).</li>
+<li><strong>Aggregate other signals:</strong> shared school, employer, location, mutual interests.</li>
+<li><strong>Score candidates per user:</strong> weighted combination of signals.</li>
+<li><strong>Top-K per user</strong> stored in candidate set.</li>
+</ol>
+<p>Graph processing frameworks: Spark, Apache Giraph, Google Pregel, custom MapReduce.</p>
+<p>For 3B users with hundreds of friends each, total friend-of-friend pairs are massive (trillions). Pruning aggressive: bound at top-K per user.</p>
+<h3 id="friend-of-friend-computation">Friend-Of-Friend Computation</h3>
+<p>Pseudocode:</p>
+<pre><code>for each user U:
+  candidates = {}
+  for friend F of U:
+    for friend G of F (where G != U and G not already U's friend):
+      candidates[G] += weight(F)
+  top_K = sort_and_truncate(candidates)
+</code></pre>
+<p>Weighted by "strength" of F's connection or recent interaction.</p>
+<p>Bipartite from <code>(U, F)</code> to <code>(F, G)</code>: matrix-product-like operation; efficient in graph frameworks.</p>
+<h3 id="other-signals">Other Signals</h3>
+<ul>
+<li><strong>Shared school:</strong> users in same school within same years.</li>
+<li><strong>Shared employer:</strong> similar pattern.</li>
+<li><strong>Shared location:</strong> in same city/region.</li>
+<li><strong>Contact import:</strong> if both sides imported each other's contact (with consent).</li>
+<li><strong>Profile interactions:</strong> profile visits, group co-membership.</li>
+</ul>
+<p>Each signal contributes to candidate score with calibrated weight.</p>
+<h3 id="online-ranker">Online Ranker</h3>
+<p>At request time:</p>
+<ol>
+<li>Fetch user's candidate set.</li>
+<li>Fetch real-time features (recent profile visits, current page context).</li>
+<li>Score candidates with online model.</li>
+<li>Filter: already-friends, blocked, hidden.</li>
+<li>Apply privacy gate.</li>
+<li>Return top N.</li>
+</ol>
+<p>Latency: sub-second.</p>
+<h3 id="privacy">Privacy</h3>
+<p>Critical. Several rules:</p>
+<ul>
+<li>Do not show that A is suggested because B (a private friend) connects them.</li>
+<li>Hidden friendships excluded from friend-of-friend.</li>
+<li>Blocked users excluded.</li>
+<li>"People who don't want to be discovered" excluded.</li>
+<li>"Why this suggestion" must respect display rules — show count of mutual friends but not list, depending on visibility.</li>
+</ul>
+<p>Privacy filter is applied at serve time; the candidate set may include private info, but display redacts.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Privacy gates apply at display. Hidden friendships influence ranking but never appear in the explanation. The candidate set might know A and B share a hidden friend, but the UI must redact that fact.</p>
+</blockquote>
+<h3 id="feedback-loop">Feedback Loop</h3>
+<p>User dismisses suggestion → "hide" stored; future candidate set excludes.</p>
+<p>User accepts → friend edge created.</p>
+<p>Strong signals: dismiss reduces score of similar candidates; accept boosts.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition strategy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Friend edges</td>
+<td>user_id hash</td>
+</tr>
+<tr>
+<td>Candidate sets</td>
+<td>user_id</td>
+</tr>
+<tr>
+<td>Hide list</td>
+<td>user_id</td>
+</tr>
+<tr>
+<td>Profile attributes</td>
+<td>user_id</td>
+</tr>
+<tr>
+<td>Graph snapshot</td>
+<td>partitioned per processing job</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Friend edges</td>
+<td>Strong</td>
+</tr>
+<tr>
+<td>Candidate sets</td>
+<td>Eventually consistent (daily)</td>
+</tr>
+<tr>
+<td>Hide list</td>
+<td>Strong on write</td>
+</tr>
+<tr>
+<td>Privacy filter</td>
+<td>Strong</td>
+</tr>
+<tr>
+<td>Engagement</td>
+<td>Eventually consistent</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>User home region for graph data.</li>
+<li>Candidate sets replicated to nearby regions.</li>
+<li>PYMK service per region.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Candidate set stale.</td>
+<td>Daily refresh; alert on lag.</td>
+<td>Candidate freshness.</td>
+</tr>
+<tr>
+<td>Privacy leak.</td>
+<td>Strict filter; audit.</td>
+<td>Privacy incident reports.</td>
+</tr>
+<tr>
+<td>Friend-of-friend computation backlog.</td>
+<td>Parallel; scale up.</td>
+<td>Job duration.</td>
+</tr>
+<tr>
+<td>Hidden user shown.</td>
+<td>Filter; respect hide.</td>
+<td>Hide-but-shown count.</td>
+</tr>
+<tr>
+<td>Spam suggestions.</td>
+<td>Rate limit accepts; suspicious patterns.</td>
+<td>Spam reports.</td>
+</tr>
+<tr>
+<td>Cold start (new user).</td>
+<td>Use signup signals (school, location).</td>
+<td>Cold-start rate.</td>
+</tr>
+<tr>
+<td>Highly-connected user dominates.</td>
+<td>Cap influence of any single friend.</td>
+<td>Cap effectiveness.</td>
+</tr>
+<tr>
+<td>Cross-region.</td>
+<td>Async replication; bounded.</td>
+<td>Lag.</td>
+</tr>
+<tr>
+<td>Block bypass.</td>
+<td>Block list authoritative.</td>
+<td>Bypass count.</td>
+</tr>
+<tr>
+<td>GDPR delete request.</td>
+<td>Cascade from edges and candidate sets.</td>
+<td>Compliance audit.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Privacy leaks (zero).</li>
+<li>Stale-suggestion rate.</li>
+<li>Block bypasses.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Job runtime.</li>
+<li>Candidate set storage.</li>
+<li>Service QPS.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Accept rate.</li>
+<li>Dismiss rate.</li>
+<li>Friend additions per DAU.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Daily refresh is acceptable; real-time would be expensive.</li>
+<li>Friend-of-friend is the primary signal; adding more signals adds compute.</li>
+<li>Aggressive privacy reduces relevance display.</li>
+<li>More candidates per user = more storage but better online ranking.</li>
+<li>Contact imports raise privacy concerns.</li>
+<li>Highly-connected nodes can dominate candidate sets — cap influence.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Real-time friend-of-friend per request.</td>
+<td>Batch pre-compute.</td>
+</tr>
+<tr>
+<td>No privacy gate.</td>
+<td>Strict filter at display.</td>
+</tr>
+<tr>
+<td>Single signal (FoF only).</td>
+<td>Multiple signals weighted.</td>
+</tr>
+<tr>
+<td>No feedback loop.</td>
+<td>Hide / accept update candidate scoring.</td>
+</tr>
+<tr>
+<td>Show hidden friends in explanation.</td>
+<td>Redact source if private.</td>
+</tr>
+<tr>
+<td>Same candidate forever.</td>
+<td>Hide TTL or permanent exclusion per user choice.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Friend-of-friend computation</td>
+<td>Distributed graph processing.</td>
+</tr>
+<tr>
+<td>Privacy</td>
+<td>Hidden friendships, blocks, explanation redaction.</td>
+</tr>
+<tr>
+<td>Ranking</td>
+<td>Multiple signals; ML rank.</td>
+</tr>
+<tr>
+<td>Cold start</td>
+<td>Signup signals; contact import.</td>
+</tr>
+<tr>
+<td>Feedback</td>
+<td>Hide / accept loops.</td>
+</tr>
+<tr>
+<td>Scale</td>
+<td>Parallel graph processing; candidate set caching.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Offline batch pipeline + online ranker.</li>
+<li>Multiple signals weighted.</li>
+<li>Strict privacy filter at display.</li>
+<li>Feedback loop from dismiss / accept.</li>
+<li>Cap influence of highly-connected nodes.</li>
+<li>Multi-region with user home.</li>
+<li>Cold-start fallback.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>PYMK is offline graph batch + online ranker. Friend-of-friend with weighted shared signals (schools, employers, location) generates candidates daily; online ranker personalizes. Privacy filter at display ensures hidden friends never leak into explanations. Feedback from dismisses and accepts loops back into the pipeline.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design People You May Know.</p>
+<p><strong>Candidate:</strong> Offline batch pipeline computes friend-of-friend candidates per user daily, adding shared-attribute signals (school, employer, location). Top-K per user stored. Online ranker scores at request time with real-time features. Privacy filter at display drops hidden friendships, blocks, and redacts explanations. Feedback from dismiss / accept loops back. The invariant is personalized candidates respecting privacy and blocks.</p>
+<p><strong>Interviewer:</strong> Friend-of-friend computation.</p>
+<p><strong>Candidate:</strong> For each user, walk their friends; for each friend's friends, count and weight. Pseudocode: <code>candidates[G] += weight(F)</code> for G in F's friends. Truncate to top-K per user. Done in batch with Spark or Giraph; bipartite matrix-product-like operation. Trillions of (U, G) pairs total across users; pruning aggressive.</p>
+<p><strong>Interviewer:</strong> Signals beyond FoF.</p>
+<p><strong>Candidate:</strong> Shared school in same years, shared employer, shared location, contact import (with consent), mutual interests, profile visits. Each signal scored and combined with calibrated weights. Multi-signal blending makes candidates more relevant than pure friend-of-friend.</p>
+<p><strong>Interviewer:</strong> Privacy.</p>
+<p><strong>Candidate:</strong> Several rules. Hidden friendships not used in FoF (or used but redacted in explanation). Blocked users excluded. Users opting out of discoverability excluded. "Why this suggestion" UI redacts private friends — show "X mutual friends" but not their names if they're hidden. The candidate set may know the private connection, but display must hide. Hard-coded filter at display; security review verifies.</p>
+<p><strong>Interviewer:</strong> What about a user with 5000 friends?</p>
+<p><strong>Candidate:</strong> Highly connected nodes can dominate candidate sets — every one of their friends gets suggested to many. Cap the contribution: weight each friend's influence by inverse of their friend count, or simply cap at a maximum count of friends to consider for FoF.</p>
+<p><strong>Interviewer:</strong> Hide an unwanted suggestion.</p>
+<p><strong>Candidate:</strong> User clicks "hide." Hide event recorded; user's hide list updated. Future candidate sets exclude that user. The hide may be permanent or TTL'd. We may also use hides as negative signals to demote similar candidates.</p>
+<p><strong>Interviewer:</strong> Cold start.</p>
+<p><strong>Candidate:</strong> New user has no friends yet. Signup signals: school (from form), location, contact import (if granted). Initial candidates from these. Within a few connections, FoF kicks in. Onboarding flow surfaces likely connections aggressively.</p>
+<p><strong>Interviewer:</strong> A user adds a friend. Should PYMK refresh?</p>
+<p><strong>Candidate:</strong> New friend should influence future PYMK. Daily refresh picks this up. For high-activity users, more frequent refresh (e.g., every few hours). Real-time incremental update is possible but expensive — usually daily is fine.</p>
+<p><strong>Interviewer:</strong> Contact import — privacy concern.</p>
+<p><strong>Candidate:</strong> Sensitive. Requires explicit user consent. The contacts uploaded are matched against the platform's users via hashed identifiers; only matched users surface as candidates. Non-matched contacts not stored beyond the matching session. Both sides should ideally have imported each other for the highest-confidence suggestion. Recent privacy scrutiny has restricted this signal significantly.</p>
+<p><strong>Interviewer:</strong> Online ranker.</p>
+<p><strong>Candidate:</strong> Takes candidate set + real-time features (recent visits, current context). Scores with ML model. Filters already-friend, blocked, hidden. Applies privacy redaction to "why" text. Returns top N. Sub-second latency.</p>
+<p><strong>Interviewer:</strong> Feedback loop.</p>
+<p><strong>Candidate:</strong> Dismiss → recorded; future candidates exclude; similar candidates may be demoted. Accept → friend edge; the new connection feeds back into next FoF cycle. Other engagement (profile visit, conversation) provides positive signals.</p>
+<p><strong>Interviewer:</strong> Multi-region.</p>
+<p><strong>Candidate:</strong> Per-user home region for graph data. Candidate sets replicated to nearby regions. PYMK service per region. Pipeline runs once globally or per-region — depends on graph storage.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Offline batch graph pipeline computes friend-of-friend candidates per user daily, blended with shared-attribute signals. Candidate set stored per user. Online ranker scores at request time. Privacy filter at display drops hidden, blocked, and redacts explanations. Feedback loops update via dismiss / accept. The hardest correctness issue is privacy (never leak hidden friendships); the hardest scale issue is the FoF computation at trillions of pairs.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: signals, freshness, privacy.</li>
+<li>Invariant: personalized; private info redacted.</li>
+<li>Offline batch FoF + online ranker.</li>
+<li>Multi-signal weighted scoring.</li>
+<li>Strict privacy filter at display.</li>
+<li>Feedback loop from dismiss / accept.</li>
+<li>Cold start via signup signals.</li>
+<li>Cap influence of super-connected nodes.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>PYMK is offline batch friend-of-friend + online ranker. Daily pipeline computes candidates per user from FoF plus shared-attribute signals. Online ranker personalizes. Privacy filter at display: hidden friendships excluded, blocks excluded, explanations redacted. Feedback from dismiss / accept loops back. Cold start uses signup signals. The hardest correctness issue is privacy — never leak hidden info into explanations.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Friend-of-friend with weighted signals; daily batch."</li>
+<li>"Privacy gate at display; explanations redact private friends."</li>
+<li>"Dismiss is a negative signal; accept feeds the next cycle."</li>
+<li>"Cap the influence of super-connected nodes to keep candidates diverse."</li>
+<li>"Cold start uses signup signals — school, location, optional contacts."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

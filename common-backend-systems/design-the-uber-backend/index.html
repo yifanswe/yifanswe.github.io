@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design the Uber Backend — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design the Uber Backend</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>The "Uber backend" extends <a href="./design-uber-or-lyft.md">Design Uber or Lyft</a> into the full backend platform — not just dispatch and matching, but trip lifecycle, payments, driver onboarding, surge, ETA modeling, and the supporting microservices that make a ride-hailing platform work. The hard part is the breadth: every component must hold up under bursty geographic demand and tightly coupled latency requirements.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every trip flows from request → match → en route → in trip → completed → paid, with at-most-one-driver per trip, deterministic fare calculation from recorded events, idempotent payment processing, and audit traceability; supply-and-demand (surge) signals reflect current market state per city cell.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can stitch together dispatch, payments, surge, ETA, driver onboarding, and observability into a coherent platform, with sharding strategies, multi-service consistency, and operational metrics that catch correctness drift.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design the Uber backend as a layered platform: a geospatial dispatch layer for matching, a trip state machine for lifecycle, a payments layer for fare capture and driver payouts, a surge engine producing per-cell heatmaps, an ETA service for prediction, and a sea of supporting services (driver onboarding, ratings, support). Each city is the natural sharding unit. The interesting decisions are dispatch correctness, trip state, payment integration, surge, and the breadth-vs-depth tradeoff in microservice design.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Rider requests a ride; driver is matched.</li>
+<li>Trip lifecycle: request → match → en route → in trip → completed → paid.</li>
+<li>Fare calculation including base, distance, time, surge, tolls, taxes.</li>
+<li>Payments and driver payouts.</li>
+<li>Ratings and feedback.</li>
+<li>Driver onboarding (background checks, vehicle).</li>
+<li>Support / dispute handling.</li>
+<li>Promotions and coupons.</li>
+<li>Multi-product (UberX, Uber Pool, Uber Eats — focus core).</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Match latency under a few seconds.</li>
+<li>Trip state transitions correct under partial failures.</li>
+<li>Payment idempotent end-to-end.</li>
+<li>Surge pricing reflects market signals within minutes.</li>
+<li>Multi-region; cities largely independent.</li>
+<li>Auditability for trips, payments, driver hours.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Self-driving / AV integration.</li>
+<li>Long-haul logistics.</li>
+<li>Map data / routing engine internals.</li>
+<li>Driver coaching analytics.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Active drivers</td>
+<td>10M global; 1-2M online peak.</td>
+</tr>
+<tr>
+<td>Active riders</td>
+<td>100M+ DAU.</td>
+</tr>
+<tr>
+<td>Concurrent trips</td>
+<td>Hundreds of thousands.</td>
+</tr>
+<tr>
+<td>Trips/day</td>
+<td>Tens of millions.</td>
+</tr>
+<tr>
+<td>Location updates</td>
+<td>10M+/sec.</td>
+</tr>
+<tr>
+<td>Cities</td>
+<td>Hundreds globally.</td>
+</tr>
+</tbody>
+</table>
+<p>Bottleneck: geospatial dispatch under contention plus payment correctness across millions of daily trips.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<p>Inherits from <a href="./design-uber-or-lyft.md">Design Uber or Lyft</a>:</p>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Experience</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Rider</td>
+<td>Request, watch driver, ride, pay.</td>
+<td>Real-time.</td>
+</tr>
+<tr>
+<td>Driver</td>
+<td>Receive offers, accept, navigate, complete.</td>
+<td>Reliable.</td>
+</tr>
+<tr>
+<td>Trip lifecycle</td>
+<td>State machine.</td>
+<td>Strong.</td>
+</tr>
+<tr>
+<td>Pricing</td>
+<td>Fare calculation.</td>
+<td>Deterministic from events.</td>
+</tr>
+<tr>
+<td>Onboarding / support</td>
+<td>Background tasks.</td>
+<td>Bounded SLA.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                          +-------------+
+                          | API Gateway |
+                          +------+------+
+                                 |
+        +------------------------+------------------------+
+        |              |             |             |     |
+        v              v             v             v     v
+  Dispatch &amp;      Trip Service  Payment Svc   Surge      Rating
+  Geo Index                     + Payouts     Engine     Service
+                                              + Heatmap
+
+  ETA Service     Driver Onboard   Promo Svc   Support
+  Routing         Background       Coupons     Tickets
+                  Checks
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dispatch</td>
+<td>Match drivers to requests.</td>
+<td>See Uber/Lyft design.</td>
+</tr>
+<tr>
+<td>Trip service</td>
+<td>Trip state machine.</td>
+<td>CAS transitions.</td>
+</tr>
+<tr>
+<td>Payment service</td>
+<td>Charge rider; pay driver.</td>
+<td>Reuse payment design.</td>
+</tr>
+<tr>
+<td>Surge engine</td>
+<td>Per-cell heatmap.</td>
+<td>Streaming supply/demand.</td>
+</tr>
+<tr>
+<td>ETA service</td>
+<td>Predict times.</td>
+<td>Routing + ML.</td>
+</tr>
+<tr>
+<td>Driver onboarding</td>
+<td>Background check, vehicle verification.</td>
+<td>Async workflow.</td>
+</tr>
+<tr>
+<td>Rating service</td>
+<td>Bidirectional ratings.</td>
+<td>Aggregated per user.</td>
+</tr>
+<tr>
+<td>Promo / coupon service</td>
+<td>Codes, eligibility, redemption.</td>
+<td>Atomic redemption.</td>
+</tr>
+<tr>
+<td>Support service</td>
+<td>Tickets, dispute resolution.</td>
+<td>Workflow engine.</td>
+</tr>
+<tr>
+<td>Driver hours / regulatory</td>
+<td>Track driver work hours per local laws.</td>
+<td>Per-jurisdiction rules.</td>
+</tr>
+<tr>
+<td>Notifications</td>
+<td>Trip updates, promos.</td>
+<td>Reuse notification design.</td>
+</tr>
+<tr>
+<td>Maps / Routing</td>
+<td>External or internal map provider.</td>
+<td>Used by ETA.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="trip-extended">Trip (Extended)</h4>
+<pre><code class="language-text">Trip(
+  trip_id,
+  rider_id,
+  driver_id?,
+  vehicle_type,
+  origin,
+  destination,
+  waypoints,
+  state,
+  states_history: [(state, ts)],
+  requested_at,
+  matched_at,
+  pickup_at,
+  dropoff_at,
+  route_polyline,
+  distance_traveled,
+  duration,
+  fare_breakdown: {
+    base,
+    per_mile,
+    per_minute,
+    surge_multiplier,
+    tolls,
+    booking_fee,
+    discount,
+    total,
+    driver_payout
+  },
+  payment_intent_id?,
+  rider_rating?,
+  driver_rating?,
+  cancellation_reason?,
+  promo_code?,
+  receipt_url,
+  version
+)
+</code></pre>
+<h4 id="driver-extended">Driver (Extended)</h4>
+<pre><code class="language-text">Driver(
+  driver_id,
+  status,                  // offline, online_available, online_on_trip
+  vehicle_id,
+  current_location,
+  current_cell,
+  rating_avg,
+  trips_completed,
+  onboarding_status,       // pending, approved, suspended
+  background_check,
+  documents,
+  hours_worked_today,
+  earnings_today,
+  version
+)
+</code></pre>
+<h4 id="surge-cell">Surge Cell</h4>
+<pre><code class="language-text">SurgeCell(
+  cell_id,
+  multiplier,              // 1.0, 1.5, 2.0, ...
+  demand_count,
+  supply_count,
+  computed_at
+)
+</code></pre>
+<h4 id="rating">Rating</h4>
+<pre><code class="language-text">Rating(
+  trip_id,
+  rater_id,                // rider or driver
+  rated_id,
+  stars,                   // 1-5
+  comment,
+  created_at
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">Rider:
+POST   /trips                   # request
+GET    /trips/{id}
+POST   /trips/{id}/cancel
+POST   /trips/{id}/rate
+
+Driver:
+POST   /driver/online
+POST   /driver/location
+POST   /trips/{id}/accept
+POST   /trips/{id}/arrive
+POST   /trips/{id}/start
+POST   /trips/{id}/complete
+GET    /driver/earnings
+
+Other:
+GET    /surge?cell=
+POST   /promos/redeem
+POST   /support/tickets
+</code></pre>
+<h3 id="trip-lifecycle-extended">Trip Lifecycle (Extended)</h3>
+<p>Adds states for cancellation, dispute, payment:</p>
+<pre><code class="language-text">requested -&gt; matched -&gt; en_route -&gt; arrived -&gt; in_trip -&gt; completed -&gt; paid
+   |             |         |          |          |             |
+   v             v         v          v          v             v
+canceled    cancelled    cancelled  cancelled  refunded    disputed
+</code></pre>
+<p>Each transition is CAS on (trip_id, from_state). Audit logged.</p>
+<p>For payment:</p>
+<ul>
+<li><code>completed -&gt; paid</code>: payment captured.</li>
+<li><code>paid -&gt; disputed</code>: rider/driver dispute opened; manual resolution.</li>
+<li><code>paid -&gt; refunded</code>: refund issued (partial or full).</li>
+</ul>
+<h3 id="fare-calculation">Fare Calculation</h3>
+<p>Fare is deterministic from recorded events:</p>
+<pre><code>fare = base + (distance * per_mile) + (duration * per_minute) + tolls
+fare = fare * surge_multiplier (locked at request time)
+fare = fare + booking_fee - discount
+total = fare + taxes
+driver_payout = total - platform_fee
+</code></pre>
+<p>The trip records:
+- Origin/destination
+- Route polyline (waypoints + travel times)
+- Surge captured at request
+- Tolls accumulated
+- Discount applied</p>
+<p>Anyone can recompute the fare given the trip record. Reconciliation jobs run.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Fare is deterministic from events: surge locked at request, distance and time accumulated during the trip, fees and discounts captured. Anyone can recompute; reconciliation catches drift.</p>
+</blockquote>
+<h3 id="payment-integration">Payment Integration</h3>
+<p>Reuse payment-system design:</p>
+<ol>
+<li>At trip request: pre-authorize estimated fare (hold on payment method).</li>
+<li>At completion: capture actual fare.</li>
+<li>Driver payout: aggregate completed trip earnings; payout on cadence (daily, weekly).</li>
+<li>Refunds: state transition + refund pipeline.</li>
+<li>Disputes: hold funds; manual resolution.</li>
+</ol>
+<p>Critical: payment idempotency. Trip_id used as idempotency key for payment provider.</p>
+<h3 id="surge-engine">Surge Engine</h3>
+<p>Per-cell heatmap of demand vs supply.</p>
+<ul>
+<li>Demand: recent open requests in cell per minute.</li>
+<li>Supply: available drivers in cell.</li>
+<li>Multiplier: function of ratio (1.0 to 3.0+ typically).</li>
+<li>Updated every 30 seconds to a few minutes.</li>
+<li>Cached at client for display.</li>
+</ul>
+<p>When a request is created, surge value at that moment is snapshotted into the trip. Subsequent surge changes don't affect the fare for in-progress trips.</p>
+<h3 id="eta-service">ETA Service</h3>
+<p>Two-level prediction:</p>
+<ul>
+<li><strong>Routing engine</strong> computes ETA from road network and current traffic.</li>
+<li><strong>ML correction</strong> adjusts for historical patterns, time of day, driver behavior.</li>
+</ul>
+<p>Used at:
+- Match scoring: ETA to pickup affects driver ranking.
+- Display: ETA to destination shown to rider.
+- En route: live updates.</p>
+<p>Pre-computed for common O-D pairs; on-demand otherwise.</p>
+<h3 id="driver-onboarding">Driver Onboarding</h3>
+<p>Asynchronous workflow:</p>
+<ol>
+<li>Driver applies; submits docs (license, registration, insurance, photo).</li>
+<li>Background check service runs (often via external provider).</li>
+<li>Vehicle verification.</li>
+<li>Training material acknowledged.</li>
+<li>On approval, driver status flips to <code>approved</code>; can go online.</li>
+<li>Periodic re-checks (annual, etc.).</li>
+</ol>
+<p>Steps may take days. State machine with status updates pushed to driver.</p>
+<h3 id="rating-service">Rating Service</h3>
+<p>Bidirectional. After each trip:</p>
+<ol>
+<li>Rider rates driver.</li>
+<li>Driver rates rider.</li>
+<li>Each rating updates aggregate score (running avg).</li>
+<li>Low ratings flagged for review.</li>
+<li>Hidden until both submit (or window expires) to avoid retaliation.</li>
+</ol>
+<p>Driver's rating affects matching priority; rider's rating affects driver acceptance.</p>
+<h3 id="promotions">Promotions</h3>
+<p>Code-based or auto-applied:</p>
+<ul>
+<li>Codes redeemable per user N times.</li>
+<li>Auto-promos applied to eligible trips.</li>
+<li>Atomic redemption: <code>INSERT INTO Redemption(user, promo) IF NOT EXISTS</code>.</li>
+<li>Discount applied at fare calculation.</li>
+</ul>
+<p>Anti-fraud: detect abuse patterns (same payment method, sequential IPs).</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Driver state</td>
+<td><code>driver_id</code> hash</td>
+<td>Per-driver CAS.</td>
+</tr>
+<tr>
+<td>Trips</td>
+<td><code>trip_id</code> hash; indexed by rider, driver</td>
+<td>Multi-direction.</td>
+</tr>
+<tr>
+<td>Geo index</td>
+<td><code>cell_id</code> hash</td>
+<td>Per-cell membership.</td>
+</tr>
+<tr>
+<td>Surge cells</td>
+<td><code>cell_id</code> hash</td>
+<td>Per-cell heatmap.</td>
+</tr>
+<tr>
+<td>Payments</td>
+<td><code>trip_id</code> for payment intent</td>
+<td>Per-trip.</td>
+</tr>
+<tr>
+<td>Ratings</td>
+<td><code>trip_id</code></td>
+<td>Per-trip.</td>
+</tr>
+<tr>
+<td>Onboarding</td>
+<td><code>driver_id</code></td>
+<td>Workflow.</td>
+</tr>
+<tr>
+<td>Cities</td>
+<td>Each city is largely independent</td>
+<td>Natural sharding.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Driver state</td>
+<td>Strong (CAS)</td>
+<td>No double-booking.</td>
+</tr>
+<tr>
+<td>Trip state</td>
+<td>Strong</td>
+<td>Money + dates.</td>
+</tr>
+<tr>
+<td>Geo index</td>
+<td>Eventually consistent</td>
+<td>Acceptable.</td>
+</tr>
+<tr>
+<td>Surge</td>
+<td>Eventually consistent</td>
+<td>Bounded.</td>
+</tr>
+<tr>
+<td>Payment</td>
+<td>Strong end-to-end</td>
+<td>Money.</td>
+</tr>
+<tr>
+<td>Ratings</td>
+<td>Eventually consistent aggregate</td>
+<td>UX.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Per-city operations in local region.</li>
+<li>Cross-city trips rare; handled with explicit logic.</li>
+<li>Global services (payments, accounts) replicated globally with regional primaries.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Double-booking.</td>
+<td>CAS on driver state.</td>
+<td>Conflict rate.</td>
+</tr>
+<tr>
+<td>Trip stuck.</td>
+<td>Reconciliation worker; max duration.</td>
+<td>Trips &gt; N hours.</td>
+</tr>
+<tr>
+<td>Payment failure post-trip.</td>
+<td>Retry; manual collection.</td>
+<td>Failed payment rate.</td>
+</tr>
+<tr>
+<td>Surge spike at event.</td>
+<td>Pre-allocate dispatch; pricing dampens demand.</td>
+<td>Per-cell ratio.</td>
+</tr>
+<tr>
+<td>Driver app offline mid-trip.</td>
+<td>Rider reports continue trip; reconcile on reconnect.</td>
+<td>Mid-trip disconnect rate.</td>
+</tr>
+<tr>
+<td>Promo abuse.</td>
+<td>Anti-fraud detection; cap redemptions.</td>
+<td>Promo redemption anomalies.</td>
+</tr>
+<tr>
+<td>Onboarding fraud.</td>
+<td>Background check; document verification.</td>
+<td>Approval rate per source.</td>
+</tr>
+<tr>
+<td>Cross-city trip.</td>
+<td>Explicit logic; longer fare calculation.</td>
+<td>Cross-city trip count.</td>
+</tr>
+<tr>
+<td>Rating manipulation.</td>
+<td>Anomaly detection; weight by trust.</td>
+<td>Rating anomalies.</td>
+</tr>
+<tr>
+<td>Region down.</td>
+<td>Failover within region; cross-region rare.</td>
+<td>Region availability.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Double-booking incidents (zero).</li>
+<li>Trip state inconsistency.</li>
+<li>Payment drift vs trips.</li>
+<li>Fare recomputation matches recorded total.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Match latency p99.</li>
+<li>Trip creation rate.</li>
+<li>Location updates per second.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Trips per city per day.</li>
+<li>Match success rate.</li>
+<li>Surge frequency.</li>
+<li>Driver utilization.</li>
+<li>Cancellation rate (rider, driver).</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Single-city sharding simplifies but cross-city is awkward.</li>
+<li>Tighter pre-trade risk slows matching.</li>
+<li>Aggressive surge dampens demand but generates user complaints.</li>
+<li>More frequent location updates give live ETA but cost battery.</li>
+<li>Strict driver state CAS limits throughput per driver.</li>
+<li>Real-time payment capture vs end-of-trip capture: latency vs cancel-friendly.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One monolithic backend.</td>
+<td>Microservices with clear ownership.</td>
+</tr>
+<tr>
+<td>Synchronous payment at trip start.</td>
+<td>Authorize at start; capture at end.</td>
+</tr>
+<tr>
+<td>Global surge slider.</td>
+<td>Per-cell heatmap.</td>
+</tr>
+<tr>
+<td>Stateful matching service per request.</td>
+<td>Stateless workers with shared geo index.</td>
+</tr>
+<tr>
+<td>No fare reconciliation.</td>
+<td>Deterministic fare from events; periodic recompute.</td>
+</tr>
+<tr>
+<td>Auto-trust onboarding.</td>
+<td>Background checks; document verification.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dispatch</td>
+<td>See Uber/Lyft design.</td>
+</tr>
+<tr>
+<td>Trip lifecycle</td>
+<td>CAS state transitions; idempotency.</td>
+</tr>
+<tr>
+<td>Payments</td>
+<td>Pre-auth, capture, payout, refund.</td>
+</tr>
+<tr>
+<td>Surge</td>
+<td>Per-cell heatmap; supply/demand ratio.</td>
+</tr>
+<tr>
+<td>ETA</td>
+<td>Routing + ML; per-O-D caching.</td>
+</tr>
+<tr>
+<td>Onboarding</td>
+<td>Async workflow; background check.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Microservices for dispatch, trip, payment, surge, ETA, onboarding.</li>
+<li>Geo-indexed driver state.</li>
+<li>Trip state machine with CAS.</li>
+<li>Reuse payment-system design.</li>
+<li>Per-cell surge.</li>
+<li>Bidirectional ratings.</li>
+<li>Per-city sharding.</li>
+<li>Async onboarding workflow.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>The Uber backend is dispatch plus trip state machine plus payment plus surge plus a constellation of supporting microservices. Each city operates independently; the geo index makes nearby fast; the trip state machine ensures correctness; payments and surge integrate via deterministic event records. Multi-region scales by adding cities, not by globalizing services.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design the Uber backend.</p>
+<p><strong>Candidate:</strong> I will scaffold the platform: dispatch with geospatial index, trip state machine, payment service, surge engine, ETA, onboarding, ratings, support. Each city is the natural sharding unit. The invariant is at-most-one-driver per trip with deterministic fare calculation, idempotent payments, and trip state transitions audited end-to-end.</p>
+<p><strong>Interviewer:</strong> Start with dispatch and matching.</p>
+<p><strong>Candidate:</strong> See <a href="./design-uber-or-lyft.md">Design Uber or Lyft</a> for depth. Geo index with H3 cells; per-city sharding. Atomic CAS on driver state prevents double-booking. Trip state machine for lifecycle.</p>
+<p><strong>Interviewer:</strong> How does fare calculation work?</p>
+<p><strong>Candidate:</strong> Deterministic from recorded events. At request, surge_multiplier is locked. During the trip, distance and duration are tracked from location updates. At completion, fare = base + distance<em>per_mile + duration</em>per_minute + tolls, times surge, plus booking_fee, minus discount, plus tax. Driver_payout = total - platform_fee. Every component is captured in the trip record; any auditor can recompute.</p>
+<p><strong>Interviewer:</strong> Payments?</p>
+<p><strong>Candidate:</strong> Reuse the payment system design. At request, pre-authorize estimated fare. At completion, capture actual fare. Driver payout aggregates earnings on a cadence (daily, weekly) via the payment system. Refunds and disputes are state transitions on the trip. Idempotency end-to-end: trip_id is the idempotency key.</p>
+<p><strong>Interviewer:</strong> Surge?</p>
+<p><strong>Candidate:</strong> Per-cell heatmap. Streaming pipeline tracks demand (recent requests) and supply (available drivers) per cell. Multiplier computed every 30 seconds. Surge at request time is snapshotted into the trip; subsequent surge changes don't affect in-progress trips. Aggressive surge dampens demand and incentivizes more drivers to come online.</p>
+<p><strong>Interviewer:</strong> ETA?</p>
+<p><strong>Candidate:</strong> Routing engine computes ETA from road network and traffic. ML model corrects for historical patterns. Used at match (ETA to pickup affects scoring), trip preview (ETA to destination), en route (live updates). Pre-computed for hot O-D pairs.</p>
+<p><strong>Interviewer:</strong> Driver onboarding?</p>
+<p><strong>Candidate:</strong> Async workflow. Driver applies; submits documents (license, registration, insurance, photo). Background check service (external provider) runs. Vehicle verification. Training material. State machine moves through <code>pending → approved → active</code>. Annual re-checks. Failures (criminal record, expired license) block onboarding or trigger suspension.</p>
+<p><strong>Interviewer:</strong> Ratings?</p>
+<p><strong>Candidate:</strong> Bidirectional after each trip. Rider rates driver; driver rates rider. Aggregated per user. Hidden until both submit (or window expires) to avoid retaliation. Low ratings flag for review. Driver rating affects matching priority; rider rating affects driver acceptance.</p>
+<p><strong>Interviewer:</strong> Promotions?</p>
+<p><strong>Candidate:</strong> Codes redeemable per user N times. Atomic redemption: <code>INSERT INTO Redemption(user, promo) IF NOT EXISTS</code>. Discount applied at fare calculation. Anti-fraud: detect abuse like same card, sequential IPs, rapid signups. Promos that exceed budget are paused.</p>
+<p><strong>Interviewer:</strong> Cross-city trip?</p>
+<p><strong>Candidate:</strong> Rare but happens (long airport runs to neighboring cities, large metropolitan regions spanning multiple cities). Trip is created in origin city's region; if destination is in another city, fare calculation considers both regions' rules. Cross-region payment handled by the payment system. Operational complexity but not architectural.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Each city in nearest data center. Cross-city operations are explicit; not the common case. Global services like payments and accounts replicated globally with regional primaries.</p>
+<p><strong>Interviewer:</strong> Reconciliation?</p>
+<p><strong>Candidate:</strong> Daily jobs. Recompute fares from trip records; flag mismatches with recorded totals. Driver hours reconciled against location updates. Payment ledger reconciled against trip totals. Promotion redemptions reconciled against discount usage. Drift triggers alerts and investigations.</p>
+<p><strong>Interviewer:</strong> A driver completes a trip but the app crashed before sending complete.</p>
+<p><strong>Candidate:</strong> The trip is stuck in <code>in_trip</code>. Detection: max trip duration alert. Reconciliation: the system can detect the driver moved to next trip or went offline; auto-complete based on heuristics. Manual review for ambiguous cases. Fare is computed from recorded events up to detected completion.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> The Uber backend is microservices: dispatch (geo + matching), trip state machine, payment (reuse design), surge (per-cell heatmap), ETA (routing + ML), onboarding, ratings, support. Each city is independent. Fare is deterministic from recorded events. Reconciliation jobs catch drift. Multi-region by city. The hardest correctness problem is double-booking (CAS); the hardest scale problem is location updates.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: dispatch, lifecycle, payment, surge, support breadth.</li>
+<li>Invariant: at-most-one-driver; deterministic fare; idempotent payment.</li>
+<li>Microservices: dispatch, trip, payment, surge, ETA, onboarding, ratings.</li>
+<li>Geo index per city; CAS on driver state.</li>
+<li>Trip state machine; explicit transitions.</li>
+<li>Deterministic fare from events.</li>
+<li>Per-cell surge; ETA from routing + ML.</li>
+<li>Async onboarding workflow; bidirectional ratings.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>The Uber backend stitches microservices around a geospatial dispatch core. Trip state machine ensures lifecycle correctness; payment reuses the payment design with idempotency on trip_id; surge is a per-cell heatmap; ETA combines routing and ML; onboarding and support run async. Cities are the natural sharding unit. Fare is deterministic from recorded events; reconciliation catches drift. Multi-region by city. The hardest correctness problem is double-booking; the breadth challenge is keeping a dozen microservices coherent.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Each city is the natural sharding unit; cross-city is the exception."</li>
+<li>"Fare is deterministic from events; anyone can recompute, reconciliation catches drift."</li>
+<li>"Surge is a per-cell heatmap, locked at request time into the trip."</li>
+<li>"Trip state machine with CAS transitions ensures lifecycle correctness."</li>
+<li>"Payment idempotency via trip_id end-to-end."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

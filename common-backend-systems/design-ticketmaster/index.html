@@ -1,0 +1,957 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Ticketmaster — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Ticketmaster</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Ticketmaster is a scarce-inventory booking system under extreme burst traffic.</p>
+<p>The hard part is not listing events or rendering venue maps. The hard part is this invariant:</p>
+<blockquote>
+<p>One seat can be sold at most once, even when millions of users arrive at sale start, clients retry, payments time out, caches are stale, and bots attack the system.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can separate fast read projections from authoritative booking state, control burst traffic before it reaches inventory, and explain the exact state transition that prevents overselling.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Ticketmaster around scarce seat inventory and burst control. Browsing and seat-map reads can be served from caches and search indexes, but holds, checkout, and ticket issuance must go through an authoritative state machine. I will first clarify requirements, then cover the read path, reservation path, waiting room, data model, scaling strategy, and failure handling. The deep dive I would expect is seat hold correctness under payment retries and hold expiry.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Users can browse events by artist, venue, city, date, and category.</li>
+<li>Users can view event details, ticket prices, and a seat map.</li>
+<li>Users can select one or more seats and place a short-lived hold.</li>
+<li>Users can complete checkout and receive tickets.</li>
+<li>Users can see order history and ticket status.</li>
+<li>The system supports event organizers creating events, venue maps, sale windows, pricing tiers, and ticket inventory.</li>
+<li>The system needs bot protection, purchase limits, and fraud checks.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Prevent double-selling a seat.</li>
+<li>Survive massive sale-start bursts for popular events.</li>
+<li>Keep browsing and search low-latency even during sales.</li>
+<li>Keep checkout reliable and idempotent under retries.</li>
+<li>Allow stale availability in browsing views, but never in final booking decisions.</li>
+<li>Provide auditability for money, inventory, ticket issuance, refunds, and disputes.</li>
+</ul>
+<p>Out of scope unless interviewer asks:</p>
+<ul>
+<li>Full resale marketplace.</li>
+<li>Dynamic pricing optimization.</li>
+<li>Barcode scanning at venue entry.</li>
+<li>Organizer analytics dashboards.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<p>State assumptions out loud so the design has a shape:</p>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>Hundreds of millions of registered users.</td>
+</tr>
+<tr>
+<td>Events</td>
+<td>Millions of events, but only a small fraction are hot at once.</td>
+</tr>
+<tr>
+<td>Popular sale</td>
+<td>1 to 10 million users arrive near sale start.</td>
+</tr>
+<tr>
+<td>Inventory</td>
+<td>A venue has 10,000 to 100,000 seats. Some events use general admission instead of assigned seats.</td>
+</tr>
+<tr>
+<td>Read/write ratio</td>
+<td>Browsing and seat-map reads dominate; hold and purchase writes are much smaller but correctness-critical.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Search under a few hundred milliseconds; hold request around hundreds of milliseconds to a few seconds during bursts; checkout may take seconds because payment providers are involved.</td>
+</tr>
+<tr>
+<td>Consistency</td>
+<td>Strong per-seat consistency for hold and sale. Event search and displayed availability can be eventually consistent.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is not normal database throughput. The bottleneck is a hot event where many users compete for the same small set of seats at the same time.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<p>Think in terms of three separate surfaces:</p>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>User experience</th>
+<th>System requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Discovery</td>
+<td>Search and browse events.</td>
+<td>Fast, cacheable, eventually consistent.</td>
+</tr>
+<tr>
+<td>Selection</td>
+<td>View seat map and pick seats.</td>
+<td>Mostly read-heavy, can show slightly stale availability with clear final validation.</td>
+</tr>
+<tr>
+<td>Booking</td>
+<td>Hold seats, pay, issue tickets.</td>
+<td>Strongly consistent per seat, idempotent, auditable.</td>
+</tr>
+</tbody>
+</table>
+<p>The main design mistake is letting the discovery or seat-map layer become the source of truth. It should only be a projection.</p>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">                +-------------------+
+User clients -&gt; | Edge / CDN / WAF   |
+                +---------+---------+
+                          |
+                          v
+                +-------------------+
+                | API Gateway       |
+                | auth, rate limit  |
+                +----+---------+----+
+                     |         |
+       browse/search |         | sale-start / hot event
+                     v         v
+        +----------------+   +-------------------+
+        | Search Service |   | Waiting Room      |
+        | Event Index    |   | admission tokens  |
+        +-------+--------+   +---------+---------+
+                |                      |
+                v                      v
+        +----------------+   +-------------------+
+        | Event Detail   |   | Seat Hold Service |
+        | Seat Map Cache |   | authority path    |
+        +-------+--------+   +---------+---------+
+                |                      |
+                v                      v
+        +----------------+   +-------------------+
+        | Availability   |   | Inventory Store   |
+        | Projection     |   | seat state machine|
+        +----------------+   +---------+---------+
+                                       |
+                                       v
+                              +-------------------+
+                              | Checkout Service  |
+                              | Payment Provider  |
+                              +---------+---------+
+                                        |
+                                        v
+                              +-------------------+
+                              | Ticket Ledger     |
+                              | ticket issuance   |
+                              +-------------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Edge, CDN, WAF</td>
+<td>Serve static assets, absorb traffic, block obvious abuse.</td>
+<td>Event pages and venue map metadata should be cacheable.</td>
+</tr>
+<tr>
+<td>API gateway</td>
+<td>Authentication, authorization, rate limits, request routing.</td>
+<td>Enforces per-user and per-device limits before traffic reaches inventory.</td>
+</tr>
+<tr>
+<td>Event catalog service</td>
+<td>Owns event metadata, performers, venue, sale window, price tiers.</td>
+<td>Not the owner of seat sale state.</td>
+</tr>
+<tr>
+<td>Search service</td>
+<td>Indexes events for discovery by text, location, time, and category.</td>
+<td>Eventually consistent projection from event catalog.</td>
+</tr>
+<tr>
+<td>Seat map service</td>
+<td>Serves venue layout, sections, seat labels, accessibility info, and price zones.</td>
+<td>Venue geometry changes rarely; availability changes often. Keep them separate.</td>
+</tr>
+<tr>
+<td>Availability projection</td>
+<td>Shows approximate available, held, sold, or low inventory status.</td>
+<td>Derived from inventory events; useful for UI, not final authority.</td>
+</tr>
+<tr>
+<td>Waiting room</td>
+<td>Controls admission into hot event purchase flow.</td>
+<td>Protects inventory service and creates a fairness story.</td>
+</tr>
+<tr>
+<td>Seat hold service</td>
+<td>Creates and expires short-lived holds.</td>
+<td>Authoritative path for seat state transitions.</td>
+</tr>
+<tr>
+<td>Checkout service</td>
+<td>Validates hold ownership, charges payment, converts hold to sold.</td>
+<td>Must be idempotent because payment calls time out and users retry.</td>
+</tr>
+<tr>
+<td>Ticket ledger</td>
+<td>Issues immutable ticket records, transfer status, barcodes, and audit log.</td>
+<td>The ticket is created only after successful checkout.</td>
+</tr>
+<tr>
+<td>Event stream</td>
+<td>Publishes inventory, order, payment, and ticket events.</td>
+<td>Used to rebuild projections and reconcile failures.</td>
+</tr>
+<tr>
+<td>Bot and fraud service</td>
+<td>Scores users, devices, IPs, velocity, payment risk, and account age.</td>
+<td>Should run before scarce inventory is touched.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<p>Keep authoritative records small and explicit.</p>
+<h4 id="event">Event</h4>
+<pre><code class="language-text">Event(
+  event_id,
+  organizer_id,
+  venue_id,
+  title,
+  city,
+  start_time,
+  sale_start_time,
+  sale_end_time,
+  status,
+  version
+)
+</code></pre>
+<h4 id="seat">Seat</h4>
+<pre><code class="language-text">Seat(
+  event_id,
+  seat_id,
+  section,
+  row,
+  number,
+  price_tier_id,
+  status,          // available, held, sold, blocked
+  hold_id,
+  hold_expires_at,
+  order_id,
+  version
+)
+</code></pre>
+<p>For assigned seating, <code>event_id + seat_id</code> is the natural authority key.</p>
+<p>For general admission, model inventory as counters or buckets:</p>
+<pre><code class="language-text">InventoryBucket(
+  event_id,
+  bucket_id,       // GA floor, VIP, balcony, etc.
+  total_count,
+  held_count,
+  sold_count,
+  version
+)
+</code></pre>
+<h4 id="hold">Hold</h4>
+<pre><code class="language-text">Hold(
+  hold_id,
+  event_id,
+  user_id,
+  seat_ids,
+  status,          // active, expired, converted, canceled
+  created_at,
+  expires_at,
+  idempotency_key,
+  version
+)
+</code></pre>
+<h4 id="order">Order</h4>
+<pre><code class="language-text">Order(
+  order_id,
+  user_id,
+  event_id,
+  hold_id,
+  amount,
+  currency,
+  status,          // pending_payment, paid, failed, canceled, refunded
+  payment_intent_id,
+  idempotency_key,
+  created_at,
+  updated_at,
+  version
+)
+</code></pre>
+<h4 id="ticket">Ticket</h4>
+<pre><code class="language-text">Ticket(
+  ticket_id,
+  order_id,
+  event_id,
+  seat_id,
+  owner_user_id,
+  status,          // active, transferred, refunded, voided, used
+  barcode_token_hash,
+  issued_at,
+  version
+)
+</code></pre>
+<h4 id="audit-event">Audit Event</h4>
+<pre><code class="language-text">InventoryEvent(
+  event_id,
+  entity_id,       // seat_id, hold_id, order_id, ticket_id
+  event_type,
+  previous_state,
+  new_state,
+  actor,
+  idempotency_key,
+  created_at
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<p>Discovery APIs:</p>
+<pre><code class="language-text">GET /events?city=&amp;query=&amp;date=&amp;cursor=
+GET /events/{event_id}
+GET /events/{event_id}/seat-map
+GET /events/{event_id}/availability?section=
+</code></pre>
+<p>Waiting room and booking APIs:</p>
+<pre><code class="language-text">POST /events/{event_id}/join-waiting-room
+GET  /events/{event_id}/waiting-room-status
+POST /events/{event_id}/holds
+POST /holds/{hold_id}/checkout
+GET  /orders/{order_id}
+GET  /tickets/{ticket_id}
+</code></pre>
+<p>Hold request:</p>
+<pre><code class="language-text">POST /events/{event_id}/holds
+Headers:
+  Idempotency-Key: client-generated-key
+Body:
+  user_id
+  admission_token
+  seat_ids
+</code></pre>
+<p>Hold response:</p>
+<pre><code class="language-text">200 OK
+  hold_id
+  status: active
+  expires_at
+  unavailable_seat_ids: []
+</code></pre>
+<p>If the same user retries with the same idempotency key, return the same hold result.</p>
+<h3 id="seat-state-machine">Seat State Machine</h3>
+<p>This is the core of the design.</p>
+<pre><code class="language-text">available -&gt; held -&gt; sold
+     |         |
+     |         +-&gt; expired -&gt; available
+     |
+     +-&gt; blocked
+</code></pre>
+<p>Allowed transitions:</p>
+<table>
+<thead>
+<tr>
+<th>Transition</th>
+<th>Who can perform it</th>
+<th>Condition</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>available -&gt; held</code></td>
+<td>Seat hold service</td>
+<td>Seat is available, sale window open, user has valid admission token, conditional write succeeds.</td>
+</tr>
+<tr>
+<td><code>held -&gt; sold</code></td>
+<td>Checkout service</td>
+<td>Hold belongs to user, hold not expired, payment succeeded, idempotency key accepted.</td>
+</tr>
+<tr>
+<td><code>held -&gt; expired</code></td>
+<td>Expiry worker or hold service</td>
+<td>Current time is after <code>hold_expires_at</code>, hold not converted.</td>
+</tr>
+<tr>
+<td><code>expired -&gt; available</code></td>
+<td>Expiry worker</td>
+<td>Release seat for future holds.</td>
+</tr>
+<tr>
+<td><code>available -&gt; blocked</code></td>
+<td>Organizer/admin</td>
+<td>Seat is reserved, removed, damaged, or held for compliance.</td>
+</tr>
+</tbody>
+</table>
+<p>The important implementation detail is conditional update:</p>
+<pre><code class="language-text">UPDATE Seat
+SET status = 'held', hold_id = ?, hold_expires_at = ?, version = version + 1
+WHERE event_id = ?
+  AND seat_id = ?
+  AND status = 'available'
+  AND version = ?
+</code></pre>
+<p>For multiple adjacent seats, options are:</p>
+<ul>
+<li>Use a single partition and transaction if all selected seats are colocated.</li>
+<li>Use a deterministic seat ordering and conditional writes, then roll back if any seat fails.</li>
+<li>Prefer holding seat groups from the same shard to avoid distributed transactions in the hot path.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The seat map may be stale, but the hold transition cannot be stale. The final decision is a conditional state transition on the authoritative seat record.</p>
+</blockquote>
+<h3 id="write-path-create-hold">Write Path: Create Hold</h3>
+<ol>
+<li>User enters event page and tries to buy.</li>
+<li>API gateway verifies auth, sale window, rate limit, and bot score.</li>
+<li>If the event is hot, user must present a waiting-room admission token.</li>
+<li>Seat hold service validates <code>event_id</code>, <code>seat_ids</code>, user purchase limits, and idempotency key.</li>
+<li>Service routes to the inventory shard for <code>event_id</code> or <code>event_id + section</code>.</li>
+<li>Inventory store performs conditional writes from <code>available</code> to <code>held</code>.</li>
+<li>Hold record is created with short expiry, for example 2 to 10 minutes.</li>
+<li>Inventory event is emitted to update availability projections and analytics.</li>
+<li>Client receives <code>hold_id</code> and <code>expires_at</code>.</li>
+</ol>
+<p>Key point: the response waits for the authoritative hold, not for search index or availability cache refresh.</p>
+<h3 id="write-path-checkout">Write Path: Checkout</h3>
+<ol>
+<li>Client submits <code>hold_id</code>, payment method, and checkout idempotency key.</li>
+<li>Checkout service verifies the hold belongs to the user and is still active.</li>
+<li>Create payment intent with the payment provider using an idempotency key.</li>
+<li>If payment succeeds, transition hold to <code>converted</code> and seats from <code>held</code> to <code>sold</code>.</li>
+<li>Create order and ticket records in the ticket ledger.</li>
+<li>Emit order paid and tickets issued events.</li>
+<li>Notify user by email, push, and order page update.</li>
+</ol>
+<p>Payment timeout handling:</p>
+<ul>
+<li>If provider returns success, complete the order.</li>
+<li>If provider returns failure, release the hold or let it expire.</li>
+<li>If provider times out, mark order as <code>payment_unknown</code> or <code>pending_payment</code> and reconcile with provider before releasing seats.</li>
+<li>Do not immediately sell the same seats to someone else if the payment may have succeeded.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Payment creates an unknown-state problem. I would rather temporarily keep the hold and reconcile than risk charging one user and selling the seat to another.</p>
+</blockquote>
+<h3 id="read-path-search-and-event-browsing">Read Path: Search And Event Browsing</h3>
+<ol>
+<li>Client searches for events by query, location, category, and time.</li>
+<li>API gateway routes to search service.</li>
+<li>Search service reads from event index, not the booking database.</li>
+<li>Event detail page reads event metadata from catalog cache.</li>
+<li>Seat map geometry is loaded from a CDN or cache because it changes rarely.</li>
+<li>Availability overlay is loaded from an availability projection with short TTL.</li>
+</ol>
+<p>This path can be eventually consistent. If the UI says a seat looks available but the hold fails, the system returns a clear unavailable response and refreshes the availability overlay.</p>
+<h3 id="waiting-room-design">Waiting Room Design</h3>
+<p>The waiting room protects the authority path from a traffic spike.</p>
+<p>Goals:</p>
+<ul>
+<li>Admit users at a rate the seat hold service can handle.</li>
+<li>Prevent queue bypass.</li>
+<li>Preserve reasonable fairness.</li>
+<li>Give users progress feedback.</li>
+<li>Let operators pause, slow, or stop admissions.</li>
+</ul>
+<p>Flow:</p>
+<ol>
+<li>Before sale start, users enter the waiting room.</li>
+<li>System assigns a queue token with user id, event id, issued time, randomization seed, and signature.</li>
+<li>At sale start, users are ordered by fairness policy, for example randomized users already in the room plus first-come order afterward.</li>
+<li>Admission controller releases signed admission tokens at a controlled rate.</li>
+<li>Booking APIs require valid admission tokens for hot events.</li>
+<li>Token expires quickly and is bound to user, event, and device/session.</li>
+</ol>
+<p>Why not pure first-come-first-served?</p>
+<ul>
+<li>It rewards bots and fastest networks.</li>
+<li>It creates an edge traffic stampede exactly at sale start.</li>
+<li>A randomized waiting room can be more fair and easier to operate.</li>
+</ul>
+<p>Admission token:</p>
+<pre><code class="language-text">AdmissionToken(
+  token_id,
+  event_id,
+  user_id,
+  admitted_at,
+  expires_at,
+  max_hold_attempts,
+  signature
+)
+</code></pre>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<p>Partitioning choices:</p>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Event catalog</td>
+<td><code>event_id</code> or organizer</td>
+<td>Normal metadata reads/writes.</td>
+</tr>
+<tr>
+<td>Search index</td>
+<td>term/location/time shards</td>
+<td>Query serving and ranking.</td>
+</tr>
+<tr>
+<td>Seat inventory</td>
+<td><code>event_id + section_id</code> for large events, <code>event_id</code> for smaller events</td>
+<td>Keeps hot event inventory isolated.</td>
+</tr>
+<tr>
+<td>Holds</td>
+<td><code>event_id + hold_id</code> or <code>user_id</code> depending on lookup path</td>
+<td>Need lookup by hold during checkout and by event during expiry.</td>
+</tr>
+<tr>
+<td>Orders</td>
+<td><code>user_id</code> and <code>order_id</code> indexes</td>
+<td>Users read order history; support staff uses order lookup.</td>
+</tr>
+<tr>
+<td>Tickets</td>
+<td><code>event_id + seat_id</code> and <code>ticket_id</code></td>
+<td>Venue entry and ownership queries.</td>
+</tr>
+</tbody>
+</table>
+<p>Hot-event strategy:</p>
+<ul>
+<li>Precompute event page, venue geometry, price tiers, and section-level availability before sale start.</li>
+<li>Put hot events into dedicated inventory shards or isolated capacity pools.</li>
+<li>Use the waiting room to shape write traffic.</li>
+<li>Keep search, analytics, and recommendation traffic away from the booking database.</li>
+<li>For very large venues, split inventory by section so users selecting balcony seats do not contend with floor seats.</li>
+<li>Use backpressure from inventory shard latency to slow waiting-room admission.</li>
+</ul>
+<p>Caching:</p>
+<ul>
+<li>Cache event metadata and seat map geometry aggressively.</li>
+<li>Cache availability overlays with short TTL and version numbers.</li>
+<li>Never trust cache for final hold or checkout.</li>
+<li>Use event stream updates to invalidate hot sections quickly.</li>
+</ul>
+<h3 id="consistency-model">Consistency Model</h3>
+<p>Strong consistency required:</p>
+<ul>
+<li>Seat hold creation.</li>
+<li>Seat sale conversion.</li>
+<li>Ticket issuance.</li>
+<li>Refund or void operations that affect ticket validity.</li>
+</ul>
+<p>Eventual consistency acceptable:</p>
+<ul>
+<li>Search results.</li>
+<li>Event detail page counts.</li>
+<li>Seat-map availability overlay.</li>
+<li>Recommendation and popularity ranking.</li>
+<li>Analytics dashboards.</li>
+</ul>
+<p>This is a classic authority/projection split:</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inventory store</td>
+<td>Strong per seat or inventory bucket</td>
+<td>Prevent oversell.</td>
+</tr>
+<tr>
+<td>Hold/order state machine</td>
+<td>Strong state transitions</td>
+<td>Retries must converge.</td>
+</tr>
+<tr>
+<td>Availability projection</td>
+<td>Eventually consistent</td>
+<td>UI hint only.</td>
+</tr>
+<tr>
+<td>Search index</td>
+<td>Eventually consistent</td>
+<td>Discovery can tolerate lag.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="expiry-and-reconciliation">Expiry And Reconciliation</h3>
+<p>Holds cannot last forever.</p>
+<p>Expiry worker responsibilities:</p>
+<ul>
+<li>Scan or consume hold-expiry tasks by time bucket.</li>
+<li>Transition active expired holds to <code>expired</code>.</li>
+<li>Release seats back to <code>available</code> if no checkout is in progress.</li>
+<li>Emit inventory events to refresh projections.</li>
+</ul>
+<p>Avoid a single giant scan:</p>
+<ul>
+<li>Store holds in time buckets by <code>expires_at</code>.</li>
+<li>Use delayed queues or a timing-wheel style scheduler.</li>
+<li>Make expiry idempotent because workers can crash and retry.</li>
+</ul>
+<p>Reconciliation jobs:</p>
+<ul>
+<li>Compare seats marked <code>sold</code> with tickets issued.</li>
+<li>Compare paid orders with payment provider settlement records.</li>
+<li>Compare active holds with expiry deadline.</li>
+<li>Rebuild availability projection from inventory events or current seat records.</li>
+<li>Quarantine inconsistent orders for manual review.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<p>For the first version, use one primary write region per event.</p>
+<p>Why:</p>
+<ul>
+<li>The invariant is per-seat correctness.</li>
+<li>Active-active writes for the same event create conflict-resolution risk.</li>
+<li>Most popular events are naturally tied to a venue and sale region.</li>
+</ul>
+<p>Design:</p>
+<ul>
+<li>Route all hold and checkout writes for an event to its owner region.</li>
+<li>Replicate read projections globally for browsing.</li>
+<li>Keep CDN and search close to users.</li>
+<li>Use active-passive failover for the authority region, with clear recovery point and recovery time goals.</li>
+</ul>
+<p>If the interviewer requires active-active:</p>
+<ul>
+<li>Assign seat sections to regional owners, not all regions writing all seats.</li>
+<li>Or pre-allocate inventory slices per region for general admission.</li>
+<li>Do not merge conflicting seat sales after the fact; avoid creating the conflict.</li>
+</ul>
+<h3 id="bot-protection-and-fairness">Bot Protection And Fairness</h3>
+<p>Bot protection needs to run before inventory.</p>
+<p>Signals:</p>
+<ul>
+<li>Account age and verification.</li>
+<li>Device fingerprint and session history.</li>
+<li>IP reputation and proxy detection.</li>
+<li>Request velocity and navigation pattern.</li>
+<li>Payment method reuse.</li>
+<li>Queue token integrity.</li>
+<li>Purchase limit per user, household, card, or device.</li>
+</ul>
+<p>Controls:</p>
+<ul>
+<li>Rate limiting at edge and gateway.</li>
+<li>CAPTCHA or challenge only when risk is high.</li>
+<li>Signed waiting-room tokens.</li>
+<li>Per-event purchase caps.</li>
+<li>Fraud review before ticket transfer or resale.</li>
+</ul>
+<p>Tradeoff:</p>
+<ul>
+<li>Aggressive bot controls may block legitimate users.</li>
+<li>Weak bot controls let automated buyers consume scarce inventory.</li>
+<li>The practical answer is progressive friction: low-risk users move quickly, suspicious users face more checks.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Seat is sold twice.</td>
+<td>Conditional writes on seat state, explicit state machine, idempotency keys, reconciliation alerts.</td>
+<td>State-transition conflict rate, duplicate <code>event_id + seat_id</code> sold records, ticket issuance mismatch.</td>
+</tr>
+<tr>
+<td>Seat map shows stale availability.</td>
+<td>Treat availability as projection, use TTL/versioning, re-check on hold.</td>
+<td>Hold failure due to stale UI, projection lag, cache version skew.</td>
+</tr>
+<tr>
+<td>Payment times out after provider charged user.</td>
+<td>Use payment idempotency key, pending/unknown state, provider reconciliation before releasing seats.</td>
+<td>Unknown payment age, provider mismatch count, delayed conversion rate.</td>
+</tr>
+<tr>
+<td>Hold expires while checkout is in progress.</td>
+<td>Use checkout state transition or short extension with fencing token.</td>
+<td>Checkout-after-expiry conflicts, expired-hold conversion attempts.</td>
+</tr>
+<tr>
+<td>Waiting room bypass overloads inventory.</td>
+<td>Require signed admission token for hot event booking APIs.</td>
+<td>Requests without valid token, inventory shard saturation, admission rate vs hold latency.</td>
+</tr>
+<tr>
+<td>Expiry worker falls behind.</td>
+<td>Time-bucketed expiry queues, idempotent workers, alert on expiry lag.</td>
+<td>Expired active holds, expiry backlog age, artificially low availability.</td>
+</tr>
+<tr>
+<td>Event stream drops or delays updates.</td>
+<td>Durable outbox pattern, replay from audit log, rebuild projections.</td>
+<td>Outbox lag, consumer lag, projection rebuild time.</td>
+</tr>
+<tr>
+<td>Bot attack floods login or queue.</td>
+<td>Edge rate limits, WAF, device reputation, progressive challenge.</td>
+<td>Bot score distribution, challenge rate, blocked traffic, false-positive reports.</td>
+</tr>
+<tr>
+<td>Primary write region fails.</td>
+<td>Event ownership failover, freeze hot holds during failover, recover from authoritative log.</td>
+<td>Failover duration, write unavailability, replication lag.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness metrics:</p>
+<ul>
+<li>Duplicate sold seat count should be zero.</li>
+<li>Paid order without ticket count.</li>
+<li>Ticket without paid order count.</li>
+<li>Active hold past expiry count.</li>
+<li>Payment unknown-state age.</li>
+</ul>
+<p>Traffic and capacity metrics:</p>
+<ul>
+<li>Waiting-room queue size and admission rate.</li>
+<li>Seat hold success/failure rate by reason.</li>
+<li>Inventory shard p95 and p99 latency.</li>
+<li>Conditional write conflict rate.</li>
+<li>Checkout conversion rate.</li>
+<li>Availability projection lag.</li>
+</ul>
+<p>Business and trust metrics:</p>
+<ul>
+<li>Bot challenge rate and pass rate.</li>
+<li>Purchase-limit violation attempts.</li>
+<li>Refund/dispute rate.</li>
+<li>Customer support contacts per hot event.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Waiting room reduces raw immediacy, but it protects the system and improves fairness.</li>
+<li>Availability overlays can be stale, but final holds must be authoritative.</li>
+<li>Per-seat strong consistency is necessary; global strong consistency across all events is unnecessary.</li>
+<li>Short holds reduce inventory lockup, but increase checkout pressure and user frustration.</li>
+<li>Longer holds improve checkout success, but make inventory look unavailable longer.</li>
+<li>Single write region per event simplifies correctness, but adds latency for faraway users.</li>
+<li>Active-active writes sound attractive, but are dangerous for assigned seats unless ownership is partitioned.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Treating seat availability cache as truth.</td>
+<td>Say the cache is a hint; the hold service performs the authoritative conditional transition.</td>
+</tr>
+<tr>
+<td>Ignoring the waiting room.</td>
+<td>Use admission control so hot-event demand does not melt the inventory service.</td>
+</tr>
+<tr>
+<td>Saying payment success immediately sells the seat without unknown-state handling.</td>
+<td>Model payment as an idempotent state machine with pending and reconciliation states.</td>
+</tr>
+<tr>
+<td>Using one global lock for an event.</td>
+<td>Partition by section or seat key; coordinate only the seats involved.</td>
+</tr>
+<tr>
+<td>Forgetting general admission.</td>
+<td>Use inventory buckets and atomic reservation counters instead of seat records.</td>
+</tr>
+<tr>
+<td>Assuming exactly-once messages.</td>
+<td>Use durable outbox, idempotent consumers, and replayable audit events.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Seat hold correctness</td>
+<td>Draw the state machine, conditional writes, idempotency, and expiry behavior.</td>
+</tr>
+<tr>
+<td>Waiting room fairness</td>
+<td>Explain signed tokens, admission rate control, anti-bypass checks, and operator controls.</td>
+</tr>
+<tr>
+<td>Payment timeout</td>
+<td>Explain pending state, provider idempotency, reconciliation, and why seats are not immediately released.</td>
+</tr>
+<tr>
+<td>Hot partition</td>
+<td>Split by event section, isolate hot events, and use backpressure to slow admission.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Use event ownership for writes and global replication for reads.</td>
+</tr>
+<tr>
+<td>General admission</td>
+<td>Use atomic inventory bucket reservation with held/sold counters and expiry.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Start with the invariant: one seat sold at most once.</li>
+<li>Separate browsing, seat-map display, hold, checkout, and ticket issuance.</li>
+<li>Name the authoritative store and every derived projection.</li>
+<li>Draw the seat state machine.</li>
+<li>Explain waiting-room admission and queue bypass prevention.</li>
+<li>Explain idempotency for hold and checkout retries.</li>
+<li>Explain payment unknown-state handling.</li>
+<li>Explain hold expiry and reconciliation.</li>
+<li>Show how hot events are isolated from normal browsing traffic.</li>
+<li>Include operational metrics that detect correctness drift.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>For Ticketmaster, I would not make the seat map the source of truth. The seat map is a fast projection. The authoritative operation is a conditional transition from available to held, then from held to sold, with idempotency and reconciliation around payment.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Ticketmaster.</p>
+<p><strong>Candidate:</strong> I will design it around scarce inventory and burst control. The core invariant is that one assigned seat can be sold at most once. Browsing and seat-map views can be eventually consistent, but hold, checkout, and ticket issuance need authoritative state transitions.</p>
+<p><strong>Interviewer:</strong> What are the main requirements?</p>
+<p><strong>Candidate:</strong> Users should search events, view event details and seat maps, hold seats, pay, and receive tickets. Organizers create events and inventory. Non-functionally, the system must survive huge sale-start bursts, prevent double sales, handle payment retries safely, and provide auditability for orders and tickets.</p>
+<p><strong>Interviewer:</strong> What is your high-level design?</p>
+<p><strong>Candidate:</strong> I would split the system into a read-heavy discovery path and a correctness-critical booking path. Search, event details, and seat-map geometry are served from indexes, caches, and CDN. For hot events, users enter a waiting room. Once admitted, they can call the seat hold service, which performs conditional writes against the authoritative inventory store. Checkout validates the hold, processes payment idempotently, converts seats to sold, and issues tickets through a ledger.</p>
+<p><strong>Interviewer:</strong> How do you prevent double-selling?</p>
+<p><strong>Candidate:</strong> Each assigned seat has a state machine: available, held, sold, blocked, and expired. The transition from available to held is a conditional write on the authoritative seat record. If two users race for the same seat, only one conditional write succeeds. The transition from held to sold also checks hold ownership, hold expiry, and order idempotency.</p>
+<p><strong>Interviewer:</strong> What if a user retries the hold request?</p>
+<p><strong>Candidate:</strong> The client sends an idempotency key. If the first request succeeded but the response was lost, the retry returns the same hold. If the first request failed because the seat was unavailable, the retry returns the same failure for that key. This prevents duplicate holds and makes client retries safe.</p>
+<p><strong>Interviewer:</strong> How does the waiting room work?</p>
+<p><strong>Candidate:</strong> Users enter before sale start. The system assigns signed queue tokens. At sale start, the admission controller releases users at a rate the inventory service can handle. Booking APIs for hot events require a signed admission token bound to user, event, and expiration time. If inventory latency rises, the waiting room slows admission.</p>
+<p><strong>Interviewer:</strong> What about stale seat maps?</p>
+<p><strong>Candidate:</strong> That is expected. Availability overlays are projections and may lag. The UI can show a seat as available, but the hold service still performs the authoritative check. If the hold fails, the client refreshes the section availability. This gives low-latency browsing without sacrificing correctness.</p>
+<p><strong>Interviewer:</strong> Payment succeeds but your service times out. What happens?</p>
+<p><strong>Candidate:</strong> That is an unknown payment state. I would use a payment idempotency key and mark the order as pending or payment_unknown. I would not immediately release the seats. A reconciliation worker asks the provider for the final payment state. If payment succeeded, we convert the hold to sold and issue tickets. If payment failed, we release or expire the hold.</p>
+<p><strong>Interviewer:</strong> How do holds expire?</p>
+<p><strong>Candidate:</strong> Holds have a short TTL, for example two to ten minutes. We store holds by expiry time bucket or delayed queue. Expiry workers idempotently transition active expired holds to expired and release seats back to available. We monitor expired active holds and expiry backlog age because stale holds artificially reduce inventory.</p>
+<p><strong>Interviewer:</strong> How do you scale for one extremely popular event?</p>
+<p><strong>Candidate:</strong> I would isolate that event into dedicated capacity, precompute its event page and seat map, and partition inventory by section for large venues. The waiting room controls admission based on inventory shard latency. Search, recommendations, analytics, and notifications are bulkheaded away from the booking authority path.</p>
+<p><strong>Interviewer:</strong> How would you handle multi-region?</p>
+<p><strong>Candidate:</strong> I would use one owner write region per event for hold and checkout. Read projections can be replicated globally. For active-active requirements, I would partition ownership by section or pre-allocate general admission inventory slices. I would avoid letting two regions write the same assigned seat.</p>
+<p><strong>Interviewer:</strong> What would you monitor?</p>
+<p><strong>Candidate:</strong> Correctness first: duplicate sold seats, paid orders without tickets, tickets without paid orders, active holds past expiry, and payment unknown-state age. Then capacity: waiting-room admission rate, inventory p99 latency, conditional write conflicts, projection lag, and checkout conversion.</p>
+<p><strong>Interviewer:</strong> Summarize the design.</p>
+<p><strong>Candidate:</strong> The design separates fast but stale discovery from authoritative booking. A waiting room controls bursts. The hold service owns the available-to-held transition, checkout owns held-to-sold, and ticket ledger records issued tickets. Idempotency, explicit state transitions, expiry workers, and reconciliation keep the system correct under retries, timeouts, and partial failures.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: assigned seats, hot sale, no double sell, checkout required.</li>
+<li>State invariant: one seat sold at most once.</li>
+<li>Split read path from authority path.</li>
+<li>Draw waiting room before seat hold service.</li>
+<li>Draw seat state machine.</li>
+<li>Explain conditional writes and idempotency.</li>
+<li>Explain payment unknown state and reconciliation.</li>
+<li>Close with scaling and observability.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Ticketmaster is a scarce-inventory system. I would cache event discovery and seat-map views, but keep holds and sales in an authoritative inventory state machine. The waiting room protects hot events, conditional writes prevent double-selling, checkout is idempotent around payment, and reconciliation repairs unknown states. The main tradeoff is that users may see stale availability, but final booking remains correct.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Availability display is a hint; hold creation is the authority."</li>
+<li>"I only need strong consistency per seat or per inventory bucket, not globally across the whole platform."</li>
+<li>"The waiting room is not just user experience. It is admission control for the inventory write path."</li>
+<li>"Payment timeout is an unknown-state problem, so I need reconciliation before releasing scarce inventory."</li>
+<li>"Every derived view should be rebuildable from inventory and order events."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

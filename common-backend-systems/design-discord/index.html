@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Discord — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Discord</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Discord is real-time chat organized into servers, channels, and voice rooms. The hard part is the combination: persistent text channels with rich history (like Slack/IRC), real-time presence and voice (like Skype), and the scale of millions of concurrent connections per server.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every sent message is durably stored in its channel, delivered to all online members of the channel, and remains retrievable for the channel's retention; presence reflects who is currently online and in which voice channel; voice and video traffic is routed peer-to-peer or through media servers with low latency; permissions are enforced at the channel and role level.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design persistent channel-based chat, real-time presence at scale, voice/video routing via WebRTC + media servers (SFU), permissions modeled via roles, and reason about server (community) scale where one server may have millions of members.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Discord as a chat substrate (channel-based persistent messages with WebSocket push), a presence/voice control plane (who's online, who's in which voice channel), and a media routing layer (SFU-based voice/video). Servers (communities) are groups of channels with role-based permissions. The interesting decisions are channel message storage, real-time fan-out to online members, voice room routing, and handling very-large servers (1M+ members).</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Users join servers (communities) with channels.</li>
+<li>Text channels: persistent message history.</li>
+<li>Voice channels: real-time audio + screen share + video.</li>
+<li>Direct messages between users.</li>
+<li>Presence (online, idle, dnd, offline).</li>
+<li>Reactions, attachments, threads.</li>
+<li>Roles and permissions per channel.</li>
+<li>Notifications when mentioned.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Real-time message delivery (&lt;200 ms).</li>
+<li>Voice latency under 150 ms.</li>
+<li>High availability per server.</li>
+<li>Multi-region.</li>
+<li>Very-large servers (1M+ members) supported.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Bot platform and APIs.</li>
+<li>Nitro / payment.</li>
+<li>Stage channels (similar to voice).</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>Hundreds of millions; tens of millions DAU.</td>
+</tr>
+<tr>
+<td>Servers</td>
+<td>Millions; some with millions of members.</td>
+</tr>
+<tr>
+<td>Channels</td>
+<td>Tens of millions.</td>
+</tr>
+<tr>
+<td>Concurrent voice</td>
+<td>Millions.</td>
+</tr>
+<tr>
+<td>Messages/day</td>
+<td>Tens of billions.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Text sub-second; voice sub-200ms RTT.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is fan-out to large channels and voice room routing under churn.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Chat</td>
+<td>Channel messages, persistent.</td>
+<td>At-least-once delivery; per-channel order.</td>
+</tr>
+<tr>
+<td>Presence</td>
+<td>Online state per user.</td>
+<td>Real-time; ephemeral.</td>
+</tr>
+<tr>
+<td>Voice/video</td>
+<td>Real-time media routing.</td>
+<td>Low latency; SFU.</td>
+</tr>
+<tr>
+<td>Servers and roles</td>
+<td>Membership, permissions.</td>
+<td>Source of truth for access.</td>
+</tr>
+<tr>
+<td>Notifications</td>
+<td>Push when mentioned.</td>
+<td>Reuse notification system.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Client --WebSocket--&gt; Gateway
+                          |
+              +-----------+----------+----------+----------+
+              |           |          |          |          |
+              v           v          v          v          v
+        Chat Service  Presence   Voice Ctrl  Server Mgmt  Notification
+              |
+              v
+        Channel Logs (append-only per channel)
+              |
+              v
+        Message Store (Cassandra-style)
+
+Voice clients --UDP--&gt; Media Servers (SFU)
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Gateway</td>
+<td>Persistent WebSocket connection per client.</td>
+<td>Routes events; subscribes to channels.</td>
+</tr>
+<tr>
+<td>Chat service</td>
+<td>Receive, persist, broadcast messages.</td>
+<td>Per-channel log.</td>
+</tr>
+<tr>
+<td>Message store</td>
+<td>Persistent storage of channel messages.</td>
+<td>Cassandra/scylla; sharded by channel + time.</td>
+</tr>
+<tr>
+<td>Presence service</td>
+<td>Online/offline state.</td>
+<td>In-memory; TTL-driven.</td>
+</tr>
+<tr>
+<td>Voice control service</td>
+<td>Manage voice channel membership.</td>
+<td>Lightweight; routes to media servers.</td>
+</tr>
+<tr>
+<td>Media server (SFU)</td>
+<td>Routes audio/video between participants.</td>
+<td>Selective Forwarding Unit; low-latency.</td>
+</tr>
+<tr>
+<td>Server (community) service</td>
+<td>Server metadata, channels, members, roles.</td>
+<td>Sharded by server_id.</td>
+</tr>
+<tr>
+<td>Permission service</td>
+<td>Role-based access checks.</td>
+<td>Evaluated on every op.</td>
+</tr>
+<tr>
+<td>Notification service</td>
+<td>Mentions and DMs trigger push.</td>
+<td>Reuse notification system.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="server-community">Server (Community)</h4>
+<pre><code class="language-text">Server(
+  server_id,
+  owner_id,
+  name,
+  icon,
+  member_count_approx,
+  channels: [channel_id],
+  roles: [role_id],
+  created_at,
+  version
+)
+</code></pre>
+<h4 id="channel">Channel</h4>
+<pre><code class="language-text">Channel(
+  channel_id,
+  server_id,
+  type,                 // text, voice, announcement, thread
+  name,
+  topic,
+  parent_category?,
+  permission_overrides: [{role_id, allow, deny}],
+  last_message_id,
+  created_at,
+  version
+)
+</code></pre>
+<h4 id="member">Member</h4>
+<pre><code class="language-text">ServerMember(
+  server_id,
+  user_id,
+  nickname,
+  roles: [role_id],
+  joined_at
+)
+</code></pre>
+<h4 id="role">Role</h4>
+<pre><code class="language-text">Role(
+  role_id,
+  server_id,
+  name,
+  permissions,          // bitfield
+  color,
+  position
+)
+</code></pre>
+<h4 id="message">Message</h4>
+<pre><code class="language-text">Message(
+  message_id,           // snowflake
+  channel_id,
+  author_id,
+  content,
+  attachments: [...],
+  reactions: [(emoji, count, user_ids)],
+  mentions: [user_id],
+  edited_at?,
+  pinned?,
+  created_at
+)
+</code></pre>
+<h4 id="presence">Presence</h4>
+<pre><code class="language-text">Presence(
+  user_id,
+  status,               // online, idle, dnd, offline
+  activity?,            // playing game, listening
+  voice_channel_id?,
+  last_heartbeat
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">WebSocket events:
+  MESSAGE_CREATE
+  MESSAGE_UPDATE / DELETE
+  PRESENCE_UPDATE
+  VOICE_STATE_UPDATE
+  TYPING_START
+  REACTION_ADD / REMOVE
+
+REST:
+  POST   /channels/{id}/messages
+  GET    /channels/{id}/messages?before=
+  PATCH  /messages/{id}
+  DELETE /messages/{id}
+  POST   /channels/{id}/voice/join
+  POST   /channels/{id}/voice/leave
+  POST   /servers/{id}/members/{uid}/roles
+</code></pre>
+<h3 id="chat-path-text">Chat Path (Text)</h3>
+<p>Send:</p>
+<ol>
+<li>Client → WebSocket → gateway → chat service.</li>
+<li>Chat service authenticates, checks channel permissions.</li>
+<li>Assigns snowflake message_id (time-ordered).</li>
+<li>Persists to message store partitioned by <code>(channel_id, time_bucket)</code>.</li>
+<li>Publishes <code>MESSAGE_CREATE</code> event.</li>
+<li>Gateway fan-out to all subscribed clients (online members of the channel).</li>
+<li>Notification service triggered for mentions.</li>
+</ol>
+<p>Receive:</p>
+<ul>
+<li>Clients subscribe to channels they have open / member of.</li>
+<li>Receive events over WebSocket.</li>
+<li>Read message history via REST (<code>GET /channels/{id}/messages?before=</code>).</li>
+</ul>
+<p>Message ordering:</p>
+<ul>
+<li>Snowflake message_id is monotonic per channel (or per shard with embedded timestamp).</li>
+<li>Clients use message_id to order display.</li>
+</ul>
+<h3 id="channel-fan-out">Channel Fan-Out</h3>
+<p>Discord's notable design choice is <strong>fan-out only to online subscribers</strong>, not maintaining offline mailboxes per user.</p>
+<ul>
+<li>Each gateway tracks which channels each connection subscribes to.</li>
+<li>On message: gateway determines which connections are subscribed; push to those.</li>
+<li>Offline users miss the real-time push; they pull via REST when they come back online.</li>
+</ul>
+<p>For very-large channels (1M+ members), only a fraction are online at once. The fan-out is bounded by online subscribers, not total members.</p>
+<p>Discord uses Elixir/Erlang's process model for managing millions of connections per gateway node, with a "guild process" per server handling routing.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Discord fan-out is to online subscribers only, not to per-user mailboxes. This scales the system to multi-million-member servers because most members are offline at any moment.</p>
+</blockquote>
+<h3 id="presence-at-scale">Presence At Scale</h3>
+<p>Presence is ephemeral — who's online, what they're doing.</p>
+<p>Challenge: for a 1M-member server, even just sending "user X is now online" to all members is heavy.</p>
+<p>Optimization:</p>
+<ul>
+<li>Presence updates are batched.</li>
+<li>For huge servers, only members in the same channel or recently active receive presence updates.</li>
+<li>"Lazy presence": list of online users is fetched on demand; not pushed proactively to everyone.</li>
+</ul>
+<p>Storage: in-memory with TTL; not durable.</p>
+<h3 id="voice-video-architecture">Voice / Video Architecture</h3>
+<p>Voice and video use WebRTC over UDP.</p>
+<p><strong>SFU (Selective Forwarding Unit):</strong></p>
+<ul>
+<li>Each participant sends a single audio/video stream to the SFU.</li>
+<li>SFU forwards each participant's stream to all other participants.</li>
+<li>Each participant receives N-1 streams (decode locally).</li>
+<li>Much cheaper than MCU (mixing at server) for moderate room sizes.</li>
+</ul>
+<p>Flow:</p>
+<ol>
+<li>User joins voice channel via voice control service.</li>
+<li>Voice control assigns a media server (SFU) close to the user.</li>
+<li>User connects to SFU via WebRTC; ICE negotiation, DTLS handshake.</li>
+<li>SFU joins user to the channel's media room.</li>
+<li>Streams flow between user and SFU.</li>
+</ol>
+<p>For large rooms (Stage channels with 1000s of listeners):</p>
+<ul>
+<li>Active speakers send to SFU.</li>
+<li>Listeners receive a forwarded stream.</li>
+<li>SFU may transcode to reduce bandwidth.</li>
+</ul>
+<p>Multi-region:</p>
+<ul>
+<li>SFUs in multiple regions.</li>
+<li>Cross-region SFU-to-SFU bridging for global voice rooms.</li>
+<li>Voice control picks the SFU region based on participant locations.</li>
+</ul>
+<h3 id="permissions-and-roles">Permissions And Roles</h3>
+<p>Per-server roles with permission bitfields:</p>
+<ul>
+<li>E.g., <code>MANAGE_MESSAGES</code>, <code>KICK_MEMBERS</code>, <code>SPEAK_IN_VOICE</code>.</li>
+</ul>
+<p>Per-channel permission overrides:</p>
+<ul>
+<li>A specific role/user has permission X allowed or denied in this channel.</li>
+</ul>
+<p>Computed effective permissions:</p>
+<ul>
+<li>Server-level base from member's roles, OR-combined.</li>
+<li>Apply channel overrides.</li>
+</ul>
+<p>Evaluated on every operation (send, delete, kick, etc.). Cached at the gateway for hot paths.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Server metadata</td>
+<td><code>server_id</code></td>
+<td>Co-locate channels, roles, members.</td>
+</tr>
+<tr>
+<td>Members</td>
+<td><code>(server_id, user_id)</code></td>
+<td>Membership lookup.</td>
+</tr>
+<tr>
+<td>Channel messages</td>
+<td><code>(channel_id, time_bucket)</code></td>
+<td>Time-range scan.</td>
+</tr>
+<tr>
+<td>Presence</td>
+<td><code>user_id</code></td>
+<td>In-memory; ephemeral.</td>
+</tr>
+<tr>
+<td>Voice rooms</td>
+<td><code>channel_id</code> → SFU</td>
+<td>Real-time routing.</td>
+</tr>
+<tr>
+<td>Roles</td>
+<td><code>server_id</code></td>
+<td>Per-server.</td>
+</tr>
+</tbody>
+</table>
+<p>Per-server sharding: each server's data (members, channels, messages) lives on a small set of shards. A "guild process" in Elixir manages live state.</p>
+<p>For multi-million member servers: shard the server itself across multiple guild processes; or use a special architecture.</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Message store</td>
+<td>Strong per channel via snowflake order</td>
+<td>Channel order required.</td>
+</tr>
+<tr>
+<td>Permissions</td>
+<td>Strong on edit</td>
+<td>Security.</td>
+</tr>
+<tr>
+<td>Presence</td>
+<td>Eventually consistent (in-memory, TTL'd)</td>
+<td>Ephemeral.</td>
+</tr>
+<tr>
+<td>Voice room membership</td>
+<td>Strong (single source)</td>
+<td>Routing correctness.</td>
+</tr>
+<tr>
+<td>Server metadata</td>
+<td>Strong</td>
+<td>Source of truth.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Gateway crashes.</td>
+<td>Client reconnects; resumes from sequence cursor.</td>
+<td>Reconnect rate.</td>
+</tr>
+<tr>
+<td>Massive server fan-out.</td>
+<td>Online-only push; lazy presence.</td>
+<td>Per-server connection count.</td>
+</tr>
+<tr>
+<td>Voice media server fails.</td>
+<td>Migrate participants; ICE renegotiation.</td>
+<td>SFU health.</td>
+</tr>
+<tr>
+<td>Presence storm.</td>
+<td>Batched updates; throttle.</td>
+<td>Presence update rate.</td>
+</tr>
+<tr>
+<td>Message store hot shard.</td>
+<td>Per-channel + time partitioning.</td>
+<td>Shard QPS.</td>
+</tr>
+<tr>
+<td>Permission cache stale.</td>
+<td>Short TTL; explicit invalidation on role change.</td>
+<td>Permission revoke lag.</td>
+</tr>
+<tr>
+<td>Voice cross-region latency.</td>
+<td>Pick SFU near majority of participants.</td>
+<td>Voice latency p99.</td>
+</tr>
+<tr>
+<td>Snowflake clock skew.</td>
+<td>Use NTP; cap drift; tiebreak.</td>
+<td>Snowflake conflicts.</td>
+</tr>
+<tr>
+<td>Spam in channel.</td>
+<td>Rate limit per channel per user; spam filter.</td>
+<td>Spam rate.</td>
+</tr>
+<tr>
+<td>1M-member server burst.</td>
+<td>Online-only fan-out; pull-based offline.</td>
+<td>Fan-out latency.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Lost messages.</li>
+<li>Permission bypass attempts.</li>
+<li>Voice drop rate.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Active connections per gateway.</li>
+<li>Message QPS per channel.</li>
+<li>Voice room churn rate.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>DAU; messages per channel; voice minutes.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Server has a home region for guild process + chat state.</li>
+<li>Members anywhere connect via local gateway, which routes to home region.</li>
+<li>Voice SFUs distributed; chosen by participant locations.</li>
+<li>Cross-region replication for DR.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Online-only push scales fan-out but offline users see history via REST (acceptable).</li>
+<li>SFU is cheaper than MCU but pushes decode cost to clients.</li>
+<li>Lazy presence avoids storms but presence may lag.</li>
+<li>Per-server guild process simplifies state but limits cross-server queries.</li>
+<li>Aggressive permission caching speeds operations but staleness on revoke.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Per-user mailbox for channel messages.</td>
+<td>Online-only fan-out; REST for history.</td>
+</tr>
+<tr>
+<td>Synchronous presence broadcast to all members.</td>
+<td>Batched + lazy presence.</td>
+</tr>
+<tr>
+<td>MCU for voice.</td>
+<td>SFU; lighter server load.</td>
+</tr>
+<tr>
+<td>Single global gateway.</td>
+<td>Regional gateways.</td>
+</tr>
+<tr>
+<td>Re-evaluate permissions per op without cache.</td>
+<td>Cached effective permissions; invalidate on change.</td>
+</tr>
+<tr>
+<td>Single guild process for 1M-member server.</td>
+<td>Shard the server.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fan-out at scale</td>
+<td>Online-only push; lazy presence.</td>
+</tr>
+<tr>
+<td>Voice architecture</td>
+<td>SFU, WebRTC, ICE, regional routing.</td>
+</tr>
+<tr>
+<td>Permissions</td>
+<td>Role bitfields + channel overrides; cached effective.</td>
+</tr>
+<tr>
+<td>Large servers</td>
+<td>Shard guild process; pull-based for inactive.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Home region per server; SFU near participants.</td>
+</tr>
+<tr>
+<td>Erlang/Elixir choice</td>
+<td>Process-per-connection model; supervisor trees.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Chat persistent + presence ephemeral + voice real-time as three planes.</li>
+<li>Online-only fan-out for channels.</li>
+<li>SFU for voice with regional routing.</li>
+<li>Role-based permissions with channel overrides.</li>
+<li>Snowflake ids for time-ordered messages.</li>
+<li>Erlang/Elixir-style process model for connections.</li>
+<li>Multi-region with server home region.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Discord is three planes overlapping in one app: persistent text chat, ephemeral presence, and real-time voice/video. The key scaling insight is online-only fan-out — messages broadcast to currently subscribed connections, not stored in per-user inboxes. Voice rides through SFUs near participants. Permissions are role-based with channel overrides.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Discord.</p>
+<p><strong>Candidate:</strong> Three planes: persistent text channels with append-only history, ephemeral presence/typing, and real-time voice/video via SFUs. Each user has a WebSocket connection to a gateway; servers (communities) own channels with role-based permissions. The invariant is durable messages with per-channel order, low-latency voice, and permission-correct access.</p>
+<p><strong>Interviewer:</strong> Walk me through sending a message.</p>
+<p><strong>Candidate:</strong> Client sends via WebSocket. Gateway forwards to chat service. Chat service authenticates, checks channel permissions, assigns a snowflake message_id, persists to the message store partitioned by <code>(channel_id, time_bucket)</code>. Publishes a <code>MESSAGE_CREATE</code> event. The gateway looks up subscribed connections for this channel and pushes the event. Notification service triggered for mentioned users.</p>
+<p><strong>Interviewer:</strong> A server has 2 million members. How does fan-out work?</p>
+<p><strong>Candidate:</strong> Online-only fan-out. The system tracks which connections subscribe to which channels — those are the only recipients of real-time push. Most of 2 million members are offline at any moment; fan-out is bounded by online subscribers (maybe 50k-100k). Offline users see history via REST pull when they reconnect. Discord uses Elixir's process model — a guild process per server handles routing — with sharding for very large servers.</p>
+<p><strong>Interviewer:</strong> Why no per-user mailbox like Messenger?</p>
+<p><strong>Candidate:</strong> Discord channels are pub-style: everyone in the channel sees the same messages. Storing one copy per user would explode storage for large channels. Channel-level history is shared. Users pull when they need history; real-time push goes only to online subscribers. The tradeoff: offline users miss live notification context but see history on reconnect.</p>
+<p><strong>Interviewer:</strong> Walk me through voice.</p>
+<p><strong>Candidate:</strong> User joins voice channel. Voice control service assigns an SFU close to the user. Client establishes WebRTC connection to SFU: ICE candidate exchange, DTLS handshake. SFU joins the user to the channel's media room. Each participant sends one audio stream to the SFU; the SFU forwards each participant's stream to every other participant. Each client decodes the N-1 streams it receives. For large stage channels, only active speakers send; listeners receive a single forwarded stream.</p>
+<p><strong>Interviewer:</strong> Why SFU and not MCU?</p>
+<p><strong>Candidate:</strong> SFU is just a packet forwarder — much cheaper than MCU which decodes, mixes, and re-encodes. For moderate room sizes (up to dozens of speakers), SFU scales better. The cost shifts to the client: each client decodes N-1 streams. For very large audience-style rooms, you might mix at the server to reduce client load, but that's a design choice.</p>
+<p><strong>Interviewer:</strong> Presence — 1M users online.</p>
+<p><strong>Candidate:</strong> Ephemeral in-memory state with TTL. The challenge is presence updates: sending "user X is now online" to every server member is heavy. Mitigations: lazy presence — clients pull the online list for a server when they open it, rather than pushing every change to everyone. Updates that do propagate are batched. For users in the same voice channel or currently chatting, presence pushes more aggressively.</p>
+<p><strong>Interviewer:</strong> Permissions?</p>
+<p><strong>Candidate:</strong> Server-level roles with permission bitfields (MANAGE_MESSAGES, KICK_MEMBERS, etc.). Each member has one or more roles; permissions OR-combined. Channels can override: "this role can't speak in this voice channel." Effective permission = (server-base from roles) ∪ (channel allow overrides) − (channel deny overrides). Cached at the gateway for performance; invalidated on role/permission change.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Each server has a home region — the region of its guild process and chat state. Members anywhere connect via local gateway, which routes to the server's home region. Voice SFUs distributed; chosen by participant geo. For globally-distributed servers, cross-region routing adds latency, accepted in chat but problematic for voice if the server's voice goes through a far SFU.</p>
+<p><strong>Interviewer:</strong> Snowflake ids?</p>
+<p><strong>Candidate:</strong> 64-bit ids combining timestamp + worker + sequence. Provides natural time-ordering across distributed message creators. Critical for displaying messages in order without sorting by wall clock (which would have skew). Discord uses snowflakes for messages, channels, servers, users.</p>
+<p><strong>Interviewer:</strong> A server gets DDoS'd via mass spam.</p>
+<p><strong>Candidate:</strong> Per-channel per-user rate limits enforced at the gateway. Anti-spam heuristics (repeated messages, links). Auto-moderation tools per server allow admins to set keyword filters, slowmode (one message per N seconds). Severe cases trigger temp mute or kick.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Three planes: persistent text channels, ephemeral presence/typing, real-time voice/video via SFUs. Online-only fan-out scales channels to multi-million members. Voice rides through SFUs near participants. Role-based permissions with channel overrides, cached for performance. Server home region; SFUs regional. Erlang/Elixir process model handles millions of connections per node. The hardest scaling case is the 1M-member server; the answer is online-only fan-out plus per-server guild process sharding.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: text, voice, presence, server scale.</li>
+<li>Invariant: durable text, real-time fan-out, low-latency voice, role-correct access.</li>
+<li>Three planes: chat / presence / voice.</li>
+<li>Online-only fan-out for channel messages.</li>
+<li>SFU for voice with regional routing.</li>
+<li>Role-based permissions with channel overrides.</li>
+<li>Snowflake ids for ordering.</li>
+<li>Multi-region per-server home + regional SFUs.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Discord is persistent text channels plus ephemeral presence plus real-time voice/video. The scaling insight is online-only fan-out — messages broadcast to currently connected subscribers, not stored in per-user inboxes. Voice uses SFU media servers near participants. Permissions are role-based with channel overrides, cached at the gateway. Each server has a home region for chat state; SFUs are regional. Erlang/Elixir process model handles millions of connections per node.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Online-only fan-out is what makes multi-million-member servers feasible."</li>
+<li>"SFU routes packets; MCU mixes them — SFU is cheaper for moderate rooms."</li>
+<li>"Permissions are roles plus per-channel overrides; cache the effective bitfield."</li>
+<li>"Snowflake ids give time-ordered messages without sorting by wall clock."</li>
+<li>"Erlang's process model is built for this — process-per-connection, supervisor trees."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web Crawler — Googlebot Class (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Web Crawler — Googlebot Class (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Hard · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build a polite, large-scale web crawler. Given a seed set, crawl reachable pages, extract content for indexing, and continuously refresh known pages. Target: crawl 1B unique URLs/day, respect robots.txt and per-host rate limits, store raw HTML + extracted text.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Discover and fetch reachable URLs starting from a seed set.
+- Extract links, text content, and metadata; store for downstream indexing.
+- Re-crawl known pages on a refresh policy (popular pages frequently, long tail rarely).</p>
+<p>I'd defer JavaScript rendering depth, image/video crawling, and PageRank-style ranking.</p>
+<p><strong>Non-functional</strong>
+- Politeness — respect robots.txt; throttle per host; identify ourselves.
+- Throughput: 1B URLs/day → ~12k fetches/sec.
+- Avoid duplicate work (URL dedup) and infinite loops (cycles, spider traps).
+- Resumable — if a worker dies, no URL is lost.
+- Eventual consistency — no real-time SLA.</p>
+<p><strong>Capacity</strong>
+- 100B known URLs in the frontier index.
+- Avg page = 50 KB → 50 TB/day of fetched content.
+- URL dedup index: 100B URLs × 32 B canonical key = ~3 TB.
+- Frontier metadata: 100B URLs × ~80 B (<code>url_hash, host_hash, next_fetch_at, priority, status</code>) ≈ 8 TB primary, ~24 TB with 3 replicas. This is large but manageable as a partitioned key-value/index store.
+- Raw content is the dominant cost: 50 TB/day fetched, maybe 15–25 TB/day after compression; 90-day hot retention is ~1.5–2.2 PB before replication, so tiering matters more than queue storage.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>URL</strong> — <code>url</code>, normalized canonical form, host, scheme.</li>
+<li><strong>Frontier entry</strong> — <code>url, next_fetch_at, priority</code>.</li>
+<li><strong>FetchResult</strong> — <code>url, status, body, headers, fetched_at, content_hash</code>.</li>
+<li><strong>HostPolicy</strong> — robots.txt parsed, per-host crawl delay.</li>
+</ul>
+<hr />
+<h2 id="3-api-interface-5-min">3. API / Interface (~5 min)</h2>
+<p>Mostly internal. Externals if any:</p>
+<pre><code>POST /v1/seeds            { urls[] }
+GET  /v1/pages/{hash}     → fetched page
+GET  /v1/stats            → crawl progress
+</code></pre>
+<p>The crawler's "API" is really the frontier-to-worker contract.</p>
+<hr />
+<h2 id="4-data-flow-5-min">4. Data Flow (~5 min)</h2>
+<p>Seed URLs → frontier → fetcher → parser (extract links + content) → URL filter (dedup, policy check) → write new URLs to frontier; write content to storage. Loop.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>URL frontier.</strong> Priority queue of URLs to fetch, partitioned by host. Per-host queue ensures politeness: workers pull at most 1 URL per host per crawl delay. Implemented as Kafka with per-host partitioning + Redis sorted set per host for delay enforcement.</li>
+<li><strong>DNS resolver service.</strong> Cached resolution; without this, DNS becomes the bottleneck.</li>
+<li><strong>Fetcher workers.</strong> Pull a URL → consult host policy (robots.txt + crawl-delay) → HTTP GET → store result. For JS-heavy pages, send to a headless-browser pool (more expensive, used sparingly).</li>
+<li><strong>Parser pipeline.</strong> From the body: extract links, canonicalize, normalize text (readability extraction), compute content hash, detect language.</li>
+<li><strong>URL filter.</strong>
+   - <strong>Seen-URL check:</strong> Bloom filter (per-shard) for O(1) dedup of already-known URLs. Persistent backing in a key-value store for evidence.
+   - <strong>Canonicalization:</strong> strip fragments, normalize trailing slashes, sort query params (allowlisted set), resolve relative paths.
+   - <strong>Robots / policy:</strong> skip disallowed paths, off-site links (depending on scope), known traps.</li>
+<li><strong>Frontier writer.</strong> Inserts new URLs with priority + next_fetch_at.</li>
+<li><strong>Content store.</strong> Raw HTML in object storage (compressed); extracted text in a downstream indexing pipeline (out of scope).</li>
+<li><strong>Scheduler / coordinator.</strong> Tracks host queues, balances workers, applies global politeness limits.</li>
+</ol>
+<p>End-to-end narration: seed URL <code>nytimes.com/</code> enqueued → fetcher pulls (host queue empty, can fetch now) → GETs robots.txt first (cached), then page → parser extracts 200 links → URL filter dedups against bloom filter → 50 are new → frontier writer enqueues them with priority = page authority × freshness. Meanwhile, the host queue for nytimes.com has a 1 s crawl delay; the next URL from that host waits 1 s before being eligible.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">Seeds/Sitemaps
+   |
+   v
+Frontier Writer -&gt; Frontier Index + Ready Queues
+   ^                         |
+   |                         v
+URL Filter &lt;- Parser &lt;- Fetcher Workers -&gt; Raw Content Store
+   |             |             |
+   v             v             v
+Seen Bloom/KV  Parsed Metadata Host Policy/Robots Cache
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete store contracts.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / data structure</th>
+<th style="text-align: right;">Entry size + TTL</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Frontier index</td>
+<td><code>frontier:{host_hash}:{url_hash}</code> → <code>{url, next_fetch_at, priority}</code></td>
+<td style="text-align: right;">~80–150 B + URL, retained while known</td>
+<td><code>host_hash</code></td>
+</tr>
+<tr>
+<td>Ready queues</td>
+<td>Kafka partitions by <code>host_hash</code>; Redis zset <code>ready:{partition}</code> score=<code>next_fetch_at</code></td>
+<td style="text-align: right;">pointer ~32 B, until fetched</td>
+<td><code>host_hash</code></td>
+</tr>
+<tr>
+<td>Host policy</td>
+<td><code>host_policy:{host}</code> robots + crawl delay</td>
+<td style="text-align: right;">1–10 KB, TTL 24h</td>
+<td><code>host_hash</code></td>
+</tr>
+<tr>
+<td>Seen filter</td>
+<td>Bloom filter per URL shard + KV evidence <code>seen:{url_hash}</code></td>
+<td style="text-align: right;">32 B hash evidence, retained years</td>
+<td><code>url_hash</code></td>
+</tr>
+<tr>
+<td>Raw content</td>
+<td><code>s3://crawl/{date}/{url_hash}</code> compressed HTML</td>
+<td style="text-align: right;">10–50 KB avg, tiered 30/90/365d</td>
+<td><code>date,url_hash</code></td>
+</tr>
+<tr>
+<td>Parsed metadata</td>
+<td><code>page:{url_hash}</code> → status, content_hash, outlink count</td>
+<td style="text-align: right;">~200 B, retained years</td>
+<td><code>url_hash</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Capacity by store.</strong> The frontier metadata is <code>100B URLs × ~80 B × 3</code> or ~24 TB; storing full normalized URLs can push the primary footprint into the 15–25 TB range before replication depending on average URL length. The exact seen evidence is <code>100B × 32 B × 3</code> or ~9 TB, while a 10-bit/item bloom filter is only ~125 GB primary. Raw content dominates: <code>1B pages/day × 50 KB</code> is 50 TB/day fetched, roughly 15–25 TB/day compressed, and 90 days at 3 replicas is several PB. Parsed metadata is moderate: <code>100B × 200 B × 3</code> is ~60 TB. Host policies can be large but bounded by active hosts and TTL, not by URL count.</p>
+<p><strong>Fetch path trace.</strong> Scheduler reads eligible URLs from <code>ready:{partition}</code> → worker leases one URL with a visibility timeout → reads <code>host_policy:{host}</code> and <code>host:next_ok_at</code> → if allowed, atomically advances <code>next_ok_at</code> → fetches HTTP → writes raw HTML to object storage and parsed metadata to KV → parser emits outlinks → URL filter canonicalizes and checks bloom/KV in parallel → new URLs are written to frontier and their host partitions. If the worker dies before ack, the lease expires and the URL is visible again.</p>
+<p><strong>Hot and cold crawler paths.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Hot path</th>
+<th>Cold/fallback path</th>
+<th>Cursor/lease state</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>New URL discovery</td>
+<td>Parser emits outlink → canonicalize → bloom says new → KV evidence write → frontier insert</td>
+<td>Bloom says maybe: verify KV before dropping; if KV down, buffer to retry topic</td>
+<td>canonical URL hash, source page hash</td>
+</tr>
+<tr>
+<td>Fetch eligible URL</td>
+<td>Ready zset by <code>next_fetch_at</code> → worker lease → host policy → fetch</td>
+<td>If host delay blocks, requeue with updated <code>next_fetch_at</code>; if no ready URLs, scheduler scans future frontier buckets</td>
+<td>lease token <code>{partition,url_hash,attempt,deadline}</code></td>
+</tr>
+<tr>
+<td>Dormant recrawl</td>
+<td><code>next_recrawl_at</code> moves URL into ready queue</td>
+<td>Long-tail URL waits for monthly/quarterly sweep or external signal</td>
+<td>frontier entry status + next_fetch_at</td>
+</tr>
+<tr>
+<td>Page retrieval for indexer</td>
+<td><code>page:{url_hash}</code> + raw object pointer</td>
+<td>Cold object tier restores slower; indexer uses extracted text if raw HTML restore is pending</td>
+<td>content version + object generation</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Politeness — the cardinal rule.</strong> Per-host crawl delay (default 1 s, or from robots.txt). Implementation: Redis key <code>host:nytimes.com:next_ok_at</code>. Worker checks this before fetching; sets it to <code>now + delay</code> on dispatch. If conflicting (multiple workers contending for the same host), the loser requeues.</p>
+<p>Interview punch line: "The crawler is fast globally by being slow locally; politeness is a per-host invariant, not a fleet-wide average."</p>
+<p><strong>Robots.txt.</strong> Fetched once per host per day. Parsed and cached. Worker consults before each fetch. Honor <code>Crawl-delay</code>, <code>User-agent</code>, <code>Disallow</code>, <code>Sitemap</code> directives.</p>
+<p><strong>URL canonicalization.</strong> Two URLs that point to the same page should hash to the same key. Rules:
+- Lowercase scheme + host.
+- Resolve <code>..</code> and <code>.</code> in path.
+- Strip default ports.
+- Sort query params; drop session-id-like params from an allowlist.
+- Strip fragment.
+Mention <code>&lt;link rel="canonical"&gt;</code> as the server-side hint we'd also honor.</p>
+<p><strong>Seen-URL dedup at scale.</strong> 100B URLs is too many for an in-memory hash set. A scalable bloom filter (per partition) gives O(1) checks with bounded false-positive rate (~0.1%). Persistent backing in a key-value store for hard checks when bloom says "maybe seen."</p>
+<p>Why Bloom + KV instead of only a database uniqueness check: the bloom filter rejects most repeats before they hit storage, while the KV gives evidence and repairability. A pure exact index is simpler but costs too much random I/O at 12k fetches/sec plus outlink expansion; a pure bloom filter is cheap but silently loses URLs on false positives.</p>
+<p><strong>Frontier prioritization.</strong> Not all URLs equal. Priority = <code>f(page_rank_estimate, freshness_need, newness)</code>. Newly discovered URLs from popular hubs get high priority. Re-crawl frequency: tier-1 (nytimes) every hour, tier-2 daily, long tail weekly+.</p>
+<p><strong>Spider traps.</strong> Infinite calendars, generated URLs with continuously incrementing query params. Defenses:
+- Cap depth per host (don't crawl &gt; 1000 levels deep).
+- Cap pages per host per day.
+- Detect content sameness — if <code>content_hash</code> repeats for many URLs from a host, blacklist a pattern.</p>
+<p><strong>Distributed coordination.</strong> Hash URLs by host → assign to one of N partitions. Each partition has its own frontier + workers, so per-host politeness lives in one place. Cross-partition: only the URL discovery emits to other partitions (a parsed page from host A may have outlinks to host B).</p>
+<p>Kafka is good for durable handoff and replay, but it is not a priority queue by itself. Redis zsets or a frontier DB hold <code>next_fetch_at</code>; Kafka carries ready work and parser outputs. Be ready for "why not just Kafka?" — because delayed priority scheduling and per-host politeness need indexed time, not only append order.</p>
+<p><strong>Two-index framing.</strong> URLs need two indexes over the same canonical URL set: host-keyed queues for politeness (<code>frontier:{host_hash}:{url_hash}</code>) and URL-hash evidence for dedupe (<code>seen:{url_hash}</code>). Host-keyed state answers "when may I crawl this host next?" URL-keyed state answers "have I already discovered this page?" Keeping that duality explicit prevents a design that optimizes throughput but violates robots/politeness.</p>
+<p><strong>JavaScript rendering.</strong> Modern web is JS-heavy. Selective rendering: only render when the static page yields no useful content. Headless Chrome workers, expensive (~2 s / page vs 50 ms for static HTML).</p>
+<p><strong>Recrawl scheduling.</strong> Each page has <code>next_recrawl_at</code>. Tier by hub-vs-leaf, page change rate, importance. Important pages (high in-link count or news sites) recrawl daily; long-tail recrawl monthly.</p>
+<p><strong>Failure handling.</strong> Fetcher retries with backoff on 5xx; respects <code>Retry-After</code>. On persistent 4xx, mark URL dead. On timeouts, demote priority.</p>
+<p><strong>Frontier entry state machine.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Transition trigger</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>discovered</code></td>
+<td>dedupe pending</td>
+<td>parser output + bloom/KV</td>
+<td>canonical URL confirmed new</td>
+</tr>
+<tr>
+<td><code>scheduled</code></td>
+<td>waiting</td>
+<td>frontier index</td>
+<td><code>next_fetch_at &lt;= now</code></td>
+</tr>
+<tr>
+<td><code>leased</code></td>
+<td>in-flight</td>
+<td>ready queue lease token</td>
+<td>worker ack or lease timeout</td>
+</tr>
+<tr>
+<td><code>fetched</code></td>
+<td>parsed/stored</td>
+<td>raw object + metadata row</td>
+<td>parser emits outlinks</td>
+</tr>
+<tr>
+<td><code>dead_or_demoted</code></td>
+<td>low priority</td>
+<td>fetch status/history</td>
+<td>repeated 4xx/5xx, trap signal</td>
+</tr>
+<tr>
+<td><code>recrawl_wait</code></td>
+<td>cold refresh</td>
+<td><code>next_recrawl_at</code></td>
+<td>freshness policy fires</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th style="text-align: right;">Latency budget</th>
+<th>Fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot host</td>
+<td>Polite throttled mode</td>
+<td><code>host:next_ok_at</code> + host daily cap</td>
+<td style="text-align: right;">Host delay honored</td>
+<td>Queue grows; priority decides which URLs wait</td>
+</tr>
+<tr>
+<td>Dormant long-tail URL</td>
+<td>Cold recrawl</td>
+<td>Frontier <code>next_fetch_at</code></td>
+<td style="text-align: right;">No real-time SLA</td>
+<td>Fetch monthly/quarterly or on external signal</td>
+</tr>
+<tr>
+<td>Spider trap</td>
+<td>Pattern quarantine</td>
+<td>content_hash repeats + URL pattern stats</td>
+<td style="text-align: right;">Same crawl batch</td>
+<td>Cap host depth/pages/day; blacklist pattern</td>
+</tr>
+<tr>
+<td>Robots fetch fails</td>
+<td>Fail closed briefly</td>
+<td>Cached host policy</td>
+<td style="text-align: right;">&lt;1 day old cache</td>
+<td>Use cached policy; if none, pause host</td>
+</tr>
+<tr>
+<td>Object storage slow</td>
+<td>Backpressure</td>
+<td>Worker lease + retry queue</td>
+<td style="text-align: right;">Minutes okay</td>
+<td>Store metadata failure, retry raw write, do not parse partial body</td>
+</tr>
+</tbody>
+</table>
+<p><strong>What I'd defer.</strong> Image/video crawling, structured data (JSON-LD) extraction, anti-fingerprinting evasion (we identify ourselves), specialized vertical crawlers (news, shopping), distributed PageRank.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

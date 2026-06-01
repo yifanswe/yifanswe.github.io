@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rate Limiter (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Rate Limiter (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Medium · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build a distributed rate limiter that protects an API from abuse. Every incoming request hits the limiter first; it either lets it through or rejects with 429. Rules look like "100 req/min per user," "1000 req/sec per API key," "10 logins/hour per IP." Single-digit-millisecond overhead is the budget. 1M QPS across the fleet, hundreds of limiter instances.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Decide allow/deny for each request, given one or more rules.
+- Support common policies: GCRA (Generic Cell Rate Algorithm) / token bucket / sliding window counter, keyed on (user, IP, key, route).
+- Surface remaining quota, reset time, and bucket scope in response headers so clients can back off intelligently.
+- Hot-reload rules without redeploying the gateway.</p>
+<p>I'd defer policy authoring UI and OAuth-quota / billing-integrated metering.</p>
+<p><strong>Non-functional</strong>
+- Latency overhead p99 &lt; 5 ms.
+- Available — counter-store outage must not take down the protected service. Fail mode is per-rule.
+- Reasonably accurate; small over-allowance is acceptable for soft rules, not for auth/abuse.
+- Scale to ≥1M decisions/sec across the cluster.</p>
+<p><strong>Capacity</strong>
+- 100M unique buckets (identity × rule × window).
+- State per bucket: ~50 bytes (counter + timestamp).
+- Raw counter state is ~5 GB, but Redis object overhead and replication make the real hot footprint closer to 30–60 GB. The dominant cost is not disk; it is memory plus one network round trip on the synchronous path.</p>
+<p><strong>Production calibration: a real rate limiter is a stack, not one knob.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Question</th>
+<th>Window</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Global shedder</td>
+<td>Is the fleet overloaded?</td>
+<td>sec</td>
+<td>Drop non-critical with 503 when busy</td>
+</tr>
+<tr>
+<td>Per-route</td>
+<td>Is this endpoint hot?</td>
+<td>sec–min</td>
+<td>10k QPS on <code>/search</code></td>
+</tr>
+<tr>
+<td>Per-tenant / identity</td>
+<td>Is one customer noisy?</td>
+<td>min–hour</td>
+<td>100 req/min per user</td>
+</tr>
+<tr>
+<td>Quota</td>
+<td>Did they exceed their plan?</td>
+<td>hour–day</td>
+<td>1M API calls/day on Pro tier</td>
+</tr>
+<tr>
+<td>Abuse</td>
+<td>Are they probing?</td>
+<td>rolling</td>
+<td>10K invalid in 10min → ban</td>
+</tr>
+</tbody>
+</table>
+<p>Each layer wants different state (memory-local for shedding, Redis-shared for per-tenant, long-term store for quotas, ML pipeline for abuse). Treating these as one component is the most common interview misstep.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Rule</strong> — <code>name</code>, matcher (a predicate over identity attributes), algorithm, limit, window, layer. Owned by the limiter service.</li>
+<li><strong>Identity</strong> — the flat set of dimensions describing a request: <code>user_id</code>, <code>ip</code>, <code>api_key</code>, <code>route</code>, <code>method</code>, anything else a rule might match on. The caller hands the whole bag over; rules pick which fields they key on.</li>
+<li><strong>Bucket</strong> — a <code>(rule, identity_subset)</code> pair mapping to one counter. The server-side identifier surfaced to clients as <code>X-RateLimit-Bucket</code>.</li>
+<li><strong>Decision</strong> — <code>allowed</code>, per-rule <code>remaining</code> / <code>reset_at</code> / <code>scope</code>, optional <code>retry_after</code>.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>// Internal RPC the API gateway calls per request.
+// The caller describes the request; the limiter owns rule lookup.
+POST /v1/check {
+  identity: { user_id?, ip?, api_key?, route, method, ... },
+  cost: 1
+} → {
+  allowed,
+  decisions: [ { rule_name, bucket_id, allowed, remaining, reset_at, scope } ],
+  retry_after?
+}
+</code></pre>
+<p><code>identity</code> is one flat bag of request attributes — there's no useful distinction between "who" (user_id) and "what" (route) at this layer, because a rule like "5 logins/hour per IP per route" needs both, and only the rule knows which fields it cares about. The caller describes the request fully; the limiter projects identity down to the fields each matched rule keys on.</p>
+<p><strong>Why the caller doesn't pass <code>rule_id</code>.</strong> Rules are config owned by the limiter. Letting callers name rules couples every gateway to the rule catalog — a new policy means a gateway redeploy, and stale clients drift from the source of truth. By passing raw request context instead, the limiter can add, retire, or reshape rules without any client change.</p>
+<p><strong>Public response headers</strong> (when the gateway returns 429): <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>, <code>X-RateLimit-Reset</code>, <code>X-RateLimit-Bucket</code>, <code>X-RateLimit-Scope</code> (<code>user</code> / <code>shared</code> / <code>global</code>), <code>Retry-After</code>. Discord's <code>X-RateLimit-Bucket</code> is opaque so the server can re-shard bucketing without breaking clients — see Deep Dives.</p>
+<p><strong>Sidecar alternative.</strong> A library that talks to a Redis/Memcached pool directly — same algorithm, no extra hop. The sidecar pulls rules from the config service and matches locally; the public API surface to application code stays identical (it still passes the identity bag, not rule IDs). I'd offer both depending on overhead constraints.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Limiter service / library.</strong> Receives the identity bag. Looks up matching rules from its in-memory rule table, projects identity to each rule's key dimensions, queries the counter store, aggregates decisions across layers. The caller never names a rule.</li>
+<li><strong>Counter store.</strong> Redis Cluster. Each bucket has a string key (e.g., <code>rl:user:42:postTweets:202605181847</code>); Redis hashes the key into one of 16,384 slots and routes to the shard that owns that slot — so buckets spread evenly across shards and any single bucket lives on exactly one node. Counters live in memory with the algorithm's data structure (one TAT integer for GCRA, two counters for sliding window). Eviction by TTL = window length. Co-located with limiters (same AZ) to keep p99 under budget.</li>
+<li><strong>Configuration service.</strong> Owns the rule catalog (source of truth). Pushes updates to limiter instances (long-poll or etcd/Consul). Limiter hot-reloads the matcher table atomically. New rules launch in <strong>observe-only mode</strong> first (see Deep Dives).</li>
+<li><strong>Local pre-check / verdict cache.</strong> In-process state — see Deep Dives (Hot keys, Adaptive enforcement) — absorbs the easy cases without a network hop.</li>
+<li><strong>Decision pipeline.</strong> Every decision emits <code>(rule_name, allowed, layer, bucket_id, identity_hash)</code> to a metrics + log pipeline. Operators see denial rates per rule; a sample lands in a structured log for offline tuning and dark-launch comparisons.</li>
+</ol>
+<p><strong>End-to-end narration.</strong> A request to <code>POST /tweets</code> arrives at the gateway. Gateway calls the limiter with <code>identity={user_id:42, ip:1.2.3.4, route:/tweets, method:POST}</code>. The limiter walks its layers in order — global shed (cheap, in-memory), per-route ("10k QPS on writes"), per-tenant ("100 req/min per user"), abuse ("recent invalid rate ok"). Each matched rule produces a bucket key (<code>rl:user:42:postTweets:202605181847</code>), updated atomically via a Lua script. If any layer denies, return 429 with <code>Retry-After</code> and bucket headers. Otherwise pass through.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code>+--------------------------------+
+| API Gateway / App Sidecar      |
++---------------+----------------+
+                |
+       POST /v1/check {identity,cost}
+                v
++------------------------------------------------+
+| Limiter Instance / Library                     |
+| local shed:{route}:{second}                    |
+| deny:{rule}:{identity_hash} verdict cache      |
++-------------+-------------------+--------------+
+              |                   |
+              | ruleset miss      | decision events
+              v                   v
++------------------------+   +--------------------------------+
+| Config Service         |   | Metrics / Logs / Dashboards     |
+| ruleset:{version}      |   | dark-launch comparisons         |
++------------------------+   +--------------------------------+
+              ^
+              |
+     hot-reload matcher table
+              |
+              v
++--------------------------------------------------------------+
+| Redis Cluster Counter Store                                  |
+| rl:{rule}:{identity_hash}       GCRA TAT string, TTL         |
+| rlsw:{rule}:{identity_hash}:win sliding counters, 2x window  |
+| rule buckets hash to one Redis shard for atomic Lua updates  |
++----------------------------+---------------------------------+
+                             |
+                             | miss / dormant bucket
+                             v
+                    +-----------------------+
+                    | Lua/GCRA creates key  |
+                    | with TTL + reset_at   |
+                    +-----------------------+
+
+Primary flow: gateway -&gt; limiter -&gt; Redis Lua update -&gt; allow or 429 headers.
+Rule flow: config service -&gt; ruleset:{version} -&gt; atomic in-memory swap.
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete keys and memory.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Key pattern</th>
+<th>Data structure / entry</th>
+<th>TTL</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Global shed</td>
+<td><code>shed:{route}:{second}</code></td>
+<td>in-process counter, ~16 B</td>
+<td>2–5 s</td>
+<td>local instance</td>
+</tr>
+<tr>
+<td>GCRA bucket</td>
+<td><code>rl:{rule}:{identity_hash}</code></td>
+<td>Redis string = theoretical arrival time + metadata, ~50 B logical</td>
+<td>burst window + idle grace</td>
+<td><code>{rule}:{identity_hash}</code></td>
+</tr>
+<tr>
+<td>Sliding counter</td>
+<td><code>rlsw:{rule}:{identity_hash}:{window}</code></td>
+<td>two Redis counters, ~32 B logical</td>
+<td>2 × window</td>
+<td><code>{rule}:{identity_hash}</code></td>
+</tr>
+<tr>
+<td>Local deny cache</td>
+<td><code>deny:{rule}:{identity_hash}</code></td>
+<td>in-process verdict + reset_at, ~64 B</td>
+<td>until reset</td>
+<td>local instance</td>
+</tr>
+<tr>
+<td>Rule config</td>
+<td><code>ruleset:{version}</code></td>
+<td>serialized matcher table, KB–MB</td>
+<td>until superseded</td>
+<td>replicated to all</td>
+</tr>
+</tbody>
+</table>
+<p>The <code>identity_hash</code> is server-generated from the dimensions the rule selects, so changing a rule's key shape creates a new bucket namespace without client changes.</p>
+<p><strong>Capacity by store / path.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Math</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Active shared buckets</td>
+<td>100M × 50 B logical ≈ 5 GB; Redis overhead + replicas ≈ 30–60 GB</td>
+<td>dominant hot memory cost</td>
+</tr>
+<tr>
+<td>Strict Redis ops</td>
+<td>1M QPS × 1–3 matched strict rules = 1–3M ops/sec</td>
+<td>pipeline independent buckets</td>
+</tr>
+<tr>
+<td>Local deny cache</td>
+<td>1M hot denied buckets × 64 B ≈ 64 MB per large gateway tier</td>
+<td>attack traffic becomes cheap</td>
+</tr>
+<tr>
+<td>Rule config</td>
+<td>thousands of rules × matcher data = KB–MB per instance</td>
+<td>replicated to every limiter</td>
+</tr>
+<tr>
+<td>Decision stream</td>
+<td>1M QPS × ~100 B ≈ 100 MB/sec if fully logged</td>
+<td>sample aggressively; metrics are aggregated</td>
+</tr>
+<tr>
+<td>Quota exports</td>
+<td>day/hour aggregates keyed by tenant</td>
+<td>analytical view, not enforcement path</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Check path with stores touched.</strong>
+1. Gateway calls <code>/v1/check</code> with the flat identity bag and request cost.
+2. Limiter matches rules in-memory; global shed and local deny-cache checks run first with no Redis hop.
+3. For each strict matched rule, limiter builds a bucket key and pipelines Lua/GCRA commands to Redis. Independent rule buckets can run in parallel, but each individual bucket is atomic on one Redis shard.
+4. Decisions are aggregated by most restrictive result. If any hard rule denies, return 429 with <code>Retry-After</code>; soft observe-only rules only emit metrics.
+5. Decision events go async to metrics/logging; logging failure never blocks the request.</p>
+<p>"My punch line: a rate limiter is a hierarchy of cheap local decisions and precise shared counters; making every rule pay the strongest consistency cost is the scalability bug."</p>
+<p><strong>Hot/cold bucket behavior.</strong>
+1. New or dormant identity: Redis key is missing, so the Lua/GCRA script creates <code>rl:{rule}:{identity_hash}</code> with TTL = burst window + idle grace. No cleanup scan is needed.
+2. Healthy cold bucket: optimistic local allow is permitted only for rules marked soft; async increment response carries the remaining quota signal.
+3. Near-limit bucket: limiter flips to strict synchronous mode and updates the same Redis key atomically before allowing the request.
+4. Exhausted bucket: limiter writes <code>deny:{rule}:{identity_hash}</code> locally until <code>reset_at</code>, so repeated abusive requests do not keep hitting Redis.
+5. Rule shape changes: <code>identity_hash</code> namespace changes with <code>ruleset:{version}</code>, so old buckets expire naturally while new buckets start clean.</p>
+<p><strong>Two-view framing.</strong> The counter store is the enforcement index keyed by <code>(rule, identity_subset)</code>. The decision stream is the analytical view keyed by rule, tenant, route, and time. Dashboards and quota exports can lag or sample; the Redis bucket decision cannot.</p>
+<p><strong>Algorithms.</strong>
+- <strong>GCRA (Generic Cell Rate Algorithm)</strong> — my default. One "theoretical arrival time" integer per bucket. Atomic in a single Redis command (<code>CL.THROTTLE</code> via redis-cell). Mathematically equivalent to leaky bucket but eliminates the drip-process failure mode and the non-atomic read-modify-write race that bites naive token buckets.
+- <strong>Sliding window counter</strong> — two fixed-window counters blended by elapsed fraction: <code>rate = prev * (1 − elapsed/window) + curr</code>. Cloudflare measured ~0.003% misclassification at production scale. Cheap and predictable.
+- <strong>Token bucket</strong> — natural for burst tolerance; needs careful Lua to stay atomic. Use when policy explicitly wants burst + steady-rate semantics.
+- <strong>Fixed window</strong> — only when the burst-at-boundary (2× limit possible) doesn't matter.
+- <strong>Sliding window log</strong> — exact but O(window × QPS) memory per bucket. Don't use at scale.</p>
+<p><strong>Counter synchronization — three models.</strong>
+- <strong>Centralized counter store (Redis).</strong> Stripe, Envoy, Kong. Single Redis Cluster, each bucket key hashed to one shard. Simple and exact. Cost: one network hop per check. My default for per-tenant and quota layers.
+- <strong>Anycast-pinned local counters.</strong> Cloudflare. Source-IP routing pins a flow to one PoP, so per-IP buckets live PoP-locally with no cross-PoP sync. Zero-hop, but unusable for per-user limits where the same user hits multiple PoPs.
+- <strong>Cooperative lease distribution.</strong> Google's Doorman. Limiters ask a master for a <em>lease</em> (e.g., 1000 req/s for 5s), refresh periodically. Trades per-request precision for the ability to enforce huge global limits without per-request hops. Good when limits are large and clients are many.</p>
+<p>Why Redis rather than DynamoDB/Cassandra for the default counter store: the limiter needs single-digit-millisecond atomic increments with TTL, not durable query history. DynamoDB can do conditional writes but its tail latency and cost per request are a poor fit at 1M QPS; Cassandra is excellent for write logs, weaker for per-request atomic counters.</p>
+<p><strong>Hot keys.</strong> A famous user or scraper IP creates a hot bucket. Mitigations stack:
+- <strong>Cache the deny verdict locally</strong> once a bucket is over-limit (Cloudflare, Envoy <code>freecache</code>). Subsequent requests from that bucket skip the store entirely until TTL. Counterintuitive: backend load <em>drops</em> during an attack on the worst-case path.
+- <strong>Layer cheap before expensive.</strong> Per-IP at the edge (in-memory); per-user behind it on Redis.
+- <strong>Counter sharding</strong> for the absolute hottest buckets — hash into N sub-keys, sum on read. Trades a read for spreading the write hot-spot.
+- <strong>Client-side micro-cache</strong> of the allow decision (e.g., 50ms) on the gateway.</p>
+<p><strong>Edge stress tests.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Edge</th>
+<th>Failure mode</th>
+<th>Fallback / budget</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dormant identity</td>
+<td>bucket expired</td>
+<td>recreate on first request; one Redis hop</td>
+</tr>
+<tr>
+<td>Exhausted hot bucket</td>
+<td>attacker hammers 429 path</td>
+<td>local deny cache until reset</td>
+</tr>
+<tr>
+<td>Burst writes</td>
+<td>many identities become hot at once</td>
+<td>pipeline Redis, shed globally before per-user checks</td>
+</tr>
+<tr>
+<td>Redis shard failure</td>
+<td>strict counters unavailable</td>
+<td>per-rule fail-closed or fail-open-with-floor</td>
+</tr>
+<tr>
+<td>Multi-region drift</td>
+<td>same user hits multiple PoPs</td>
+<td>use central Redis for strict user limits or Doorman-style leases for large global quotas</td>
+</tr>
+<tr>
+<td>Cold config rollout</td>
+<td>new rule too aggressive</td>
+<td>observe-only first, then enforce after dashboard review</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Latency budget.</strong> 5 ms p99 means one Redis hop max. Co-locate Redis with gateways (same AZ). Connection pooling, pipelining, and Lua scripts keep wire round-trips to one.</p>
+<p><strong>Adaptive enforcement (predict instead of check).</strong> ≫99% of <code>(identity, rule)</code> pairs never approach their limit — paying a Redis hop on every request is wasteful. Maintain per-bucket state in the limiter: <strong>cold</strong> (counter well under limit, denial rate ≈ 0) and <strong>hot</strong> (near limit or denials rising):
+- <strong>Cold path:</strong> allow immediately, fire-and-forget the increment (batched / pipelined). Latency ≈ 0.
+- <strong>Hot path:</strong> synchronous check-then-allow via the Lua script. Strict.</p>
+<p>Transitions: cold→hot when the counter crosses ~80% of the limit or async denials appear; hot→cold after a quiet window. The signal rides back on the async increment response — Redis tells us "you're at 95%," we flip to hot. Cost: brief over-allowance at the cold→hot edge. Acceptable for soft limits (pagination quotas); never for hard limits (auth, abuse). Per-rule opt-in.</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cold</td>
+<td>optimistic allow</td>
+<td>local state + async Redis increment</td>
+<td>lowest latency, bounded over-allow</td>
+</tr>
+<tr>
+<td>Warm</td>
+<td>sampled sync</td>
+<td>periodic Redis check</td>
+<td>detects drift before limit</td>
+</tr>
+<tr>
+<td>Hot</td>
+<td>strict sync</td>
+<td>Redis Lua/GCRA</td>
+<td>exact decision before request passes</td>
+</tr>
+<tr>
+<td>Store failed</td>
+<td>floor mode</td>
+<td>local safe-capacity bucket</td>
+<td>fail-open-with-floor or fail-closed by rule</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Fail-open with a floor, not binary.</strong> If the counter store is unreachable, the binary choice (fail-open = abuse gets through; fail-closed = self-inflicted outage) is wrong for most rules. Each gateway carries a <strong>safe-capacity floor</strong> per identity (e.g., "if Redis is down, allow up to 10 req/s per user from local memory"). Hard rules (auth, payment) still fail-closed; soft rules fail-open-with-floor. Doorman models this explicitly; Stripe approximates it by fail-open + a concurrent-request limiter that keeps a faulty client from monopolizing workers.</p>
+<p><strong>Bucket discovery via response headers.</strong> Server returns <code>X-RateLimit-Bucket: &lt;opaque&gt;</code> so well-behaved clients group endpoints that share a bucket and back off correctly without hardcoding limits. Server controls bucketing, can re-shard, and clients adapt automatically. Pair with <code>X-RateLimit-Scope</code> so the client knows which layer fired (user / shared / global) and whether to back off this token or all tokens.</p>
+<p><strong>Cost model.</strong> Not all requests are equal:
+- <strong>Point system</strong> (GitHub: GET=1, mutation=5; 900 points/min). Counter increments by request cost — supported trivially by passing <code>cost</code> through the Lua script.
+- <strong>GraphQL query complexity</strong> — sum field costs at parse time, charge once.
+- <strong>Concurrent in-flight limiter</strong> — <em>distinct</em> from RPS. A user making 100 slow expensive requests can starve workers without exceeding RPS. Stripe runs this as its own layer; catches the case RPS limits miss.</p>
+<p><strong>Don't leak the limit (abuse layer).</strong> For adversarial rules, 429 + <code>Retry-After</code> tells the attacker exactly when to retry. Figma's pattern: <strong>shadow ban</strong> — return 200, silently drop or delay. The attacker can't tell they've been throttled and can't pivot to fresh credentials. Use shadow-ban only on suspected-bot layers; never on developer-facing API quotas where transparent feedback is the contract.</p>
+<p><strong>Dark-launch / shadow mode.</strong> Never enforce a new rule cold. Run it in <strong>observe-only</strong> mode for days first — count what <em>would</em> have been blocked, dashboard the verdicts, tune the threshold. Stripe and Envoy both build this in as a first-class mode. Cheap to add; saves you from accidentally 429-ing a critical batch job.</p>
+<p><strong>Multi-tenant fairness.</strong> Noisy tenant must not slow others. Partition Redis per-tenant (or per-tier) so one tenant's hot buckets don't evict another's. Combine with the per-tenant layer in the stack so an abusive tenant's denial work doesn't burn the shared budget.</p>
+<p><strong>Synchronizing config.</strong> Rule changes propagate via the config service. Limiter watches; on change, swaps the rule table atomically. In-flight requests finish on the old config — that's fine.</p>
+<p><strong>Clock skew.</strong> Counters live in one place at a time — the Redis server's clock (centralized) or the PoP-local clock (anycast). Don't trust client timestamps. For lease-based systems, leases are seconds-scale and NTP skew is negligible.</p>
+<p><strong>What I'd defer.</strong> ML-based novel-bot detection, CAPTCHA fallback, OAuth quota enforcement, billing-integrated metering, deeply hierarchical (org → team → user) quota allocation.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Apache Cassandra — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Apache Cassandra</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> and the <a href="../amazon-dynamo/">Amazon Dynamo</a> writeup, which Cassandra extends.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Cassandra is a wide-column distributed database that combines Dynamo's leaderless cluster design (consistent hashing, sloppy quorum, gossip) with Bigtable's storage model (SSTables, LSM tree, column families). The hard part is the trade between the strict-as-needed consistency (CL ALL, QUORUM, ONE) and high availability, plus the data model based on wide rows with clustering columns.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every write is durably persisted to a commit log on at least one replica and propagated to all N replicas; reads at the configured consistency level reflect the latest write (within tunability); the wide-column model allows efficient per-partition queries with clustering-column-ordered reads; the cluster scales linearly by adding nodes.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can articulate Cassandra's data model (partition key + clustering columns), the LSM-tree storage engine, consistency levels, lightweight transactions (Paxos), and the operational complexity (compaction, repair).</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would describe Cassandra as Dynamo's cluster model plus Bigtable's storage engine. Consistent hashing for partitioning; configurable replication and consistency level per query; commit log + memtable + SSTables for storage; LSM compaction; gossip for membership. The data model is wide rows with a partition key plus clustering columns for sorted ranges within a partition. Lightweight transactions via Paxos for compare-and-set. The interesting decisions are data model, consistency levels, compaction strategy, and repair.</p>
+</blockquote>
+<h3 id="requirements-cassandra-addresses">Requirements Cassandra Addresses</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Distributed wide-column store.</li>
+<li>Wide row queries with clustering order.</li>
+<li>Tunable consistency per query.</li>
+<li>Multi-data-center replication.</li>
+<li>Lightweight transactions (compare-and-set).</li>
+<li>Time-series and IoT workloads.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>High write throughput.</li>
+<li>High availability.</li>
+<li>Linear scalability.</li>
+<li>Operationally simple cluster expansion.</li>
+<li>Multi-region (active-active).</li>
+</ul>
+<p>Out of scope:</p>
+<ul>
+<li>Multi-row transactions across partitions.</li>
+<li>Strict global ordering.</li>
+<li>Ad-hoc full-table joins (not designed for relational workloads).</li>
+</ul>
+<h3 id="core-concepts">Core Concepts</h3>
+<h4 id="data-model">Data Model</h4>
+<pre><code class="language-text">Keyspace
+  └── Table
+       └── Row
+            ├── Partition key (determines node placement)
+            ├── Clustering columns (sort order within partition)
+            └── Regular columns (values)
+</code></pre>
+<p>Example: sensor time series.</p>
+<pre><code class="language-text">CREATE TABLE sensor_data (
+  sensor_id text,
+  reading_ts timestamp,
+  value double,
+  PRIMARY KEY (sensor_id, reading_ts)
+);
+</code></pre>
+<ul>
+<li><code>sensor_id</code> = partition key → hashed to a node.</li>
+<li><code>reading_ts</code> = clustering column → sorted within the partition.</li>
+<li>Query: <code>SELECT * FROM sensor_data WHERE sensor_id = ? AND reading_ts &gt; ? ORDER BY reading_ts</code>.</li>
+</ul>
+<p>A "row" in Cassandra is identified by (partition_key, clustering_columns); a "partition" holds many rows with the same partition key, sorted by clustering columns.</p>
+<p>This data model is <strong>partition-local</strong>: efficient queries are within a single partition. Queries spanning partitions are expensive (require scatter-gather).</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>The Cassandra data model is partition-key + clustering columns. Query patterns must be designed first; tables are denormalized per query pattern.</p>
+</blockquote>
+<h4 id="storage-engine-lsm-tree">Storage Engine: LSM Tree</h4>
+<p>Inherited from Bigtable.</p>
+<ul>
+<li><strong>Write path:</strong> commit log (durability) + memtable (in-memory sorted structure).</li>
+<li>When memtable fills: flush to SSTable on disk.</li>
+<li>SSTables are immutable sorted files.</li>
+<li>Compaction merges SSTables periodically.</li>
+<li>Bloom filters per SSTable speed up negative lookups.</li>
+</ul>
+<p>Compaction strategies:
+- <strong>SizeTieredCompactionStrategy (STCS):</strong> merge similar-sized SSTables. Good for write-heavy.
+- <strong>LeveledCompactionStrategy (LCS):</strong> maintain levels with size limits. Good for read-heavy.
+- <strong>TimeWindowCompactionStrategy (TWCS):</strong> group by time window. Good for time-series.</p>
+<h4 id="consistency-levels-per-query">Consistency Levels (per query)</h4>
+<table>
+<thead>
+<tr>
+<th>Level</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ONE</td>
+<td>Wait for 1 replica.</td>
+</tr>
+<tr>
+<td>QUORUM</td>
+<td>Wait for <code>floor(N/2) + 1</code>.</td>
+</tr>
+<tr>
+<td>ALL</td>
+<td>Wait for all N.</td>
+</tr>
+<tr>
+<td>LOCAL_QUORUM</td>
+<td>Quorum within local DC.</td>
+</tr>
+<tr>
+<td>EACH_QUORUM</td>
+<td>Quorum in each DC.</td>
+</tr>
+<tr>
+<td>ANY</td>
+<td>Coordinator accepts via hinted handoff if all replicas down.</td>
+</tr>
+</tbody>
+</table>
+<p>Strong consistency: <code>R + W &gt; N</code> (e.g., QUORUM + QUORUM with N=3).
+Eventual consistency: lower levels.</p>
+<h4 id="cluster-design-from-dynamo">Cluster Design (from Dynamo)</h4>
+<ul>
+<li>Consistent hashing ring with vnodes.</li>
+<li>Replication factor N per keyspace.</li>
+<li>Gossip for membership.</li>
+<li>Hinted handoff for short failures.</li>
+<li>Anti-entropy repair via Merkle trees.</li>
+<li>Sloppy quorum optional.</li>
+</ul>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Client -&gt; Coordinator (any node)
+              |
+              v
+     Consistent Hashing Ring
+              |
+              v
+       Preference List (N nodes)
+              |
+        Replicate write to N (wait for CL)
+              |
+              v
+       Commit log + Memtable
+              |
+        Flush to SSTable
+              |
+        Compaction (background)
+              |
+        Gossip / Hints / Repair
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Coordinator</td>
+<td>Per-request node.</td>
+<td>Any node.</td>
+</tr>
+<tr>
+<td>Commit log</td>
+<td>Append-only durable log.</td>
+<td>First write target.</td>
+</tr>
+<tr>
+<td>Memtable</td>
+<td>In-memory sorted by clustering.</td>
+<td>Flushes on size/time.</td>
+</tr>
+<tr>
+<td>SSTable</td>
+<td>Immutable on-disk sorted file.</td>
+<td>Many per partition.</td>
+</tr>
+<tr>
+<td>Compactor</td>
+<td>Merges SSTables.</td>
+<td>Background; strategy-driven.</td>
+</tr>
+<tr>
+<td>Gossip</td>
+<td>Cluster membership.</td>
+<td>From Dynamo.</td>
+</tr>
+<tr>
+<td>Hinted handoff</td>
+<td>Temp store for unreachable replicas.</td>
+<td>Replay on recovery.</td>
+</tr>
+<tr>
+<td>Repair</td>
+<td>Merkle-tree anti-entropy.</td>
+<td>Manual or scheduled.</td>
+</tr>
+<tr>
+<td>Bloom filter</td>
+<td>Per-SSTable negative lookup.</td>
+<td>In memory.</td>
+</tr>
+<tr>
+<td>Snitch</td>
+<td>Topology awareness for replica placement.</td>
+<td>E.g., DC-aware.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model-continued">Data Model Continued</h3>
+<h4 id="counters">Counters</h4>
+<p>Special column type for atomic increment/decrement. Implementation uses different replication semantics (delta-based). Limited consistency guarantees.</p>
+<h4 id="materialized-views">Materialized Views</h4>
+<p>Server-side denormalization: secondary tables auto-maintained from a base table. Per-write overhead; useful when you query by different keys.</p>
+<h4 id="secondary-indexes">Secondary Indexes</h4>
+<p>Local per-node index on a non-partition column. Query requires scatter-gather across all partitions; expensive.</p>
+<h3 id="write-path-details">Write Path Details</h3>
+<ol>
+<li>Coordinator receives write.</li>
+<li>Computes partition key hash → preference list (N replicas).</li>
+<li>Sends write to all N replicas in parallel.</li>
+<li>Each replica: append to commit log → insert into memtable.</li>
+<li>Wait for CL responses.</li>
+<li>Return success.</li>
+</ol>
+<p>Memtable flush: when size or time threshold reached, write to a new SSTable. Commit log truncated after flush.</p>
+<h3 id="read-path-details">Read Path Details</h3>
+<ol>
+<li>Coordinator receives read.</li>
+<li>Computes partition key hash → preference list.</li>
+<li>Sends read request to closest replicas (per CL).</li>
+<li>Each replica: query memtable + relevant SSTables (filtered by bloom).</li>
+<li>Coordinator merges responses (latest timestamp wins).</li>
+<li>If CL &gt; 1, return when CL responses received.</li>
+<li><strong>Read repair</strong> (optional): if responses disagree, write merged value back.</li>
+</ol>
+<p>For range queries within a partition: read SSTables in clustering order, merge, return rows in clustering order.</p>
+<h3 id="lightweight-transactions-cas">Lightweight Transactions (CAS)</h3>
+<p>Paxos-based compare-and-set for single-partition atomic operations.</p>
+<pre><code class="language-sql">UPDATE users SET email = 'new' WHERE id = 1 IF email = 'old';
+INSERT INTO users (...) VALUES (...) IF NOT EXISTS;
+</code></pre>
+<p>Implementation: four-phase Paxos within the partition. Slower (4× round trips) than normal writes. Useful for cases where strict atomicity is required (e.g., unique username).</p>
+<h3 id="tombstones">Tombstones</h3>
+<p>Deletes don't physically remove data; they write a tombstone marking the row deleted.</p>
+<ul>
+<li>Tombstone has a timestamp.</li>
+<li>On read, tombstone wins over older data.</li>
+<li>Compaction eventually drops tombstones older than <code>gc_grace_seconds</code>.</li>
+</ul>
+<p>Why grace period: prevents resurrection of deleted data after a missed replica catches up. If a replica was offline during the delete and tombstone was already GC'd, the replica's old value could resurrect the data via repair.</p>
+<p>Common operational pitfall: high tombstone count slows reads.</p>
+<h3 id="compaction-strategies">Compaction Strategies</h3>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Best for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SizeTieredCompactionStrategy</td>
+<td>Write-heavy; tolerates higher read amplification.</td>
+</tr>
+<tr>
+<td>LeveledCompactionStrategy</td>
+<td>Read-heavy; bounded read amplification.</td>
+</tr>
+<tr>
+<td>TimeWindowCompactionStrategy</td>
+<td>Time-series; drops old data efficiently.</td>
+</tr>
+</tbody>
+</table>
+<p>Pick based on workload.</p>
+<h3 id="repair">Repair</h3>
+<p>Cassandra requires regular repair to ensure replicas converge.</p>
+<ul>
+<li>Merkle-tree comparison between replicas.</li>
+<li>Streams differing data.</li>
+<li>Run on a schedule (typically weekly).</li>
+<li>Heavy operation; usually one node at a time.</li>
+</ul>
+<p>Without repair: stale replicas drift, deleted data may resurrect after <code>gc_grace_seconds</code>.</p>
+<h3 id="multi-data-center">Multi-Data-Center</h3>
+<p>Snitches make placement DC-aware.</p>
+<ul>
+<li>Replication factor per DC: <code>{"DC1": 3, "DC2": 3}</code>.</li>
+<li>Writes propagate to all DCs; coordinator can wait for local quorum (LOCAL_QUORUM) — fast — and async to other DCs.</li>
+<li>For strict cross-DC consistency: EACH_QUORUM.</li>
+</ul>
+<p>Cassandra is known for multi-DC active-active.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Strategy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Add node</td>
+<td>Bootstrap from existing; streams responsible ranges.</td>
+</tr>
+<tr>
+<td>Remove node</td>
+<td>Decommission; redistribute.</td>
+</tr>
+<tr>
+<td>Hot partition</td>
+<td>Bound partition size; model around access pattern.</td>
+</tr>
+<tr>
+<td>Tombstone overhead</td>
+<td>Tune gc_grace; design for fewer deletes.</td>
+</tr>
+<tr>
+<td>Read amplification</td>
+<td>LCS compaction; smaller SSTables.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Per write</td>
+<td>At configured CL</td>
+<td>Tunable.</td>
+</tr>
+<tr>
+<td>Per read</td>
+<td>At configured CL</td>
+<td>Tunable.</td>
+</tr>
+<tr>
+<td>Repair</td>
+<td>Eventually consistent</td>
+<td>Periodic.</td>
+</tr>
+<tr>
+<td>LWT</td>
+<td>Strong (Paxos)</td>
+<td>At cost of latency.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Replica down.</td>
+<td>Hinted handoff; lower CL maintains availability.</td>
+<td>Hint backlog.</td>
+</tr>
+<tr>
+<td>Permanent loss.</td>
+<td>Repair; replica replacement.</td>
+<td>Repair lag.</td>
+</tr>
+<tr>
+<td>Compaction backlog.</td>
+<td>Tune strategy; scale up.</td>
+<td>Pending compactions.</td>
+</tr>
+<tr>
+<td>Tombstone overload.</td>
+<td>gc_grace tuning; design.</td>
+<td>Tombstone count per read.</td>
+</tr>
+<tr>
+<td>Hot partition.</td>
+<td>Re-shard at app level.</td>
+<td>Partition size.</td>
+</tr>
+<tr>
+<td>Wide partition.</td>
+<td>Bound partition keys.</td>
+<td>Partition size.</td>
+</tr>
+<tr>
+<td>Stale read (low CL).</td>
+<td>Read repair; higher CL.</td>
+<td>Stale read rate.</td>
+</tr>
+<tr>
+<td>Network partition.</td>
+<td>Sloppy quorum; alert.</td>
+<td>Partition events.</td>
+</tr>
+<tr>
+<td>Multi-DC lag.</td>
+<td>LOCAL_QUORUM; cross-DC monitoring.</td>
+<td>Cross-DC lag.</td>
+</tr>
+<tr>
+<td>Bootstrap slow.</td>
+<td>Streaming throttle; parallel.</td>
+<td>Bootstrap duration.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Repair lag.</li>
+<li>Tombstone count per read.</li>
+<li>Hint backlog.</li>
+<li>Stale reads from low CL.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Per-node QPS.</li>
+<li>Compaction backlog.</li>
+<li>Read latency p99.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Throughput.</li>
+<li>Storage per node.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Cassandra trades multi-row transactions for high write throughput and linear scaling.</li>
+<li>Wide rows enable efficient per-partition queries but require modeling per query.</li>
+<li>LCS gives bounded read amplification but more write amplification than STCS.</li>
+<li>LWT gives atomic CAS at significant latency cost.</li>
+<li>Tombstones cleanup time vs delete resurrection risk.</li>
+<li>Multi-DC active-active is great for read locality but eventual consistency cross-DC.</li>
+<li>Counters have weaker consistency than regular columns.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Use as relational DB with joins.</td>
+<td>Denormalize per query; design data model first.</td>
+</tr>
+<tr>
+<td>Default consistency without thought.</td>
+<td>Pick CL per query; QUORUM is common.</td>
+</tr>
+<tr>
+<td>Frequent deletes.</td>
+<td>Design to minimize; understand tombstone cost.</td>
+</tr>
+<tr>
+<td>Random partition keys for time-series.</td>
+<td>TimeWindowCompactionStrategy.</td>
+</tr>
+<tr>
+<td>Ignore repair.</td>
+<td>Schedule regular repairs.</td>
+</tr>
+<tr>
+<td>LWT for everything.</td>
+<td>Only when atomicity truly needed.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Data model</td>
+<td>Partition key + clustering; query-driven design.</td>
+</tr>
+<tr>
+<td>Storage engine</td>
+<td>Commit log + memtable + SSTable + compaction.</td>
+</tr>
+<tr>
+<td>Consistency</td>
+<td>CL per query; R+W&gt;N for strong.</td>
+</tr>
+<tr>
+<td>Compaction strategies</td>
+<td>STCS / LCS / TWCS tradeoffs.</td>
+</tr>
+<tr>
+<td>LWT</td>
+<td>Paxos; cost; use sparingly.</td>
+</tr>
+<tr>
+<td>Multi-DC</td>
+<td>Snitch + per-DC RF + LOCAL_QUORUM.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Dynamo cluster model + Bigtable storage engine.</li>
+<li>Partition key + clustering columns.</li>
+<li>LSM tree write path; SSTables + compaction.</li>
+<li>Tunable consistency per query.</li>
+<li>LWT via Paxos for CAS.</li>
+<li>Repair for anti-entropy.</li>
+<li>Multi-DC with snitch and per-DC RF.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Cassandra is Dynamo's cluster plus Bigtable's storage. Consistent hashing for partitioning; LSM tree (commit log + memtable + SSTables + compaction) for storage; tunable consistency per query; lightweight transactions via Paxos for CAS. The data model is partition key + clustering columns — query patterns first, denormalized tables per pattern. Multi-DC active-active is a strength; multi-row transactions are not.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> What is Cassandra?</p>
+<p><strong>Candidate:</strong> Distributed wide-column database. Cluster model from Dynamo: consistent hashing, gossip, sloppy quorum, anti-entropy repair. Storage engine from Bigtable: commit log, memtable, SSTables, compaction. Data model: keyspaces → tables → partitions → rows; each row is (partition_key, clustering_columns) → values. Queries optimized per partition. Tunable consistency per query. The invariant is high availability, linear scaling, and efficient per-partition queries.</p>
+<p><strong>Interviewer:</strong> Walk me through a write.</p>
+<p><strong>Candidate:</strong> Client sends write to a coordinator. Coordinator hashes partition_key, finds the N replicas in the preference list, sends the write to all in parallel. Each replica appends to commit log (durability) and inserts into memtable (sorted in-memory by clustering columns). Coordinator waits for CL replicas to ack; returns success. Memtable flushes to a new immutable SSTable when full. Background compaction merges SSTables.</p>
+<p><strong>Interviewer:</strong> Read path.</p>
+<p><strong>Candidate:</strong> Coordinator hashes partition_key, picks closest replicas per CL. Each replica queries memtable + SSTables (Bloom filter avoids unnecessary disk seeks). Returns rows for the requested partition + clustering range. Coordinator merges responses (latest timestamp wins per column). Optional read repair if replicas disagree.</p>
+<p><strong>Interviewer:</strong> Data model.</p>
+<p><strong>Candidate:</strong> Wide rows. A partition_key determines node placement. Clustering columns define sort order within the partition. Example: <code>(user_id, post_ts)</code> — all of a user's posts are in one partition, sorted by time, so range query "user X's posts in time range" is efficient (single partition read). The art is designing the partition_key + clustering to match query patterns. Tables are denormalized per query.</p>
+<p><strong>Interviewer:</strong> Why no joins?</p>
+<p><strong>Candidate:</strong> Joining across partitions would require cross-node coordination, hurting Cassandra's linear scaling. Instead, denormalize: store related data in the same partition or duplicate across tables. For a user's posts and comments, store comments embedded in the same partition or in a parallel table per (user, post).</p>
+<p><strong>Interviewer:</strong> LWT — when to use?</p>
+<p><strong>Candidate:</strong> Compare-and-set when atomicity matters: unique username, leader election, sequence numbers. Uses Paxos under the hood — 4 round-trips. Much slower than normal writes (10x). Use sparingly. For most use cases, accept eventual consistency and design around races.</p>
+<p><strong>Interviewer:</strong> Tombstones — what's the issue?</p>
+<p><strong>Candidate:</strong> Delete doesn't physically remove; writes a tombstone with timestamp. Reads must check tombstones to know what's deleted. Many tombstones slow reads. Compaction eventually drops tombstones after <code>gc_grace_seconds</code> (default 10 days). Before that, the tombstone must be retained so an offline replica receiving an old value during repair sees the tombstone and doesn't resurrect deleted data.</p>
+<p><strong>Interviewer:</strong> Compaction strategy.</p>
+<p><strong>Candidate:</strong> Three main strategies. SizeTieredCompactionStrategy: merge similar-sized SSTables; write-heavy. LeveledCompactionStrategy: maintain levels with size budgets; bounded read amplification; better for read-heavy. TimeWindowCompactionStrategy: group SSTables by time window; ideal for time-series where old data is dropped wholesale. Pick based on workload.</p>
+<p><strong>Interviewer:</strong> Multi-DC?</p>
+<p><strong>Candidate:</strong> Snitch makes placement DC-aware. Replication factor per DC. Writes propagate to all DCs. LOCAL_QUORUM waits for local DC quorum (fast); EACH_QUORUM for cross-DC strict consistency. Common pattern: active-active across DCs with LOCAL_QUORUM; cross-DC lag in seconds is OK.</p>
+<p><strong>Interviewer:</strong> Repair.</p>
+<p><strong>Candidate:</strong> Anti-entropy. Merkle-tree comparison between replicas of a partition range. Differences streamed to converge. Required to ensure eventual consistency, especially after long failures. Run regularly (weekly typical). Heavy operation; usually one node at a time.</p>
+<p><strong>Interviewer:</strong> A hot partition?</p>
+<p><strong>Candidate:</strong> All traffic for one partition_key lands on the same N replicas. Bottleneck. Fix at the application: sub-partition by adding a random or time-based suffix to partition_key, then query all suffixes for aggregation. Alternative: caching layer above. Cassandra itself can't shard a single partition_key across nodes.</p>
+<p><strong>Interviewer:</strong> Counter columns?</p>
+<p><strong>Candidate:</strong> Special column type for atomic increment/decrement. Internally uses delta-based replication different from regular columns. Eventually consistent; some loss possible in failure scenarios. Useful for "likes counter" semantics where exactness isn't critical. For exact counts, use periodic recomputation from event logs.</p>
+<p><strong>Interviewer:</strong> Bootstrap a new node.</p>
+<p><strong>Candidate:</strong> Pre-assigned vnode ranges. New node joins ring; existing nodes stream the relevant ranges. Parallelized across vnodes — multiple nodes stream simultaneously. Throttle to avoid saturating. Gossip propagates the new membership. Once bootstrap completes, the new node serves reads/writes for its ranges.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Dynamo cluster + Bigtable storage. Wide-column data model with partition_key + clustering columns; query-pattern-driven design. LSM tree write path; SSTable compaction. Tunable consistency per query; LWT via Paxos for CAS. Multi-DC active-active. Anti-entropy repair required. Hot partitions and tombstones are operational pitfalls. The strength is linear scale and high write throughput; the weakness is multi-row transactions.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Dynamo cluster + Bigtable storage.</li>
+<li>Wide rows: partition_key + clustering columns.</li>
+<li>LSM: commit log + memtable + SSTable + compaction.</li>
+<li>Tunable CL per query.</li>
+<li>LWT via Paxos for CAS.</li>
+<li>Multi-DC active-active.</li>
+<li>Repair (Merkle); tombstone gc.</li>
+<li>Compaction strategy per workload.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Cassandra combines Dynamo's cluster model with Bigtable's LSM storage. Wide rows with partition_key + clustering columns enable efficient per-partition queries. Tunable consistency per query. LWT via Paxos for compare-and-set. LSM compaction (STCS, LCS, TWCS) chosen per workload. Multi-DC active-active. Anti-entropy repair required. The strengths are linear write scale and HA; the weaknesses are no joins, no multi-row transactions, and operational complexity around tombstones and compaction.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Data model first: query patterns determine partition keys and clustering."</li>
+<li>"Tunable consistency per query; LWT for the rare strict atomic case."</li>
+<li>"LSM tree write path; SSTable compaction strategy depends on workload."</li>
+<li>"Tombstones live until gc_grace; many tombstones slow reads."</li>
+<li>"Multi-DC active-active is a strength; multi-row transactions are not."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

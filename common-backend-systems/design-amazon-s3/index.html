@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design Amazon S3 — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design Amazon S3</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>S3 is the canonical planet-scale object store. The hard part is offering 11 nines of durability and near-100% availability while supporting trillions of objects across exabytes of storage, where individual disk and node failures happen constantly.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every PUT that returns success has its data durably stored across multiple failure domains; every GET against a stored key returns the latest committed version (or the requested version for versioned buckets); listing, key uniqueness, and ACL enforcement are correct; data survives any single-AZ failure without loss.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design erasure-coded storage with high durability, separate metadata from data, handle high-throughput key listing, manage hot keys, and reason about consistency (strong since the 2020 update, eventual prior).</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design S3 as two services: a metadata service that maps object keys to data placements, and a data plane that stores object content using erasure coding or replication across availability zones. The interesting decisions are durability via erasure coding, key namespace partitioning, consistency (now strong read-after-write), hot-prefix handling, and multipart uploads for large objects.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>PUT, GET, DELETE objects by key in a bucket.</li>
+<li>LIST objects by prefix; sorted lexicographically.</li>
+<li>Multipart upload for large objects.</li>
+<li>Bucket versioning (optional per bucket).</li>
+<li>Lifecycle policies: tier or expire after N days.</li>
+<li>Access control via IAM and bucket policies.</li>
+<li>Presigned URLs.</li>
+<li>Cross-region replication (optional).</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>11 nines of durability (99.999999999%).</li>
+<li>High availability per region.</li>
+<li>Strong read-after-write consistency (modern S3).</li>
+<li>Object size: 1 byte to 5 TB.</li>
+<li>Throughput: thousands of requests per second per prefix.</li>
+<li>Petabyte to exabyte scale per customer.</li>
+<li>Geo-replication and DR.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Direct integration with compute (e.g., S3 Select).</li>
+<li>Querying object content (Athena, Glue).</li>
+<li>Object transformations (Lambda triggers).</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Objects</td>
+<td>Trillions globally; billions per large customer.</td>
+</tr>
+<tr>
+<td>Buckets</td>
+<td>Millions.</td>
+</tr>
+<tr>
+<td>Object size</td>
+<td>Bimodal: many small, many huge.</td>
+</tr>
+<tr>
+<td>Throughput</td>
+<td>Up to 1000s of QPS per prefix; millions per bucket.</td>
+</tr>
+<tr>
+<td>Durability</td>
+<td>11 nines = ~1 object lost per 10^11.</td>
+</tr>
+<tr>
+<td>Availability</td>
+<td>99.99%+ per region.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>GET first-byte under 100 ms; small PUT under 200 ms.</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Exabytes per region.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is per-prefix throughput due to the metadata partitioning by prefix, plus durability under correlated failures.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>API gateway</td>
+<td>Authenticate, parse request, route.</td>
+<td>Stateless; scalable.</td>
+</tr>
+<tr>
+<td>Metadata service</td>
+<td>Maps object key → data placement.</td>
+<td>Strongly consistent; sharded by key range.</td>
+</tr>
+<tr>
+<td>Data plane (storage nodes)</td>
+<td>Stores object bytes with erasure coding or replication.</td>
+<td>Distributed across AZs; durability-first.</td>
+</tr>
+<tr>
+<td>Lifecycle / GC</td>
+<td>Tier or delete per policy.</td>
+<td>Async; eventually consistent.</td>
+</tr>
+<tr>
+<td>Replication</td>
+<td>Cross-region copies for resilience.</td>
+<td>Optional per bucket.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Client --&gt; Load Balancer --&gt; Frontend (auth, route)
+                                  |
+                  +---------------+---------------+
+                  |                               |
+                  v                               v
+        +-------------------+         +---------------------+
+        | Metadata Service  |         | Data Plane          |
+        | key -&gt; placement  |         | erasure-coded chunks |
+        | sharded by key    |         | across AZs           |
+        +---------+---------+         +----------+----------+
+                  |                              |
+                  v                              v
+        +-------------------+         +---------------------+
+        | Metadata Store    |         | Object Storage      |
+        | (KV per key range)|         | (disks, SSDs)       |
+        +-------------------+         +---------------------+
+                                                 |
+                                                 v
+                                      +---------------------+
+                                      | Lifecycle / GC      |
+                                      | Replication         |
+                                      +---------------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Frontend</td>
+<td>TLS, auth, signature verification, request routing.</td>
+<td>Stateless; horizontal.</td>
+</tr>
+<tr>
+<td>Metadata service</td>
+<td>Object key to placement mapping.</td>
+<td>Sharded by key range or hash; strongly consistent.</td>
+</tr>
+<tr>
+<td>Index service</td>
+<td>Listing and prefix queries.</td>
+<td>B-tree-like ordered index per bucket.</td>
+</tr>
+<tr>
+<td>Storage nodes</td>
+<td>Hold erasure-coded chunks or replicas.</td>
+<td>Disk-heavy; durability-focused.</td>
+</tr>
+<tr>
+<td>Erasure coder</td>
+<td>Encodes objects (Reed-Solomon style).</td>
+<td>k+m chunks; survives m losses.</td>
+</tr>
+<tr>
+<td>Placement service</td>
+<td>Decides which storage nodes to use.</td>
+<td>Spreads across AZs, racks.</td>
+</tr>
+<tr>
+<td>Lifecycle service</td>
+<td>Tiering and expiration.</td>
+<td>Per-bucket policy; runs nightly.</td>
+</tr>
+<tr>
+<td>Replication service</td>
+<td>Cross-region copies.</td>
+<td>Per-object after PUT.</td>
+</tr>
+<tr>
+<td>Repair / recovery</td>
+<td>Rebuilds chunks on disk failure.</td>
+<td>Continuous background work.</td>
+</tr>
+<tr>
+<td>ACL service</td>
+<td>Bucket policies and IAM checks.</td>
+<td>Synchronous gate.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="object-metadata">Object Metadata</h4>
+<pre><code class="language-text">ObjectMeta(
+  bucket,
+  key,
+  version_id,
+  size,
+  etag,                  // hash of content
+  storage_class,         // standard, IA, glacier
+  placement_refs,        // list of (storage_node_id, chunk_id)
+  encryption,
+  acl,
+  created_at,
+  user_metadata
+)
+</code></pre>
+<h4 id="bucket">Bucket</h4>
+<pre><code class="language-text">Bucket(
+  bucket_id,
+  name,
+  region,
+  owner_account,
+  versioning_enabled,
+  lifecycle_policies,
+  replication_config,
+  default_acl,
+  created_at
+)
+</code></pre>
+<h4 id="storage-chunk">Storage Chunk</h4>
+<pre><code class="language-text">Chunk(
+  chunk_id,              // content-addressed or random
+  storage_node_id,
+  bucket,
+  key,                   // for repair
+  offset,                // within object
+  size,
+  checksum,
+  erasure_index?         // for EC chunks
+)
+</code></pre>
+<h3 id="apis-s3-compatible">APIs (S3-Compatible)</h3>
+<pre><code class="language-text">PUT    /{bucket}/{key}
+GET    /{bucket}/{key}
+DELETE /{bucket}/{key}
+HEAD   /{bucket}/{key}
+GET    /{bucket}?prefix=&amp;delimiter=&amp;marker=&amp;max-keys=
+
+# Multipart
+POST   /{bucket}/{key}?uploads           # initiate
+PUT    /{bucket}/{key}?partNumber=&amp;uploadId=
+POST   /{bucket}/{key}?uploadId          # complete (list of parts + etags)
+</code></pre>
+<h3 id="durability-and-erasure-coding">Durability And Erasure Coding</h3>
+<p>11 nines means losing one object per 10^11. Achieving this requires:</p>
+<ul>
+<li>Spread chunks across availability zones (independent failure domains).</li>
+<li>Erasure coding (e.g., 10+4 Reed-Solomon): split object into 10 data chunks + 4 parity chunks; survive any 4 chunk losses; 1.4× storage overhead vs 3× for triple replication.</li>
+<li>For small objects, replication may be cheaper than EC overhead.</li>
+</ul>
+<p>Placement:</p>
+<ul>
+<li>For each object, pick N + M storage nodes across at least 3 AZs.</li>
+<li>Ensure no two chunks of one object share a rack within an AZ.</li>
+<li>Background repair: when a node fails, regenerate its chunks on a healthy node from the surviving chunks.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Durability is achieved by spreading chunks across failure domains plus erasure coding. The math: with chunks across 3 AZs and Reed-Solomon 10+4, the probability of losing more than 4 chunks before repair is astronomically small.</p>
+</blockquote>
+<h3 id="write-path">Write Path</h3>
+<p>For a typical PUT under 100 MB:</p>
+<ol>
+<li>Client PUT to frontend with key, content, headers.</li>
+<li>Frontend authenticates, checks ACL, generates request_id.</li>
+<li>Compute content hash (etag) as content is streamed in.</li>
+<li>Erasure-encode into k+m chunks.</li>
+<li>Placement service picks k+m storage nodes across AZs.</li>
+<li>Frontend writes chunks in parallel; waits for quorum (or all).</li>
+<li>After all chunks written and confirmed, frontend commits to metadata service: <code>(bucket, key, version) -&gt; chunk_refs</code>.</li>
+<li>Metadata write returns; ACK to client.</li>
+</ol>
+<p>For strong read-after-write consistency, the metadata commit must be visible to all readers before the client receives success. This typically means the metadata service writes through consensus.</p>
+<h3 id="multipart-upload-for-large-objects">Multipart Upload (For Large Objects)</h3>
+<p>For objects 100 MB to 5 TB:</p>
+<ol>
+<li>Client initiates multipart upload: gets <code>uploadId</code>.</li>
+<li>Uploads parts in parallel; each part is independently stored.</li>
+<li>Each part has its own placement and etag.</li>
+<li>After all parts uploaded, client calls complete with list of (partNumber, etag).</li>
+<li>Metadata service records the object as a composition of parts.</li>
+<li>Client GET retrieves the composition and streams parts sequentially.</li>
+</ol>
+<p>Benefits:</p>
+<ul>
+<li>Resumable: failed parts retried independently.</li>
+<li>Parallel: many parts uploaded simultaneously.</li>
+<li>Bounded memory: server doesn't buffer the whole object.</li>
+</ul>
+<h3 id="read-path">Read Path</h3>
+<ol>
+<li>Client GET to frontend.</li>
+<li>Auth and ACL check.</li>
+<li>Frontend queries metadata service for object's chunk placements.</li>
+<li>Frontend reads chunks from storage nodes in parallel.</li>
+<li>If EC: reconstruct from any k of k+m chunks; survives slow or failed nodes.</li>
+<li>Stream bytes to client.</li>
+</ol>
+<p>For hot objects, frontend may cache chunk content briefly; or a CDN sits in front.</p>
+<h3 id="listing">Listing</h3>
+<p>LIST is the painful operation: ordered by key lexicographically, paginated.</p>
+<p>Implementation:</p>
+<ul>
+<li>Per-bucket B-tree-like index keyed by object key.</li>
+<li>Range scan from <code>marker</code> for <code>max-keys</code> entries.</li>
+<li>Sharded by key range; range scan spans shards if needed.</li>
+</ul>
+<p>Performance:</p>
+<ul>
+<li>LIST is much slower than GET/PUT.</li>
+<li>Customers are encouraged to LIST sparingly and cache results.</li>
+</ul>
+<p>Hot bucket (millions of keys): partition the bucket's key space into ranges; each range is its own metadata shard.</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<p>Modern S3 (post-2020):</p>
+<ul>
+<li>Strong read-after-write for new objects.</li>
+<li>Strong consistency for overwrites and deletes.</li>
+<li>No more "list shows old, get returns new" issues.</li>
+</ul>
+<p>Achieved by:</p>
+<ul>
+<li>Metadata service is strongly consistent (consensus per range).</li>
+<li>LIST queries the strongly consistent index.</li>
+<li>Frontend coordinates write-then-ack only after metadata commit.</li>
+</ul>
+<h3 id="hot-prefix-handling">Hot Prefix Handling</h3>
+<p>The metadata service partitions by key prefix. A bucket with millions of writes to keys starting with <code>logs/2024/01/</code> pins one shard.</p>
+<p>Mitigations:</p>
+<ul>
+<li>Customer guidance: use hashed prefixes for high-throughput patterns.</li>
+<li>Adaptive partitioning: S3 auto-splits hot prefixes.</li>
+<li>Pre-warm: contact AWS for known high-throughput buckets.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Object metadata</td>
+<td>Key range per bucket</td>
+<td>Listing by prefix; range scans.</td>
+</tr>
+<tr>
+<td>Object chunks</td>
+<td>Storage node hash</td>
+<td>Spread load.</td>
+</tr>
+<tr>
+<td>Bucket-level metadata</td>
+<td>Bucket ID</td>
+<td>Per-bucket config.</td>
+</tr>
+<tr>
+<td>ACL</td>
+<td>Account + bucket</td>
+<td>IAM lookups.</td>
+</tr>
+<tr>
+<td>Replication queue</td>
+<td>Time + bucket</td>
+<td>Per-bucket processing.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Disk fails.</td>
+<td>Erasure coding survives; background repair.</td>
+<td>Disk failure rate; rebuild backlog.</td>
+</tr>
+<tr>
+<td>AZ fails.</td>
+<td>Chunks across AZs; service continues from remaining.</td>
+<td>AZ availability; quorum size.</td>
+</tr>
+<tr>
+<td>Hot prefix.</td>
+<td>Adaptive partitioning; customer guidance.</td>
+<td>Per-prefix QPS.</td>
+</tr>
+<tr>
+<td>Metadata shard hot.</td>
+<td>Sub-shard; cache popular reads.</td>
+<td>Per-shard QPS.</td>
+</tr>
+<tr>
+<td>Slow storage node.</td>
+<td>Read from EC quorum, skip slow node.</td>
+<td>Per-node tail latency.</td>
+</tr>
+<tr>
+<td>Correlated failure (firmware bug).</td>
+<td>Diverse hardware; staged rollouts.</td>
+<td>Cross-AZ failure correlation.</td>
+</tr>
+<tr>
+<td>Object versioning conflict.</td>
+<td>Versioning generates unique version_id.</td>
+<td>Version conflict count.</td>
+</tr>
+<tr>
+<td>Multipart upload incomplete.</td>
+<td>Garbage collection of stale parts.</td>
+<td>Stale uploads age.</td>
+</tr>
+<tr>
+<td>Cross-region replication lag.</td>
+<td>Async with monitoring; alert on lag.</td>
+<td>Replication lag distribution.</td>
+</tr>
+<tr>
+<td>ACL bug exposes data.</td>
+<td>Defense-in-depth checks; audit logs.</td>
+<td>Unauthorized access attempts.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Durability:</p>
+<ul>
+<li>Repair backlog; time-to-repair after disk failure.</li>
+<li>Lost-object events (must be near zero).</li>
+<li>Cross-AZ chunk distribution.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>PUT/GET QPS by region.</li>
+<li>Latency p50/p99 by operation.</li>
+<li>Storage growth.</li>
+<li>Per-prefix QPS.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Storage per customer.</li>
+<li>Request volume per customer.</li>
+<li>Egress bandwidth.</li>
+</ul>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Each region operates independently.</li>
+<li>Cross-region replication is opt-in per bucket; PUT replicates to peer region async.</li>
+<li>Replication can be one-way or bidirectional.</li>
+<li>Buckets are region-scoped; key namespace per bucket per region.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Erasure coding gives high durability with lower overhead than replication but adds CPU and read complexity.</li>
+<li>Strong consistency adds metadata write latency but eliminates a class of user bugs.</li>
+<li>Per-prefix partitioning makes listing fast but creates hot-prefix bottlenecks.</li>
+<li>Versioning preserves history at storage cost.</li>
+<li>Cross-region replication is expensive; usually opt-in.</li>
+<li>Small objects pay metadata overhead disproportionately; aggregating tiny objects helps.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Triple replication everywhere.</td>
+<td>Erasure coding for large objects; replication for small.</td>
+</tr>
+<tr>
+<td>Single metadata service.</td>
+<td>Sharded by key range; consensus per shard.</td>
+</tr>
+<tr>
+<td>Eventually consistent.</td>
+<td>Strong read-after-write via metadata consensus.</td>
+</tr>
+<tr>
+<td>Treat listing like GET.</td>
+<td>LIST is expensive; encourage sparse use.</td>
+</tr>
+<tr>
+<td>Ignore correlated failure.</td>
+<td>Diverse hardware; staged firmware rollouts.</td>
+</tr>
+<tr>
+<td>Single AZ chunks.</td>
+<td>Spread across at least 3 AZs.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Durability math</td>
+<td>Erasure coding rate; failure probability; repair time.</td>
+</tr>
+<tr>
+<td>Multipart upload</td>
+<td>Initiate, parts, complete; parallelism; resumability.</td>
+</tr>
+<tr>
+<td>Strong consistency</td>
+<td>Metadata consensus; commit before ack.</td>
+</tr>
+<tr>
+<td>Hot prefix</td>
+<td>Adaptive partitioning; customer-side hashed keys.</td>
+</tr>
+<tr>
+<td>Erasure vs replication</td>
+<td>Tradeoffs by object size.</td>
+</tr>
+<tr>
+<td>Cross-region replication</td>
+<td>Async PUT; conflict handling.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Two services: metadata + data plane.</li>
+<li>Erasure coding across AZs for durability.</li>
+<li>Strongly consistent metadata via consensus.</li>
+<li>Multipart upload for large objects.</li>
+<li>Adaptive partitioning for hot prefixes.</li>
+<li>Lifecycle and tiering.</li>
+<li>Async cross-region replication.</li>
+<li>Background repair on disk failure.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>S3 is metadata plus data plane. The data plane achieves 11 nines via erasure coding across AZs and continuous background repair. The metadata service is strongly consistent per key range. The hardest scaling problems are hot prefixes and durability under correlated failures; the answers are adaptive partitioning and diverse failure domains.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design S3.</p>
+<p><strong>Candidate:</strong> I will design two services: metadata that maps object keys to data placements, and a data plane that stores object bytes using erasure coding across availability zones. The invariant is durability — every successful PUT survives any single-AZ failure, with 11 nines target. Strong consistency for reads after writes since the 2020 update. I will walk through PUT, GET, multipart, and durability math.</p>
+<p><strong>Interviewer:</strong> Walk me through a PUT.</p>
+<p><strong>Candidate:</strong> Client sends PUT with key and bytes. Frontend authenticates, checks ACL, streams the data and computes the etag. The bytes are erasure-encoded into k+m chunks — say 10 data chunks plus 4 parity chunks. The placement service picks 14 storage nodes spread across at least 3 AZs. Frontend writes chunks in parallel; after all confirm, commits to the metadata service: <code>(bucket, key, version_id) -&gt; chunk_refs</code>. Metadata commit goes through consensus per key range. Once committed, ACK to client.</p>
+<p><strong>Interviewer:</strong> Why erasure coding over triple replication?</p>
+<p><strong>Candidate:</strong> Storage overhead. Triple replication is 3× overhead. Reed-Solomon 10+4 is 1.4× overhead with comparable durability. For large objects, the difference is huge at petabyte scale. For small objects, EC has metadata overhead that may exceed the savings; replication is sometimes better. Modern S3 uses a hybrid.</p>
+<p><strong>Interviewer:</strong> 11 nines — how do you achieve it?</p>
+<p><strong>Candidate:</strong> Spread chunks across 3 AZs. With Reed-Solomon 10+4, we tolerate 4 chunk losses before data loss. AZs are independent failure domains. Probability of losing 5 chunks before repair completes is astronomically small with continuous background repair. Concrete math: assume disk MTBF 1M hours, repair time 1 hour, 14 chunks across 3 AZs — the combined probability over a year is well below 10^-11. Diverse hardware and firmware reduce correlated failure risk.</p>
+<p><strong>Interviewer:</strong> Walk me through a GET.</p>
+<p><strong>Candidate:</strong> Client GET to frontend. Auth + ACL. Metadata lookup returns the chunk_refs. Frontend reads chunks from storage nodes in parallel. Because of EC, any k chunks (10 of 14) are sufficient to reconstruct. We initiate reads to all 14 and accept the first 10 to complete, which gives natural tail-latency mitigation. Stream bytes to client.</p>
+<p><strong>Interviewer:</strong> A 1 TB object — how?</p>
+<p><strong>Candidate:</strong> Multipart upload. Client initiates and gets an uploadId. Uploads parts in parallel (e.g., 100 MB each, 10,000 parts). Each part is independently stored — its own erasure-coded chunks. The client retries failed parts. After all parts complete, client sends a finalize request with the list of (partNumber, etag). The metadata service records the object as a composition of parts. GET reconstructs by reading parts sequentially or in parallel.</p>
+<p><strong>Interviewer:</strong> Strong consistency — how?</p>
+<p><strong>Candidate:</strong> The metadata service is strongly consistent per key range, via consensus (Paxos or Raft within the range's replica set). After a successful PUT commit, any subsequent GET sees the new version. LIST queries the same strongly consistent index. Prior to 2020, S3 was eventually consistent for new keys after delete; modern S3 fixed this.</p>
+<p><strong>Interviewer:</strong> A customer writes 100,000 objects/sec all with keys starting with <code>logs/2024/01/</code>. What happens?</p>
+<p><strong>Candidate:</strong> All those writes hit the metadata shard owning that prefix range. Hot. Mitigations: adaptive partitioning — S3 auto-detects hot prefixes and splits the range across more shards. Customer guidance: use a hashed prefix to spread load. For known high-throughput buckets, pre-partition. We monitor per-prefix QPS and alert.</p>
+<p><strong>Interviewer:</strong> A disk dies. What happens?</p>
+<p><strong>Candidate:</strong> The chunks on that disk are missing. Background repair detects and rebuilds them on a healthy node from the surviving k chunks of each affected object. Repair is continuous; backlog is monitored. Until repair completes, GETs still work because we have remaining k+m-1 chunks (still above the k threshold).</p>
+<p><strong>Interviewer:</strong> Versioning?</p>
+<p><strong>Candidate:</strong> Per-bucket toggle. When enabled, every PUT to an existing key creates a new version_id rather than overwriting. The metadata service indexes by <code>(bucket, key, version_id)</code>. DELETE creates a delete marker; the object can be restored. Lifecycle policies can expire old versions.</p>
+<p><strong>Interviewer:</strong> Lifecycle?</p>
+<p><strong>Candidate:</strong> Per-bucket policy: e.g., "after 30 days move to Infrequent Access, after 1 year to Glacier, after 7 years delete." Lifecycle service runs daily, scans bucket index, applies transitions. Moving to Glacier may involve re-encoding for different storage class with different durability/latency tradeoffs.</p>
+<p><strong>Interviewer:</strong> Cross-region replication?</p>
+<p><strong>Candidate:</strong> Per-bucket configuration: source → destination. On every PUT, after metadata commit, replication service enqueues a copy. The peer region receives the object via internal API. Async; lag typically seconds to minutes. Monitor replication lag.</p>
+<p><strong>Interviewer:</strong> Listing a bucket with billions of objects?</p>
+<p><strong>Candidate:</strong> LIST is the hardest operation. The metadata service has a per-bucket B-tree-like ordered index. Range scan from marker for max-keys entries. If keys span multiple shards, the frontend stitches. We strongly encourage customers to use specific prefixes to bound the scan and to paginate.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> S3 is metadata + data plane. Erasure coding across AZs gives 11 nines. Metadata is strongly consistent per key range via consensus. Multipart upload handles large objects. Adaptive partitioning handles hot prefixes. Background repair survives constant disk failures. Lifecycle and replication are async pipelines. Strong consistency was added in 2020 by making the metadata commit synchronous before ack.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: durability, throughput, multipart, consistency.</li>
+<li>Invariant: 11 nines durability; strong R-A-W.</li>
+<li>Two services: metadata + data plane.</li>
+<li>Erasure coding across 3 AZs; e.g., RS 10+4.</li>
+<li>Multipart upload for large objects.</li>
+<li>Strong consistency via metadata consensus.</li>
+<li>Adaptive partitioning for hot prefixes.</li>
+<li>Background repair; lifecycle; cross-region replication.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>S3 is metadata plus data plane. The data plane achieves 11 nines via erasure coding spread across availability zones with continuous background repair. The metadata service is strongly consistent per key range; PUT acks only after metadata commit. Multipart upload handles objects up to 5 TB. Adaptive partitioning handles hot prefixes; customer guidance to use hashed keys helps. Lifecycle and cross-region replication are async pipelines. The hardest correctness problem is durability under correlated failures; the answer is diverse failure domains and continuous repair.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Erasure coding across AZs gives durability with lower storage overhead than replication."</li>
+<li>"Strong consistency requires the metadata commit before the PUT ack."</li>
+<li>"Multipart upload is mandatory for large objects; parallel and resumable."</li>
+<li>"Hot prefixes are mitigated by adaptive partitioning and customer-side key hashing."</li>
+<li>"Continuous background repair makes constant disk failures invisible to users."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LeetCode — Code Judging Platform (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">LeetCode — Code Judging Platform (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Medium · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build LeetCode. Users browse problems, write code in the browser, submit, and within a few seconds see verdict + runtime stats. We run hostile code from strangers safely. Assume 2k problems, 1M daily active users (DAU), ~5M submissions/day with weekly contest spikes of 100k concurrent submissions.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Browse problems and view problem statement.
+- Submit code; get verdict (accepted, wrong answer, time limit exceeded, memory limit exceeded, runtime error).
+- See submission history and contest leaderboards.</p>
+<p>I'd defer discussions/forum, premium subscriptions, and contest organization.</p>
+<p><strong>Non-functional</strong>
+- <strong>Sandboxed execution</strong> — running arbitrary code, must not let it touch our infra.
+- p95 verdict latency &lt; 5 s for normal load; &lt; 15 s during contest spikes.
+- Submission durability — never lose a contest submission.
+- Eventual consistency on leaderboards is fine (within 5–10 s).
+- Fairness during contests — same problem, same machine class, deterministic timing.</p>
+<p><strong>Capacity</strong>
+- 5M submissions/day → ~60/sec average; contest peak ~100k in 5 min → ~330/sec.
+- Each submission: small source code (&lt;10 KB) + small judge output.
+- Submission archive dominates metadata: assume 20 KB code/result/log per submission × 5M/day × RF=3 ≈ 300 GB/day, or ~100 TB/year before compression/tiering. Hidden tests are comparatively small: 2k problems × 50 MB/problem is ~100 GB.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Problem</strong> — <code>problem_id</code>, statement, test cases (hidden), constraints.</li>
+<li><strong>Submission</strong> — <code>submission_id</code>, user_id, problem_id, language, code, status, runtime_ms, memory_kb.</li>
+<li><strong>TestCase</strong> — <code>problem_id, idx, input, expected_output, is_sample</code>.</li>
+<li><strong>Contest</strong> — <code>contest_id, problems[], start, end, participants</code>.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>GET   /v1/problems                          → Problem[]
+GET   /v1/problems/{id}                     → Problem (with sample cases)
+POST  /v1/submissions                        { problem_id, language, code, contest_id? }  → { submission_id }
+GET   /v1/submissions/{id}                   → { status, runtime, memory, failed_case? }
+WS    /v1/submissions/{id}/stream            → status updates
+GET   /v1/contests/{id}/leaderboard
+</code></pre>
+<p>User from token. Idempotency-key optional but recommended on submissions.</p>
+<p>Submission POST is idempotent on <code>{user_id, problem_id, contest_id, idempotency_key}</code>. Leaderboard cursors encode <code>{contest_id, score, penalty, user_id}</code>.</p>
+<hr />
+<h2 id="4-data-flow-5-min">4. Data Flow (~5 min)</h2>
+<p>Submit → API writes submission row (status=queued) → enqueue to judge queue → worker picks up → spin up sandbox → compile → run against hidden test cases until first failure or all pass → write verdict + stats → push to client via WS → update leaderboard if contest.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>API gateway / submission service.</strong> Validates input, writes the submission row (sharded by submission_id) in <code>queued</code> state, enqueues a job to a priority queue (Kafka or SQS), pushes a <code>submission_created</code> event for leaderboard subscribers.</li>
+<li><strong>Judge queue.</strong> Separate queues per language and per priority (contest vs practice). Contest submissions get a dedicated worker pool to prevent practice traffic from starving them.</li>
+<li><strong>Judge workers (the hard part).</strong> Pull a job, spin up an isolated execution environment (gVisor, Firecracker microVM, or Docker with strict seccomp + cgroups + no network). Compile the source, run against the hidden test cases in order, capture stdout, compare against expected output, measure CPU and memory.</li>
+<li><strong>Test-case storage.</strong> Object store (S3) with a CDN-fronted cache; problems are immutable so caching is trivial.</li>
+<li><strong>Verdict service.</strong> Writes the final status, runtime, memory to the submission row; pushes update to WS subscribers.</li>
+<li><strong>Leaderboard service.</strong> Per-contest sorted set in Redis keyed by <code>(score, time_penalty)</code> — score = problems solved, penalty = time of first AC. Updated by the judge result event.</li>
+<li><strong>Discussion/comments/etc.</strong> out of scope.</li>
+</ol>
+<p>End-to-end narration: Alice submits her solution → API writes row → Kafka topic <code>judge.python</code> → worker pulls, starts a fresh Firecracker VM (pre-warmed), compiles, runs case 1...30, case 18 fails on wrong answer → worker writes verdict, pushes WS update → Alice's browser shows "WA on test 18, expected <code>[1,2]</code> got <code>[2,1]</code>."</p>
+<p>Concrete stores:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Problem DB</td>
+<td><code>problem:{problem_id}</code> statement + metadata</td>
+<td style="text-align: right;">10-100 KB</td>
+<td>forever</td>
+<td><code>problem_id</code></td>
+</tr>
+<tr>
+<td>Test objects</td>
+<td><code>tests/{problem_id}/{version}/{case}</code> encrypted blob</td>
+<td style="text-align: right;">KB-MB</td>
+<td>forever, versioned</td>
+<td><code>problem_id</code></td>
+</tr>
+<tr>
+<td>Submission DB</td>
+<td><code>submission:{submission_id}</code> code, status, stats</td>
+<td style="text-align: right;">~20 KB</td>
+<td>forever, tier old</td>
+<td><code>submission_id</code></td>
+</tr>
+<tr>
+<td>Judge queue</td>
+<td>topic <code>judge.{language}.{priority}</code> message=<code>submission_id</code></td>
+<td style="text-align: right;">~500 B</td>
+<td>24 h replay</td>
+<td>language + priority</td>
+</tr>
+<tr>
+<td>Contest leaderboard</td>
+<td><code>contest:{contest_id}:lb</code> Redis ZSET member=<code>user_id</code></td>
+<td style="text-align: right;">~80 B/member</td>
+<td>contest + 30 days hot</td>
+<td><code>contest_id</code></td>
+</tr>
+<tr>
+<td>Compiler cache</td>
+<td><code>compile:{lang}:{hash}</code> -&gt; binary object ref</td>
+<td style="text-align: right;">1-20 MB</td>
+<td>7 days / size cap</td>
+<td>code hash</td>
+</tr>
+</tbody>
+</table>
+<p>Capacity by store:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Math</th>
+<th>Dominant knob</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Problem DB</td>
+<td>2k problems * 100 KB * RF=3 ~= 600 MB</td>
+<td>negligible; cache all public statements</td>
+</tr>
+<tr>
+<td>Hidden tests</td>
+<td>2k * 50 MB * RF=3 ~= 300 GB</td>
+<td>versioning and encryption, not bytes</td>
+</tr>
+<tr>
+<td>Submission DB</td>
+<td>5M/day * 20 KB * RF=3 ~= 300 GB/day, about 100 TB/year before compression</td>
+<td>retention, compression, cold archive</td>
+</tr>
+<tr>
+<td>Judge queues</td>
+<td>5M/day * 500 B * RF=3 ~= 7.5 GB/day</td>
+<td>24 h replay and priority separation</td>
+</tr>
+<tr>
+<td>Leaderboards</td>
+<td>100k users * 80 B * RF=2 ~= 16 MB per contest hot set</td>
+<td>TTL after contest</td>
+</tr>
+<tr>
+<td>Compiler cache</td>
+<td>cap by language, e.g. 10 TB global</td>
+<td>hit rate vs storage cost</td>
+</tr>
+</tbody>
+</table>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">                            +-----------------------+
+                            |       Browser         |
+                            +---+------+-------+----+
+                                |      |       |
+ GET /v1/problems---------------+      |       +----WS /submissions/{id}/stream
+ POST /v1/submissions------------------+            GET /contests/{id}/leaderboard
+                                v      v       v
+                       +-------------+ +-------------+ +-------------+
+                       | Problem API | | Submission  | | Verdict /   |
+                       |             | | API         | | WS service  |
+                       +------+------+ +------+------+ +------+------+
+                              |               |               |
+                              | statement     | queued row    | status push
+                              v               v               v
+                       +-------------+  +-------------+  +-------------+
+                       | Problem DB  |  | Judge queue |  | Leaderboard |
+                       | metadata    |  | judge.*     |  | service     |
+                       +-------------+  +------+------+  +------+------+
+                                               |                |
+                                               v                |
+                                      +----------------+        |
+                                      | Judge workers  |        |
+                                      | by lang/pri    |        |
+                                      +---+------+-----+        |
+                                          |      | judge.result |
+                                          v      v              v
+   +----------------------------------------------------------------+
+   | Stores / Caches                                                |
+   | submission:{submission_id} code,status,stats, ~20 KB           |
+   | tests/{problem_id}/{version}/{case} encrypted object           |
+   | compile:{lang}:{hash} binary object ref, 7d TTL                |
+   | contest:{contest_id}:lb Redis ZSET member=user_id              |
+   | problem:{problem_id} statement + metadata                      |
+   +----------------------+----------------------------+------------+
+                          | cache miss                 | WS gone
+                          v                            v
+                +-------------------+        +----------------------+
+                | Object store for  |        | GET submission row   |
+                | tests/images      |        | remains truth        |
+                +-------------------+        +----------------------+
+                          ^
+                          |
+                +-------------------+
+                | Sandbox runtime   |
+                | Firecracker/gVisor|
+                +-------------------+
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Sandboxing — the centerpiece.</strong> Three layers:
+- <strong>Process isolation:</strong> Firecracker microVM or gVisor (lightweight VM-class isolation per submission). Cheaper than Docker for security; faster than VMs for startup.
+- <strong>Resource limits:</strong> cgroups for CPU (one core), memory (hard cap), pids, file descriptors. Timeout enforced by the worker, not by the guest.
+- <strong>No network, no host filesystem.</strong> seccomp denies all networking syscalls; root filesystem is read-only with a small tmpfs scratch.
+- Submission and result piped in/out via stdin/stdout — no shared volumes.</p>
+<p>Why Firecracker/gVisor over plain Docker: Docker with seccomp and cgroups is fast but has a larger shared-kernel attack surface. Firecracker gives VM-class isolation with acceptable startup if pre-warmed; gVisor is a middle ground. For hostile code, I would spend extra milliseconds on isolation.</p>
+<p>Judge path trace: API writes <code>submission:{id}</code> as queued and publishes to <code>judge.{language}.{priority}</code>; worker pulls, fetches code and test manifest in parallel, starts a pre-warmed sandbox, compiles, runs cases sequentially with CPU/memory limits, streams progress events, writes terminal verdict with compare output, then emits <code>judge.result</code> for leaderboard updates.</p>
+<p>Hot submission path, step by step:
+1. Client sends <code>POST /v1/submissions</code> with an idempotency key; API shards <code>submission:{submission_id}</code> by the generated id and writes <code>queued</code> durably before returning.
+2. API publishes only <code>{submission_id, language, priority}</code> to <code>judge.{language}.{priority}</code>; code stays in the submission store so queue messages remain tiny.
+3. Worker pulls from the language/priority partition, reads code and test manifest in parallel, and checks <code>compile:{lang}:{hash}</code>.
+4. If the compile cache hits, it starts execution immediately; otherwise it compiles inside the sandbox image and may write a cache object.
+5. Worker runs tests in deterministic order, stops on first visible failure for normal problems, writes the terminal verdict, and emits <code>judge.result</code> for leaderboard and websocket subscribers.</p>
+<p>Cold path: a cache-miss worker fetches the language image, hidden tests, and compiler toolchain from object storage; this is why contest pools keep pre-warmed sandboxes per language. If the websocket subscriber is gone, the submission row remains the source of truth and the client can poll <code>GET /v1/submissions/{id}</code>.</p>
+<p>Queue and store choice defense: Kafka is attractive for partitioned, replayable contest traffic; SQS is acceptable for simpler operation but weaker for ordered replay and custom priority. Redis fits leaderboards because each contest is a small, hot sorted view derived from submissions; the submission database remains authoritative. A relational database can store problems and contests, but submission history should be sharded by <code>submission_id</code> because writes dominate.</p>
+<p><strong>Worker pool sizing.</strong> Each VM is short-lived (~2 s). At 60 QPS steady, ~120 concurrent workers; contest peak 330 QPS → ~700 workers. Pre-warm 50 spare VMs per language at all times to absorb bursts; autoscale on queue depth.</p>
+<p><strong>Fairness during contests.</strong> Deterministic test machine class for contest submissions — same instance type, same OS image. Worker only judges one submission at a time (no CPU sharing). Time limits are wall-clock plus a generous slack to absorb scheduler jitter.</p>
+<p><strong>Verdict-stream UX.</strong> Client opens a WS to <code>/submissions/{id}/stream</code> after submitting. Worker can publish progress (compiling, running case 5/30) for long-running submissions. Cleaner than polling.</p>
+<p><strong>Compiler caching.</strong> Compilation is the slow part for C++ submissions. Cache compiled binaries by hash(code + language + compiler flags). On a re-submit of identical code, skip the compile step.</p>
+<p><strong>Cheating detection.</strong> Plagiarism via code similarity hashing across recent submissions for the same problem; flag for review, don't auto-penalize. Rate-limit submissions per user (token bucket).</p>
+<p><strong>Leaderboard at contest scale.</strong> 100k concurrent submitters → 100k judge results in 5 min. Redis ZADD is fine for the rate; sharding by contest_id is natural since each contest is independent.</p>
+<p>Leaderboard update path: <code>judge.result</code> -&gt; contest service checks first accepted submission per <code>{contest_id,user_id,problem_id}</code> in the submission index -&gt; computes <code>score</code> and <code>penalty</code> -&gt; <code>ZADD contest:{contest_id}:lb</code> -&gt; cache top page for 1 s. Practice submissions bypass this path.</p>
+<p>Submission state machine:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Transition</th>
+<th>User-visible state</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Queued</td>
+<td>durable wait</td>
+<td>submission DB + judge queue</td>
+<td>worker claims message</td>
+<td>"Queued" with ETA from queue depth</td>
+</tr>
+<tr>
+<td>Compiling</td>
+<td>isolated build</td>
+<td>sandbox + compiler cache</td>
+<td>compile success/fail</td>
+<td>"Compiling"</td>
+</tr>
+<tr>
+<td>Running</td>
+<td>test execution</td>
+<td>sandbox + hidden tests</td>
+<td>first failure or all pass</td>
+<td>progress optional</td>
+</tr>
+<tr>
+<td>Retrying infra</td>
+<td>worker/sandbox lost</td>
+<td>submission row + queue replay</td>
+<td>retry once with same id</td>
+<td>still pending, no duplicate score</td>
+</tr>
+<tr>
+<td>Terminal</td>
+<td>verdict written</td>
+<td>submission DB</td>
+<td>AC/WA/TLE/MLE/RE</td>
+<td>final verdict + stats</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Two-view framing.</strong> The submission row is the write-ahead truth, while the websocket stream and leaderboard are derived views. If the stream or Redis leaderboard is lost, replaying <code>judge.result</code> from terminal submission rows can rebuild the user-visible views.</p>
+<p><strong>Edge stress tests.</strong> Contest spikes route to dedicated contest queues so practice traffic degrades first. A hot problem with a large hidden-test file should be pinned in worker-local cache; a cold miss pays object-store latency but stays under the contest p95 by prewarming. Malicious code gets no network, capped processes, read-only filesystem, and a hard wall-clock kill. If a user paginates deep into submission history, the API switches from hot recent partitions to archived rows using the <code>{last_submission_id, created_at}</code> cursor. Multi-region fairness is handled by judging a contest in one region/machine class and replicating results outward.</p>
+<p><strong>Graceful degradation.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th>User-visible behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Contest spike</td>
+<td>Dedicated contest queues and workers</td>
+<td>judge queue</td>
+<td>practice latency rises first</td>
+</tr>
+<tr>
+<td>Language worker exhausted</td>
+<td>Queue by language, show ETA</td>
+<td>queue depth</td>
+<td>verdict delayed, submission durable</td>
+</tr>
+<tr>
+<td>Test object cache miss</td>
+<td>Fetch from encrypted object store</td>
+<td>test store</td>
+<td>first judge slower</td>
+</tr>
+<tr>
+<td>Sandbox lost mid-run</td>
+<td>Mark attempt lost and retry once</td>
+<td>worker heartbeat + submission DB</td>
+<td>no lost submission</td>
+</tr>
+<tr>
+<td>Leaderboard lag</td>
+<td>Show verdict immediately, rank catches up</td>
+<td>submission DB + Redis LB</td>
+<td>rank lags 5-10 s</td>
+</tr>
+</tbody>
+</table>
+<p>Interview punch line: "The source of truth is the submission row; everything else, including the contest leaderboard, is a derived view fed by judge results."</p>
+<p><strong>What I'd defer.</strong> Problem authoring tools, contest registration, discussion threading, language interop (custom judges, interactive problems), premium subscription billing.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

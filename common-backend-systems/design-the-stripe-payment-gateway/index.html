@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design the Stripe Payment Gateway — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design the Stripe Payment Gateway</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>Stripe is the canonical merchant payment gateway: API-first, developer-friendly, abstracts away the complexity of card networks, banks, regulatory regimes. It builds on <a href="./design-a-payment-system.md">Design a Payment System</a> but emphasizes the gateway layer: API design, idempotency, webhooks, SDK integration, and multi-method support.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every API call to charge a customer produces exactly one terminal outcome (succeeded, failed, requires_action) for that payment intent; idempotency keys make retries safe; webhooks reliably notify merchants of every state change; the API behaves predictably across hundreds of payment methods and regions.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can design the developer-facing API surface, idempotency end-to-end, webhook reliability, payment method abstraction, and reason about regulatory complexity (PSD2 SCA, KYC, AML).</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design Stripe as a developer-facing payment gateway. Four core systems: API gateway with idempotency, payment intent state machine, integration adapters to card networks and alternative payment methods, and webhook delivery to merchants. The interesting decisions are idempotency end-to-end, payment method abstraction, webhook reliability, and 3DS / SCA flows.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Merchants integrate via REST API and SDKs.</li>
+<li>Charge a customer (one-time, subscription).</li>
+<li>Multiple payment methods: cards, ACH, SEPA, wallets (Apple Pay, Google Pay), local methods.</li>
+<li>Idempotency on all writes.</li>
+<li>Webhooks notify merchants of events.</li>
+<li>Refunds, voids, disputes.</li>
+<li>3DS / SCA flows for European compliance.</li>
+<li>Customer / Payment Method tokenization.</li>
+<li>Multi-currency.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>API latency under 500ms p99.</li>
+<li>High availability per region.</li>
+<li>PCI-DSS compliance.</li>
+<li>Idempotent retries.</li>
+<li>Webhook delivery within seconds with retries.</li>
+<li>Auditability.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Connect platform (multi-tenant marketplace flows).</li>
+<li>Issuing (Stripe Issuing).</li>
+<li>Treasury / banking-as-a-service.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Merchants</td>
+<td>Millions.</td>
+</tr>
+<tr>
+<td>API calls</td>
+<td>Hundreds of thousands/sec peak.</td>
+</tr>
+<tr>
+<td>Charges/day</td>
+<td>Hundreds of millions.</td>
+</tr>
+<tr>
+<td>Payment methods supported</td>
+<td>100+.</td>
+</tr>
+<tr>
+<td>Webhooks/day</td>
+<td>Billions.</td>
+</tr>
+<tr>
+<td>Currencies</td>
+<td>100+.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Global.</td>
+</tr>
+</tbody>
+</table>
+<p>Bottleneck: provider integration variability + webhook reliability.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Responsibility</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Public API</td>
+<td>Developer-facing REST/SDK.</td>
+<td>Idempotent; well-documented.</td>
+</tr>
+<tr>
+<td>Payment intent</td>
+<td>State machine for one charge.</td>
+<td>Strong.</td>
+</tr>
+<tr>
+<td>Payment method</td>
+<td>Tokenized card / bank / wallet.</td>
+<td>Vault.</td>
+</tr>
+<tr>
+<td>Provider integration</td>
+<td>Talk to card networks, banks, wallets.</td>
+<td>Idempotent.</td>
+</tr>
+<tr>
+<td>Webhook delivery</td>
+<td>Notify merchants.</td>
+<td>At-least-once, retried.</td>
+</tr>
+<tr>
+<td>Reconciliation</td>
+<td>Match internal vs provider records.</td>
+<td>Daily.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">Merchant App --API--&gt; Stripe API Gateway
+                            |
+                            v
+                    +----------------+
+                    | Idempotency    |
+                    | Store          |
+                    +-------+--------+
+                            |
+                            v
+                    +----------------+
+                    | Payment Intent |
+                    | State Machine  |
+                    +-------+--------+
+                            |
+                            v
+                    +----------------+
+                    | Card Vault     |
+                    | (PCI scope)    |
+                    +-------+--------+
+                            |
+                            v
+                    +----------------+
+                    | Provider       |
+                    | Adapter        |
+                    +-------+--------+
+                            |
+                            v
+                    External (Visa, Mastercard, ACH, etc.)
+
+
+Webhook Pipeline:
+    Event Stream -&gt; Webhook Delivery -&gt; Merchant Endpoint
+                                              |
+                                              v
+                                      retry on failure
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Public API</td>
+<td>REST API, SDKs.</td>
+<td>Idempotency-Key header.</td>
+</tr>
+<tr>
+<td>Idempotency store</td>
+<td>Cache responses by key.</td>
+<td>Per-merchant TTL.</td>
+</tr>
+<tr>
+<td>Payment intent service</td>
+<td>State machine.</td>
+<td>Strong; per-intent CAS.</td>
+</tr>
+<tr>
+<td>Customer / Payment Method service</td>
+<td>Stores tokenized cards.</td>
+<td>PCI-isolated vault.</td>
+</tr>
+<tr>
+<td>Provider adapter</td>
+<td>Per-provider (Visa, MC, ACH, Apple Pay, etc.).</td>
+<td>Circuit breaker; retries.</td>
+</tr>
+<tr>
+<td>3DS service</td>
+<td>SCA challenge flows.</td>
+<td>Browser redirect.</td>
+</tr>
+<tr>
+<td>Webhook delivery</td>
+<td>Sends events to merchants.</td>
+<td>At-least-once, signed.</td>
+</tr>
+<tr>
+<td>Webhook retry queue</td>
+<td>Retry failed deliveries.</td>
+<td>Exponential backoff.</td>
+</tr>
+<tr>
+<td>Reconciliation</td>
+<td>Daily match internal vs provider.</td>
+<td>Authoritative.</td>
+</tr>
+<tr>
+<td>Fraud / Radar</td>
+<td>Risk scoring per charge.</td>
+<td>Inline + async.</td>
+</tr>
+<tr>
+<td>Dispute handler</td>
+<td>Chargebacks.</td>
+<td>State + evidence flow.</td>
+</tr>
+<tr>
+<td>Reporting</td>
+<td>Merchant dashboards.</td>
+<td>Eventually consistent.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="payment-intent-stripes-central-abstraction">Payment Intent (Stripe's central abstraction)</h4>
+<pre><code class="language-text">PaymentIntent(
+  pi_id,                   // &quot;pi_...&quot; prefix
+  amount,
+  currency,
+  customer_id,
+  payment_method_id,
+  state,                   // requires_payment_method, requires_confirmation, requires_action, processing, succeeded, canceled
+  client_secret,           // for frontend SCA flows
+  capture_method,          // automatic, manual
+  confirmation_method,     // automatic, manual
+  next_action,             // for 3DS / SCA
+  charges: [charge_id],
+  metadata,
+  idempotency_key,
+  created_at,
+  version
+)
+</code></pre>
+<h4 id="customer">Customer</h4>
+<pre><code class="language-text">Customer(
+  customer_id,             // &quot;cus_...&quot;
+  email,
+  default_payment_method,
+  payment_methods: [pm_id],
+  invoice_settings,
+  metadata
+)
+</code></pre>
+<h4 id="payment-method-tokenized">Payment Method (Tokenized)</h4>
+<pre><code class="language-text">PaymentMethod(
+  pm_id,                   // &quot;pm_...&quot;
+  type,                    // card, us_bank_account, sepa_debit, ...
+  card?: { last4, brand, exp, fingerprint },
+  bank_account?: {...},
+  billing_details,
+  customer_id?
+)
+</code></pre>
+<h4 id="webhook-event">Webhook Event</h4>
+<pre><code class="language-text">Event(
+  event_id,                // &quot;evt_...&quot;
+  type,                    // payment_intent.succeeded, charge.refunded, ...
+  data: { object: ... },
+  created_at,
+  livemode
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">POST   /v1/payment_intents
+       Idempotency-Key: client-key
+       Body: amount, currency, customer, payment_method, confirm: true/false
+
+POST   /v1/payment_intents/{id}/confirm
+POST   /v1/payment_intents/{id}/capture
+POST   /v1/payment_intents/{id}/cancel
+GET    /v1/payment_intents/{id}
+
+POST   /v1/customers
+POST   /v1/payment_methods
+POST   /v1/refunds
+
+POST   /v1/webhook_endpoints
+</code></pre>
+<h3 id="payment-intent-flow">Payment Intent Flow</h3>
+<pre><code>created -&gt; requires_payment_method -&gt; requires_confirmation -&gt; processing -&gt; succeeded
+   |                |                          |                |
+   v                v                          v                v
+ canceled        requires_action          requires_action    failed
+</code></pre>
+<p>Sub-states for 3DS / SCA: <code>requires_action</code> means the customer must complete a challenge (3DS redirect, push notification, etc.).</p>
+<h3 id="idempotency">Idempotency</h3>
+<p>Every write API call accepts <code>Idempotency-Key</code> header.</p>
+<ul>
+<li>Per-merchant scope.</li>
+<li>TTL: 24 hours typically.</li>
+<li>First request with a key stores response.</li>
+<li>Subsequent requests with same key return the same response (and don't re-execute).</li>
+<li>Different requests (different body) with same key return error.</li>
+</ul>
+<p>The idempotency store is a fast KV: <code>(merchant_id, idempotency_key) → response</code>.</p>
+<p>For provider calls: Stripe maintains its own idempotency to the provider. Different from merchant's key. This means if a merchant retries with the same key, Stripe doesn't double-charge at the provider level.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Idempotency is end-to-end. The merchant's idempotency key dedupes at our API; we maintain a separate provider-side idempotency key so the upstream network doesn't see duplicates. Three layers: merchant→Stripe, Stripe→provider, and the payment intent state machine itself.</p>
+</blockquote>
+<h3 id="tokenization-and-card-vault">Tokenization And Card Vault</h3>
+<p>Raw card data never leaves the PCI-isolated vault.</p>
+<ul>
+<li>Merchant collects card via Stripe.js or mobile SDK; raw card goes directly to Stripe (never touches merchant's servers).</li>
+<li>Stripe vaults the card; returns a <code>payment_method_id</code>.</li>
+<li>Merchant uses <code>pm_id</code> for charges; can't access raw card.</li>
+<li>Vault is in heavily-isolated infrastructure with PCI DSS Level 1 audit.</li>
+</ul>
+<p>This is what brings most merchants into PCI scope reduction.</p>
+<h3 id="3ds-sca-flow">3DS / SCA Flow</h3>
+<p>European PSD2 requires Strong Customer Authentication (SCA) for most transactions.</p>
+<ol>
+<li>PaymentIntent created with <code>payment_method</code> requiring SCA.</li>
+<li>API returns <code>requires_action</code> with <code>next_action</code> describing the challenge.</li>
+<li>Frontend SDK loads the challenge (typically iframe or redirect to issuing bank).</li>
+<li>Customer completes (password, biometric, OTP).</li>
+<li>Bank issues authentication result.</li>
+<li>Frontend confirms PaymentIntent.</li>
+<li>PaymentIntent transitions to <code>processing</code> then <code>succeeded</code> or <code>failed</code>.</li>
+</ol>
+<p>The client_secret is used by the frontend to access the PaymentIntent without exposing the API key.</p>
+<h3 id="provider-integration">Provider Integration</h3>
+<p>Each payment method has its own provider adapter:</p>
+<ul>
+<li><strong>Cards:</strong> Visa, Mastercard via acquirer banks; Stripe is the acquirer.</li>
+<li><strong>ACH:</strong> US bank transfers.</li>
+<li><strong>SEPA:</strong> European bank transfers.</li>
+<li><strong>Apple Pay / Google Pay:</strong> wallet tokens, processed as cards.</li>
+<li><strong>Local methods:</strong> iDEAL (NL), Bancontact (BE), Alipay, WeChat Pay, etc.</li>
+</ul>
+<p>Adapters are pluggable. Each handles its own retry, idempotency, error mapping.</p>
+<h3 id="webhook-delivery">Webhook Delivery</h3>
+<p>Stripe events fire webhooks to merchants. Reliability is critical.</p>
+<ol>
+<li>Event published to internal event stream.</li>
+<li>Webhook delivery service consumes; looks up merchant's webhook endpoints subscribed to this event type.</li>
+<li>For each endpoint, POST event payload (signed with merchant's webhook secret).</li>
+<li>On 2xx response within timeout: success.</li>
+<li>On failure: retry with exponential backoff for up to 3 days.</li>
+<li>After exhaustion: mark dead-letter; merchant can replay from dashboard.</li>
+</ol>
+<p>Signing prevents forgery:</p>
+<ul>
+<li>Stripe computes HMAC of (timestamp + body) with merchant's webhook secret.</li>
+<li>Adds <code>Stripe-Signature</code> header.</li>
+<li>Merchant verifies signature before processing.</li>
+</ul>
+<h3 id="event-stream">Event Stream</h3>
+<p>All state changes emit events. Event types are versioned (API version of the event).</p>
+<p>Examples:
+- <code>payment_intent.succeeded</code>
+- <code>payment_intent.payment_failed</code>
+- <code>charge.refunded</code>
+- <code>customer.created</code>
+- <code>invoice.paid</code></p>
+<h3 id="fraud-stripe-radar">Fraud (Stripe Radar)</h3>
+<p>Inline ML scoring per charge:</p>
+<ul>
+<li>Features: card patterns, behavioral, geographic, prior history.</li>
+<li>Returns risk score.</li>
+<li>High-risk: decline or require additional verification.</li>
+<li>Async deeper analysis for patterns across merchants.</li>
+</ul>
+<h3 id="disputes-and-chargebacks">Disputes And Chargebacks</h3>
+<p>When customer disputes a charge:</p>
+<ol>
+<li>Card network sends chargeback to Stripe.</li>
+<li>Webhook fires to merchant.</li>
+<li>Merchant provides evidence (receipts, communication, delivery proof).</li>
+<li>Stripe submits to card network.</li>
+<li>Resolution: lost (refund + fee) or won.</li>
+<li>Status visible in dashboard.</li>
+</ol>
+<h3 id="reconciliation">Reconciliation</h3>
+<p>Daily, Stripe reconciles its internal records against card network settlement files. Drift triggers investigation.</p>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Payment intents</td>
+<td><code>pi_id</code> hash; indexed by merchant + customer</td>
+</tr>
+<tr>
+<td>Customers</td>
+<td><code>merchant_id</code></td>
+</tr>
+<tr>
+<td>Payment methods</td>
+<td><code>customer_id</code></td>
+</tr>
+<tr>
+<td>Idempotency store</td>
+<td><code>(merchant_id, key)</code></td>
+</tr>
+<tr>
+<td>Webhook events</td>
+<td><code>merchant_id</code> + time</td>
+</tr>
+<tr>
+<td>Webhook delivery state</td>
+<td><code>delivery_id</code></td>
+</tr>
+<tr>
+<td>Provider call logs</td>
+<td>Time + provider</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Payment intent</td>
+<td>Strong (CAS transitions)</td>
+</tr>
+<tr>
+<td>Card vault</td>
+<td>Strong</td>
+</tr>
+<tr>
+<td>Idempotency</td>
+<td>Strong</td>
+</tr>
+<tr>
+<td>Event delivery</td>
+<td>At-least-once</td>
+</tr>
+<tr>
+<td>Webhook signature</td>
+<td>Per-merchant</td>
+</tr>
+<tr>
+<td>Reporting</td>
+<td>Eventually consistent</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>API endpoints per region.</li>
+<li>Card vault per region (data residency).</li>
+<li>Provider integrations regional (different acquirers per region).</li>
+<li>Webhook delivery from merchant's region.</li>
+<li>Cross-region replication for DR.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Provider timeout.</td>
+<td>Mark intent processing; reconcile.</td>
+<td>Unknown-state count.</td>
+</tr>
+<tr>
+<td>Duplicate API call.</td>
+<td>Idempotency key.</td>
+<td>Dup retry rate.</td>
+</tr>
+<tr>
+<td>Webhook endpoint down.</td>
+<td>Retry queue with backoff.</td>
+<td>Per-endpoint failure rate.</td>
+</tr>
+<tr>
+<td>Card decline.</td>
+<td>Standard reason codes; surface to merchant.</td>
+<td>Decline rate.</td>
+</tr>
+<tr>
+<td>Fraud false positive.</td>
+<td>Review queue; merchant can override per case.</td>
+<td>False positive rate.</td>
+</tr>
+<tr>
+<td>3DS challenge fail.</td>
+<td>Surface to user; retry.</td>
+<td>SCA failure rate.</td>
+</tr>
+<tr>
+<td>Card vault outage.</td>
+<td>Cached tokenized payment methods continue.</td>
+<td>Vault availability.</td>
+</tr>
+<tr>
+<td>Cross-region replication lag.</td>
+<td>Async; bounded.</td>
+<td>Lag.</td>
+</tr>
+<tr>
+<td>Webhook payload too large.</td>
+<td>Truncate or omit; provide URL to fetch.</td>
+<td>Oversize events.</td>
+</tr>
+<tr>
+<td>Reconciliation drift.</td>
+<td>Daily compare; alerts.</td>
+<td>Drift %.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Double-charge incidents (zero).</li>
+<li>Lost-event count.</li>
+<li>Webhook delivery success rate.</li>
+<li>Reconciliation drift.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>API QPS by endpoint.</li>
+<li>Provider latency per integration.</li>
+<li>Webhook delivery queue depth.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Volume processed.</li>
+<li>Approval rate.</li>
+<li>Dispute rate.</li>
+<li>Merchant retention.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Synchronous provider call adds latency but gives merchant immediate result.</li>
+<li>Async confirmation simplifies the API but adds webhook complexity.</li>
+<li>Aggressive fraud scoring reduces losses but increases false positives.</li>
+<li>Strict 3DS improves security but adds friction.</li>
+<li>Token vault centralizes PCI scope but is critical infrastructure.</li>
+<li>Multi-region per data residency vs cross-region failover ease.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single endpoint for all flows.</td>
+<td>Payment intent abstracts; sub-states for 3DS.</td>
+</tr>
+<tr>
+<td>Synchronous webhooks.</td>
+<td>Async with retry.</td>
+</tr>
+<tr>
+<td>Same idempotency key across merchants.</td>
+<td>Per-merchant scope.</td>
+</tr>
+<tr>
+<td>Card data in API logs.</td>
+<td>PCI vault; tokens only.</td>
+</tr>
+<tr>
+<td>Hard-coded provider.</td>
+<td>Pluggable adapter per method.</td>
+</tr>
+<tr>
+<td>Reverse-time billing.</td>
+<td>Forward-time event stream with replay.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Idempotency</td>
+<td>Three-layer; per-merchant scope.</td>
+</tr>
+<tr>
+<td>3DS / SCA</td>
+<td>client_secret; next_action; challenge flow.</td>
+</tr>
+<tr>
+<td>Webhook reliability</td>
+<td>At-least-once with retry; signed.</td>
+</tr>
+<tr>
+<td>Provider abstraction</td>
+<td>Pluggable adapters per method.</td>
+</tr>
+<tr>
+<td>Vault</td>
+<td>PCI-isolated; token-based.</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Per-region API + vault; data residency.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Payment intent as central abstraction.</li>
+<li>End-to-end idempotency.</li>
+<li>Pluggable provider adapters.</li>
+<li>PCI-isolated card vault.</li>
+<li>3DS / SCA flow with client_secret.</li>
+<li>Webhook delivery with retry and signing.</li>
+<li>Daily reconciliation.</li>
+<li>Multi-region with data residency.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>Stripe is a developer-facing payment gateway. The PaymentIntent is the central abstraction — a state machine that captures the lifecycle from creation through SCA challenge to success. Idempotency is end-to-end: merchant API, provider call, state machine. Webhooks are at-least-once with retries and HMAC signatures. The card vault is PCI-isolated. Multi-region with data residency.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design Stripe.</p>
+<p><strong>Candidate:</strong> Stripe is a payment gateway built around the PaymentIntent abstraction — a state machine for one charge from creation through confirmation, SCA challenge, processing, and success. Four core systems: developer-facing API with idempotency, payment intent state machine, provider adapter layer abstracting card networks and alternative methods, and webhook delivery to merchants. The invariant is exactly one terminal outcome per payment intent and idempotent retries throughout.</p>
+<p><strong>Interviewer:</strong> Walk me through a charge.</p>
+<p><strong>Candidate:</strong> Merchant POSTs <code>/v1/payment_intents</code> with <code>Idempotency-Key</code> and amount, currency, payment method. Idempotency check: if seen, return cached response. New intent created in <code>requires_payment_method</code> or directly in <code>processing</code> if <code>confirm=true</code>. Provider adapter is invoked with the payment method (e.g., card via Visa/Mastercard acquirer). Provider returns success, failure, or 3DS challenge. On success: intent transitions to <code>succeeded</code>; event emitted; webhook fired. On 3DS: intent moves to <code>requires_action</code>; frontend completes challenge; merchant calls confirm; flow resumes.</p>
+<p><strong>Interviewer:</strong> Idempotency — explain the three layers.</p>
+<p><strong>Candidate:</strong> First layer: merchant's API call uses <code>Idempotency-Key</code> header. Stripe's idempotency store caches the response by <code>(merchant_id, key)</code>. Retries return the same response without re-executing. Second layer: Stripe's call to the provider (card network) uses Stripe's own idempotency mechanism — different from merchant's. This means even if merchant retries with same key, the provider sees one charge. Third layer: payment intent state machine — transitions are CAS on <code>(intent_id, from_state)</code>. A retried transition fails because state has advanced.</p>
+<p><strong>Interviewer:</strong> Webhooks.</p>
+<p><strong>Candidate:</strong> Events emit to an internal stream for every state change. Webhook delivery service consumes events, looks up merchant's subscribed endpoints, POSTs payload with HMAC signature header. On 2xx within timeout: success. On failure: retry with exponential backoff up to 3 days. After exhaustion: dead-letter; merchant can replay from dashboard. Signing uses merchant's webhook secret; merchant verifies before processing.</p>
+<p><strong>Interviewer:</strong> 3DS / SCA?</p>
+<p><strong>Candidate:</strong> PaymentIntent transitions to <code>requires_action</code> with <code>next_action</code> describing the challenge. The API returns <code>client_secret</code> which the frontend uses to access the intent. Frontend SDK presents the challenge (iframe to issuing bank). Customer completes (password, biometric, OTP). Bank issues authentication result. Frontend calls confirm; intent transitions to <code>processing</code> then <code>succeeded</code> or <code>failed</code>.</p>
+<p><strong>Interviewer:</strong> Card vault.</p>
+<p><strong>Candidate:</strong> Raw card data never leaves the PCI-isolated vault. Merchants integrate via Stripe.js or mobile SDK; raw card goes directly to Stripe (skipping merchant servers, reducing PCI scope). Vault tokenizes; returns <code>payment_method_id</code>. Merchants use <code>pm_id</code> for charges. The vault is in heavily-audited infrastructure (PCI DSS Level 1).</p>
+<p><strong>Interviewer:</strong> Provider abstraction.</p>
+<p><strong>Candidate:</strong> Pluggable adapter per payment method. Cards via Visa/Mastercard acquirer. ACH for US bank. SEPA for Euro bank. Wallets (Apple Pay, Google Pay) processed as cards. Local methods (iDEAL, Alipay, etc.) each with their own adapter. Each adapter handles its own retry, idempotency mapping, error code translation. The PaymentIntent state machine is provider-agnostic.</p>
+<p><strong>Interviewer:</strong> Provider times out.</p>
+<p><strong>Candidate:</strong> Intent stays in <code>processing</code> with <code>unknown_state</code> indicator. A reconciliation worker queries the provider with the same idempotency key. On confirmed success: transition to <code>succeeded</code>. On confirmed failure: transition to <code>failed</code>. Never retry blindly — that could double-charge.</p>
+<p><strong>Interviewer:</strong> Disputes / chargebacks.</p>
+<p><strong>Candidate:</strong> Card network sends chargeback to Stripe. Webhook fires <code>charge.dispute.created</code> to merchant. Merchant provides evidence (receipt, communication, delivery proof) via API. Stripe submits to network. Resolution: lost (refund + fee) or won. Webhook fires final resolution. Merchant sees dispute lifecycle in dashboard.</p>
+<p><strong>Interviewer:</strong> Fraud (Radar)?</p>
+<p><strong>Candidate:</strong> Inline ML scoring per charge. Features: card patterns, behavioral signals, geographic, account history. Returns risk score. High-risk: decline or require additional verification. Custom rules per merchant via dashboard. Async deeper analysis across merchants for emerging fraud patterns.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> API endpoints per region. Card vault per region for data residency compliance (EU data stays in EU). Provider integrations regional (different acquirers per geography). Webhook delivery from merchant's region. Cross-region replication for DR. Data residency is a strict constraint, not just a perf optimization.</p>
+<p><strong>Interviewer:</strong> Reconciliation?</p>
+<p><strong>Candidate:</strong> Daily. Stripe reconciles internal payment records against card network settlement files. Mismatches go to review. Aggregate drift triggers investigation. The cold path (reconciliation) is authoritative for billing and reporting; the hot path (real-time intent state) is operational.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> PaymentIntent state machine as central abstraction; pluggable provider adapters; three-layer idempotency; PCI-isolated card vault; 3DS via client_secret + next_action; at-least-once webhook delivery with HMAC signing and retry; daily reconciliation; multi-region with data residency. The hardest correctness problem is exactly-one terminal outcome per intent under retries and timeouts; idempotency end-to-end is the answer.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: API, idempotency, methods, webhooks, SCA.</li>
+<li>Invariant: one terminal outcome per intent; idempotent retries.</li>
+<li>PaymentIntent state machine.</li>
+<li>Three-layer idempotency.</li>
+<li>PCI-isolated card vault.</li>
+<li>Pluggable provider adapters.</li>
+<li>3DS via client_secret + next_action.</li>
+<li>At-least-once signed webhooks with retry.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>Stripe is a developer-facing payment gateway built around the PaymentIntent state machine. Three-layer idempotency (API, provider, state). PCI-isolated card vault. Pluggable provider adapters per method. 3DS / SCA via client_secret and next_action. At-least-once webhook delivery with HMAC signing and exponential retry. Daily reconciliation. Multi-region with data residency. The hardest correctness problem is exactly-one terminal outcome under retries and timeouts.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"PaymentIntent is the central abstraction — a state machine for one charge."</li>
+<li>"Idempotency is end-to-end: merchant, provider, state machine."</li>
+<li>"Card vault is PCI-isolated; merchants get tokens, not raw cards."</li>
+<li>"3DS flow: requires_action + client_secret + next_action."</li>
+<li>"Webhooks are at-least-once with HMAC signing and retry."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

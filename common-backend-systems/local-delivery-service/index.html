@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local Delivery Service — DoorDash-Style (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Local Delivery Service — DoorDash-Style (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Easy · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build a local food/parcel delivery service like DoorDash. A customer opens the app, sees nearby merchants, places an order, and a dasher picks it up and drops it at their address. We care about getting the order to the right place in 30–45 minutes with live tracking. Assume 10M daily orders across the US.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Customer browses nearby merchants and places an order.
+- System matches the order to a nearby available dasher and routes them merchant → customer.
+- Customer sees live ETA and the dasher's location on a map.</p>
+<p>I'd scope out menu management, payments deep-dive, and dasher onboarding.</p>
+<p><strong>Non-functional</strong>
+- Order placement must be transactional — never two charges, never a lost order.
+- Match latency p99 &lt; 5 seconds; users won't wait longer with a finger on "Place order."
+- Live tracking updates every 3–5 seconds with sub-second freshness on the map.
+- Geographic isolation — a US-East outage cannot stall US-West orders.
+- Strong consistency on the order state machine (placed → accepted → picked → delivered). Eventual consistency is fine for browse and analytics.</p>
+<p><strong>Capacity</strong>
+- 10M orders/day → ~115/sec average, ~1000/sec peak at lunch/dinner.
+- ~1M concurrent active dashers at peak emitting GPS every 3s → ~350k GPS writes/sec.
+- Order rows at ~2 KB × 10M/day × RF=3 are ~60 GB/day. The live dasher index is small because it only stores latest state (~1M × 150 B × RF=2 ≈ 300 MB), but the GPS analytics log can dominate if retained raw: 350k/sec × ~50 B ≈ 1.5 TB/day before RF/compression.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>User</strong> — customer.</li>
+<li><strong>Merchant</strong> — restaurant; has a fixed geo location and a menu.</li>
+<li><strong>Order</strong> — customer, merchant, items, status, addresses, dasher_id.</li>
+<li><strong>Dasher</strong> — current location, status (offline / available / on-trip), current order.</li>
+<li><strong>GPS ping</strong> — <code>dasher_id, lat, lng, ts</code>. High volume, ephemeral.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>GET   /v1/merchants?lat=&amp;lng=&amp;radius=    → Merchant[]
+POST  /v1/orders                          { merchant_id, items[], address } → { order_id }
+GET   /v1/orders/{id}                     → Order (status, dasher, eta)
+WS    /v1/orders/{id}/track               → push dasher location + ETA
+POST  /v1/dashers/location                { lat, lng } (auth: dasher)
+POST  /v1/dashers/orders/{id}/{action}    action ∈ {accept, picked_up, delivered}
+</code></pre>
+<p>Customer ID and dasher ID come from the auth token.</p>
+<p>Order mutations carry idempotency keys. Tracking cursors encode <code>{order_id, last_location_ts, last_state_version}</code> so a reconnect receives only missed state and location updates.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<p>I'd partition the world by city/region. Each region is largely self-contained.</p>
+<ol>
+<li><strong>Merchant search.</strong> Client sends lat/lng. A geo-indexed merchant service (PostGIS, S2 cells, or geohash) returns nearby merchants ranked by distance + popularity. This is read-heavy and cacheable per cell + time of day.</li>
+<li><strong>Order placement.</strong> Transactional service. Writes an order row in the regional order store (MySQL, sharded by <code>order_id</code> within the region) with status <code>placed</code>. Publishes an <code>OrderPlaced</code> event to Kafka.</li>
+<li><strong>Matching service.</strong> Consumes <code>OrderPlaced</code>, queries the live dasher index for the region (nearby + available), runs a small optimization (closest dasher with low estimated finish time), tries to assign. Assignment is a Redis-backed lease so two simultaneous orders don't grab the same dasher.</li>
+<li><strong>Dasher location pipeline.</strong> Dasher app posts GPS every 3s → ingest service writes to a regional Redis geo-index (<code>GEOADD</code>) keyed by region. Persistent log to Kafka for analytics.</li>
+<li><strong>Tracking WebSocket.</strong> Once assigned, the customer's WS pulls from a per-order channel that fans out the dasher's location updates plus state changes.</li>
+<li><strong>Order state service.</strong> Owns the state machine; emits events to Kafka for downstream (notifications, payments capture, analytics).</li>
+<li><strong>Payments and notifications</strong> sit downstream of the order event stream — out of scope to design, in scope to draw.</li>
+</ol>
+<p>End-to-end narration: customer taps "Place order" → order row written, event published → matcher picks Dasher #42 → leases Dasher 42 in Redis → publishes <code>OrderAccepted</code> → customer WS opens → dasher's GPS stream now also fans into the customer's WS → state advances on each dasher action → on <code>delivered</code>, capture payment, terminal state.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">                         +---------------------------+
+                         | Customer app / Dasher app |
+                         +---+---------+--------+----+
+                             |         |        |
+ GET /merchants--------------+         |        +----POST /dashers/location
+ POST /orders, WS /track---------------+             POST /dashers/orders/{id}/{action}
+                             v         v        v
+                    +-------------+ +--------+ +-------------+
+                    | Merchant    | | Order  | | GPS ingest  |
+                    | search      | | API    | | service     |
+                    +------+------+ +---+----+ +------+------+
+                           |            |             |
+                           |            |OrderPlaced  | GPS ping
+                           v            v             v
+                    +-------------+ +----------+ +-------------+
+                    | ETA/routing | | Kafka    | | Kafka       |
+                    | service     | | orders.* | | gps.{region}|
+                    +-------------+ +----+-----+ +------+------+
+                                           |              |
+                                           v              v
+                                    +-------------+ +-------------+
+                                    | Matcher     | | Tracking WS |
+                                    | service     | | fanout      |
+                                    +------+------+ +------+------+
+                                           |               |
+                                           v               v
+   +----------------------------------------------------------------+
+   | Regional Stores / Caches                                       |
+   | order:{region}:{order_id} MySQL state row, versioned           |
+   | dashers:{region} Redis GEO member=dasher_id, 10s freshness     |
+   | dasher:{id}:lease -&gt; order + fencing token, 10-30s TTL         |
+   | merchant_cell:{s2_cell} -&gt; merchant IDs                        |
+   | orders.{region} state-transition log                           |
+   | gps.{region} dasher_id,lat,lng,ts raw stream                   |
+   +----------------------+-------------------------+---------------+
+                          | stale GPS / lease loss  | terminal event
+                          v                         v
+                +-------------------+       +-------------------+
+                | Last Redis point  |       | Payments +        |
+                | + DB fencing      |       | notifications     |
+                +-------------------+       +-------------------+
+</code></pre>
+<p>Concrete stores:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Order DB</td>
+<td><code>order:{region}:{order_id}</code> state row</td>
+<td style="text-align: right;">~2 KB</td>
+<td>7 years/archive by policy</td>
+<td><code>region + order_id</code></td>
+</tr>
+<tr>
+<td>Dasher geo index</td>
+<td><code>dashers:{region}</code> Redis GEO member=<code>dasher_id</code></td>
+<td style="text-align: right;">~150 B/dasher</td>
+<td>10 s freshness TTL</td>
+<td><code>region</code></td>
+</tr>
+<tr>
+<td>Dasher lease</td>
+<td><code>dasher:{id}:lease</code> -&gt; order + fencing token</td>
+<td style="text-align: right;">~100 B</td>
+<td>10-30 s TTL</td>
+<td><code>dasher_id</code></td>
+</tr>
+<tr>
+<td>Merchant index</td>
+<td><code>merchant_cell:{s2_cell}</code> -&gt; merchant IDs</td>
+<td style="text-align: right;">~16 B/member</td>
+<td>hours, rebuilt</td>
+<td>S2/geohash cell</td>
+</tr>
+<tr>
+<td>GPS log</td>
+<td>topic <code>gps.{region}</code> event=<code>dasher_id, lat,lng,ts</code></td>
+<td style="text-align: right;">~50 B</td>
+<td>24 h raw, roll up</td>
+<td><code>region + dasher_id</code></td>
+</tr>
+<tr>
+<td>Order event log</td>
+<td>topic <code>orders.{region}</code> state transitions</td>
+<td style="text-align: right;">~500 B</td>
+<td>7-30 days replay</td>
+<td><code>region + order_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>Store math: order data is ~60 GB/day replicated and easy to shard by region. The raw GPS stream is bigger: ~1.5 TB/day primary, ~4.5 TB/day at RF=3 before compression, so keep only 24h raw and roll up for analytics. The live index is tiny; its risk is freshness, not bytes.</p>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Geo-indexing for dashers and merchants.</strong> Merchants are static, so a precomputed S2 cell → merchant list works. Dashers move every 3s; Redis <code>GEOADD</code> with <code>GEORADIUS</code> is the practical choice — in-memory, sub-millisecond, naturally per-region.</p>
+<p>Why Redis GEO for dashers but S2/PostGIS for merchants: dashers need latest-position reads and short TTLs, where an in-memory geo index wins. Merchants are static and richer, so precomputed S2 cells or PostGIS work well and are cheaper to cache by cell/time of day.</p>
+<p>Be ready for "why not PostGIS for dashers too?" It can work at lower write rates, but 350k location writes/sec plus 5-second matching latency pushes us toward an ephemeral in-memory index. PostGIS remains the source for merchant truth and offline spatial queries.</p>
+<p><strong>The matching algorithm.</strong> Naive nearest-dasher creates clustering and unfair distribution. I'd run a greedy assignment with a small batch window (collect orders for 2s, run a bipartite match) to balance dasher utilization. Mention the Hungarian algorithm or auction-based matching as the production lever.</p>
+<p><strong>Concurrency on dasher assignment.</strong> Same dasher could be claimed for two orders if not careful. Use Redis <code>SET dasher:42:lease order:99 NX EX 10</code> to lease for 10s while the dasher is being notified. If the dasher rejects or times out, lease expires and matcher reruns.</p>
+<p>Order placement path trace: client -&gt; order service validates cart and idempotency key -&gt; payment authorization and order row write happen in the same saga step -&gt; publish <code>OrderPlaced</code> -&gt; matcher reads nearby available dashers from <code>dashers:{region}</code> -&gt; leases one dasher -&gt; writes <code>assigned</code> state with row lock -&gt; emits state event to WS/notifications.</p>
+<p>Tracking read path: customer WS subscribes to <code>order:{id}</code>; push layer reads latest order state from MySQL/cache and latest dasher position from Redis in parallel; after that it streams batched updates from <code>gps.{region}</code> and order events using <code>{last_location_ts,last_state_version}</code>.</p>
+<pre><code class="language-text">Order placement hot path
+    client -&gt; Order API
+        -&gt; idempotency:{customer}:{key}
+        -&gt; MySQL order row status=placed
+        -&gt; Kafka orders.{region} OrderPlaced
+        -&gt; Matcher GEORADIUS dashers:{region}
+        -&gt; SET dasher:{id}:lease NX EX 10 with fencing token
+        -&gt; MySQL order status=assigned version+1
+        -&gt; WS/notification event
+</code></pre>
+<p>Two views, one trip: the order row is keyed by <code>order_id</code> for correctness, while the live dasher index is keyed by <code>region/geo_cell</code> for matching. The same dasher location event also feeds <code>gps.{region}</code> for replay/analytics, but only Redis is on the user-facing hot path.</p>
+<p><strong>Live tracking scale.</strong> 350k GPS writes/sec is too much to fan out per write. Instead: GPS writes go to Redis; the WS push layer batches updates per order every 3–5s rather than per ping.</p>
+<p><strong>Order state transitions.</strong> Single owner of the state machine, behind a row-level lock in MySQL keyed on <code>order_id</code>. Every transition emits a Kafka event for downstream services. Idempotency keys on dasher action endpoints prevent double-transitions on flaky networks.</p>
+<p><strong>Regional isolation.</strong> Per-region cells: MySQL, Redis, Kafka, services. Global services only for identity and merchant catalog. A US-East failure doesn't stop SF orders.</p>
+<p><strong>ETA prediction.</strong> Start with a heuristic (haversine distance / avg city speed + 5-min merchant prep). Later, plug a model fed by historical trip data. Be explicit that v1 is a heuristic.</p>
+<p><strong>Graceful degradation.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th>User-visible behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dasher GPS stale</td>
+<td>Keep assignment, mark location stale</td>
+<td>last Redis position</td>
+<td>map pauses, ETA widens</td>
+</tr>
+<tr>
+<td>No nearby dashers</td>
+<td>Expand radius, then queue order</td>
+<td>geo index + matcher</td>
+<td>delayed assignment</td>
+</tr>
+<tr>
+<td>Matcher overload</td>
+<td>Batch 1-2 s and prioritize paid orders</td>
+<td>order queue</td>
+<td>placement succeeds, assignment lags</td>
+</tr>
+<tr>
+<td>Redis lease lost</td>
+<td>Reconcile with order DB fencing token</td>
+<td>order state + lease</td>
+<td>avoid double assignment</td>
+</tr>
+<tr>
+<td>Region outage</td>
+<td>Stop taking new regional orders</td>
+<td>regional health</td>
+<td>other regions unaffected</td>
+</tr>
+</tbody>
+</table>
+<p>State machine for an order:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source of truth</th>
+<th style="text-align: right;">Latency budget</th>
+<th>Transition guard</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>placed</td>
+<td>durable order</td>
+<td>MySQL row + <code>OrderPlaced</code> event</td>
+<td style="text-align: right;">&lt;300 ms</td>
+<td>idempotency key unique</td>
+</tr>
+<tr>
+<td>matching</td>
+<td>ephemeral lease</td>
+<td>Redis GEO + lease token</td>
+<td style="text-align: right;">&lt;5 s</td>
+<td>lease fencing token</td>
+</tr>
+<tr>
+<td>assigned</td>
+<td>strong state</td>
+<td>MySQL versioned update</td>
+<td style="text-align: right;">&lt;200 ms</td>
+<td>row lock / compare version</td>
+</tr>
+<tr>
+<td>in_transit</td>
+<td>live signal</td>
+<td>Redis latest GPS + Kafka events</td>
+<td style="text-align: right;">3-5 s update</td>
+<td>dasher action idempotency</td>
+</tr>
+<tr>
+<td>delivered</td>
+<td>terminal</td>
+<td>MySQL row + payment capture event</td>
+<td style="text-align: right;">&lt;1 s user-visible</td>
+<td>no backward transition</td>
+</tr>
+</tbody>
+</table>
+<p>Interview punch line: "Orders need strong state transitions; locations are ephemeral signals. I would never put them in the same consistency bucket."</p>
+<p><strong>What I'd defer.</strong> Multi-stop orders, batched deliveries (a dasher carrying 2 orders), surge pricing, dasher scheduling and earnings.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

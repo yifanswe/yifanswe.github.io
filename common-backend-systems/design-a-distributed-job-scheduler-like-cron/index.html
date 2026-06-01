@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design a Distributed Job Scheduler Like Cron — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design a Distributed Job Scheduler Like Cron</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A distributed cron is not "how do I run a script every five minutes." The hard part is correctness across hundreds of machines when clocks drift, workers crash mid-execution, and schedules overlap.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every scheduled occurrence of every job runs at most once and (subject to the failure model) at least once; long-running jobs that overlap with their next schedule do not silently double-run; failures are visible, retried under policy, and never lost.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can separate scheduling from execution, design exactly-once-effect semantics over at-least-once delivery, prevent split-brain in the scheduler tier, and handle jobs that run longer than their interval.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design a distributed cron with three layers: a job catalog (definitions and schedules), a scheduler tier that materializes occurrences and dispatches them, and a worker fleet that executes idempotently. The interesting decisions are how the scheduler avoids split-brain, how I represent occurrences as durable rows in an "expected runs" table, and how at-least-once dispatch combines with worker idempotency to produce exactly-once effects. I will clarify requirements, walk the data model, then deep-dive scheduler leadership and overrun handling.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>Users register jobs with a cron expression or interval and a target action (HTTP, gRPC, function, container image).</li>
+<li>Jobs can be enabled, disabled, edited, or paused.</li>
+<li>Users see run history, current run status, and logs.</li>
+<li>Manual one-off runs are possible (run now).</li>
+<li>Failed runs retry under configurable policy: max attempts, backoff, dead-letter.</li>
+<li>Concurrent run policy: allow, skip-if-running, queue-and-serialize.</li>
+<li>Cross-job dependencies (optional): job B runs only after job A succeeds.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>No silent missed run: every scheduled occurrence either runs or is explicitly recorded as missed/skipped.</li>
+<li>At most one execution per occurrence under normal operation.</li>
+<li>Schedule trigger accuracy within a few seconds.</li>
+<li>Survive scheduler node failures without missing or duplicating runs.</li>
+<li>Scale to millions of jobs and tens of millions of runs per day.</li>
+<li>Auditability for who created, modified, or triggered each job.</li>
+</ul>
+<p>Out of scope unless interviewer asks:</p>
+<ul>
+<li>Workflow DAGs (Airflow-style); we are designing cron, not a DAG engine.</li>
+<li>Resource scheduling (CPU/GPU allocation) inside the worker fleet.</li>
+<li>User-facing log search beyond pointers.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Jobs</td>
+<td>10M registered jobs across tenants.</td>
+</tr>
+<tr>
+<td>Frequency</td>
+<td>Some jobs every minute, most hourly or daily.</td>
+</tr>
+<tr>
+<td>Runs/day</td>
+<td>100M-1B job runs.</td>
+</tr>
+<tr>
+<td>Concurrency peak</td>
+<td>Top-of-hour creates a thundering herd (millions of jobs all due at :00).</td>
+</tr>
+<tr>
+<td>Duration</td>
+<td>Most runs finish in seconds; long-running ones span hours.</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Trigger within a few seconds of scheduled time at p99.</td>
+</tr>
+<tr>
+<td>Consistency</td>
+<td>Per-job at-most-once execution under normal operation.</td>
+</tr>
+</tbody>
+</table>
+<p>The bottleneck is the schedule horizon — the moment many jobs become due simultaneously, especially every minute, hour, and day boundary.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<p>Three planes:</p>
+<table>
+<thead>
+<tr>
+<th>Plane</th>
+<th>Responsibility</th>
+<th>System requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Catalog plane</td>
+<td>Owns job definitions, schedules, tenants, permissions.</td>
+<td>Strongly consistent CRUD, audit.</td>
+</tr>
+<tr>
+<td>Scheduling plane</td>
+<td>Materializes job occurrences and triggers them at the right time.</td>
+<td>Highly available leader-elected service; durable expected-run table.</td>
+</tr>
+<tr>
+<td>Execution plane</td>
+<td>Workers that pick up dispatched runs and execute idempotently.</td>
+<td>Pull-based queue; at-least-once delivery; visibility timeouts.</td>
+</tr>
+</tbody>
+</table>
+<p>Treating these as one component is the most common mistake. Triggering and executing must be split because executions are slow and unreliable, but triggers must remain timely.</p>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">+-----------------+         +--------------------+
+| Job Catalog API |&lt;-------&gt;| Catalog DB         |
+| CRUD + audit    |         | jobs, schedules    |
++--------+--------+         +---------+----------+
+         |                            |
+         | publish job changes        |
+         v                            v
++-------------------+      +---------------------+
+| Scheduler Tier    |-----&gt;| Expected Runs Table |
+| leader-elected    |      | (event_id, due_at)  |
+| materializer      |      +----------+----------+
++---------+---------+                 |
+          | dispatch                  | reconcile
+          v                           v
++-------------------+      +---------------------+
+| Dispatch Queue    |-----&gt;| Worker Pool         |
+| at-least-once     |      | execution + retries |
++-------------------+      +----------+----------+
+                                       |
+                                       v
+                          +-----------------------+
+                          | Run History + Logs    |
+                          +-----------------------+
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Catalog API</td>
+<td>CRUD on job definitions, schedules, owners.</td>
+<td>Validates cron expression; tracks <code>next_run_at</code> projections.</td>
+</tr>
+<tr>
+<td>Catalog DB</td>
+<td>Authoritative store for job definitions.</td>
+<td>Strongly consistent, modest scale.</td>
+</tr>
+<tr>
+<td>Scheduler tier</td>
+<td>Computes upcoming occurrences, materializes them into the expected-runs table, dispatches as they become due.</td>
+<td>Leader per shard via lease; uses a Paxos/Raft/lease coordination service.</td>
+</tr>
+<tr>
+<td>Expected runs table</td>
+<td>Durable list of <code>(job_id, occurrence_id, due_at, status)</code>.</td>
+<td>The authoritative source of "what should run when." Drives at-least-once delivery.</td>
+</tr>
+<tr>
+<td>Dispatch queue</td>
+<td>Carries runs from scheduler to workers.</td>
+<td>Visibility timeout; at-least-once delivery; reads pull-based.</td>
+</tr>
+<tr>
+<td>Worker pool</td>
+<td>Executes jobs; reports results.</td>
+<td>Stateless except for run state; idempotent via occurrence_id.</td>
+</tr>
+<tr>
+<td>Run history</td>
+<td>Records start, end, status, attempts, logs pointer.</td>
+<td>Append-only; eventually consistent for dashboards.</td>
+</tr>
+<tr>
+<td>Coordination service</td>
+<td>Leader election for scheduler shards.</td>
+<td>ZooKeeper, etcd, Consul, or built-in Raft.</td>
+</tr>
+<tr>
+<td>Time service</td>
+<td>Source of monotonic wall time.</td>
+<td>NTP synced; the scheduler must not trust local clocks beyond bounds.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="job-definition">Job Definition</h4>
+<pre><code class="language-text">Job(
+  job_id,
+  tenant_id,
+  name,
+  schedule,            // cron expression or interval
+  timezone,            // affects cron interpretation
+  action,              // type + payload (http, grpc, container, function)
+  retry_policy,        // max_attempts, backoff, dead_letter
+  concurrency_policy,  // allow, skip, queue
+  timeout,
+  enabled,
+  owner,
+  created_at,
+  updated_at,
+  version
+)
+</code></pre>
+<h4 id="expected-run">Expected Run</h4>
+<pre><code class="language-text">ExpectedRun(
+  occurrence_id,       // deterministic: hash(job_id, due_at)
+  job_id,
+  due_at,
+  status,              // pending, dispatched, in_progress, succeeded, failed, missed, skipped
+  attempt,
+  dispatched_at,
+  picked_up_at,
+  finished_at,
+  worker_id,
+  error_summary,
+  version
+)
+</code></pre>
+<p>Primary key: <code>(occurrence_id)</code>. Often partitioned by <code>due_at</code> time bucket so the scheduler can scan ranges efficiently.</p>
+<h4 id="run-attempt">Run Attempt</h4>
+<pre><code class="language-text">RunAttempt(
+  attempt_id,
+  occurrence_id,
+  attempt_number,
+  started_at,
+  ended_at,
+  status,
+  error,
+  log_pointer
+)
+</code></pre>
+<h4 id="scheduler-lease">Scheduler Lease</h4>
+<pre><code class="language-text">SchedulerLease(
+  shard_id,
+  leader_node_id,
+  acquired_at,
+  expires_at,
+  fence_token          // monotonic; used by workers to reject stale leaders
+)
+</code></pre>
+<h3 id="apis">APIs</h3>
+<p>User-facing:</p>
+<pre><code class="language-text">POST   /jobs
+GET    /jobs/{job_id}
+PATCH  /jobs/{job_id}
+DELETE /jobs/{job_id}
+POST   /jobs/{job_id}/runs            // manual trigger
+GET    /jobs/{job_id}/runs
+GET    /runs/{occurrence_id}
+</code></pre>
+<p>Manual trigger uses an idempotency key so a UI double-click does not create two runs.</p>
+<p>Internal:</p>
+<pre><code class="language-text">PullDispatch (worker -&gt; queue): returns [(occurrence_id, job_id, action, lease_until)]
+ReportResult (worker -&gt; scheduler): occurrence_id, status, attempt_number, error?
+RenewLease   (worker -&gt; scheduler): occurrence_id, lease_until extension
+</code></pre>
+<h3 id="schedule-materialization">Schedule Materialization</h3>
+<p>The scheduler is not a free-running cron daemon. It is a database operator:</p>
+<ol>
+<li>For each enabled job, compute the next N occurrences from <code>now</code>.</li>
+<li>Insert <code>ExpectedRun(occurrence_id, job_id, due_at, status=pending)</code> if not already present. The occurrence_id is <code>hash(job_id, due_at)</code> so it is deterministic and idempotent.</li>
+<li>Periodically, a sweep job walks the expected-runs table looking for rows due within the next minute (or scheduling tick) and dispatches them.</li>
+<li>On dispatch, transition status <code>pending -&gt; dispatched</code> with a conditional write keyed on <code>(occurrence_id, version)</code> and enqueue to the worker queue.</li>
+</ol>
+<p>This separation is critical. The scheduler does not "decide each minute what runs"; it materializes intent into durable rows, and dispatch is just a state transition on those rows.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>I represent expected runs as durable rows with deterministic ids. The scheduler is a state machine over those rows, not a timer. That is how I survive restarts without missing or duplicating runs.</p>
+</blockquote>
+<h3 id="scheduler-leadership-and-split-brain">Scheduler Leadership And Split-Brain</h3>
+<p>If two scheduler nodes both believe they own a shard, the same job runs twice.</p>
+<p>Approach:</p>
+<ul>
+<li>Shard the job space by <code>hash(job_id) % N</code> shards.</li>
+<li>For each shard, elect a leader via a lease service (etcd, ZooKeeper).</li>
+<li>The lease has a TTL and a monotonically increasing fence token.</li>
+<li>Every dispatch carries the fence token.</li>
+<li>Workers and downstream queues check the fence token; stale leaders' dispatches are rejected.</li>
+</ul>
+<p>This is fencing tokens, the standard technique to prevent split-brain.</p>
+<p>Failure scenarios:</p>
+<ul>
+<li>Leader pauses (GC, network); lease expires; new leader takes over. Some occurrences may have been dispatched by old leader; the duplicate dispatch fails the fence check at the worker or the conditional write.</li>
+<li>Lease service unavailable: leaders refuse to dispatch new work after their current lease expires. Better to miss-then-catch-up than double-execute.</li>
+</ul>
+<h3 id="dispatch-and-execution">Dispatch And Execution</h3>
+<ol>
+<li>Scheduler dispatches <code>(occurrence_id, action, fence_token)</code> to the queue.</li>
+<li>Worker pulls a batch; sets a visibility timeout (longer than expected job duration plus margin).</li>
+<li>Worker performs a conditional write to expected_runs: <code>status = in_progress WHERE status = dispatched AND fence_token = expected</code>.</li>
+<li>If conditional write fails, drop the message (another worker has it or scheduler is stale).</li>
+<li>Worker executes the action.</li>
+<li>Worker writes <code>RunAttempt</code> and updates <code>ExpectedRun</code> status to <code>succeeded</code> or <code>failed</code>.</li>
+<li>On success, the dispatch message is acknowledged.</li>
+<li>On failure with attempts remaining, the worker creates a delayed re-dispatch with backoff.</li>
+</ol>
+<p>Worker idempotency: the action payload may itself be retried, so it should carry the <code>occurrence_id</code> so downstream services can dedupe by it.</p>
+<h3 id="concurrency-policy-for-slow-jobs">Concurrency Policy For Slow Jobs</h3>
+<p>If a job runs every 5 minutes but takes 7 minutes, occurrences overlap. Three policies:</p>
+<table>
+<thead>
+<tr>
+<th>Policy</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Allow</td>
+<td>New occurrence runs in parallel with the previous. Risk: resource contention.</td>
+</tr>
+<tr>
+<td>Skip</td>
+<td>New occurrence is recorded as <code>skipped</code> if previous is <code>in_progress</code>.</td>
+</tr>
+<tr>
+<td>Queue</td>
+<td>New occurrence waits in a per-job serial queue until previous completes.</td>
+</tr>
+</tbody>
+</table>
+<p>Implementation: dispatch checks the most recent ExpectedRun row for the job; on <code>in_progress</code>, applies the policy. Queueing requires a per-job FIFO that orders dispatches and respects backpressure.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Overlap is a product decision, not a system bug. I make the policy explicit on the job definition and enforce it at dispatch time, not at execution time.</p>
+</blockquote>
+<h3 id="missed-run-handling">Missed Run Handling</h3>
+<p>If the scheduler tier was down across a due time:</p>
+<ul>
+<li>After recovery, scan expected_runs for <code>status=pending AND due_at &lt; now - threshold</code>.</li>
+<li>Apply a missed-run policy per job: <code>run-late</code>, <code>skip</code>, or <code>run-once</code>.</li>
+<li>Mark skipped runs explicitly with status <code>missed</code> rather than silently dropping them.</li>
+</ul>
+<p>For jobs scheduled per minute, running-late may flood the system after a long outage. A common policy is "if behind by more than N occurrences, skip all but the latest."</p>
+<h3 id="retry-policy">Retry Policy</h3>
+<p>Per-job configuration:</p>
+<ul>
+<li><code>max_attempts</code>: total attempts including the first.</li>
+<li><code>backoff</code>: exponential with jitter; min/max delay.</li>
+<li><code>retry_on</code>: list of error codes that trigger retry (network errors, 5xx); contrasts with permanent errors (4xx, validation) that go straight to dead letter.</li>
+</ul>
+<p>Implementation:</p>
+<ul>
+<li>On failure, the worker schedules a new dispatch with <code>delay = backoff(attempt)</code>.</li>
+<li>The new dispatch carries <code>attempt_number + 1</code>.</li>
+<li>After <code>max_attempts</code>, status is <code>failed</code> and the run lands in a dead-letter table for operator review.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Jobs (catalog)</td>
+<td>Hash on <code>job_id</code> or by tenant</td>
+<td>Read-heavy, modest scale.</td>
+</tr>
+<tr>
+<td>Expected runs</td>
+<td>Time bucket on <code>due_at</code> + hash on <code>occurrence_id</code></td>
+<td>The scheduler sweeps by time; workers look up by id.</td>
+</tr>
+<tr>
+<td>Dispatch queue</td>
+<td>Per-shard partitions</td>
+<td>Avoid global hotspot at the top of the hour.</td>
+</tr>
+<tr>
+<td>Run history</td>
+<td>Time bucket by completion</td>
+<td>Append-only; analytics.</td>
+</tr>
+</tbody>
+</table>
+<p>Top-of-hour thundering herd:</p>
+<ul>
+<li>Spread occurrences with deterministic jitter: <code>due_at = scheduled + hash(job_id) mod jitter_window</code>.</li>
+<li>Pre-materialize the next hour's occurrences so the dispatch tier scans existing rows rather than computing them at the moment.</li>
+<li>Workers pull at their own rate; the queue absorbs the burst.</li>
+</ul>
+<p>Hot-tenant strategy:</p>
+<ul>
+<li>Tenants with millions of jobs get dedicated scheduler shards or capacity.</li>
+<li>Per-tenant rate limits on dispatch to prevent one tenant from saturating the worker pool.</li>
+</ul>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Job catalog</td>
+<td>Strong</td>
+<td>Schedule edits must be visible to scheduler immediately.</td>
+</tr>
+<tr>
+<td>Expected runs</td>
+<td>Strong per-row CAS</td>
+<td>Prevents double dispatch.</td>
+</tr>
+<tr>
+<td>Dispatch queue</td>
+<td>At-least-once</td>
+<td>The worker performs the final correctness check.</td>
+</tr>
+<tr>
+<td>Run history</td>
+<td>Eventually consistent</td>
+<td>Read by dashboards and audit.</td>
+</tr>
+<tr>
+<td>Logs</td>
+<td>Eventually consistent</td>
+<td>Stored separately; pointer in history.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<p>For most jobs, a single owner region per tenant suffices.</p>
+<ul>
+<li>Job catalog replicated globally, but writes go to a single region per tenant.</li>
+<li>Scheduler runs in the tenant's region; workers can be globally distributed if the action allows.</li>
+<li>For HTTP/gRPC actions targeting an external service, workers can run close to the target to reduce latency.</li>
+<li>Failover region keeps a warm replica of the catalog and expected-runs table; takes over on regional failure.</li>
+</ul>
+<p>Avoid active-active scheduler: two regions racing to dispatch the same occurrence is exactly what fencing tokens prevent locally, but adding cross-region coordination here is brittle.</p>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Two schedulers dispatch the same occurrence.</td>
+<td>Conditional <code>status</code> transition + fence token.</td>
+<td>Conditional-write conflict rate, duplicate execution alerts.</td>
+</tr>
+<tr>
+<td>Worker crashes after action runs but before reporting.</td>
+<td>Worker action is idempotent on <code>occurrence_id</code>; report retried; status transitions are CAS.</td>
+<td>Number of <code>dispatched</code> rows older than visibility timeout; duplicate result reports.</td>
+</tr>
+<tr>
+<td>Job runs longer than visibility timeout.</td>
+<td>Worker periodically renews the lease.</td>
+<td>Lease renewal failures; visibility-timeout exceeded count.</td>
+</tr>
+<tr>
+<td>Top-of-hour burst saturates workers.</td>
+<td>Deterministic jitter; pre-materialization; per-tenant rate limits.</td>
+<td>Dispatch queue depth at hour boundary; worker queue backlog.</td>
+</tr>
+<tr>
+<td>Catalog change races with active dispatch.</td>
+<td>Schedule change updates <code>version</code>; in-flight occurrences continue under old version.</td>
+<td>Out-of-version dispatch rate.</td>
+</tr>
+<tr>
+<td>Long scheduler outage causes missed runs.</td>
+<td>Missed-run policy per job; explicit <code>missed</code> status.</td>
+<td>Pending rows older than <code>due_at</code> by threshold.</td>
+</tr>
+<tr>
+<td>Backoff retry storm.</td>
+<td>Capped backoff; jittered; per-job max in-flight retries.</td>
+<td>Retry rate, dead-letter growth.</td>
+</tr>
+<tr>
+<td>Tenant explodes job count.</td>
+<td>Per-tenant scheduler quotas; alerts on job-count growth.</td>
+<td>Tenant job count and dispatch share.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness metrics:</p>
+<ul>
+<li>Duplicate executions per occurrence (must be zero).</li>
+<li>Pending occurrences older than <code>due_at + threshold</code> (missed-run signal).</li>
+<li>Dispatched rows older than visibility timeout (stuck runs).</li>
+<li>Catalog vs scheduler version skew.</li>
+</ul>
+<p>Capacity metrics:</p>
+<ul>
+<li>Dispatch queue depth and consumer lag.</li>
+<li>Scheduler tick latency (time from <code>due_at</code> to dispatch).</li>
+<li>Worker pool utilization and queue wait times.</li>
+<li>Top-N jobs by run frequency.</li>
+</ul>
+<p>Business metrics:</p>
+<ul>
+<li>Job success/failure rate by tenant.</li>
+<li>Dead-letter growth.</li>
+<li>Manual trigger volume.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>At-least-once dispatch plus idempotent workers gives exactly-once effects without distributed transactions, but requires action authors to design for idempotency.</li>
+<li>Pre-materializing occurrences makes recovery easy but uses more storage; pure timer-based scheduling is leaner but loses durability.</li>
+<li>Strict per-job concurrency policy (skip, queue) adds latency but prevents resource contention; allow-all is simpler but risks pile-up.</li>
+<li>Fencing tokens prevent split-brain but require downstream cooperation; not all queues support them natively.</li>
+<li>Multi-region active-active scheduler is hard; single-owner per tenant is much simpler.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Treating it as one cron daemon.</td>
+<td>Three planes: catalog, scheduler, workers. State the boundaries.</td>
+</tr>
+<tr>
+<td>Letting workers decide schedules.</td>
+<td>Materialize occurrences in a durable table first.</td>
+</tr>
+<tr>
+<td>Ignoring split-brain.</td>
+<td>Lease + fence token; downstream rejects stale dispatches.</td>
+</tr>
+<tr>
+<td>Assuming exactly-once delivery.</td>
+<td>At-least-once delivery + idempotent action via deterministic occurrence_id.</td>
+</tr>
+<tr>
+<td>Forgetting overlap policy.</td>
+<td>Make it a job property and enforce at dispatch.</td>
+</tr>
+<tr>
+<td>Storing logs in the run table.</td>
+<td>Store pointers; logs live in object storage.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scheduler split-brain</td>
+<td>Lease + fence tokens; conditional writes; downstream validation.</td>
+</tr>
+<tr>
+<td>Long-running jobs</td>
+<td>Lease renewal; visibility timeout extension; overlap policy.</td>
+</tr>
+<tr>
+<td>Missed-run recovery</td>
+<td>Pending sweep; per-job policy; deduplicate via occurrence_id.</td>
+</tr>
+<tr>
+<td>Thundering herd at :00</td>
+<td>Deterministic jitter; pre-materialization; per-tenant quotas.</td>
+</tr>
+<tr>
+<td>Action idempotency</td>
+<td>Pass occurrence_id to action; advise users to dedupe by it.</td>
+</tr>
+<tr>
+<td>Cross-job dependencies</td>
+<td>Show DAG layer above cron, or simple "after-success" trigger.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Separate catalog, scheduling, and execution planes.</li>
+<li>Materialize expected runs as durable rows with deterministic ids.</li>
+<li>Use leader election + fencing tokens to prevent split-brain.</li>
+<li>Pair at-least-once dispatch with idempotent workers.</li>
+<li>Define concurrency policy per job and enforce at dispatch.</li>
+<li>Define retry policy with backoff, jitter, max attempts, dead letter.</li>
+<li>Address top-of-hour thundering herd explicitly.</li>
+<li>Show how missed runs are detected and policy-handled.</li>
+<li>Include audit and run history as a separate plane.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>A distributed cron is fundamentally a state machine over a durable expected-runs table. The schedule materializes intent; dispatch and execution are state transitions guarded by leases, fencing tokens, and idempotency. The hard parts are split-brain, overlap, and the top-of-hour burst.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design a distributed cron.</p>
+<p><strong>Candidate:</strong> I will design three planes: catalog for job definitions, scheduling for materializing and dispatching occurrences, and a worker fleet for execution. The invariant is that every scheduled occurrence runs at most once under normal operation and at least once even when nodes fail, with no silent missed runs.</p>
+<p><strong>Interviewer:</strong> How do you avoid two nodes triggering the same job?</p>
+<p><strong>Candidate:</strong> The scheduler tier is sharded by <code>hash(job_id) % N</code>. For each shard, one node is the leader via a lease from etcd or ZooKeeper. Each lease carries a monotonically increasing fence token, which the scheduler attaches to every dispatch. Downstream workers and the expected-runs table reject dispatches with a stale token. If a leader pauses for too long and a new one takes over, any dispatches from the old leader fail at the fence check.</p>
+<p><strong>Interviewer:</strong> What if the scheduler crashes for ten minutes?</p>
+<p><strong>Candidate:</strong> Because expected runs are durable rows, nothing is lost. On recovery, the scheduler scans for <code>status = pending AND due_at &lt; now</code>. Each row has a per-job missed-run policy: run-late, skip, or run-once (run the latest only). For jobs that run every minute, "skip all but the latest" prevents a flood. Missed runs are explicitly marked <code>missed</code> so they show up in audit, not silently dropped.</p>
+<p><strong>Interviewer:</strong> A job runs every five minutes but takes seven. What happens?</p>
+<p><strong>Candidate:</strong> That is the overlap problem, handled by per-job concurrency policy: allow, skip, or queue. The dispatcher checks the latest ExpectedRun for the job; if it is <code>in_progress</code> and the policy is <code>skip</code>, the new occurrence is marked <code>skipped</code>. If <code>queue</code>, it sits in a per-job FIFO until the previous finishes. If <code>allow</code>, it runs in parallel. The choice is explicit on the job definition.</p>
+<p><strong>Interviewer:</strong> How does a worker know it should still be running?</p>
+<p><strong>Candidate:</strong> Lease renewal. When a worker picks up a dispatch, it gets a visibility timeout. It periodically renews; if it fails to renew, it stops doing damage. If the visibility timeout expires, the queue makes the message visible again and another worker can pick it up. The expected-runs row uses CAS on <code>worker_id</code> and <code>status</code>, so the original worker's final write fails if it has been preempted.</p>
+<p><strong>Interviewer:</strong> Top of the hour, a million jobs are due. How do you prevent meltdown?</p>
+<p><strong>Candidate:</strong> Three techniques. First, deterministic jitter: add <code>hash(job_id) mod jitter_window</code> to <code>due_at</code> so jobs spread across a few seconds. Second, pre-materialize the next hour's occurrences in advance; the dispatcher does range scans on existing rows rather than computing schedules at trigger time. Third, the dispatch queue absorbs the burst; workers pull at their own rate. Per-tenant rate limits ensure one heavy tenant does not starve others.</p>
+<p><strong>Interviewer:</strong> How do you handle exactly-once semantics?</p>
+<p><strong>Candidate:</strong> I do not promise exactly-once delivery; I promise exactly-once effects. Dispatch is at-least-once. The occurrence_id is deterministic: <code>hash(job_id, due_at)</code>. Workers pass this id to the action; users design their handlers to dedupe by it. For HTTP actions, we add <code>Idempotency-Key: &lt;occurrence_id&gt;</code>. The combination of at-least-once delivery and idempotent execution gives the exactly-once user experience.</p>
+<p><strong>Interviewer:</strong> How do you store run history at scale?</p>
+<p><strong>Candidate:</strong> The expected-runs table holds current and recent state. After completion plus a retention window, rows move to an archive table or warehouse partitioned by date. Logs from runs are stored in object storage (S3 or equivalent), with a pointer in the run-attempt record. The catalog and serving paths never read logs directly.</p>
+<p><strong>Interviewer:</strong> Multi-region?</p>
+<p><strong>Candidate:</strong> Single owner region per tenant. The catalog is replicated globally for reads; writes route to the tenant's home region. Workers can be globally distributed if the actions target external services close to the user. For regional failover, a warm standby holds replicated state; on failure, leases are revoked and the new region picks up. I avoid active-active schedulers because dispatch correctness requires a single ordering authority per shard.</p>
+<p><strong>Interviewer:</strong> What is your retry policy?</p>
+<p><strong>Candidate:</strong> Per-job configuration: max attempts, exponential backoff with jitter, retry-on error class. On retryable failure, the worker schedules a re-dispatch with delay. After max attempts, the occurrence is <code>failed</code> and lands in a dead-letter table for review. Non-retryable errors (4xx, validation) skip the retry chain.</p>
+<p><strong>Interviewer:</strong> A tenant registers a million jobs that fire every minute. Now what?</p>
+<p><strong>Candidate:</strong> Per-tenant quotas on job count and dispatch rate. Tenants with high job counts get dedicated scheduler shards. We rate-limit dispatch per tenant so one runaway tenant cannot starve the worker pool. Worst case, we disable the tenant via the admin API and notify them.</p>
+<p><strong>Interviewer:</strong> How do you monitor correctness?</p>
+<p><strong>Candidate:</strong> Three buckets. Correctness: duplicate executions per occurrence (must be zero), pending rows older than due_at (missed runs), dispatched rows older than visibility timeout (stuck runs). Capacity: queue depth, scheduler tick latency, worker utilization. Business: success/failure rate by tenant, dead-letter growth, manual trigger volume.</p>
+<p><strong>Interviewer:</strong> Summarize the design.</p>
+<p><strong>Candidate:</strong> Three planes: catalog, scheduler, workers. The scheduler is a state machine over an expected-runs table with deterministic occurrence ids. Leader election plus fencing tokens prevent split-brain. At-least-once dispatch combined with idempotent workers gives exactly-once effects. Overlap, retry, and missed-run policies are per-job and explicit. Top-of-hour bursts are handled with jitter and pre-materialization. Single-owner regional design avoids cross-region scheduling races.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: at most once execution, no silent misses, retries, overlap policy.</li>
+<li>State invariant: durable occurrence rows, exactly-once effects.</li>
+<li>Draw three planes: catalog, scheduler, workers.</li>
+<li>Explain materialization: deterministic occurrence_id.</li>
+<li>Explain leader election + fencing tokens.</li>
+<li>Explain at-least-once dispatch + idempotent worker.</li>
+<li>Explain overlap policy and missed-run policy.</li>
+<li>Close with top-of-hour burst handling and metrics.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>A distributed cron is a state machine over a durable expected-runs table. Schedules materialize occurrences; dispatch and execution are CAS transitions. Leader election with fencing tokens prevents double dispatch; at-least-once delivery with deterministic occurrence ids and idempotent workers gives exactly-once effects. Overlap, retry, and missed-run behaviors are per-job policies. The hardest case is the top-of-hour burst, handled with jitter and pre-materialization.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"The schedule materializes intent into durable rows; the scheduler is a state machine over those rows."</li>
+<li>"I do not promise exactly-once delivery. I promise exactly-once effects via idempotency on a deterministic occurrence id."</li>
+<li>"Fencing tokens turn the split-brain problem into a downstream rejection."</li>
+<li>"Overlap is a product decision, not a system bug."</li>
+<li>"Top-of-hour is solved with deterministic jitter, not with infinite workers."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

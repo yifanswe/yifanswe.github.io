@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ChatGPT — Conversational LLM Service (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">ChatGPT — Conversational LLM Service (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Hard · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build ChatGPT. Users type a prompt; we route it to a Large Language Model (LLM), stream the response token-by-token, persist the conversation. Each request consumes substantial GPU compute. 100M users, 100M conversations/day, peak ~10k concurrent generation streams. GPU economics and time-to-first-token (TTFT) drive the design.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- User sends a prompt within a conversation; receives a streamed response.
+- Conversation history persisted; resume any past conversation.
+- Apply conversation-level context (history + system prompt).</p>
+<p>I'd defer per-user fine-tuning, function calling / tools, deep multi-modal inputs.</p>
+<p><strong>Non-functional</strong>
+- <strong>Time-to-first-token (TTFT)</strong> p95 &lt; 1 s — user must see something quickly.
+- <strong>Tokens-per-second (TPS)</strong> ≥ 30 during streaming — feels fluid.
+- Sustain 10k concurrent active streams; spike to 30k.
+- Strong consistency on conversation history (turn ordering).
+- Multi-tenant isolation — one user's request doesn't see another's data.</p>
+<p><strong>Capacity</strong>
+- 100M conversations/day × ~5 turns × ~500 generated tokens = 250B tokens/day.
+- GPU cost dominates everything else.
+- Conversation storage is not the scary part: 500M turns/day × ~2 KB average persisted text/metadata is ~1 TB/day before replicas. The dominant cost is GPU memory/compute for active token generation.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>User</strong>.</li>
+<li><strong>Conversation</strong> — <code>conversation_id, user_id, system_prompt, created_at</code>.</li>
+<li><strong>Turn</strong> — <code>(conversation_id, idx, role, content, tokens)</code>. Append-only.</li>
+<li><strong>GenerationRequest</strong> — <code>request_id, prompt_tokens, response_tokens, model, status</code>.</li>
+<li><strong>Model</strong> — <code>model_id, params, deployment, version</code>.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST /v1/conversations                                                          → { conversation_id }
+POST /v1/conversations/{id}/messages   { content, model? }   (Server-Sent Events) → streamed tokens
+GET  /v1/conversations/{id}                                                     → { turns[] }
+</code></pre>
+<p>SSE or chunked HTTP for streaming; WebSocket as alternative. Idempotency key on the message POST so retries don't double-bill or double-generate.</p>
+<p>The message POST stores the user turn before routing inference and returns streamed events with monotonically increasing <code>token_seq</code>. A retry with the same idempotency key either reattaches to the in-flight stream or returns the finalized assistant turn.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code>       +-----------------------------+
+       | CLIENT                      |
+       | browser / mobile app        |
+       +------+----------+-----------+
+        |          |
+    POST /v1/conversations|          | GET /v1/conversations/{id}
+    POST /v1/conversations/{id}/messages (SSE)
+        |          |
+        v          v
+       +----------------+  +----------------+  +--------------------+
+       | API Gateway    |-&gt;| Conversation   |-&gt;| Prompt Assembly    |
+       | auth, quota,   |  | Service        |  | history + summary  |
+       | SSE connection |  | append turns   |  | + system prompt    |
+       +-------+--------+  +--------+-------+  +---------+----------+
+         |                    |                    |
+         |                    |                    v
+         |                    |          +--------------------+
+         |                    |          | Inference Router   |
+         |                    |          | sticky conv +      |
+         |                    |          | prefix-aware pick  |
+         |                    |          +---------+----------+
+         |                    |                    |
+         |                    | assign / token stream
+         |                    v                    v
+       +------------------------------------------------------------+
+       | STORE / CACHE GROUP                                       |
+       | Cassandra/Dynamo (conversation_id, turn_idx) turn log      |
+       | summary:{conversation_id}:{version} compressed history     |
+       | idem:{user_id}:{key}, conv_sticky:{conversation_id}        |
+       | prefix:{model_id}:{hash}, stream:{request_id} replay buf   |
+       | worker-local KV block table, 16-token GPU blocks           |
+       +---------------------+----------------------+---------------+
+           ^                      |
+           | history/cache miss   | prefix miss -&gt; load-only route
+           | reads durable turns  v
+       +---------------------+--------+    +------------------------+
+       | GPU Worker Pool (vLLM)       |---&gt;| Streaming Safety       |
+       | continuous batching, paged KV|    | Filter -&gt; Gateway SSE  |
+       +--------------+---------------+    +------------------------+
+          |
+          v
+       +------------------------------------------------------------+
+       | ASYNC / CONTROL ROW                                       |
+       | usage_events[tenant_id] -&gt; billing, model registry -&gt;      |
+       | workers, autoscaler -&gt; warm pool, moderation side checks   |
+       +------------------------------------------------------------+
+</code></pre>
+<ol>
+<li><strong>API gateway.</strong> Authenticates, applies per-tenant rate limit, runs input-side moderation, holds the SSE connection to the client. Idempotency keys deduplicate retries.</li>
+<li><strong>Conversation service.</strong> Persists conversation metadata + turns in a sharded LSM store — Cassandra or DynamoDB, keyed by <code>conversation_id</code> with <code>turn_idx</code> as the clustering/sort key. The choice is driven by the access pattern: append-heavy writes (LSM &gt; B-tree), reads are always "last N turns of one conversation" (single-partition range scan, &lt;10 ms inside the TTFT budget), no joins, no cross-conversation transactions, and we need horizontal scale across billions of conversations. PostgreSQL/MySQL would need manual sharding; S3 can't hit the read latency; Redis isn't durable. Cassandra and Dynamo are interchangeable here — pick by infra.</li>
+<li><strong>Prompt assembly.</strong> Combines system prompt + relevant conversation history + new user message into a prompt that fits the model's context window. Truncates oldest turns; optionally summarizes via a background offline job.</li>
+<li><strong>Inference router.</strong> Picks a model deployment, finds a GPU worker. Decision uses worker load, conversation stickiness, and the prefix-cache index (which workers already hold the prompt's prefix in their KV cache).</li>
+<li><strong>GPU worker pool.</strong> Each worker hosts a deployed model. Runs prefill (encode prompt into KV cache), then a continuous-batching decode loop generating one token per forward pass per active request. Streams each token back.</li>
+<li><strong>Streaming safety filter.</strong> Small model classifies the output with a lookback window; passes / masks / aborts.</li>
+<li><strong>Streaming proxy.</strong> Tokens flow from GPU worker → safety filter → router → gateway → client SSE. Gateway buffers up to ~1 MB if client is slow.</li>
+<li><strong>Token usage / billing.</strong> Counted on stream completion (input tokens + output tokens × per-token cost). Emitted to usage pipeline.</li>
+<li><strong>Storage.</strong> Conversation turns written as they finalize. On completion, summary + token counts persisted.</li>
+</ol>
+<p><strong>End-to-end narration.</strong> Alice opens a chat → POSTs first message with an idempotency key → conversation service writes user turn → prompt assembled (system prompt + user turn) → router consults the prefix-cache index: "system prompt blocks are on workers W3 and W7" → picks W7 (lower load) → W7 prefills (mostly cache hits on the shared system prompt blocks) → decode joins W7's continuous batch → tokens stream through the safety filter at ~50 TPS → SSE to Alice's browser. On end-of-stream, assistant turn written to conversation history; usage event emitted.</p>
+<p>Concrete API path:</p>
+<ol>
+<li>Gateway authenticates, checks tenant token budget, and reserves <code>request:{request_id}</code> using the idempotency key.</li>
+<li>Conversation service appends the user turn to <code>(conversation_id, turn_idx)</code> with a conditional write so turn order is strict.</li>
+<li>Prompt assembly reads the last N turns and optional summary in parallel with feature/quota reads.</li>
+<li>Router checks <code>conv_sticky:{conversation_id}</code> and <code>prefix:{prefix_hash}</code>; it picks a worker with both KV locality and enough token budget.</li>
+<li>Worker streams tokens through the safety filter. Gateway persists a small ring buffer <code>{request_id -&gt; last K tokens}</code> for mid-stream replay.</li>
+<li>On EOS, assistant turn, usage counters, and billing event are committed; the idempotency record points to the final response.</li>
+</ol>
+<p>Resume / history read path:</p>
+<ol>
+<li>Gateway authenticates <code>user_id</code> and routes <code>GET /v1/conversations/{id}</code> by <code>conversation_id</code>.</li>
+<li>Conversation service reads the conversation metadata row and the latest page of turns from the same partition key <code>conversation_id</code>.</li>
+<li>Older pages use an opaque cursor <code>{conversation_id, last_turn_idx, page_size, snapshot_version}</code> so edits/deletes do not shift pagination.</li>
+<li>In parallel, the UI can fetch generated assets or attachments from object storage by turn attachment IDs; text history should not wait on large blobs.</li>
+<li>If the hot conversation partition is temporarily unavailable, the read path can serve a cached snapshot for display, but message append must fail closed or queue behind the per-conversation turn lock.</li>
+</ol>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>GPU scheduling — continuous batching is the heart.</strong> Each GPU forward pass produces one token for <em>every</em> request in the batch. Static batching wastes the GPU — slowest request stalls the rest; finished requests leave empty slots. <strong>Iteration-level scheduling</strong> (vLLM's term): at every forward pass the scheduler can (a) drop a request that emitted EOS, (b) admit a new request whose prefill is ready, (c) demote a request whose KV cache no longer fits. Net effect: GPU at ~80%+ utilization vs ~30% for static batching.</p>
+<p>Concrete serving state:</p>
+<table>
+<thead>
+<tr>
+<th>Store / state</th>
+<th>Key pattern</th>
+<th>Value / data structure</th>
+<th style="text-align: right;">Size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Conversation turns</td>
+<td><code>(conversation_id, turn_idx)</code></td>
+<td>role, content, token counts</td>
+<td style="text-align: right;">~2 KB/turn avg</td>
+<td>forever / user delete</td>
+<td><code>conversation_id</code></td>
+</tr>
+<tr>
+<td>Idempotency</td>
+<td><code>idem:{user_id}:{key}</code></td>
+<td>request_id, status, response pointer</td>
+<td style="text-align: right;">~200 B</td>
+<td>24 h</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>Sticky route</td>
+<td><code>conv_sticky:{conversation_id}</code></td>
+<td>worker_id, model_id</td>
+<td style="text-align: right;">~64 B</td>
+<td>30-120 s</td>
+<td><code>conversation_id</code></td>
+</tr>
+<tr>
+<td>Prefix index</td>
+<td><code>prefix:{model_id}:{hash}</code></td>
+<td>small set of worker_ids</td>
+<td style="text-align: right;">~100 B</td>
+<td>seconds, heartbeat refreshed</td>
+<td><code>prefix_hash</code></td>
+</tr>
+<tr>
+<td>Conversation summary</td>
+<td><code>summary:{conversation_id}:{version}</code></td>
+<td>compressed older turns</td>
+<td style="text-align: right;">~4-20 KB</td>
+<td>until superseded/delete</td>
+<td><code>conversation_id</code></td>
+</tr>
+<tr>
+<td>Stream replay buffer</td>
+<td><code>stream:{request_id}</code></td>
+<td>last K token events + seq</td>
+<td style="text-align: right;">~10-100 KB</td>
+<td>request + 10 min</td>
+<td><code>request_id</code></td>
+</tr>
+<tr>
+<td>KV cache</td>
+<td>worker-local block table</td>
+<td>16-token GPU blocks</td>
+<td style="text-align: right;">~4.8 MB/block for 70B FP16</td>
+<td>request lifetime</td>
+<td>worker-local</td>
+</tr>
+<tr>
+<td>Usage stream</td>
+<td><code>usage_events[{partition}]</code></td>
+<td>token counts + tenant</td>
+<td style="text-align: right;">~200 B/event</td>
+<td>30-90 days</td>
+<td><code>tenant_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>Capacity math: 10k active streams × 8k context × ~300 KB/token is 24 TB of KV cache if every stream used a full 8k context, which is why admission control, prefix sharing, and shorter effective prompts matter. A 4×H100 pod with ~180 GB usable KV cache supports roughly 75 full 8k-context streams; 10k streams means ~130 such pods before headroom. This is the dominant cost; Cassandra/Dynamo storage is noise compared with GPUs.</p>
+<p>Storage math beyond GPUs: 500M turns/day x ~2 KB x 3 replicas ~= 3 TB/day before compression, so a 90-day hot history window is a few hundred TB, still cheaper than GPU serving. Idempotency is 100M message requests/day x 200 B x 24 h ~= 20 GB before overhead. Replay buffers are bounded by concurrency: 30k active streams x 100 KB ~= 3 GB plus replication. Prefix index state is tiny; the expensive part is the worker-local KV blocks it points to.</p>
+<p>There are two views of the same conversation data. The append-only turn log is the source of truth for audit, ordering, and user-visible history. The prompt view is a materialized serving view made from latest turns + summary + retrieved snippets; it is allowed to be lossy and regenerated, but it must always cite a <code>snapshot_version</code> so retries use the same context.</p>
+<p>Subtle wrinkle: prefill (encode the whole prompt at once) and decode (one token at a time) have very different compute profiles. Mixing them naively is bad. <strong>Chunked prefill</strong> splits a long prompt's prefill across N forward passes so each iteration's compute is balanced — decode of other requests doesn't stall waiting for one giant prefill.</p>
+<p><strong>KV cache management (PagedAttention).</strong> During decode each request holds a key/value cache: roughly <code>2 × layers × kv_heads × head_dim × seq_len × dtype_bytes</code> ≈ <strong>~300 KB per token</strong> on a 70B FP16 model with Grouped Query Attention. At 8k context that's ~2.4 GB per request. Naive contiguous allocation (one max-sized block per request) wastes 60–80% of GPU memory.</p>
+<p><strong>PagedAttention (vLLM)</strong> treats KV cache like virtual memory:
+- Fixed-size <strong>blocks of 16 tokens</strong> in physical GPU memory.
+- Each request carries a <strong>page table</strong> mapping logical positions → physical blocks.
+- Blocks allocated on demand as generation proceeds. No external fragmentation; ~4× more concurrent requests on the same GPU.
+- <strong>Prefix sharing via copy-on-write.</strong> If two requests share a prompt prefix (e.g., the same 2k-token system prompt across 10k users), the prefix blocks are physically shared. Hash the prefix tokens to look up shared blocks. When a request needs to diverge (write its own token), copy that block. Net: O(1) prefix storage instead of O(users).</p>
+<p>Eviction (evict a request's blocks, re-prefill later) is expensive — admission control should prevent it from happening.</p>
+<p><strong>Time-to-first-token (TTFT) — budget breakdown.</strong> Target p95 &lt; 1 s. Components:
+- Auth + rate limit + input moderation: ~20 ms
+- Conversation history read: ~10 ms (replica read)
+- Prompt assembly: ~5 ms
+- Router → worker handoff: ~5 ms
+- <strong>Queue wait on worker:</strong> variable; the dominant term under load
+- <strong>Prefill compute:</strong> ~50 ms per 1k prompt tokens on a 70B model (linear in length)
+- First-token decode: ~30 ms</p>
+<p>That leaves ~900 ms for queue + prefill. The next deep dives are the levers to keep queue + prefill within that.</p>
+<p><strong>Pre-warming workers — how, not just "no cold start."</strong>
+- <strong>Image-baked weights.</strong> Container image (or a sidecar volume) carries the model weights so they end up on node-local NVMe at boot once. Avoids pulling 60+ GB from object storage on every scale-out (which is the difference between a 30 s and a 10 min spin-up).
+- <strong>Warm pool / floor.</strong> Autoscaler keeps a minimum <em>N</em> workers always loaded per model — never scaled to zero. Floor sized to off-peak QPS.
+- <strong>Synthetic warmup prompts.</strong> After model load, the worker runs a handful of dummy prompts (a few hundred tokens) to JIT-compile CUDA kernels, populate the cuBLAS heuristic cache, and trigger TensorRT autotuning. vLLM does this on startup by default. Skipping warmup → the first real prompt pays 2–5× the steady-state prefill cost.
+- <strong>Health gate.</strong> Worker doesn't register with the router until warmup completes and a steady-state benchmark passes. New workers can't poison the latency distribution.
+- <strong>Pre-emptive scale-out.</strong> Autoscaler triggers a new worker when the pool hits ~70% token-budget pressure. Model load + warmup takes ~30–60 s — provisioning ahead of saturation means the worker is ready <em>before</em> the existing pool is full.
+- <strong>Candidate pool.</strong> A small set of nodes with the model already loaded but excluded from the active LB rotation. Promotion is a config flip — sub-second — versus a full provision.</p>
+<p><strong>Sticky routing for KV-cache and prefix locality.</strong>
+- <strong>Conversation stickiness.</strong> Router keeps <code>conv_id → worker_id</code> in a fast store (Redis, ~few-second TTL). Subsequent turns route to the same worker so its KV cache for prior turns can be reused — saves a full prefill on continuation. Sticky window is intentionally short (workers churn); on miss, the new worker re-prefills.
+- <strong>Prefix-cache index.</strong> Router maintains a small global index <code>prefix_hash → [workers holding it]</code>. On a new request, hash the prompt's prefix in 16-token windows, look up which workers already hold those blocks, and prefer one of them. Saves prefill cost even for fresh conversations that share a system prompt (most of them).
+- <strong>Migration.</strong> If the owner worker is overloaded, do <em>prefix-aware migration</em>: the new target worker likely already has part of the prefix (system-prompt blocks are universal). Way cheaper than a full request restart.</p>
+<p><strong>Speculative decoding (2–3× throughput on suitable workloads).</strong> A small <strong>draft model</strong> (e.g., 1B params) proposes the next <em>k</em> tokens (k ≈ 4–8). The <strong>target model</strong> (e.g., 70B) verifies all <em>k</em> in a single forward pass — the same pass it would otherwise do for one token. <strong>Rejection sampling</strong> keeps the longest prefix that matches the target's distribution. If average accepted length is <em>n</em>, throughput multiplier ≈ <code>n / (k+1) × cost(target) / cost(target + draft)</code>. Big wins on structured outputs (code, factual answers); less on creative writing. <strong>Medusa variant:</strong> add multiple decoding heads to the target model itself — no separate draft model — for ~2× speedup with less infra.</p>
+<p><strong>Admission control by token budget, not request count.</strong> The unit of GPU work is tokens, not requests. Each worker exposes "remaining token budget" = <code>(free KV blocks) × (block size)</code>. Router admits a request iff <code>(input_tokens + max_output_tokens) ≤ remaining budget</code>. If no worker has budget and the projected queue wait would breach TTFT, return 503 + <code>Retry-After</code> immediately — better than holding the client connection until timeout. <strong>Two queues</strong>: short-output (&lt;200 tokens, fast lane) vs long-form (slow lane) so a chat doesn't queue behind a 4k-token essay.</p>
+<p>Load degradation state:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source / action</th>
+<th>User impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>normal</td>
+<td>cache-local route</td>
+<td>sticky worker or prefix hit</td>
+<td>TTFT &lt;1 s</td>
+</tr>
+<tr>
+<td>warm miss</td>
+<td>re-prefill</td>
+<td>route to least-loaded worker</td>
+<td>TTFT rises with prompt length</td>
+</tr>
+<tr>
+<td>overloaded</td>
+<td>queue by token budget</td>
+<td>short lane and paid tiers first</td>
+<td>some requests wait</td>
+</tr>
+<tr>
+<td>saturated</td>
+<td>reject early</td>
+<td>503 + <code>Retry-After</code> before SSE starts</td>
+<td>no hidden GPU burn</td>
+</tr>
+<tr>
+<td>worker lost</td>
+<td>replay or regenerate</td>
+<td>prompt + emitted-token ring buffer</td>
+<td>brief stall or regenerate UI</td>
+</tr>
+</tbody>
+</table>
+<p>Cold and edge-state handling:</p>
+<table>
+<thead>
+<tr>
+<th>Edge</th>
+<th>Design response</th>
+<th>Budget</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dormant conversation resumed after summaries expired</td>
+<td>Read turn log, rebuild summary asynchronously, generate from last N turns first</td>
+<td>extra 100-500 ms before generation</td>
+</tr>
+<tr>
+<td>Very long prompt exhausts context window</td>
+<td>deterministic truncation: system prompt, recent turns, pinned facts, then summary</td>
+<td>no silent overflow</td>
+</tr>
+<tr>
+<td>Hot tenant floods long generations</td>
+<td>token-budget quota and slow lane for long outputs</td>
+<td>preserve paid/short TTFT</td>
+</tr>
+<tr>
+<td>Multi-region drift</td>
+<td>route conversation writes to home region; read replicas serve history with version watermark</td>
+<td>no out-of-order turns</td>
+</tr>
+<tr>
+<td>Model cold start</td>
+<td>worker stays out of router until weights loaded and warmup benchmark passes</td>
+<td>no first-user latency spike</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Interview punch line:</strong> the same turn log feeds two products: exact history for the user and a compact prompt view for the model; separating those lets us optimize latency without corrupting conversation truth.</p>
+<p><strong>Why SSE.</strong> Server-Sent Events are enough because the server sends a one-way token stream and cancellation is just connection close. WebSocket is useful for richer bidirectional tools, but it adds connection-state complexity without improving token latency for basic chat.</p>
+<p><strong>Streaming protocol — SSE specifics.</strong> HTTP response with <code>Content-Type: text/event-stream</code>. Each token emits as <code>data: {...}\n\n</code>. <strong>Keepalive comments</strong> (<code>:\n\n</code>) every 15 s prevent intermediate proxies (cloud LBs, corporate proxies — most idle-timeout at 30–60 s) from closing the connection. <strong>Cancellation:</strong> when the client closes the connection, the gateway notifies the router, which signals the worker to drop the request from the <em>next</em> iteration — frees its KV cache immediately. This matters: an idle GPU slot is wasted; a freed slot serves another user. <strong>Backpressure:</strong> if the client buffer fills, TCP backpressure propagates upstream, but you <em>cannot</em> pause GPU decode without wasting the batch slot. Gateway buffers up to ~1 MB; on overflow, abort with reason — better than burning the slot on an unreachable client.</p>
+<p><strong>Streaming safety filter — how it works in band.</strong> Output passes through a small classifier (~8B-class model or distilled head) before reaching the gateway. It maintains a <strong>sliding lookback window</strong> of the last ~50 tokens, classifying every ~10 tokens. Filter latency must be smaller than the inter-token interval (~30 ms) or the stream stalls. On a hit:
+- <em>Soft (mild policy violation):</em> mask the offending span (<code>[redacted]</code>), continue.
+- <em>Hard (severe):</em> abort the stream, emit a safety message, log for review.</p>
+<p>Default failure mode is closed: if the filter times out or is unreachable, mask the chunk.</p>
+<p><strong>Conversation context window.</strong> Context window is finite (e.g., 128k tokens). For long conversations:
+- Keep last N turns verbatim.
+- Summarize older turns into a compressed system message — done offline by a background job on a cheaper model.
+- For very long chats, retrieve only the most relevant past turns via vector search (retrieval-augmented).</p>
+<p><strong>Per-tenant fairness on shared GPUs.</strong> Token bucket on requests is wrong — the resource is GPU-seconds (i.e., tokens), not requests. Use a <strong>token-rate quota</strong> per tenant (tokens-out per second). Enforcement is in the scheduler: when a tenant exceeds its share, the scheduler deprioritizes its in-flight requests (skips them in the next iteration's decode list, costing ~1 token of latency per skip) so other tenants get serviced. Hard cap: tenant burns through 2× quota for &gt;10 s → admission control rejects until cooldown. Priority lanes for paid tiers (paid &gt; free; in-conversation continuation &gt; new conversation because cache is hot).</p>
+<p><strong>Autoscaling signal.</strong> Not QPS. The right signal is <strong>token-budget pressure</strong> = <code>sum(active KV bytes across workers) / total KV capacity</code>. Scale out at ~70% pressure; lead time = pre-warm latency (~30–60 s with image-baked weights). Scale in conservatively: workers drain (no new assignments, finish in-flight, then deprovision) over a ~10 min idle threshold because spin-up is expensive.</p>
+<p><strong>Failure modes — real mid-stream recovery.</strong>
+- <strong>GPU worker dies mid-stream.</strong> Tokens already streamed are gone (client received them). Router gets a <code>worker_disconnected</code> event. Choices:
+  - <em>Replay on new worker:</em> gateway holds the last <em>K</em> emitted tokens in a small ring buffer; on failure, concat <code>(original prompt + emitted tokens)</code> into the new prompt; new worker prefills, resumes decode where the stream left off. User sees a brief stall.
+  - <em>Regenerate UI:</em> emit a <code>[stream interrupted]</code> sentinel and let the client click regenerate.
+  - Production typically replays under TTFT budget; regenerates otherwise.
+- <strong>Router crash.</strong> Gateway sees timeout; conversation_id is durable; client retries with the same idempotency key. No double-billing.
+- <strong>Conversation store unavailable.</strong> Skip persistence on the write path; generate from in-flight context; queue the turn-write to a durable retry queue. Read path falls back to a cached snapshot.
+- <strong>Safety filter timeout.</strong> Fail closed — mask the chunk, log a filter-outage event.</p>
+<p><strong>Multi-model.</strong> Different requests route to different models (free vs paid tier, "fast" vs "thinking" mode). Named worker pools share the same router; routing picks the pool based on user tier + request hint. Prefix indexes and KV caches are per-pool.</p>
+<p><strong>Cost optimization — the ROI levers, ranked.</strong> GPU-hour is the dominant cost.
+1. Continuous batching (no idle slots) — table stakes.
+2. PagedAttention + prefix sharing (shared system prompt → near-zero incremental prefill).
+3. Speculative decoding (2–3× decode throughput on structured outputs).
+4. Quantization (INT8 / FP8) — ~2× memory, ~1.5× speed, small accuracy loss.
+5. Multi-tier serving — small model handles easy queries; large model handles hard ones (router uses a query classifier).</p>
+<p><strong>Critical numbers worth memorizing.</strong>
+- KV cache per token, 70B FP16 (GQA): ~300 KB. At 8k context: ~2.4 GB per request.
+- 70B FP16 weights: ~140 GB → tensor-parallel across 4× H100 80GB; ~180 GB free for KV cache on that pod → ~75 concurrent 8k-context requests.
+- Prefill rate: ~10k input tokens/s per pod; decode rate: ~50 tokens/s per request inside a busy batch.
+- Model load: ~30 s from local NVMe (image-baked); 5–15 min from object storage (cold) — argues for image baking.
+- SSE keepalive: 15 s (most LB idle timeouts are 30–60 s).</p>
+<p><strong>What I'd defer.</strong> Tool / function calling protocol, plugins ecosystem, multi-modal (image input/output), per-customer fine-tuning, RLHF training pipeline, cross-region failover semantics.</p>
+<p><strong>Interview punch line:</strong> the product looks like chat, but the system is a GPU scheduler with a conversation store attached. Optimize for token budget, KV locality, and graceful early rejection; the text rows are the easy part.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

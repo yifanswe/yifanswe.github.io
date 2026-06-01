@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Facebook Post Search — Full-Text Search Across the Firehose (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Facebook Post Search — Full-Text Search Across the Firehose (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Medium · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build Facebook (FB) post search — like Twitter's search bar. User types a query, gets ranked recent posts that match the keywords, filtered by their network/visibility. Index 1B new posts/day; serve 10k searches/sec; results within a few seconds of post creation.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Search recent posts by keyword(s), optionally filtered by date/author/type.
+- Results respect post visibility (public / friends / private).
+- Index new posts near-real-time (target: post visible in search within ~30 s).</p>
+<p>I'd defer ranking depth (we can mention ML reranking) and image/video search content.</p>
+<p><strong>Non-functional</strong>
+- Search p99 &lt; 500 ms.
+- Indexing throughput keeps up with 1B posts/day (~12k posts/sec average).
+- Strong consistency on visibility — never leak a private post.
+- Eventual consistency on document availability — a 30 s delay between post and search-visibility is acceptable.</p>
+<p><strong>Capacity</strong>
+- 1B posts/day × 1 KB = 1 TB/day of post text, ~30 TB/month.
+- Inverted index ≈ 0.5× document size with term posting lists.
+- Multi-year retention → petabytes.
+- Query fan-out is bounded by time routing: most searches hit recent shards first and only expand older if fewer than K visible results come back.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Post</strong> — <code>post_id</code>, author_id, text, created_at, visibility (public/friends/private), entities (mentions, hashtags).</li>
+<li><strong>IndexShard</strong> — inverted index keyed by term → list of <code>(post_id, score, ts)</code>.</li>
+<li><strong>User</strong> — needed for visibility checks (friend graph).</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>GET /v1/search?q=...&amp;filters=...&amp;cursor=...    → { posts[], next_cursor }
+</code></pre>
+<p>User from token. Cursor is opaque server state (term, last seen score+id) for pagination stability.</p>
+<p>The cursor encodes <code>{query_hash, time_bucket, shard_offsets, last_score, last_post_id, visibility_epoch}</code> so page 2 uses the same visibility snapshot and does not reshuffle while new posts arrive.</p>
+<hr />
+<h2 id="4-data-flow-5-min">4. Data Flow (~5 min)</h2>
+<p>Post created → published to Kafka <code>posts.created</code> → indexer consumes, tokenizes, applies analyzer, writes to inverted index shard → search service queries indexed shards on read.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Post service</strong> publishes <code>post.created</code> events to Kafka. Out of scope to design; we're consumers.</li>
+<li><strong>Indexer service.</strong> Stream processor (Flink/Kafka consumer pool):
+   - Tokenize text (Unicode-aware, lowercase, stem optionally).
+   - Strip noise; extract entities.
+   - Compute initial static score (author authority, post type).
+   - Write document to the index.</li>
+<li><strong>Index storage.</strong> Elasticsearch (or a custom inverted index over a key-value store like RocksDB). Shard by <code>time bucket</code> (recent month vs older) and within bucket by <code>term hash</code> for spread.
+   - Recent month sharded for write-heavy near-real-time indexing.
+   - Older months are read-mostly, can be merged into fewer, larger shards.</li>
+<li><strong>Visibility filtering.</strong> Two approaches:
+   - <strong>Filter at query time:</strong> join results against user's friend list. Works if friend lists are reasonable size (a few thousand).
+   - <strong>Indexed visibility tokens:</strong> index a synthetic term per allowed-viewer-group (public, friend-list-id). Query ANDs the user's tokens with the search terms.
+   - I'd default to query-time filtering for friends and indexed tokens for public/private boolean.</li>
+<li><strong>Search service.</strong> Parses query → fan-out to relevant shards (most recent first) → merge sort → rerank top N with a ranking model → return.</li>
+<li><strong>Ranking pipeline.</strong> Lightweight learn-to-rank model (LightGBM): features include text relevance (BM25), recency, author affinity, engagement. Rerank top 200 down to top 20.</li>
+<li><strong>Cache.</strong> Common queries cached for 30 s (hot trending searches dominate volume).</li>
+</ol>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code>+-------------------------+
+|        FB CLIENT        |
++------------+------------+
+        |
+    +-- POST/PATCH/DELETE /post
+    |       |
+    |       v
+    |   +-----------+
+    |   | Post Svc  |
+    |   +-----+-----+
+    |         | post events
+    |         v
+    |   +--------------+
+    |   | Kafka post.* |
+    |   | key=post_id  |
+    |   +------+-------+
+    |          |
+    |          v
+    |   +--------------+
+    |   | Indexer Fleet|
+    |   | tokenize+ACL |
+    |   +------+-------+
+    |          | postings + docs
+    |          v
+    |
+    +-- GET /search?q&amp;cursor
+        |
+        v
+        +--------------+
+        | Search API   |
+        +------+-------+
+           | query cache miss
+           v
+        +--------------+
+        | Search Shards|
+        | time buckets |
+        +------+-------+
+           |
+    +----------+-----------+
+    |                      |
+    v                      v
+ +-------------+        +-------------+
+ | Graph / ACL |        | Ranker +    |
+ | friend/block|        | Feature Svc |
+ +------+------+        +------+------+
+    |                      |
++--------------------------------------------+---------------+-------+
+| Stores / Indexes                                                    |
+| QueryCache: query:{hash}:public-&gt;top post_ids, TTL 30s              |
+| Postings: (bucket,term_hash)-&gt;compressed post_id postings           |
+| DocStore: doc:{post_id}-&gt;snippet + visibility metadata              |
+| Watermark: index_watermark:{bucket}-&gt;offset/lag                     |
+| Visibility: visibility:{user_id}:{epoch}-&gt;ACL set                   |
+| Post SoT: post:{post_id}-&gt;body/media refs                           |
++----------------------+---------------------------------------------+
+             | doc/post or ACL miss
+             v
+         +----------------+
+         | TAO / MySQL    |
+         | source of truth|
+         +----------------+
+</code></pre>
+<p>End-to-end narration: Alice posts "Niners just won the Super Bowl!" → indexer in 5 s adds the post to today's shard. Bob searches "Super Bowl" 30 s later → search service fans out across last-week shards → each shard returns its top 50 → merge to top 200 candidates → rerank model picks the freshest, most engaging, most network-relevant → top 20 returned, including Alice's post.</p>
+<p>Concrete query path:</p>
+<ol>
+<li>Search service parses terms, filters, and user visibility context.</li>
+<li>It routes to recent time buckets first, shard key <code>(time_bucket, term_hash)</code>.</li>
+<li>Shards fetch posting lists for each term, intersect/score locally, and return top 50 post IDs plus BM25 scores.</li>
+<li>In parallel, the service fetches user friend/block filters and ranking features for the candidate authors/posts.</li>
+<li>It applies fine-grained visibility checks, hydrates post snippets by batched post ID lookup, reranks top 200, and returns top 20 with cursor.</li>
+</ol>
+<p>Write/index path:</p>
+<ol>
+<li><code>post.created</code> is appended to Kafka with key <code>(created_at_bucket, post_id)</code>; updates/deletes use the same <code>post_id</code> so indexers see versions in order per post.</li>
+<li>Indexer tokenizes text, emits one posting per unique term, and writes the document snippet under <code>doc:{post_id}</code>.</li>
+<li>Public visibility is written as a coarse token; friends/private posts keep enough metadata for query-time ACL checks and are never trusted solely from the index.</li>
+<li>The indexer writes postings to hot time-bucket shards keyed by <code>(bucket, term_hash)</code> and advances an <code>index_watermark:{bucket}</code>.</li>
+<li>Search only routes to shards whose watermark is healthy; a lagging shard is marked degraded and retried asynchronously rather than blocking all queries.</li>
+</ol>
+<p>Hot vs cold query path: a trending public query first checks <code>query:{hash}:public</code> and may return in &lt;100 ms. A personalized query misses cache, fans out to recent shards, over-fetches top 500, fetches <code>visibility:{user_id}:{epoch}</code> in parallel with ranking features, then filters and reranks. If fewer than K visible results survive, the cursor expands to the next older time bucket with the same <code>query_hash</code> and shard offsets.</p>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Near-real-time indexing.</strong> Elasticsearch refreshes new segments every ~1 s by default; tuned for our volume that's fine. New posts appear searchable within seconds.</p>
+<p>Concrete index stores:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key pattern</th>
+<th>Value / data structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inverted postings</td>
+<td><code>(bucket, term_hash)</code></td>
+<td>compressed list of <code>(post_id, ts, term_freq, static_score)</code></td>
+<td style="text-align: right;">~12-20 B/posting</td>
+<td>hot 30 days SSD; older tiered</td>
+<td><code>term_hash</code> within time bucket</td>
+</tr>
+<tr>
+<td>Document store</td>
+<td><code>post_id</code></td>
+<td>text snippet, author, visibility, entity ids</td>
+<td style="text-align: right;">~1 KB</td>
+<td>same as post retention</td>
+<td><code>post_id</code></td>
+</tr>
+<tr>
+<td>Delete tombstone</td>
+<td><code>deleted:{post_id}</code></td>
+<td>version / tombstone bit</td>
+<td style="text-align: right;">~32 B</td>
+<td>until segment compaction</td>
+<td><code>post_id</code></td>
+</tr>
+<tr>
+<td>Hot query cache</td>
+<td><code>query:{hash}:visibility:{tier}</code></td>
+<td>top-N post IDs + scores</td>
+<td style="text-align: right;">~10 KB</td>
+<td>30 s</td>
+<td>query hash</td>
+</tr>
+<tr>
+<td>Friend/block filter</td>
+<td><code>visibility:{user_id}:{epoch}</code></td>
+<td>compact friend ids / block bloom</td>
+<td style="text-align: right;">KBs-user dependent</td>
+<td>minutes</td>
+<td><code>user_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>Capacity math: 1B posts/day × 1 KB = 1 TB/day raw document text. If each post averages 20 unique terms and each posting is ~16 B compressed, postings are ~320 GB/day before replicas; doc snippets add ~1 TB/day. With 3 replicas and 30 hot days, hot search storage is roughly 120 TB before compression wins. Multi-year retention is object-store/cold-index territory. Dominant cost is postings/doc storage for hot recent shards plus query CPU on skewed terms.</p>
+<p>Indexing queue math: 12k posts/sec average at ~1.5 KB/event is ~18 MB/sec raw through Kafka, ~54 MB/sec with RF=3. A 30 s freshness target means normal lag should stay under ~360k events; if indexers are down for 10 minutes, the backlog is ~7.2M posts, or ~10 GB raw event data, which Kafka can hold easily but shard refresh/merge CPU becomes the limiter. Hot query cache is modest: 1M cached query variants × 10 KB is ~10 GB raw with a 30 s TTL, but cache invalidation is intentionally time-based, not per-post.</p>
+<p><strong>Time-sharded index.</strong> Most searches are weighted to recent posts. Shard by time bucket so recent shards are tiny and indexed hot; older shards are larger and read-mostly. Query routing hits the freshest shards first, falls back to older shards only on insufficient results.</p>
+<p><strong>Two indexes, one answer.</strong> The inverted index answers "which posts contain these terms?" The graph/visibility index answers "which of those posts can this viewer see?" I would not build a per-user search index because the storage would explode; instead, over-fetch from the term index and apply the visibility view at read time before hydration.</p>
+<p><strong>Why Elasticsearch/OpenSearch.</strong> It gives inverted indexes, refresh/segment merge, query routing, and scoring out of the box. Solr is a close alternative. A custom RocksDB inverted index can be cheaper at FB scale, but it means owning analyzers, merges, ranking, and operations. Bigtable/Cassandra are not enough by themselves because the key operation is term posting-list intersection, not a single wide-row read.</p>
+<p><strong>Term skew.</strong> Hashtags like <code>#superbowl</code> produce massive posting lists. Mitigations: per-shard caching of top postings; pre-computing top-K hot terms with their best-scoring docs (a "hot phrase" cache).</p>
+<p>Skew degradation:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Latency target</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>normal</td>
+<td>live shard fan-out</td>
+<td>recent postings</td>
+<td>&lt;500 ms</td>
+</tr>
+<tr>
+<td>hot term</td>
+<td>cached top-K</td>
+<td><code>query:{hash}</code> / hot phrase cache</td>
+<td>&lt;100 ms for first page</td>
+</tr>
+<tr>
+<td>exhausted page</td>
+<td>continue cursor</td>
+<td>shard offsets + older bucket</td>
+<td>&lt;700 ms acceptable</td>
+</tr>
+<tr>
+<td>visibility-heavy</td>
+<td>over-fetch</td>
+<td>get top 500-1000 then filter</td>
+<td>more CPU, no leaks</td>
+</tr>
+<tr>
+<td>shard failed</td>
+<td>partial results</td>
+<td>omit failed shard, mark degraded, retry async</td>
+<td>return some results</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Ranking — text + behavior.</strong> BM25 for raw relevance. Boost by post engagement (likes/comments per minute). Personalize by author affinity (does the searcher interact with this author?). For staff-level depth, mention training data from clicks and "did this satisfy the query" signals.</p>
+<p><strong>Visibility correctness.</strong> The hard one. A search must never return a post the searcher isn't allowed to see. Two-stage:
+1. <strong>Coarse filter at index time.</strong> Public posts indexed in a public shard; friends-only posts indexed with a synthetic term <code>_friend_of_author_X</code>. Searcher's query adds their author tokens.
+2. <strong>Fine filter at result time.</strong> After retrieving, re-check each result against the searcher's friend graph for the small number of edge cases (recent unfriends, blocks).</p>
+<p>The fine filter is non-negotiable. If the friend graph service is unavailable, fail closed for friends/private posts and return public-only results rather than risk a privacy leak.</p>
+<p>The visibility cursor carries <code>visibility_epoch</code>; page 2 should use the same ACL snapshot or a newer fail-closed one. If Bob unfriends Alice between page 1 and page 2, page 2 may omit Alice's older result, but it must never resurrect it from a cached query page.</p>
+<p><strong>Privacy / blocking.</strong> If A blocks B, neither sees the other's posts. Maintain a block-list per user; cross-check at result time. Implement as a small bloom filter per user for O(1) check.</p>
+<p><strong>Update + delete propagation.</strong> Posts can be edited or deleted. Indexer subscribes to <code>post.updated</code> / <code>post.deleted</code> topics; updates inverted index (tombstone + later compaction). Stale results possible for a few seconds — acceptable.</p>
+<p><strong>Storage cost.</strong> Inverted index for 1 PB of raw text → ~500 TB. Tier by age: hot (SSD-backed ES nodes) for last 30 days, warm (HDD) for older, cold (snapshot to object store) for everything past a year.</p>
+<p><strong>Hot query caching.</strong> Trending queries (e.g., "Super Bowl") dominate traffic. Cache top-N results per query for 30 s. Cache key includes the searcher's coarse visibility tier (most users share the "public-only" view).</p>
+<p><strong>Multi-region and cold-start behavior.</strong> Indexing can happen in the post's home region and replicate segments to search regions; a remote region may be 5-30 s behind and that is acceptable for freshness. Visibility data is stricter: blocks and privacy changes replicate on a priority stream, and if the local ACL epoch is stale, search returns public-only or asks the home region for the fine check. A new time bucket starts empty, so routers keep querying the previous bucket until <code>index_watermark:{bucket}</code> proves the new shard is serving; after a shard restart, it replays Kafka from the bucket offset and search marks that shard partial until replay catches up.</p>
+<p><strong>Interview punch line for failure cases:</strong> I can return fewer or older results, but I cannot return one private result. The degradation path is partial/public-only results, not stale ACLs.</p>
+<p><strong>What I'd defer.</strong> Semantic / vector search, image/video search, autocomplete and query suggestion, multilingual analysis, query understanding (entity recognition, intent classification).</p>
+<p><strong>Interview punch line:</strong> search can be eventually consistent for freshness, but never eventually consistent for privacy. I would over-fetch and filter at read time before I would risk returning one private post.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

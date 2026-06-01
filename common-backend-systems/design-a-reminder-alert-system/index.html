@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Design a Reminder Alert System — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Design a Reminder Alert System</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<blockquote>
+<p><strong>New to these terms?</strong> See the <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> for plain-English + Chinese explanations of recurring system-design terms.</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. Basic Knowledge And Solution</h2>
+<h3 id="what-this-question-is-testing">What This Question Is Testing</h3>
+<p>A reminder alert system fires user-scheduled events at the right moment, sometimes years in advance, often with recurrence rules and snooze. The hard part is reliable wakeup at the exact scheduled time, handling timezones, and recovering from outages without flooding users with delayed reminders.</p>
+<p>The invariant is this:</p>
+<blockquote>
+<p>Every active reminder fires at most once at or near its scheduled local time on every user device that owns it; missed reminders due to outages either fire promptly with a "delayed" indicator or are explicitly marked missed per policy; recurrence rules expand into discrete occurrences each handled independently; user edits and deletes propagate within seconds.</p>
+</blockquote>
+<p>At ICT5 / L6+ level, the interviewer is testing whether you can model reminders as scheduled occurrences with deterministic ids (similar to cron), handle timezones correctly, scale to billions of reminders, and integrate with the notification delivery system.</p>
+<h3 id="60-second-interview-framing">60-Second Interview Framing</h3>
+<p>Spoken version:</p>
+<blockquote>
+<p>I would design the reminder system as a scheduling layer over a notification delivery layer. Each reminder is stored as a definition plus expanded occurrences pre-materialized to a horizon. A time-bucketed scheduler scans for due occurrences and dispatches them to the notification system. The interesting decisions are timezone handling, recurrence expansion, edit/delete propagation, and recovery from missed reminders.</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">Requirements To Clarify First</h3>
+<p>Functional requirements:</p>
+<ul>
+<li>User creates a reminder with title, notes, scheduled time, recurrence, devices.</li>
+<li>Recurrence: daily, weekly, monthly, custom RRULE.</li>
+<li>Snooze: postpone by N minutes or until a specific time.</li>
+<li>Edit and delete (single occurrence or entire series).</li>
+<li>Per-device delivery: phone push, email, in-app.</li>
+<li>Timezone-aware; respects user's current timezone.</li>
+<li>Acknowledgment / dismiss tracking.</li>
+</ul>
+<p>Non-functional requirements:</p>
+<ul>
+<li>Trigger within seconds of scheduled time.</li>
+<li>Scale to billions of reminders.</li>
+<li>High availability of scheduling.</li>
+<li>Edits visible within seconds.</li>
+<li>Survive scheduler outages without losing reminders.</li>
+<li>Multi-device sync.</li>
+</ul>
+<p>Out of scope unless asked:</p>
+<ul>
+<li>Calendar event semantics (attendees, invites, RSVP).</li>
+<li>Smart suggestions based on context.</li>
+</ul>
+<h3 id="scale-assumptions">Scale Assumptions</h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Assumption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Users</td>
+<td>100M-1B.</td>
+</tr>
+<tr>
+<td>Reminders/user</td>
+<td>10-100 active typical; 1000s long-tail.</td>
+</tr>
+<tr>
+<td>Recurrence horizon</td>
+<td>Materialize 30-365 days ahead.</td>
+</tr>
+<tr>
+<td>Fire rate</td>
+<td>100k-1M per minute peak (top of hour effect).</td>
+</tr>
+<tr>
+<td>Trigger accuracy</td>
+<td>Within seconds of scheduled time.</td>
+</tr>
+<tr>
+<td>Latency to device</td>
+<td>Push delivery seconds.</td>
+</tr>
+</tbody>
+</table>
+<p>Bottleneck is the same as cron: top-of-hour bursts and reliable wakeup.</p>
+<h3 id="core-product-model">Core Product Model</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>User experience</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Create</td>
+<td>Set reminder; pick time/recurrence.</td>
+<td>Sync to all user devices.</td>
+</tr>
+<tr>
+<td>Fire</td>
+<td>Notification at the right time.</td>
+<td>Reliable, timezone-correct.</td>
+</tr>
+<tr>
+<td>Snooze</td>
+<td>Postpone.</td>
+<td>Idempotent; updates next occurrence.</td>
+</tr>
+<tr>
+<td>Edit / Delete</td>
+<td>Modify or cancel.</td>
+<td>Propagates to scheduler quickly.</td>
+</tr>
+<tr>
+<td>List</td>
+<td>See upcoming reminders.</td>
+<td>Synced across devices.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">High-Level Architecture</h3>
+<pre><code class="language-text">User --create--&gt;  Reminder API ---&gt;  Reminder Store
+                                          |
+                                          v
+                                +-----------------+
+                                | Occurrence      |
+                                | Materializer    |
+                                | (expand RRULE)  |
+                                +--------+--------+
+                                         |
+                                         v
+                                +-----------------+
+                                | Scheduled Queue |
+                                | by due_at bucket|
+                                +--------+--------+
+                                         |
+                                  due-time tick
+                                         |
+                                         v
+                                +-----------------+
+                                | Dispatcher      |
+                                +--------+--------+
+                                         |
+                                         v
+                                +-----------------+
+                                | Notification    |
+                                | System          |
+                                +--------+--------+
+                                         |
+                                         v
+                                  User devices
+</code></pre>
+<h3 id="core-components">Core Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Responsibility</th>
+<th>Key detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reminder API</td>
+<td>CRUD on reminder definitions.</td>
+<td>Sync across user devices.</td>
+</tr>
+<tr>
+<td>Reminder store</td>
+<td>Persistent reminders + recurrence.</td>
+<td>Per-user partitioned.</td>
+</tr>
+<tr>
+<td>Occurrence materializer</td>
+<td>Expands recurrence into individual due timestamps.</td>
+<td>Materializes a horizon ahead.</td>
+</tr>
+<tr>
+<td>Scheduled queue</td>
+<td>Time-bucketed list of due occurrences.</td>
+<td>Like the distributed cron's expected-runs.</td>
+</tr>
+<tr>
+<td>Dispatcher</td>
+<td>At fire time, sends to notification system.</td>
+<td>Idempotent on occurrence_id.</td>
+</tr>
+<tr>
+<td>Snooze handler</td>
+<td>Updates next occurrence; doesn't change series.</td>
+<td>Idempotent on snooze_id.</td>
+</tr>
+<tr>
+<td>Notification system</td>
+<td>Delivers via push, email, in-app.</td>
+<td>See separate notification design.</td>
+</tr>
+<tr>
+<td>Sync service</td>
+<td>Pushes reminder list changes to user devices.</td>
+<td>WebSocket / push for live sync.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">Data Model</h3>
+<h4 id="reminder-definition">Reminder Definition</h4>
+<pre><code class="language-text">Reminder(
+  reminder_id,
+  user_id,
+  title,
+  notes,
+  start_time,            // first occurrence
+  recurrence_rule,       // RRULE string
+  timezone,
+  devices: [device_id],
+  status,                // active, paused, deleted
+  created_at,
+  updated_at,
+  version
+)
+</code></pre>
+<h4 id="occurrence">Occurrence</h4>
+<pre><code class="language-text">Occurrence(
+  occurrence_id,         // hash(reminder_id, due_at)
+  reminder_id,
+  user_id,
+  due_at,                // in UTC
+  due_local,             // in user tz at occurrence time
+  status,                // pending, fired, snoozed, dismissed, missed
+  snoozed_until?,
+  fired_at?,
+  ack_devices: [device_id],
+  version
+)
+</code></pre>
+<p>Primary key <code>occurrence_id</code> is deterministic; partitioned by <code>due_at</code> time bucket for scan efficiency.</p>
+<h3 id="apis">APIs</h3>
+<pre><code class="language-text">POST   /reminders
+PATCH  /reminders/{id}
+DELETE /reminders/{id}
+POST   /reminders/{id}/snooze       Body: until?, minutes?
+POST   /occurrences/{id}/dismiss
+GET    /reminders?upcoming=
+GET    /reminders/{id}/occurrences
+</code></pre>
+<h3 id="occurrence-materialization">Occurrence Materialization</h3>
+<p>When a reminder is created or modified:</p>
+<ol>
+<li>Compute occurrences for the next horizon (e.g., 30 or 365 days).</li>
+<li>For each occurrence, generate <code>occurrence_id = hash(reminder_id, due_at_utc)</code>.</li>
+<li>Insert into Occurrence table with <code>status=pending</code> if not exists (idempotent on occurrence_id).</li>
+<li>Schedule a background task to extend the horizon periodically (e.g., daily nightly job extends each reminder's occurrences forward).</li>
+</ol>
+<p>For very long-tail reminders (one-time, far future), insert single occurrence at the scheduled time.</p>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Like distributed cron, occurrences are durable rows with deterministic ids. The scheduler is a state machine over those rows. Edits update the rows; fires transition state.</p>
+</blockquote>
+<h3 id="scheduling-and-dispatch">Scheduling And Dispatch</h3>
+<p>A time-bucketed scheduler (similar to distributed cron):</p>
+<ol>
+<li>Time buckets per minute (or finer).</li>
+<li>Scheduler scans for occurrences with <code>due_at</code> in the current bucket and <code>status=pending</code>.</li>
+<li>Conditional update <code>status = dispatched</code>.</li>
+<li>Sends to notification system with idempotency key derived from occurrence_id.</li>
+<li>On ack from notification system, status <code>fired</code>.</li>
+</ol>
+<p>If the scheduler is briefly down, the next scan picks up missed buckets and dispatches with a "delayed" flag if the lag is significant.</p>
+<h3 id="timezone-handling">Timezone Handling</h3>
+<p>Reminders are stored with user's timezone. A "9am Monday" reminder fires at 9am in the user's local timezone, accounting for travel and DST.</p>
+<ul>
+<li>Reminder stored with <code>timezone</code> and recurrence rule.</li>
+<li>When materializing occurrences, compute <code>due_at_utc</code> based on the user's current timezone at occurrence time.</li>
+<li>If user changes timezone, re-materialize future occurrences from new TZ.</li>
+<li>Edge cases: ambiguous local times during DST transitions (1:30am on fall-back day exists twice) — pick one explicitly.</li>
+</ul>
+<p>Interview phrase:</p>
+<blockquote>
+<p>Timezone correctness is the most easily overlooked detail. The reminder "every Monday at 9am" must fire at 9am local even if the user crosses timezones or DST changes.</p>
+</blockquote>
+<h3 id="snooze">Snooze</h3>
+<p>User taps snooze:</p>
+<ol>
+<li>Snooze API receives <code>(occurrence_id, until_time)</code>.</li>
+<li>Update occurrence: <code>status = snoozed</code>, <code>snoozed_until = until_time</code>.</li>
+<li>Create a new occurrence (or re-schedule same one) with <code>due_at = until_time</code>.</li>
+<li>The scheduler picks it up at the new time.</li>
+</ol>
+<p>Snooze does not affect the series; future occurrences from the recurrence rule fire normally.</p>
+<h3 id="edits-and-deletes">Edits And Deletes</h3>
+<p>Edit a single occurrence: change the one row.
+Edit the series: change Reminder, then re-materialize future occurrences. Existing scheduled occurrences may need to be canceled or rescheduled.
+Delete the series: set Reminder status to <code>deleted</code>, cancel all pending occurrences.</p>
+<p>Edits propagate fast because:</p>
+<ul>
+<li>Reminder change publishes an event.</li>
+<li>The materializer rebuilds future occurrences within seconds.</li>
+<li>The scheduler picks up new occurrences.</li>
+</ul>
+<h3 id="multi-device-delivery">Multi-Device Delivery</h3>
+<p>A user with phone + watch + computer wants all to alert.</p>
+<ul>
+<li>Reminder definition lists devices (or "all my devices").</li>
+<li>Dispatch creates one notification per device via the notification system.</li>
+<li>Each device acks independently.</li>
+<li>Dismiss from one device propagates to others via sync.</li>
+</ul>
+<p>Sync mechanism:</p>
+<ul>
+<li>Each device subscribes to user's reminder change stream.</li>
+<li>On dismiss/snooze from one device, server broadcasts to other online devices.</li>
+</ul>
+<h3 id="scaling-and-partitioning">Scaling And Partitioning</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Partition key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reminders</td>
+<td><code>user_id</code> hash</td>
+<td>Per-user CRUD.</td>
+</tr>
+<tr>
+<td>Occurrences</td>
+<td><code>due_at</code> time bucket + hash</td>
+<td>Time-range scan for due occurrences.</td>
+</tr>
+<tr>
+<td>Snooze state</td>
+<td><code>occurrence_id</code></td>
+<td>Lookup by id.</td>
+</tr>
+<tr>
+<td>Device subscriptions</td>
+<td><code>user_id</code> hash</td>
+<td>Sync per-user.</td>
+</tr>
+</tbody>
+</table>
+<p>Top-of-hour burst (lots of users set 9am reminders): jitter occurrences by a few seconds based on <code>hash(reminder_id)</code> to spread the fire rate.</p>
+<h3 id="consistency-model">Consistency Model</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Consistency</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reminder definitions</td>
+<td>Strong</td>
+<td>User expects edits to take effect.</td>
+</tr>
+<tr>
+<td>Occurrences</td>
+<td>Strong on transitions</td>
+<td>Idempotency, no double-fire.</td>
+</tr>
+<tr>
+<td>Sync to devices</td>
+<td>Eventually consistent</td>
+<td>Online devices update fast; offline catch up on reconnect.</td>
+</tr>
+<tr>
+<td>Notification delivery</td>
+<td>At-least-once + dedupe</td>
+<td>See notification design.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">Multi-Region Strategy</h3>
+<ul>
+<li>Per-user home region.</li>
+<li>Reminder edits route to home region.</li>
+<li>Occurrences materialized in home region.</li>
+<li>Scheduler runs in user's home region.</li>
+<li>Failover: warm replica in alternate region.</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">Failure Modes And Mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Failure mode</th>
+<th>Mitigation</th>
+<th>Signal to monitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scheduler outage causes missed fires.</td>
+<td>Backfill from pending occurrences with <code>due_at &lt; now</code>.</td>
+<td>Pending-past-due count.</td>
+</tr>
+<tr>
+<td>Duplicate fire from retry.</td>
+<td>Idempotent dispatch on occurrence_id.</td>
+<td>Duplicate fire rate.</td>
+</tr>
+<tr>
+<td>Timezone change misses fire.</td>
+<td>Re-materialize on TZ change event.</td>
+<td>TZ-mismatch alerts.</td>
+</tr>
+<tr>
+<td>Edit not propagated before fire.</td>
+<td>Edit cancels pending occurrence and re-creates.</td>
+<td>Edit-vs-fire race count.</td>
+</tr>
+<tr>
+<td>User has 1000 reminders all set for 9am.</td>
+<td>Per-user fan-out rate limit; jitter.</td>
+<td>Per-user fire rate.</td>
+</tr>
+<tr>
+<td>Notification delivery fails.</td>
+<td>Notification system retries; mark occurrence based on system result.</td>
+<td>Delivery failure rate.</td>
+</tr>
+<tr>
+<td>Recurrence horizon not extended.</td>
+<td>Nightly horizon-extension job; alert on stale reminders.</td>
+<td>Reminders without future occurrences.</td>
+</tr>
+<tr>
+<td>DST transition.</td>
+<td>Recompute occurrences around DST boundary; pick policy for ambiguous times.</td>
+<td>DST-ambiguity alerts.</td>
+</tr>
+<tr>
+<td>Snooze followed by delete.</td>
+<td>Cancel via state transition; idempotent.</td>
+<td>Snooze-then-delete count.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">Operational Metrics</h3>
+<p>Correctness:</p>
+<ul>
+<li>Fire-time accuracy distribution.</li>
+<li>Missed reminders (fired more than threshold late).</li>
+<li>Duplicate fires.</li>
+<li>TZ mismatch.</li>
+</ul>
+<p>Capacity:</p>
+<ul>
+<li>Per-minute fire rate.</li>
+<li>Scheduler scan latency.</li>
+<li>Notification system lag.</li>
+</ul>
+<p>Business:</p>
+<ul>
+<li>Reminders set per user.</li>
+<li>Dismiss / snooze ratios.</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">Tradeoffs To Call Out</h3>
+<ul>
+<li>Pre-materializing occurrences uses storage but makes scheduling robust.</li>
+<li>Long horizons (1 year) waste storage on never-fired occurrences; short horizons (30 days) require frequent extension.</li>
+<li>Strict fire-time accuracy requires frequent scheduler ticks; coarse ticks are cheaper but allow lateness.</li>
+<li>Per-device delivery gives flexibility but requires sync across devices.</li>
+<li>TZ-aware scheduling adds complexity but is correctness-critical.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">Common Traps And Stronger Moves</h3>
+<table>
+<thead>
+<tr>
+<th>Trap</th>
+<th>Stronger move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single global timer.</td>
+<td>Time-bucketed scheduler with sharded buckets.</td>
+</tr>
+<tr>
+<td>Storing only the recurrence rule.</td>
+<td>Materialize occurrences; rule is just the source.</td>
+</tr>
+<tr>
+<td>Storing UTC only.</td>
+<td>Store user TZ + recurrence; materialize UTC per occurrence.</td>
+</tr>
+<tr>
+<td>Synchronous notification on fire.</td>
+<td>Async dispatch; notification system owns delivery.</td>
+</tr>
+<tr>
+<td>Recompute on every edit.</td>
+<td>Only recompute future occurrences; past are immutable.</td>
+</tr>
+<tr>
+<td>Forgetting horizon extension.</td>
+<td>Nightly extend; monitor reminders without future occurrences.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">Deep Dives Interviewer May Choose</h3>
+<table>
+<thead>
+<tr>
+<th>Deep dive</th>
+<th>Strong answer shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Timezone handling</td>
+<td>Store TZ; materialize UTC at occurrence time; re-materialize on TZ change.</td>
+</tr>
+<tr>
+<td>Recurrence expansion</td>
+<td>RRULE parsing; horizon strategy; extension job.</td>
+</tr>
+<tr>
+<td>Missed reminder recovery</td>
+<td>Backfill from pending; mark delayed; do not flood user.</td>
+</tr>
+<tr>
+<td>Multi-device sync</td>
+<td>Push to all listed devices; dismiss propagates.</td>
+</tr>
+<tr>
+<td>Edit propagation</td>
+<td>Cancel pending and re-materialize.</td>
+</tr>
+<tr>
+<td>Top-of-hour burst</td>
+<td>Jitter; pre-materialize; scheduler scales.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff-Level Answer Checklist</h3>
+<ul>
+<li>Reminders are definitions; occurrences are durable scheduled events.</li>
+<li>Time-bucketed scheduler with deterministic occurrence ids.</li>
+<li>Timezone correctness via stored TZ + UTC materialization.</li>
+<li>Edits and deletes propagate via occurrence cancellation + re-materialization.</li>
+<li>Snooze creates a new occurrence; idempotent.</li>
+<li>Per-device delivery via notification system.</li>
+<li>Multi-device sync of dismiss/snooze.</li>
+<li>Burst handling via jitter and pre-materialization.</li>
+</ul>
+<h3 id="interview-phrase">Interview Phrase</h3>
+<blockquote>
+<p>A reminder system is a scheduling layer over a notification system. Reminders are definitions; occurrences are pre-materialized durable rows with deterministic ids. A time-bucketed scheduler dispatches them at the right moment, accounting for timezones. Edits cancel and re-materialize; snooze creates a new occurrence. Multi-device delivery rides the notification substrate.</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. Simulated Interview</h2>
+<p><strong>Interviewer:</strong> Design a reminder alert system.</p>
+<p><strong>Candidate:</strong> I will design two layers: a scheduling layer that owns reminder definitions and pre-materializes occurrences, and the notification delivery layer that handles per-device push. The invariant is that every active reminder fires at or near its scheduled local time on every user device, with no double-fires and reliable recovery from outages.</p>
+<p><strong>Interviewer:</strong> Why materialize occurrences instead of computing on the fly?</p>
+<p><strong>Candidate:</strong> Two reasons. First, it makes the scheduler a state machine over durable rows — same as distributed cron. The scheduler scans for due occurrences and dispatches; recovery from outages is just "find pending past due." Second, it lets edits and deletes propagate cleanly: cancel the pending occurrences and re-materialize. Computing on the fly couples scheduling to the recurrence interpretation on every tick.</p>
+<p><strong>Interviewer:</strong> Timezones?</p>
+<p><strong>Candidate:</strong> Store reminder with user's timezone and the recurrence rule. When materializing each occurrence, compute the UTC time based on that local time and the user's current TZ. If the user changes timezones, we re-materialize future occurrences from the new TZ. DST transitions are handled at materialization: "every day at 2:30am" handles fall-back ambiguity per policy (we pick the first occurrence).</p>
+<p><strong>Interviewer:</strong> A user has 100 reminders, all set for 9am Monday. How do you not fire 100 push notifications at the same instant?</p>
+<p><strong>Candidate:</strong> Jitter. Each occurrence's <code>due_at</code> is offset by <code>hash(reminder_id) mod jitter_window</code> (say, 30 seconds). The user gets 100 reminders within a 30-second window. Per-user notification rate limits also help; the notification system may digest if the user has too many fires.</p>
+<p><strong>Interviewer:</strong> What if the scheduler is down for 30 minutes?</p>
+<p><strong>Candidate:</strong> On recovery, the scheduler scans for occurrences with <code>due_at &lt; now AND status = pending</code>. It dispatches them, marking each as <code>delayed</code>. The notification system shows "Was due at X" so the user knows. We avoid flooding by rate-limiting and digesting if the backlog is large. Per-reminder policy can be "fire late," "skip if more than N minutes late," or "fire next occurrence only."</p>
+<p><strong>Interviewer:</strong> Snooze?</p>
+<p><strong>Candidate:</strong> Snooze creates a new occurrence (or updates the existing one) with the new <code>due_at = snooze_until</code>. The state transitions to <code>snoozed</code>. The scheduler picks it up at the new time. Original recurrence series is unaffected.</p>
+<p><strong>Interviewer:</strong> Edit the recurrence — "change weekly Monday 9am to Tuesday 10am."</p>
+<p><strong>Candidate:</strong> Update the reminder definition. Cancel pending future occurrences for this reminder. Re-materialize future occurrences from the new rule. Past occurrences are immutable. The materializer respects idempotency: re-running on the same data produces the same occurrence_ids; cancellation marks them.</p>
+<p><strong>Interviewer:</strong> Multi-device dismiss?</p>
+<p><strong>Candidate:</strong> When the user dismisses on phone, the phone acks the occurrence. The server updates the occurrence state and broadcasts a sync event to user's other devices via the notification system or a sync channel. Other devices remove the notification from their UI. If a device was offline, it gets the dismiss on reconnect.</p>
+<p><strong>Interviewer:</strong> Scale — billions of reminders.</p>
+<p><strong>Candidate:</strong> Reminders partitioned by user_id; occurrences partitioned by (due_at time bucket + hash). The scheduler scans buckets, which keeps the scan size manageable per tick. Hot users with thousands of reminders are bounded by per-user rate limits. The horizon for materialization is bounded (30-365 days) to cap storage.</p>
+<p><strong>Interviewer:</strong> What about a reminder set for "in 5 years"?</p>
+<p><strong>Candidate:</strong> Stored with single occurrence at the scheduled time, no materialization beyond the existing horizon. The nightly horizon-extension job picks it up when it falls into the materialization window. Until then, it's just a row in the reminder store waiting for the scheduler to claim it within horizon.</p>
+<p><strong>Interviewer:</strong> Summarize.</p>
+<p><strong>Candidate:</strong> Reminders are definitions; occurrences are durable scheduled rows with deterministic ids. A time-bucketed scheduler dispatches due occurrences to the notification system. Timezones are stored with the reminder and respected at materialization. Edits cancel and re-materialize. Snooze creates a new occurrence. Multi-device dismiss syncs across devices. Top-of-hour bursts are handled with jitter. Recovery from outages backfills past-due occurrences with delayed flag.</p>
+<h2 id="3-practice-notes">3. Practice Notes</h2>
+<h3 id="five-minute-version">Five-Minute Version</h3>
+<ol>
+<li>Clarify: scale, recurrence, timezone, snooze, multi-device.</li>
+<li>Invariant: fire at scheduled local time, no double-fire, recovery.</li>
+<li>Reminder definitions + materialized occurrences.</li>
+<li>Deterministic occurrence_id from reminder_id + due_at.</li>
+<li>Time-bucketed scheduler + horizon extension.</li>
+<li>Timezone via stored TZ + UTC materialization.</li>
+<li>Edits cancel and re-materialize; snooze creates new occurrence.</li>
+<li>Multi-device delivery via notification system; sync for dismiss.</li>
+</ol>
+<h3 id="one-minute-closeout">One-Minute Closeout</h3>
+<blockquote>
+<p>A reminder system is a scheduling layer over notification delivery. Reminders are definitions; occurrences are pre-materialized durable rows. A time-bucketed scheduler dispatches them at the right UTC time, derived from the user's stored timezone. Edits cancel and re-materialize. Snooze creates a new occurrence. Multi-device delivery rides the notification system; dismiss syncs across devices. Top-of-hour bursts get jittered. Outage recovery backfills past-due occurrences with a delayed flag.</p>
+</blockquote>
+<h3 id="best-interview-phrases">Best Interview Phrases</h3>
+<ul>
+<li>"Occurrences are durable rows with deterministic ids; the scheduler is a state machine over them."</li>
+<li>"Timezone is stored with the reminder; UTC is derived per occurrence."</li>
+<li>"Edits cancel pending occurrences and re-materialize; past is immutable."</li>
+<li>"Snooze is just a new occurrence at the new time."</li>
+<li>"Recovery from scheduler outage is a backfill, not a re-scheduling problem."</li>
+</ul>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

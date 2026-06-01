@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Uber — Rideshare Backend (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Uber — Rideshare Backend (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Hard · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build Uber. A rider requests a ride; the system matches them with a nearby driver; both see each other's live location; on drop-off, payment captures. 100M monthly riders, 5M drivers, 20M rides/day, peak ~1500 rides/sec, ~1M concurrent drivers reporting GPS at 4 Hz.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Rider requests a ride from origin to destination; system matches an available driver.
+- Both sides see each other's live location during the trip.
+- On completion, capture payment.</p>
+<p>I'd defer Uber Eats, surge pricing depth, driver onboarding/background checks, and ride pooling (UberPool) beyond mentioning it.</p>
+<p><strong>Non-functional</strong>
+- Match latency p99 &lt; 5 s — riders won't wait.
+- Live location updates within 1 s.
+- Strong consistency on ride state machine (requested → matched → in-progress → completed).
+- Regional isolation — one city's outage doesn't stall others.
+- Highly available — money on the line.</p>
+<p><strong>Capacity</strong>
+- 1M concurrent drivers × 4 Hz GPS = 4M GPS writes/sec.
+- 1500 rides/sec peak.
+- Per ride: ~30 min of GPS pings × 240 pings/min = 7200 GPS pings persisted per ride.
+- Live location state is tiny: 1M drivers × ~80 B latest-location record ≈ 80 MB primary, a few hundred MB with replicas. The dominant cost is the stream: 4M pings/sec × ~100 B ≈ 400 MB/sec, ~35 TB/day before compression/replication.
+- Ride state is small: 20M rides/day × ~1 KB/ride ≈ 20 GB/day primary; it must be transactionally correct, not huge.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Rider</strong> — <code>rider_id</code>.</li>
+<li><strong>Driver</strong> — <code>driver_id</code>, current location, status (offline / available / on-trip), current ride.</li>
+<li><strong>Ride</strong> — <code>ride_id, rider, driver, origin, destination, status, fare</code>.</li>
+<li><strong>GPSPing</strong> — <code>(driver_id or rider_id), lat, lng, ts</code>.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST  /v1/rides                  { origin, destination }   → { ride_id, status: requested }
+GET   /v1/rides/{id}             → Ride
+WS    /v1/rides/{id}/stream      → push: state changes + counterparty location
+
+POST  /v1/drivers/location       { lat, lng }   (auth: driver)
+POST  /v1/drivers/rides/{id}/{action}    // accept, pickup, dropoff
+</code></pre>
+<p>User from token. Ride state transitions idempotent on <code>(ride_id, action)</code>.</p>
+<p>Ride cursors are not exposed; the server owns the ride state machine. Clients only submit actions, and each action is accepted if the current persisted state allows it.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<p>I'd partition the world by city/region. Each region is mostly autonomous.</p>
+<ol>
+<li><strong>Ride service.</strong> Owns the ride state machine. Sharded by <code>ride_id</code>, but routing ensures all rides for one region land on a regional cluster.</li>
+<li><strong>Driver location service.</strong> Drivers POST GPS at 4 Hz → ingest writes to a regional Redis geospatial index (<code>GEOADD</code>) and to Kafka for downstream consumers (analytics, anti-fraud, trip records).</li>
+<li><strong>Matching service.</strong> Triggered on ride request:
+   - Query nearby drivers in the rider's S2 cell + ring (cheap GEORADIUS).
+   - Filter to available drivers (status = available).
+   - Score: ETA to pickup × driver acceptance rate × surge willingness.
+   - Offer to top candidate; on reject/timeout, move to next.</li>
+<li><strong>Notification.</strong> Driver app receives offer over a persistent WS or push channel. Driver accepts within ~15 s or the offer reroutes.</li>
+<li><strong>Trip tracker.</strong> Once matched, both rider and driver share a WS connected to the ride's channel; pings from one side fan out to the other.</li>
+<li><strong>Pricing service.</strong> On ride creation, estimate fare from a heuristic (base + per-km + per-min + surge multiplier for the cell). On dropoff, finalize from actual trip data.</li>
+<li><strong>Payment.</strong> Out of scope to design, in scope to draw. Capture after dropoff via the payment gateway.</li>
+</ol>
+<p>End-to-end narration: Alice taps "Request UberX" → ride service writes ride row (status=requested) and asks matcher → matcher GEORADIUSes for nearby drivers, picks Driver 42 → notification pushes offer → 42 accepts → ride state → <code>matched</code>, driver assigned. Both apps open WS to the ride channel. Driver location pings stream from 42 → ingest → fan-out to Alice's WS. At pickup, driver hits "Pickup" → ride state → <code>in_progress</code>. At dropoff, ride state → <code>completed</code>, fare finalized, payment captured.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">+------------------------+          +------------------------+
+| Rider App              |          | Driver App             |
++-----+------------------+          +-----+------------------+
+      |                               |
+POST /v1/rides, WS /v1/rides/{id}/stream
+                                      POST /v1/drivers/location
+                                      POST /v1/drivers/rides/{id}/accept
+      v                               v
++----------------------------------------------------------------+
+| API Gateway / Regional Routing                                 |
++------------+----------------------+----------------------------+
+             |                      |
+             v                      v
++---------------------+      +----------------------+    +----------------+
+| Ride Service        |&lt;----&gt;| Matching Service     |&lt;--&gt;| Location Svc   |
+| state machine       |      | offer leasing        |    | GPS ingest     |
++----------+----------+      +----------+-----------+    +-------+--------+
+           |                            |                        |
+           | ride events                | offer push              | GPS pings
+           v                            v                        v
++-----------------------------------------------------------------------+
+| Async / Event Row                                                     |
+| Notification/Offer Gateway -&gt; driver offer WS                         |
+| Kafka ride_events + GPS stream -&gt; Pricing / Payment / Analytics       |
+| trip traces compacted into object/columnar GPS history                |
++--------------------------+--------------------------------------------+
+                           |
+                           v
++-----------------------------------------------------------------------+
+| Stores / Caches                                                       |
+| geo:{region}:{s2_cell} Redis geo/zset member=driver_id TTL 10s        |
+| driver:{driver_id}:status KV {available,on_trip,ride_id,version}      |
+| offer:{driver_id} -&gt; ride_id Redis NX EX 15                           |
+| rides:{region} SQL/Spanner row, sharded by region + ride_id           |
+| Kafka ride_events keyed by ride_id; GPS history by region,date        |
++------------------------------+----------------------------------------+
+                               |
+                               | geo/status miss or stale GPS
+                               v
+                      +-------------------------+
+                      | Wider S2 ring search    |
+                      | pause affected cells    |
+                      +-------------------------+
+
+Primary write: ride request -&gt; match -&gt; offer lease -&gt; accept CAS -&gt; events.
+Primary read: ride WS -&gt; latest state + counterparty location + replay by seq.
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete store contracts.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / data structure</th>
+<th style="text-align: right;">Entry size + TTL</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Driver geo</td>
+<td><code>geo:{region}:{s2_cell}</code> Redis geo/zset member=<code>driver_id</code></td>
+<td style="text-align: right;">~40 B/member, TTL 10s</td>
+<td><code>region+s2_cell</code></td>
+</tr>
+<tr>
+<td>Driver status</td>
+<td><code>driver:{driver_id}:status</code> KV <code>{available,on_trip,ride_id,version}</code></td>
+<td style="text-align: right;">~100 B, TTL while online</td>
+<td><code>driver_id</code></td>
+</tr>
+<tr>
+<td>Offer lease</td>
+<td><code>offer:{driver_id}</code> → <code>ride_id</code> with <code>NX EX 15</code></td>
+<td style="text-align: right;">~40 B, TTL 15s</td>
+<td><code>driver_id</code></td>
+</tr>
+<tr>
+<td>Ride truth</td>
+<td><code>rides:{region}</code> SQL/Spanner row</td>
+<td style="text-align: right;">~1 KB, retained years</td>
+<td><code>region, ride_id</code></td>
+</tr>
+<tr>
+<td>Ride event log</td>
+<td>Kafka <code>ride_events</code></td>
+<td style="text-align: right;">~200 B/event, 7–30 days hot</td>
+<td><code>ride_id</code></td>
+</tr>
+<tr>
+<td>GPS history</td>
+<td>object/columnar store partitioned by date + region</td>
+<td style="text-align: right;">20–100 B/ping compressed, 30–90 days hot</td>
+<td><code>region, date</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Capacity by store.</strong> The hot matcher state is tiny compared with the stream: <code>1M online drivers × 40 B × 3</code> is ~120 MB for geo entries, and status rows are ~300 MB with replicas. Offer leases are tiny: even <code>1500 rides/sec × 15 s × 40 B × 3</code> is under 3 MB. Ride truth is <code>20M rides/day × 1 KB × 3</code> or ~60 GB/day. The expensive path is GPS history and Kafka retention: <code>4M pings/sec × 100 B</code> is ~35 TB/day before compression/replication, so I keep latest location in Redis, short retention in Kafka, and compact trip traces into columnar object storage.</p>
+<p><strong>Ride request path trace.</strong> Client → ride service creates <code>rides</code> row with <code>requested</code> → matcher queries nearby S2 cells in parallel from Redis geo → reads driver status for top candidates in parallel → writes <code>offer:{driver_id}</code> lease with <code>NX EX 15</code> → notification pushes offer → driver accept calls ride service → ride service conditionally updates ride <code>requested→matched</code> and driver <code>available→on_trip</code> in one transaction/compare-and-set → emits <code>ride.matched</code> to Kafka. If the first driver times out, the lease expires and the matcher tries the next candidate.</p>
+<p><strong>Hot and cold API paths.</strong></p>
+<table>
+<thead>
+<tr>
+<th>API path</th>
+<th>Hot path</th>
+<th>Cold/fallback path</th>
+<th>Cursor/session state</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /v1/rides</code></td>
+<td>Create ride row → query nearby geo cells in parallel → lease driver → push offer</td>
+<td>Sparse suburb expands S2 rings and returns longer ETA while keeping ride <code>requested</code></td>
+<td>ride_id, matcher attempt number, offer lease</td>
+</tr>
+<tr>
+<td>Driver accept</td>
+<td>Validate <code>offer:{driver_id}</code> → CAS ride and driver status in one region</td>
+<td>If lease expired, return stale offer and app fetches current status</td>
+<td>offer lease token, ride state version</td>
+</tr>
+<tr>
+<td><code>WS /rides/{id}/stream</code></td>
+<td>Ride channel sends state changes + counterparty latest location</td>
+<td>On reconnect, replay ride events since last sequence and send latest known location</td>
+<td>per-connection last event seq</td>
+</tr>
+<tr>
+<td><code>POST /drivers/location</code></td>
+<td>Update Redis geo/status and append ping to Kafka</td>
+<td>If Kafka lags, keep latest Redis update but degrade analytics/trip trace</td>
+<td>heartbeat timestamp; driver status version</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Geo-indexing at 4M GPS writes/sec.</strong> Redis geospatial index per region. Each region's Redis sharded into multiple cells if a single Redis maxes out. Writes are <code>GEOADD driver:region:cell</code>; reads are <code>GEOSEARCH</code>. Sub-millisecond per op, fits in-memory.</p>
+<p>Why Redis/S2 instead of PostGIS or Elasticsearch: this path is high-write, low-retention, and needs nearest active drivers within seconds. PostGIS is great for durable spatial queries but not 4M/sec volatile writes; Elasticsearch adds indexing lag and heavier refresh costs. The durable GPS trail goes to Kafka/object storage, not the hot matcher.</p>
+<p>For ride truth, I would use a regional SQL/Spanner-style store rather than Cassandra because the state machine needs conditional transitions and driver assignment must not double-book. Cassandra is fine for append-only event history, but the source of truth for <code>requested→matched→completed</code> benefits from transactions or strong compare-and-set semantics.</p>
+<p><strong>Matching algorithm.</strong> Naive nearest-driver is greedy and unfair. Better: batched matching every 1–2 s collects pending requests + available drivers in a cell, runs a bipartite assignment minimizing total ETA. Mention Hungarian or auction-style matching as the production lever. Also: drivers can be offered to multiple riders but lock the first to accept.</p>
+<p><strong>Concurrency on driver assignment.</strong> Two ride requests in the same area could pick the same driver. Use Redis <code>SET driver:42:offered ride:99 NX EX 15</code> to lease the driver for 15 s while the offer is outstanding. If they reject, lease expires and they're eligible again.</p>
+<p><strong>GPS fan-out.</strong> A trip has 1 driver and 1 rider — fan-out is 1:1 per trip. The challenge is the ingest rate (4M/sec), not the fan-out. Use ingest workers per region with stateless write-through to Redis. Persist to Kafka for analytics, then to cold storage.</p>
+<p><strong>Ride state machine.</strong> Owned by the ride service. Each transition is a single row update with a state check (<code>UPDATE rides SET status='completed' WHERE id=X AND status='in_progress'</code>) to enforce legal transitions. Emit Kafka events on each transition for downstream services.</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Allowed next state</th>
+<th>Source of truth</th>
+<th style="text-align: right;">Latency target</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>requested</code></td>
+<td><code>matched</code>, <code>canceled</code></td>
+<td>ride row + matcher attempt</td>
+<td style="text-align: right;">&lt;5 s to first offer</td>
+</tr>
+<tr>
+<td><code>matched</code></td>
+<td><code>driver_arrived</code>, <code>canceled</code></td>
+<td>ride row + driver status</td>
+<td style="text-align: right;">immediate CAS</td>
+</tr>
+<tr>
+<td><code>driver_arrived</code></td>
+<td><code>in_progress</code>, <code>canceled_no_show</code></td>
+<td>ride row</td>
+<td style="text-align: right;">&lt;500 ms</td>
+</tr>
+<tr>
+<td><code>in_progress</code></td>
+<td><code>completed</code>, <code>support_intervention</code></td>
+<td>ride row + trip pings</td>
+<td style="text-align: right;">&lt;500 ms</td>
+</tr>
+<tr>
+<td><code>completed</code></td>
+<td>terminal</td>
+<td>ride row + payment idempotency</td>
+<td style="text-align: right;">payment may settle async</td>
+</tr>
+</tbody>
+</table>
+<p>Interview punch line: "Location can be eventually consistent; the ride state machine cannot, because that is where money, safety, and driver assignment meet."</p>
+<p><strong>ETA prediction.</strong> v1: haversine distance × city avg speed + buffer. v2: routed ETA from a map service that knows current traffic. v3: ML model fed by historical trip times. Each level adds latency and complexity; we'd start at v1 and call out the upgrade path.</p>
+<p><strong>Surge pricing.</strong> Per-S2-cell rolling demand/supply ratio; surge multiplier = piecewise function of the ratio. Recomputed every minute, written to a Redis cache the pricing service reads on ride creation. Show surge to rider before they request.</p>
+<p><strong>Two-index framing.</strong> Drivers are indexed by location for matching (<code>geo:{region}:{s2_cell}</code>) and by identity for correctness (<code>driver:{driver_id}:status</code>). Matching reads both: the geo index finds candidates, but the driver status row decides whether a driver is actually assignable. This is the same active-driver dataset optimized for two access patterns.</p>
+<p><strong>Failure modes.</strong>
+- Driver app dies mid-trip: server's <code>last_ping &gt; 30s</code> triggers a check; rider sees "trying to reconnect."
+- Network split mid-payment: payment is idempotent on <code>ride_id</code>, retried.
+- Rider cancels post-match but pre-pickup: small cancellation fee, driver freed.</p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th style="text-align: right;">Latency budget</th>
+<th>Fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot downtown cell</td>
+<td>Batched matching</td>
+<td>Redis geo + driver status</td>
+<td style="text-align: right;">Match &lt;5s</td>
+<td>Expand cell ring, reduce offer timeout, batch assignment every 1s</td>
+</tr>
+<tr>
+<td>Sparse suburb</td>
+<td>Wider search</td>
+<td>Adjacent S2 rings + ETA service</td>
+<td style="text-align: right;">Match &lt;10s</td>
+<td>Show longer ETA, keep ride requested, let rider cancel free</td>
+</tr>
+<tr>
+<td>Driver GPS stale</td>
+<td>Degraded tracking</td>
+<td>Last ping + route estimate</td>
+<td style="text-align: right;">UI update &lt;1s</td>
+<td>Extrapolate briefly; mark driver unavailable after 30s</td>
+</tr>
+<tr>
+<td>Redis geo shard down</td>
+<td>Conservative fallback</td>
+<td>Last-known status + Kafka lag monitor</td>
+<td style="text-align: right;">Match pauses locally</td>
+<td>Stop new matches in affected cells; existing rides continue</td>
+</tr>
+<tr>
+<td>Payment gateway slow</td>
+<td>Async capture</td>
+<td>Ride completed event + payment idempotency</td>
+<td style="text-align: right;">User receipt may lag</td>
+<td>Mark ride completed, retry capture, notify if manual review needed</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Regional isolation.</strong> Each city has its own ride/matching/Redis stack. Cross-region failures are contained. Global services only for identity, ride history aggregation, and payment.</p>
+<p><strong>What I'd defer.</strong> UberPool matching (multi-stop optimization), driver heatmaps, fare splitting, scheduled rides, driver routing optimization, fraud detection.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

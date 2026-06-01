@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment System — Stripe / PayPal Class (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Payment System — Stripe / PayPal Class (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Hard · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build a payment system. Merchants charge customers' cards via our API; we route to card networks (Visa/MC) or wallets, settle funds, handle refunds and disputes, and never lose or double-charge a customer. 100M transactions/day, peak ~5k/sec, average txn $30. Failure modes around money are the whole interview.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Merchant submits a charge intent (customer payment method + amount).
+- System authorizes with the card network, captures funds, returns success/failure.
+- Refund and partial-refund.
+- Webhook callbacks to merchants on terminal events.</p>
+<p>I'd defer recurring billing, subscriptions, multi-currency conversion, and fraud-model details.</p>
+<p><strong>Non-functional</strong>
+- <strong>Correctness above all.</strong> Never double-charge, never silently drop a charge.
+- Idempotency on all writes — networks retry; we must too without duplicating money movement.
+- Strong consistency on ledger balances.
+- Durable audit log of every state transition (regulatory).
+- p99 charge &lt; 2 s (most of that is the card network).
+- High availability — payments down means real revenue loss for every merchant.</p>
+<p><strong>Capacity</strong>
+- 100M txns/day = 1200/sec average, 5k/sec peak.
+- ~7-year retention for transaction records (PCI / regulatory).
+- Hot traffic is not huge; retained money history is. 100M/day × 7 years ≈ 255B transactions.
+- If each transaction creates ~4 ledger entries at ~250 B, ledger storage is ~255 TB raw, ~765 TB with 3 replicas before indexes/cold compression. Ledger + audit are the dominant costs.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>PaymentIntent</strong> — the merchant's order: <code>intent_id, merchant_id, amount, currency, customer_id, status</code>.</li>
+<li><strong>Charge</strong> — an attempt to move money: <code>charge_id, intent_id, status, network_ref</code>.</li>
+<li><strong>LedgerEntry</strong> — double-entry: <code>(account, debit/credit, amount, ref)</code>. Authoritative.</li>
+<li><strong>PaymentMethod</strong> — tokenized card / wallet handle.</li>
+<li><strong>Refund</strong> — partial or full reverse of a charge.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST  /v1/payment_intents                { amount, currency, payment_method, customer }   (Idempotency-Key header required)   → PaymentIntent
+POST  /v1/payment_intents/{id}/confirm                                                                                       → Charge
+POST  /v1/charges/{id}/refunds            { amount }                                                                          → Refund
+GET   /v1/charges/{id}
+POST  /v1/webhooks/{merchant_id}/events                                                                                       // outgoing
+</code></pre>
+<p><strong>Idempotency-Key is mandatory on every state-changing request.</strong> That's the cornerstone.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>API gateway.</strong> Auth, rate-limit, idempotency-key middleware: looks up <code>(merchant_id, key)</code> → returns cached response if seen, else passes through.</li>
+<li><strong>PaymentIntent service.</strong> Writes the intent row in a strong-consistency store (Spanner-class, or sharded MySQL with a master per shard). State machine: <code>requires_payment_method → requires_confirmation → processing → succeeded | failed</code>.</li>
+<li><strong>Authorization service.</strong> On confirm, build the network message (ISO 8583 or HTTP for processor APIs), route to a card-network-adapter. Persist the outgoing attempt before sending; persist the response. On timeout, mark <code>unknown</code> (not <code>failed</code>) and reconcile later — never assume failure on timeout, that's how you double-charge.</li>
+<li><strong>Ledger service.</strong> Double-entry bookkeeping. Every money movement = a debit on one account + a credit on another, totals must balance. Examples:
+   - Authorization: pending_authorization (customer) ↔ pending_capture (merchant payable).
+   - Capture: pending_capture → merchant_balance; customer pending → settled.
+   - Refund: reverse the entries.
+   Stored in an append-only ledger table, partitioned by account.</li>
+<li><strong>Webhook service.</strong> On terminal state, enqueue a delivery to the merchant's webhook URL. Retry with backoff up to 3 days; persisted queue.</li>
+<li><strong>Network adapters.</strong> Per-card-network or processor (e.g., Visa, Stripe Connect). Each owns its connection pool, message format, and retry policy.</li>
+<li><strong>Reconciliation.</strong> Daily batch job pulls the day's network settlement file, compares against our ledger, flags discrepancies.</li>
+<li><strong>Audit log.</strong> Every state transition appended to an immutable log (Kafka with very long retention + cold storage).</li>
+</ol>
+<p>End-to-end narration: merchant calls <code>POST /payment_intents</code> with idempotency key K. Gateway checks; never seen. Intent row written (status=<code>requires_confirmation</code>). Merchant calls <code>/confirm</code> → auth service sends ISO 8583 message to Visa → Visa responds approved in 800 ms → ledger writes double-entry (customer pending: −$30; merchant payable: +$30) → intent.status=<code>succeeded</code> → webhook fired. Two days later, settlement file from Visa arrives → reconciliation confirms our records match → ledger entries become settled.</p>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">                         +------------------------------+
+                         | MERCHANT + CARD NETWORKS    |
+                         +----------+-----------+-------+
+                                    |           |
+        POST /payment_intents       |           | settlement files
+        POST /confirm, /refunds     |           v
+                                    v    +------+--------+
+                         +----------+---+| Reconciliation|
+                         | Gateway /    || Service       |
+                         | Idempotency  |+------+--------+
+                         +------+-------+       |
+                                |               | compare
+                                v               v
+                         +------+-------+  +----+---------+
+                         | PaymentIntent|  | Ledger       |
+                         | Service      |  | Service      |
+                         +------+-------+  +----+---------+
+                                |               ^
+                         confirm/refund         | balanced entries
+                                v               |
+                         +------+-------+       |
+                         | Authorization|-------+
+                         | Service      |
+                         +------+-------+
+                                | persisted request before send
+                                v
+                         Network Adapter --&gt; Visa / MC / Wallets
+                                |
+                                v terminal event
+        +----------------------------------------------------------+
+        | STORE / CACHE                                            |
+        | idem:{merchant_id}:{key} status + response pointer       |
+        | pi:{intent_id} strongly consistent intent row            |
+        | ch:{charge_id} network request/response/status           |
+        | ledger:{account_id}:{seq} append-only debit/credit entry |
+        | webhook:{merchant_id}:{event_id} outbox delivery row     |
+        | audit/yyyy/mm/dd/{partition} immutable event stream      |
+        +-----------+-----------------------------+----------------+
+                    | old charge/history miss     ^ outbox retry
+                    v                             |
+          +-------------------+          +--------+-------+
+          | Cold archive      |          | Webhook        |
+          | + audit storage   |          | Service        |--&gt; merchant webhook
+          +-------------------+          +----------------+
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Concrete stores and shard keys.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key pattern</th>
+<th>Data structure / entry</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Idempotency</td>
+<td><code>idem:{merchant_id}:{key}</code></td>
+<td>status + response hash/body pointer, 1–4 KB</td>
+<td>24–72 h hot, 7 d durable</td>
+<td><code>(merchant_id, key)</code></td>
+</tr>
+<tr>
+<td>PaymentIntent</td>
+<td><code>pi:{intent_id}</code></td>
+<td>strongly consistent row, amount/status/customer, ~1 KB</td>
+<td>7 y</td>
+<td><code>merchant_id</code> + <code>intent_id</code></td>
+</tr>
+<tr>
+<td>Charge attempt</td>
+<td><code>ch:{charge_id}</code></td>
+<td>network request/response refs/status, ~1 KB</td>
+<td>7 y</td>
+<td><code>charge_id</code></td>
+</tr>
+<tr>
+<td>Ledger</td>
+<td><code>ledger:{account_id}:{seq}</code></td>
+<td>append-only debit/credit entry, ~250 B</td>
+<td>7 y hot/warm, archive longer</td>
+<td><code>account_id</code></td>
+</tr>
+<tr>
+<td>Outbox/webhook</td>
+<td><code>webhook:{merchant_id}:{event_id}</code></td>
+<td>destination/status/attempts/body pointer, ~1 KB</td>
+<td>retry 3 d, status 90 d</td>
+<td><code>merchant_id</code></td>
+</tr>
+<tr>
+<td>Audit log</td>
+<td><code>audit/yyyy/mm/dd/{partition}</code></td>
+<td>immutable event stream/object records, ~500 B/event</td>
+<td>7 y+</td>
+<td>date + partition</td>
+</tr>
+</tbody>
+</table>
+<p>The ledger is content and source of truth; caches and idempotency keys are control-plane safety rails. I would explicitly avoid making Redis authoritative for any money movement.</p>
+<p><strong>Capacity by store.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Store / index</th>
+<th>Math</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Idempotency</td>
+<td>100M/day × 2 KB avg × 3 ≈ 600 GB for 24 h; up to ~1.8 TB for 72 h</td>
+<td>hot safety rail, TTL-bounded</td>
+</tr>
+<tr>
+<td>PaymentIntent</td>
+<td>255B over 7 y × 1 KB × 3 ≈ 765 TB</td>
+<td>compress/archive cold years</td>
+</tr>
+<tr>
+<td>Charge attempt</td>
+<td>255B × 1 KB × 3 ≈ 765 TB</td>
+<td>includes network refs, not full PAN/card data</td>
+</tr>
+<tr>
+<td>Ledger</td>
+<td>255B txns × 4 entries × 250 B × 3 ≈ 765 TB</td>
+<td>authoritative money history</td>
+</tr>
+<tr>
+<td>Webhook outbox</td>
+<td>100M/day × 1 KB × 90 d × 3 ≈ 27 TB if status retained hot</td>
+<td>active retry set is much smaller</td>
+</tr>
+<tr>
+<td>Audit log</td>
+<td>255B txns × ~5 events × 500 B × 3 ≈ 1.9 PB raw</td>
+<td>cold object storage + compression dominates savings</td>
+</tr>
+<tr>
+<td>Settlement files</td>
+<td>100M/day × 200 B ≈ 20 GB/day raw</td>
+<td>batch reconciliation input</td>
+</tr>
+</tbody>
+</table>
+<p>Kafka is useful for audit/event fan-out, but it is not the ledger. The outbox row is committed with the state transition first, then a broker delivery can be retried. That keeps the durable payment state ahead of asynchronous notifications.</p>
+<p><strong>Confirm charge path.</strong>
+1. Gateway authenticates merchant and checks <code>idem:{merchant_id}:{key}</code>; if another request is in flight on the same key, it waits or returns the eventual result.
+2. PaymentIntent service CASes <code>requires_confirmation → processing</code> on <code>pi:{intent_id}</code>.
+3. In parallel where allowed, it loads the tokenized payment method from the vault and runs fraud/risk checks; if either fails, the intent transitions to <code>failed</code> with an audit event.
+4. Authorization service writes <code>ch:{charge_id}</code> as <code>network_request_persisted</code> before sending anything to the network.
+5. Network adapter sends the auth/capture request. Approved response triggers a ledger transaction: customer pending debit and merchant payable credit must commit together.
+6. Intent/charge transition to terminal state, outbox writes <code>webhook:{merchant_id}:{event_id}</code>, and the idempotency record stores the exact response.
+7. If the adapter times out, the charge remains <code>unknown</code>; retry/reconcile is keyed by <code>network_ref</code>, not by creating a second charge.</p>
+<p><strong>Refund and read paths.</strong>
+1. Refund request checks <code>idem:{merchant_id}:{refund_key}</code> and reads <code>ch:{charge_id}</code> on shard <code>charge_id</code>.
+2. Service verifies <code>refunded_amount + requested_amount &lt;= charge.amount</code>, then creates <code>refund:{refund_id}</code> and persists the outgoing network refund attempt before sending.
+3. On network approval, ledger writes the reversing double-entry rows on shard <code>account_id</code>; the charge's materialized <code>refunded_amount</code> updates with a CAS.
+4. <code>GET /v1/charges/{id}</code> reads <code>ch:{charge_id}</code>, <code>pi:{intent_id}</code>, and a ledger summary in parallel. If the charge is older than the hot retention window, the API falls through to the cold archive and may return slower but still audit-complete history.
+5. The only session state clients carry is the idempotency key. Pagination for merchant transaction exports uses an opaque cursor <code>{merchant_id, created_at, charge_id}</code> so exports do not rely on offset scans over money history.</p>
+<p><strong>Two-index framing.</strong> The ledger is account-keyed because balances are computed by account. Merchant dashboards are transaction-keyed by <code>merchant_id</code> and <code>created_at</code>. Those are two indexes over the same money events; the dashboard index can lag, but the ledger cannot.</p>
+<p><strong>Idempotency — the heart.</strong> Every mutating endpoint accepts an <code>Idempotency-Key</code>. Server stores <code>(merchant_id, key) → response, status</code> for ≥24 h. Repeat requests return the cached response without re-executing. Key store is a Redis cluster + a durable backing store. Critically, the key locks the operation: in-flight requests with the same key wait (with a timeout); subsequent requests return the result. Networks WILL retry; we must absorb retries safely.</p>
+<p><strong>Timeout = "unknown", not "failed".</strong> If the card network call times out, the truth is unknown. Marking the charge <code>failed</code> and accepting a retry could double-charge. Mark <code>processing/unknown</code>; reconcile later via the network's stand-in advice or settlement file. The merchant sees <code>pending</code>; the customer doesn't get billed twice.</p>
+<p><strong>Double-entry ledger.</strong> Every money movement is a balanced pair of entries. Total debits = total credits, always. Account balances are derived (sum of entries) or materialized for performance. Audit invariant: at any snapshot, the sum across all accounts is zero. This catches bugs that would otherwise hide.</p>
+<p><strong>State machine.</strong> PaymentIntent state transitions are tightly controlled by a CAS update: <code>UPDATE intent SET status='succeeded' WHERE id=X AND status='processing'</code>. Illegal transitions return error. Every transition emits an event for the audit log.</p>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Source of truth</th>
+<th>Allowed next states</th>
+<th>Recovery behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>requires_confirmation</code></td>
+<td><code>pi:{intent_id}</code></td>
+<td><code>processing</code>, <code>canceled</code></td>
+<td>safe to retry confirm with same key</td>
+</tr>
+<tr>
+<td><code>processing</code></td>
+<td>intent + charge row</td>
+<td><code>succeeded</code>, <code>failed</code>, <code>unknown</code></td>
+<td>do not expose as failed on timeout</td>
+</tr>
+<tr>
+<td><code>unknown</code></td>
+<td>charge row + network ref</td>
+<td><code>succeeded</code>, <code>failed</code></td>
+<td>reconcile via network advice/settlement file</td>
+</tr>
+<tr>
+<td><code>succeeded</code></td>
+<td>ledger committed</td>
+<td>refund/dispute flows only</td>
+<td>immutable success; no backward transition</td>
+</tr>
+<tr>
+<td><code>failed</code></td>
+<td>charge terminal reason</td>
+<td>new intent or new confirm attempt</td>
+<td>no ledger movement</td>
+</tr>
+</tbody>
+</table>
+<p>Why Spanner-class storage instead of Cassandra: we need transactional state transitions and ledger invariants more than write throughput. Sharded MySQL with a primary per shard is an honest alternative if we can keep account/merchant writes local; Cassandra is better for append-only audit, not authoritative balances.</p>
+<p><strong>Exactly-once webhook delivery.</strong> Merchants' webhook endpoints can also fail. Outgoing deliveries are persisted; retried with exponential backoff up to 3 days; merchants are expected to dedupe on the event ID (we include it).</p>
+<p><strong>PCI compliance.</strong> Card numbers (PAN) only ever pass through the tokenization service, which stores them encrypted in an isolated vault. Application code only ever sees tokens. Reduces our PCI scope.</p>
+<p><strong>Failover and durability.</strong> Single-region failure must not lose any intent. Multi-region active-active with conflict-free state model: intent_id includes region + random component; ledger is per-region for hot writes with global reconciliation.</p>
+<p><strong>Refunds.</strong> Refund = a separate state machine that mirrors the original charge in reverse. Idempotent on a refund-specific key. Network refund call → ledger entries that reverse the original. Partial refunds need careful arithmetic — track refunded_amount, never exceed charge.amount.</p>
+<p><strong>Disputes / chargebacks.</strong> Customer reports fraud → network sends a dispute event. We hold the disputed amount from merchant balance, kick off the evidence collection flow. Out of scope to design fully.</p>
+<p><strong>Reconciliation.</strong> Daily batch: pull network settlement file → join with our charges → assert match → flag mismatches for human review. This is the primary correctness check; an unreconciled day is an incident.</p>
+<p><strong>Hot merchant.</strong> Black Friday: one merchant doing 1000/sec. Their intents shard on merchant_id, so one shard takes the load. Pre-shard hot merchants across multiple sub-shards if needed.</p>
+<p><strong>Edge stress tests.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Edge</th>
+<th>Failure mode</th>
+<th>Fallback / invariant</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Network timeout</td>
+<td>charge truth unknown</td>
+<td>keep <code>unknown</code>; reconcile by <code>network_ref</code>, never create a second charge blindly</td>
+</tr>
+<tr>
+<td>Expired idempotency key</td>
+<td>merchant retries after TTL</td>
+<td>require client to query by intent/order reference before re-confirming</td>
+</tr>
+<tr>
+<td>Hot merchant</td>
+<td>one shard overloaded</td>
+<td>pre-shard by <code>(merchant_id, sub_shard)</code> while ledger accounts remain balanced</td>
+</tr>
+<tr>
+<td>Multi-region drift</td>
+<td>same intent confirmed in two regions</td>
+<td>region-scoped intent owner or global CAS on <code>pi:{intent_id}</code> fences duplicates</td>
+</tr>
+<tr>
+<td>Cold archive read</td>
+<td>5-year-old charge lookup</td>
+<td>fetch charge + ledger events from archive; p99 can be seconds, not on checkout path</td>
+</tr>
+</tbody>
+</table>
+<p>"The staff-level punch line: the network can be ambiguous, but my ledger cannot be; timeout creates an unknown state, never a second attempt that might move money twice."</p>
+<p><strong>What I'd defer.</strong> Subscriptions/recurring, multi-currency FX, payment method storage and reuse, fraud scoring depth, fees &amp; revenue share, sub-merchant marketplace flows (Connect).</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

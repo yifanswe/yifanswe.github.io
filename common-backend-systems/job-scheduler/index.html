@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Distributed Job Scheduler — Cron at Scale (walkthrough) — Yifan Li</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="shortcut icon" type="image/x-icon" href="/images/favicon.ico" />
+    <link rel="stylesheet" href="/css/style/monokai-sublime.min.css">
+    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" crossorigin="anonymous">
+    <script src="/js/jquery.min.js"></script>
+    <script src="/js/highlight.min.js"></script>
+    <script src="/js/highlight-init.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand"><a href="/">Yifan Li</a></div>
+        <nav class="topbar-nav">
+            <a href="/">Home</a>
+            <a href="/backend-fundamentals/">Backend Fundamentals</a>
+            <a href="/common-backend-systems/">Common Backend Systems</a>
+            <a href="/system-design-patterns/">System Design Patterns</a>
+            <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+        </nav>
+    </div>
+    <div class="article">
+        <a class="article-back" href="/common-backend-systems/">← Back to Common Backend Systems</a>
+        <h1 class="article-title">Distributed Job Scheduler — Cron at Scale (walkthrough)</h1>
+        <div class="article-meta">
+            <i class="fas fa-edit"></i> 2026/06/01 &nbsp;·&nbsp; Common Backend Systems
+        </div>
+        <details class="toc-inline toc" open>
+            <summary>Contents</summary>
+            <nav id="toc-nav-inline"></nav>
+        </details>
+        <aside class="toc-sticky toc">
+            <div class="toc-title">Contents</div>
+            <nav id="toc-nav"></nav>
+        </aside>
+        <div class="article-content">
+<p><strong>Difficulty:</strong> Hard · <strong>Total:</strong> ~45 min · <strong>Framework:</strong> Hello Interview Delivery</p>
+<p><strong>Scenario in one breath:</strong> Build a distributed cron / job scheduler. Users register jobs with a schedule (cron expression or one-shot timestamp) and a payload (URL to POST or function to invoke). The system fires each job at its scheduled time, exactly once, retries on failure. 10M registered jobs, peak ~100k jobs fire per second at top-of-minute, average job runtime 5 s.</p>
+<hr />
+<h2 id="1-requirements-5-min">1. Requirements (~5 min)</h2>
+<p><strong>Functional</strong>
+- Register a recurring or one-shot job with cron expression + handler.
+- Fire each job at its scheduled time within ~1 s.
+- At-most-once or at-least-once semantics (configurable); never silently miss.
+- Retry on failure with backoff.
+- Visibility: see job history, success/failure.</p>
+<p>I'd defer multi-tenancy depth and the handler runtime sandbox (assume HTTP webhook target).</p>
+<p><strong>Non-functional</strong>
+- Fire-time accuracy: p99 within 1 s of scheduled time.
+- Survive scheduler node failure without dropping firings.
+- <strong>No silent misses.</strong> Better to double-fire (and require idempotent handlers) than to miss.
+- Linear scale: 10M jobs, 100k fires/sec peak.</p>
+<p><strong>Capacity</strong>
+- 10M registered jobs × ~200 B metadata = 2 GB.
+- 100k fires/sec × ~5 s handler runtime = 500k concurrent in-flight executions.
+- Schedule metadata is tiny after replication (~2 GB × RF=3 = 6 GB). The dominant cost is run history and retry/audit events: if peak 100k fires/sec lasted an hour, at ~300 B/event × RF=3 that hour alone is ~324 GB before indexes.</p>
+<hr />
+<h2 id="2-core-entities-2-min">2. Core Entities (~2 min)</h2>
+<ul>
+<li><strong>Job</strong> — <code>job_id</code>, schedule (cron / one-shot), target (URL + payload), retry policy, owner.</li>
+<li><strong>JobInstance</strong> — a specific firing: <code>instance_id</code>, job_id, scheduled_at, status (queued/running/done/failed).</li>
+<li><strong>Lease</strong> — claim that prevents two workers from running the same instance.</li>
+</ul>
+<hr />
+<h2 id="3-api-5-min">3. API (~5 min)</h2>
+<pre><code>POST  /v1/jobs              { schedule, target, retry_policy }  → { job_id }
+GET   /v1/jobs/{id}/runs?cursor=...
+DELETE /v1/jobs/{id}
+POST  /v1/jobs/{id}/pause / resume
+</code></pre>
+<p>User from token. Job creation is idempotent on optional <code>client_id</code>.</p>
+<p>Run history cursors encode <code>{job_id, last_scheduled_at, last_instance_id}</code>. Handler invocations include <code>fire_id</code> so customers can dedupe retries on their side.</p>
+<hr />
+<h2 id="4-data-flow-5-min">4. Data Flow (~5 min)</h2>
+<p>Job registered → next_fire_at computed → indexed in time-bucket. Timing wheel walks buckets second-by-second → due jobs claimed by workers via lease → handler invoked → result recorded → next_fire_at recomputed.</p>
+<hr />
+<h2 id="5-high-level-design-1015-min">5. High Level Design (~10–15 min)</h2>
+<ol>
+<li><strong>Job catalog.</strong> Sharded MySQL keyed by <code>job_id</code>. Row holds the schedule, target, and <code>next_fire_at</code>.</li>
+<li><strong>Scheduling index.</strong> A time-bucketed index for "due in next N seconds." Two flavors that fit the question:
+   - <strong>Timing wheel:</strong> in-memory bucket array, slot per second (or finer), each slot holds <code>job_id</code>s due in that slot. Cheap O(1) per slot tick. Persisted state in a backing store so a crash doesn't lose state.
+   - <strong>Sorted set / heap by <code>next_fire_at</code>:</strong> Redis ZSET keyed on <code>next_fire_at</code>. Workers <code>ZRANGEBYSCORE 0 now</code> and consume.</li>
+<li><strong>Dispatcher.</strong> Walks the timing wheel/ZSET each tick (1 Hz). For each due job, writes a <code>JobInstance</code> row (status=queued) and pushes a fire event to the job queue (Kafka or SQS).</li>
+<li><strong>Worker pool.</strong> Pulls fire events. Each worker:
+   - Acquires a lease (Redis <code>SET instance:I worker:W NX EX 60</code>).
+   - Invokes the handler (HTTP POST to target with payload + signed retry token).
+   - Records result; releases lease.</li>
+<li><strong>Retry policy.</strong> On failure, compute next retry time = <code>now + backoff(attempt)</code>. Schedule a new <code>JobInstance</code> with that fire time. Cap attempts.</li>
+<li><strong>Next-fire recomputation.</strong> On successful fire, recompute <code>next_fire_at</code> from the cron expression and update both the catalog row and the scheduling index.</li>
+<li><strong>Coordination.</strong> Multiple dispatcher instances. Each is responsible for a shard of <code>job_id</code>s (consistent hash). Leader election within a shard for the active dispatcher; standbys take over on failure.</li>
+</ol>
+<p>End-to-end narration: at 09:59:55, dispatcher walks the timing wheel for <code>10:00:00</code> slot, finds 100k jobs due → writes 100k JobInstance rows (batched) → pushes to Kafka. At 10:00:00, workers pull from Kafka, lease each instance, fire HTTP POST to the target. Handler responds 200 in 200 ms → result recorded → dispatcher recomputes next fire (e.g., <code>10:01:00</code> for a every-minute job) and reinserts into the timing wheel.</p>
+<p>Concrete stores:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Key / structure</th>
+<th style="text-align: right;">Entry size</th>
+<th>TTL / retention</th>
+<th>Shard key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Job catalog</td>
+<td><code>job:{job_id}</code> row with schedule, target, next_fire_at</td>
+<td style="text-align: right;">~200-500 B</td>
+<td>until deleted</td>
+<td><code>job_id</code></td>
+</tr>
+<tr>
+<td>Schedule index</td>
+<td><code>due:{epoch_second}:{shard}</code> list or ZSET member=<code>job_id</code></td>
+<td style="text-align: right;">~24 B/member</td>
+<td>until fired/rebuilt</td>
+<td><code>job_id % N</code></td>
+</tr>
+<tr>
+<td>Instance DB</td>
+<td><code>instance:{job_id}:{scheduled_at}</code> status row</td>
+<td style="text-align: right;">~300 B</td>
+<td>30-90 days</td>
+<td><code>job_id</code></td>
+</tr>
+<tr>
+<td>Lease</td>
+<td><code>lease:{instance_id}</code> -&gt; worker + fencing token</td>
+<td style="text-align: right;">~100 B</td>
+<td>60 s TTL, renewed</td>
+<td><code>instance_id</code></td>
+</tr>
+<tr>
+<td>Fire queue</td>
+<td>topic <code>fires.{shard}</code> event=<code>instance_id</code></td>
+<td style="text-align: right;">~200 B</td>
+<td>24 h replay</td>
+<td><code>job_id % N</code></td>
+</tr>
+</tbody>
+</table>
+<p>Capacity by store:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Math</th>
+<th>Dominant knob</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Job catalog</td>
+<td>10M jobs * 500 B * RF=3 ~= 15 GB</td>
+<td>small; shard count matters more than bytes</td>
+</tr>
+<tr>
+<td>Schedule index</td>
+<td>10M due entries * 24 B * RF=2 ~= 480 MB</td>
+<td>bucket width and rebuild source</td>
+</tr>
+<tr>
+<td>Instance DB</td>
+<td>50M fires/day * 300 B * RF=3 ~= 45 GB/day; a 100k/sec hour ~= 324 GB</td>
+<td>history retention and rollups</td>
+</tr>
+<tr>
+<td>Leases</td>
+<td>500k in-flight * 100 B * RF=2 ~= 100 MB</td>
+<td>TTL/heartbeat interval</td>
+</tr>
+<tr>
+<td>Fire queue</td>
+<td>50M/day * 200 B * RF=3 ~= 30 GB/day; sustained peak would be much higher</td>
+<td>retention and batching</td>
+</tr>
+</tbody>
+</table>
+<h3 id="system-components-diagram">System Components Diagram</h3>
+<pre><code class="language-text">             +---------------------------+
+             |   Scheduler UI / Client   |
+             +------+---------------+----+
+                |               |
+              POST /jobs        GET /runs
+                |               |
+                v               v
+           +-------------+   +-------------+
+           | Job API     |   | History API |
+           | idempotent  |   | cursor read |
+           +------+------+   +------+------+
+              |                 ^
+              | job + due entry | run rows
+              v                 |
+   +----------------------------------------------------------------+
+   | Stores / Caches                                                |
+   | job:{job_id} schedule,target,next_fire_at                      |
+   | due:{epoch_second}:{shard} list/ZSET job_ids                   |
+   | instance:{job_id}:{scheduled_at} status row                    |
+   | lease:{instance_id} worker + fencing token                     |
+   | fires.{shard} compact event, 24h replay                        |
+   +----------+----------------------+------------------------------+
+      | due tick             | schedule index miss/corrupt
+      v                      v
+    +-------------+        +-------------------+
+    | Dispatcher  |        | Repair scan from  |
+    | shard owner |        | job:{job_id} rows |
+    +------+------+        +-------------------+
+       | instance + fire event
+       v
+    +-------------+       retry/backoff      +----------------+
+    | Fire queue  |&lt;-------------------------| Retry scheduler|
+    | fires.*     |                          +----------------+
+    +------+------+
+       |
+       v
+    +-------------+      POST target + fire_id      +-------------+
+    | Worker pool |-------------------------------&gt; | HTTP target |
+    | lease/call  |                                +-------------+
+    +------+------+
+       | result
+       v
+         Instance DB status update
+
+    +----------------+
+    | etcd/ZooKeeper |
+    | shard leases   |---- leader lease ----&gt; Dispatcher
+    +----------------+
+</code></pre>
+<hr />
+<h2 id="6-deep-dives-10-min">6. Deep Dives (~10 min)</h2>
+<p><strong>Why a timing wheel.</strong> With 10M jobs and 100k firing per second peak, scanning a heap for due jobs every second is expensive. Timing wheel costs O(active jobs per slot) per tick. For a 1-hour wheel at 1 Hz, that's 3600 slots; jobs landing beyond the wheel are handled by a hierarchical second wheel (e.g., day wheel feeds the hour wheel). Hierarchical timing wheels are the classic answer.</p>
+<p>Why not only Redis ZSET: a ZSET by <code>next_fire_at</code> is a good persistent index and simpler v1, but at top-of-minute it creates hot range scans and lock contention. The timing wheel gives predictable per-slot work; the ZSET/Kafka log is the recovery source.</p>
+<p>Tech choice defense: MySQL/Postgres is fine for the job catalog because updates are per-job and need transactional create/pause/delete semantics; DynamoDB also works if the interview leans cloud-native, but secondary access by owner/history is more awkward. Kafka is better than direct worker RPC because dispatch bursts need buffering and replay; SQS is simpler operationally but gives less control over partition ownership and ordered replay by <code>job_id % N</code>. Redis leases are fast enough for second-level coordination, while etcd/ZooKeeper should only own dispatcher shard leadership, not every job instance.</p>
+<p><strong>Persistence + recovery.</strong> Timing wheel is in-memory; if the process dies, in-flight slots are lost. Two defenses:
+- Backed by a sorted set in Redis (so on restart the wheel rebuilds).
+- Periodic snapshot to durable storage + replay of recent events from a Kafka topic.</p>
+<p>Register path trace: API validates cron and owner quota -&gt; writes <code>job:{job_id}</code> with <code>next_fire_at</code> -&gt; writes <code>due:{epoch_second}:{shard}</code> -&gt; emits <code>job.registered</code> audit event. The catalog row and schedule index update must be atomic or reconciled by a repair job that scans for catalog rows missing from the index.</p>
+<p>Fire path trace: dispatcher owns shard -&gt; reads wheel slot -&gt; creates <code>instance:{job_id}:{scheduled_at}</code> with idempotent insert -&gt; publishes <code>fires.{shard}</code> -&gt; worker acquires <code>lease:{instance_id}</code> -&gt; invokes target -&gt; writes terminal status -&gt; recomputes next fire and reinserts job.</p>
+<p>Hot fire path, step by step:
+1. Dispatcher owns hash range <code>job_id % N = shard</code> through a coordinator lease.
+2. At tick <code>T</code>, it drains <code>due:{T}:{shard}</code> from memory; if the wheel slot is missing, it falls back to the Redis/ZSET recovery index for <code>[T - grace, T]</code>.
+3. It batch-inserts <code>instance:{job_id}:{scheduled_at}</code> with idempotency on <code>(job_id, scheduled_at, attempt)</code>.
+4. It publishes compact fire messages to <code>fires.{shard}</code> and commits the slot watermark.
+5. Worker pulls by shard, reads the instance row, acquires <code>lease:{instance_id}</code> with a fencing token, calls the target, and writes the terminal status only if its fencing token is current.</p>
+<p>Cold / recovery path: after dispatcher failure, a standby claims the shard, reads the last committed watermark, scans the schedule index for <code>[watermark, now]</code>, and recreates missing instance rows. Duplicate fire events are allowed because the instance insert and customer-visible <code>fire_id</code> are idempotent; misses are not allowed.</p>
+<p>Run-history pagination uses <code>{job_id, last_scheduled_at, last_instance_id}</code> so the UI walks the <code>job_id</code> shard in time order without offset scans.</p>
+<p><strong>Exactly-once vs at-least-once.</strong> True exactly-once across a distributed scheduler is fool's gold. Promise at-least-once + require idempotent handlers (via a <code>fire_id</code> the handler can dedupe on). Document this clearly in the SDK.</p>
+<p><strong>Lease-based double-fire prevention.</strong> Worker acquires <code>SET instance:I worker:W NX EX 60</code>. If worker dies, lease expires and a different worker can re-claim. Worker periodically renews the lease (heartbeat) for long-running jobs.</p>
+<p><strong>Hot-second problem.</strong> Top-of-minute is a thundering herd — everyone's <code>*/1 * * * *</code> job lands on <code>:00</code>. Two mitigations:
+- <strong>Jitter at registration:</strong> automatically jitter the schedule by ±5 s (with user opt-out for strict schedules).
+- <strong>Smear within slot:</strong> during dispatch, spread firings uniformly within the second using a small jitter buffer.</p>
+<p><strong>Scaling the dispatch.</strong> Shard <code>job_id</code> across N dispatcher instances. Each owns a hash range; jobs only fire from one owner. Coordinator (etcd / ZooKeeper) tracks ownership; on failure, range fails over.</p>
+<p><strong>Backpressure on the worker pool.</strong> If targets are slow, the queue grows. Auto-scale workers on queue depth. For burst targets, allow per-target concurrency limits (don't pile 10k concurrent calls on a single endpoint).</p>
+<p><strong>Two-view model.</strong> The scheduler keeps the same future firing in two views: the catalog row (<code>job:{job_id}.next_fire_at</code>) is the source of truth for repair, while the schedule index (<code>due:{second}:{shard}</code> or ZSET) is the serving index for the next tick. The repair loop continuously reconciles them so a lost bucket does not become a silent miss.</p>
+<p>Job instance state machine:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Transition</th>
+<th>Latency / behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scheduled</td>
+<td>future firing</td>
+<td>schedule index + catalog</td>
+<td>tick reaches <code>scheduled_at</code></td>
+<td>p99 within 1 s target</td>
+</tr>
+<tr>
+<td>Queued</td>
+<td>fire event emitted</td>
+<td>fire queue + instance row</td>
+<td>worker pull</td>
+<td>seconds under normal load</td>
+</tr>
+<tr>
+<td>Running</td>
+<td>lease held</td>
+<td>lease + worker heartbeat</td>
+<td>target returns or timeout</td>
+<td>renew every 15-30 s</td>
+</tr>
+<tr>
+<td>Retrying</td>
+<td>failed attempt</td>
+<td>instance DB + retry policy</td>
+<td>backoff expires</td>
+<td>jittered retry</td>
+</tr>
+<tr>
+<td>Terminal</td>
+<td>done/failed/dead-letter</td>
+<td>instance DB</td>
+<td>success or attempts exhausted</td>
+<td>retained 30-90 d</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Edge stress tests.</strong> Top-of-minute bursts are handled by jitter, slot smearing, and batched instance writes. Dormant jobs whose wheel entry aged out are recovered from <code>job:{job_id}.next_fire_at</code> by the repair scan. If a user pages through very old run history, the API reads archived instance partitions instead of hot rows and returns a slower cursor. Multi-region active-active scheduling is risky because two regions can fire the same job; I would keep a single write/dispatch region per job and replicate history globally. Cold-starting a new dispatcher should rebuild only its shard window, not all 10M jobs.</p>
+<p><strong>Webhook reliability.</strong> Target may be flaky. Retry with exponential backoff + jitter, cap at N attempts. After exhausting retries, route to a dead-letter queue and surface in the UI.</p>
+<p><strong>Cron drift / time zone.</strong> Schedules stored in user-specified time zones. Server computes next_fire_at by converting to UTC at parse time. Daylight saving transitions need care (skipped hour, repeated hour) — document the convention.</p>
+<p><strong>Auditability.</strong> Every fire emits a structured event. JobInstance history retained for 30+ days. Useful for debugging and SLA reporting.</p>
+<p><strong>Graceful degradation.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Mode</th>
+<th>Source</th>
+<th>Latency / behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dispatcher dies</td>
+<td>Standby claims shard and replays due range</td>
+<td>schedule index + Kafka</td>
+<td>duplicate possible, no miss</td>
+</tr>
+<tr>
+<td>Top-of-minute hot slot</td>
+<td>Smear and batch instance writes</td>
+<td>timing wheel slot</td>
+<td>fire within 1-5 s depending SLA</td>
+</tr>
+<tr>
+<td>Worker pool saturated</td>
+<td>Queue grows, autoscale, per-target caps</td>
+<td>fire queue</td>
+<td>delayed, visible backlog</td>
+</tr>
+<tr>
+<td>Lease expires mid-run</td>
+<td>New worker may retry with same <code>fire_id</code></td>
+<td>lease + instance DB</td>
+<td>at-least-once semantics</td>
+</tr>
+<tr>
+<td>Schedule index corrupted</td>
+<td>Rebuild from catalog <code>next_fire_at</code></td>
+<td>job catalog</td>
+<td>degraded accuracy during rebuild</td>
+</tr>
+</tbody>
+</table>
+<p>Interview punch line: "I would rather be at-least-once with a stable <code>fire_id</code> than pretend exactly-once; the product promise is no silent misses."</p>
+<p><strong>What I'd defer.</strong> Sandboxed code execution for inline handlers (vs webhook targets), workflows/DAGs of jobs (cross-job dependencies), pricing/quotas, tenant isolation depth.</p>
+        </div>
+    </div>
+    <div class="footer">
+        <a href="#">© 2018–2026 Yifan Li</a>
+    </div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ Top</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>
