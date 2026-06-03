@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>排序 / 因果一致性 — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/system-design-patterns/">← 返回系统设计模式</a>
+<h1 class="article-title">排序 / 因果一致性</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/05/31  ·  系统设计模式
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p>设计系统以使事件遵循"happened-before"关系，同时避免为每次写入支付单一全局序列化器的开销。词汇表请参见《Staff 系统设计词汇表》（向量时钟、Lamport 时钟、CRDT、仲裁、提示转交）。与以下题目文档密切相关： <a href="/zh/common-backend-systems/design-facebook-messenger/">Facebook Messenger</a>, <a href="/zh/common-backend-systems/design-whatsapp/">WhatsApp</a>, <a href="/zh/common-backend-systems/design-google-docs/">Google Docs</a>, <a href="/zh/common-backend-systems/design-twitter/">Twitter</a>, <a href="/zh/common-backend-systems/design-the-stripe-payment-gateway/">Stripe 支付网关</a>, <a href="/zh/common-backend-systems/design-a-collaborative-whiteboard-like-miro/">协同白板</a>, <a href="/zh/common-backend-systems/amazon-dynamo/">Amazon Dynamo</a>.</p>
+</blockquote>
+<hr/>
+<h2 id="1-the-fundamental-hardness">1. 核心难点</h2>
+<p>分布式系统没有统一的共享时钟。在两台不同机器上"同时"发生的两个事件，在客观上没有先后顺序——物理挂钟会漂移（数据中心内通常为数十毫秒，即便有网络时间协议（NTP），跨地区也会达到数百毫秒），数据包经由不同路径传输、延迟各异，消息队列也会乱序。然而，用户和产品语义要求有序性：一条聊天消息必须显示在其所回复的消息之后，Google Docs 的编辑必须基于正确的基础版本，银行账户的借记必须在关联的贷记之前可见。</p>
+<p>最简单的答案是"用单一序列化器给所有内容分配全序"。这在小规模下有效（单个 Kafka 分区配单个生产者、单个 Spanner Paxos 组）。但在规模扩大后会失效，原因如下：</p>
+<ol>
+<li>单一序列化器是单键吞吐量瓶颈——一台机器的打戳速率（每秒数万至数十万次）限制了其所管辖整个键空间的吞吐量。</li>
+<li>单一序列化器需要地理上集中的协调——每次写入都要跨地区往返，这对即时通讯或协同编辑来说是不可接受的。（可用性 <em>非</em> 并非大多数时候的问题——逻辑序列化器可以通过 Raft 实现高可用。吞吐量和地理位置才是。）</li>
+</ol>
+<p>解决之道在于区分 <strong>全序</strong> （每个事件都有全局认可的位置，包括从未交互过的事件）和 <strong>因果序</strong> （相互依赖的事件遵循 happened-before 关系；独立事件可以任意排序）。因果序严格弱于全序，代价也大幅降低。Leslie Lamport 1978 年的论文《时间、时钟与事件排序》定义了 happened-before（记为 <code>→</code>）：在同一节点上事件 <code>a → b</code> 如果 <code>a</code> 发生在 <code>b</code> 之前，或者 <code>a</code> 是发送方而 <code>b</code> 是匹配的接收方，或者存在传递链。两个事件之间若不存在这样的链，则称为 <strong>并发</strong>，因果序不要求我们对它们进行排序。</p>
+<p>高级工程师的思路是： <strong>我的产品实际上需要的最小排序范围是什么？</strong> 按会话？按文档？按用户账户？然后设计一个分区键，将该范围限定在单一序列化器内，让独立范围横向扩展。当两个范围必须合并时（多地区对同一键写入，或两个用户同时编辑同一文档），则使用下方工具箱中的技术。</p>
+<hr/>
+<h2 id="2-how-to-recognize-it-in-the-interview">2. 如何在面试中识别背压问题</h2>
+<h3 id="prompt-phrases">提示性短语</h3>
+<ul>
+<li>"消息必须在所有设备上按序显示。"</li>
+<li>"两个客户端同时编辑同一文档。"</li>
+<li>"多地区复制，但用户期望一致的视图。"</li>
+<li>"乱序到达不应破坏状态。"</li>
+<li>"会话/动态/时间线必须是确定性的。"</li>
+<li>跨设备的"读己所写"。</li>
+<li>"银行账本"或"复式记账事务"。</li>
+</ul>
+<h3 id="architectural-smells">架构异味</h3>
+<ul>
+<li>两个写入方可能操作同一个逻辑实体（同一聊天、同一文档、同一计数器）。</li>
+<li>正在使用挂钟时间戳作为排序键（可疑——时钟偏移会破坏此方案）。</li>
+<li>系统跨地区，且题目提到"主主模式"。</li>
+<li>写入方和存储之间存在队列或扇出，因此消息可能乱序到达。</li>
+<li>状态本质上是一个序列（消息、事件、编辑、账本条目）而非集合。</li>
+</ul>
+<h3 id="example-interview-prompts-where-this-is-core">该类型为核心的面试题示例</h3>
+<ol>
+<li>设计 Facebook Messenger / WhatsApp——跨设备和地区的会话内排序。</li>
+<li>设计 Google Docs——对同一文档的并发编辑。</li>
+<li>设计类似 Miro 的协同白板——二维空间中的同类问题。</li>
+<li>设计支付/账本系统——借记和贷记必须保持因果一致性；复式记账不变量必须成立。</li>
+<li>设计 Twitter 时间线——多个生产者发布内容且扇出导致乱序时，时间线仍需合理呈现。</li>
+<li>设计广告点击聚合器——跨地区乱序到达的点击事件必须正确聚合，且不重复计数。</li>
+</ol>
+<p>一旦听到上述任何一种情形，你在回答开头的 90 秒内就应明确说出排序范围和你将采用的技术。</p>
+<hr/>
+<h2 id="3-60-second-spoken-framing">3. 60秒口头框架</h2>
+<blockquote>
+<p>我所设计的不变量是因果一致性——如果事件 <code>B</code> 可能观察到了事件 <code>A</code>，系统必须按该顺序展示它们。我明确不承诺无关键之间的全序，因为那需要单一序列化器且无法扩展。我的第一步是选定排序范围——按会话、按文档、按账户——并将同一范围内的所有写入路由到单一分区的单一写入方，从而在范围内获得免费的全序。当两个范围必须合并时，例如多地区复制或并发编辑，我会根据是否需要检测冲突、自动合并或变换操作，选用向量时钟、无冲突复制数据类型（CRDT）或操作变换（OT）。我会说明选择哪种方案及其原因。</p>
+</blockquote>
+<hr/>
+<h2 id="4-canonical-toolkit">4. 标准工具集</h2>
+<table>
+<thead>
+<tr>
+<th>技术</th>
+<th>提供能力</th>
+<th>成本</th>
+<th>典型用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单键单写入方 / 单分区</td>
+<td>分区内的免费全序。</td>
+<td>单键吞吐量瓶颈；如果该键是热键，分区就是热点。</td>
+<td>Kafka 分区键、Spanner 目录、按会话的日志。</td>
+</tr>
+<tr>
+<td>Lamport 时间戳</td>
+<td>与因果关系一致的全序（但不唯一对应因果关系）。</td>
+<td>每个事件一个标量；同值时以节点 ID 打破平局。</td>
+<td>轻量级事件排序；日志；简单的复制状态机。</td>
+</tr>
+<tr>
+<td>向量时钟</td>
+<td>精确检测 happened-before 与并发关系。</td>
+<td>每个对象历史中曾经活跃的每个写入方对应一个计数槽；在 1000 个节点的场景下，每个复制对象上有 1000 个 <code>(node_id, counter)</code> 条目，直到被清理。</td>
+<td>Dynamo 兄弟副本、Riak、多地区复制——当你确实需要 <em>检测</em> 并发写入（而非仅排序）时使用。</td>
+</tr>
+<tr>
+<td>无冲突复制数据类型（CRDT）</td>
+<td>可自动合并的数据结构（G-Counter、OR-Set、最后写入者胜出寄存器、用于文本的 RGA）。</td>
+<td>每个副本的状态随操作历史增长——OR-Set 为每个副本上每次曾被删除的元素保留一个墓碑，直到垃圾回收；并非每种数据类型都有实用的 CRDT 实现（例如"带基数约束的集合"、带乘法的任意整数）。</td>
+<td>多地区计数器、离线优先应用、无中央服务器的协同编辑。</td>
+</tr>
+<tr>
+<td>操作变换（OT）</td>
+<td>将并发操作相互变换以达到收敛。</td>
+<td>通常需要中央服务器；变换函数微妙且易出错——对每对操作必须满足 TP1 属性。</td>
+<td>Google Docs、Etherpad、Office Online。</td>
+</tr>
+<tr>
+<td>来自客户端的会话序列号</td>
+<td>以近零代价实现单一客户端会话内的因果排序。</td>
+<td>仅对单个客户端自身的操作排序。</td>
+<td>多设备同步、幂等键、重试去重。</td>
+</tr>
+<tr>
+<td>来自序列化器的单调 ID</td>
+<td>每台机器的单调 ID，可 <em>大致</em> 跨机器按时间排序。</td>
+<td>并非真正的全局全序——同一毫秒内两台不同机器上的事件仅按任意机器 ID 打破平局。依赖单调挂钟。</td>
+<td>Twitter Snowflake、Sonyflake、KSUID。适合生成唯一可排序 ID；在需要真正线性一致性时，不能替代共识协议。</td>
+</tr>
+<tr>
+<td>混合逻辑时钟（HLC）</td>
+<td>Lamport 语义加上挂钟近似值，偏差有界。</td>
+<td>代码稍多；依赖 NTP 提供挂钟部分。</td>
+<td>CockroachDB、YugabyteDB、现代多地区存储。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="41-lamport-timestamp-update">4.1 Lamport 时间戳更新</h3>
+<pre><code class="language-python">class LamportClock:
+    """One Lamport scalar per node. Monotonically increases with any event."""
+
+    def __init__(self, node_id: int) -&gt; None:
+        self.node_id = node_id
+        self.counter = 0
+
+    def on_local_event(self) -&gt; int:
+        self.counter += 1
+        return self.counter
+
+    def on_send(self) -&gt; int:
+        # Stamp the outgoing message with our incremented counter.
+        self.counter += 1
+        return self.counter
+
+    def on_receive(self, incoming_ts: int) -&gt; int:
+        # Lamport rule: counter = max(local, incoming) + 1.
+        self.counter = max(self.counter, incoming_ts) + 1
+        return self.counter
+
+    def order_key(self, ts: int) -&gt; tuple[int, int]:
+        # Break ties with node_id so the total order is deterministic.
+        return (ts, self.node_id)
+</code></pre>
+<p>Lamport 给出 <code>a → b</code> 蕴含 <code>LC(a) &lt; LC(b)</code>，但逆命题不成立： <code>LC(a) &lt; LC(b)</code> 并不意味着 <code>a → b</code>。两个并发事件仍可被 Lamport 全序排列；只是无法仅从时间戳判断并发性。当你只需要确定性顺序而不关心冲突检测时，这完全没问题。</p>
+<h3 id="42-vector-clock-compare">4.2 向量时钟比较</h3>
+<pre><code class="language-python">from enum import Enum
+
+class Causality(Enum):
+    BEFORE = "before"        # A happened before B
+    AFTER = "after"          # A happened after B
+    EQUAL = "equal"          # Same event
+    CONCURRENT = "concurrent"  # Conflict; neither observed the other
+
+VectorClock = dict[str, int]  # node_id -&gt; counter
+
+def compare(a: VectorClock, b: VectorClock) -&gt; Causality:
+    a_less_eq_b = True
+    b_less_eq_a = True
+    for node in a.keys() | b.keys():
+        ca, cb = a.get(node, 0), b.get(node, 0)
+        if ca &gt; cb:
+            a_less_eq_b = False
+        if cb &gt; ca:
+            b_less_eq_a = False
+    if a_less_eq_b and b_less_eq_a:
+        return Causality.EQUAL
+    if a_less_eq_b:
+        return Causality.BEFORE
+    if b_less_eq_a:
+        return Causality.AFTER
+    return Causality.CONCURRENT
+
+def merge(a: VectorClock, b: VectorClock) -&gt; VectorClock:
+    # Element-wise max; used when a node observes a remote version.
+    out: VectorClock = {}
+    for node in a.keys() | b.keys():
+        out[node] = max(a.get(node, 0), b.get(node, 0))
+    return out
+
+def on_local_write(vc: VectorClock, node: str) -&gt; VectorClock:
+    out = dict(vc)
+    out[node] = out.get(node, 0) + 1
+    return out
+</code></pre>
+<p>代价高昂的不是比较本身，而是存储。每个复制对象都携带一个向量时钟，其中每个曾经写过它的写入方对应一个槽位。在 Dynamo 风格的集群中，若有数百个节点且任意协调者都可以给任意键打戳，那么一个长期存在的对象上的时钟可能积累数百个 <code>(node_id, counter)</code> 对，即便其中只有少数几个最近写过。生产系统会清理长时间未被触及的条目，接受少量误报并发的概率。大多数面试题实际上并不需要向量时钟——它们需要的是 Lamport 时间戳或按范围的序列号。只有当设计中存在多个协调者写同一个键， <em>。</em> 且应用需要区分"并发、需解决"与"严格先后顺序"时，才应使用向量时钟。如果只需要确定性顺序，Lamport 更廉价。</p>
+<h3 id="43-g-counter-crdt-merge">4.3 G-Counter CRDT 合并</h3>
+<pre><code class="language-python">class GCounter:
+    """Grow-only counter. Each node increments only its own slot.
+    Merge is element-wise max; value is the sum.
+    Used for things like "global like count" across regions without coordination.
+    """
+
+    def __init__(self, node_id: str) -&gt; None:
+        self.node_id = node_id
+        self.slots: dict[str, int] = {}
+
+    def increment(self, by: int = 1) -&gt; None:
+        if by &lt; 0:
+            raise ValueError("G-Counter cannot decrement. Use PN-Counter for that.")
+        self.slots[self.node_id] = self.slots.get(self.node_id, 0) + by
+
+    def value(self) -&gt; int:
+        return sum(self.slots.values())
+
+    def merge(self, other: "GCounter") -&gt; "GCounter":
+        out = GCounter(self.node_id)
+        for k in self.slots.keys() | other.slots.keys():
+            out.slots[k] = max(self.slots.get(k, 0), other.slots.get(k, 0))
+        return out
+</code></pre>
+<p>CRDT 的属性：合并操作满足交换律、结合律和幂等性。因此，副本可以以任意顺序、多次进行 gossip，最终仍能收敛。数据结构为此付出的代价是额外状态——G-Counter 存储每个曾经活跃节点对应的一个整数，而非单个整数。</p>
+<p>需要坦诚说明的权衡：</p>
+<ul>
+<li><strong>G-Counter 不支持递减。</strong> 如果同时需要递增和递减（点赞数减去取消点赞数），需要 PN-Counter，它由两个 G-Counter 组成——状态翻倍，显示值是 <em>差值</em>，在分区恢复期间若删除操作先于匹配的添加操作到达，可能会短暂出现负值。</li>
+<li><strong>OR-Set 携带墓碑。</strong> 每次 <code>remove(x)</code> 必须作为墓碑持久化，直到每个副本都观察到它（因果稳定性），否则落后副本上的并发 <code>add(x)</code> 操作会使该元素复活。若无垃圾回收，状态会随历史删除次数（而非当前集合大小）增长。</li>
+<li><strong>并非每种数据类型都有 CRDT 实现。</strong> 不满足交换律的操作（将整数赋值为其当前值的函数、强制执行"最多 K 个元素"约束）没有实用的合并方式。CRDT 让可交换操作变得廉价，而无法使不可交换操作成为可能。</li>
+</ul>
+<h3 id="44-operational-transform-insert-vs-insert">4.4 操作变换——插入 vs 插入</h3>
+<pre><code class="language-python">from dataclasses import dataclass
+
+@dataclass
+class InsertOp:
+    position: int
+    text: str
+    author: str  # tiebreaker for same-position conflicts
+
+def transform_insert_insert(local: InsertOp, remote: InsertOp) -&gt; InsertOp:
+    """Transform `local` so it can be applied after `remote` was applied.
+    Both ops were generated against the same base document.
+    """
+    if remote.position &lt; local.position:
+        # Remote inserted to the left; shift our position right.
+        return InsertOp(local.position + len(remote.text), local.text, local.author)
+    if remote.position &gt; local.position:
+        # Remote inserted to the right; we are unaffected.
+        return local
+    # Same position. Break ties deterministically so both sides agree.
+    if remote.author &lt; local.author:
+        return InsertOp(local.position + len(remote.text), local.text, local.author)
+    return local
+</code></pre>
+<p>OT 是 Google Docs 所使用的技术。变换函数必须满足 TP1 属性：对任意两个并发操作 <code>a</code> 。 <code>b</code>, <code>transform(a, b)</code> ，然后应用 <code>b</code> ，必须与 <code>transform(b, a)</code> ，然后应用 <code>a</code>产生相同的文档。为富文本（插入、删除、格式化，含光标和选区）构建正确的 OT 出了名地困难。许多现代系统更倾向于使用 CRDT（特别是 RGA——可复制可增长数组，或 Yjs/Automerge）以避开 TP1 的雷区。</p>
+<h3 id="45-hybrid-logical-clock-update">4.5 混合逻辑时钟更新</h3>
+<pre><code class="language-python">import time
+
+class HLC:
+    """Hybrid Logical Clock — Lamport behavior, but tracks wall-clock too.
+    Two-tuple: (wall_ms, logical). Comparison is lexicographic.
+    Used in CockroachDB, YugabyteDB.
+    """
+
+    def __init__(self) -&gt; None:
+        self.wall_ms = 0
+        self.logical = 0
+
+    def _now(self) -&gt; int:
+        return int(time.time() * 1000)
+
+    def on_local_event(self) -&gt; tuple[int, int]:
+        now = self._now()
+        if now &gt; self.wall_ms:
+            self.wall_ms = now
+            self.logical = 0
+        else:
+            self.logical += 1
+        return (self.wall_ms, self.logical)
+
+    def on_receive(self, incoming_wall: int, incoming_logical: int) -&gt; tuple[int, int]:
+        now = self._now()
+        new_wall = max(self.wall_ms, incoming_wall, now)
+        if new_wall == self.wall_ms == incoming_wall:
+            self.logical = max(self.logical, incoming_logical) + 1
+        elif new_wall == self.wall_ms:
+            self.logical += 1
+        elif new_wall == incoming_wall:
+            self.logical = incoming_logical + 1
+        else:
+            self.logical = 0
+        self.wall_ms = new_wall
+        return (self.wall_ms, self.logical)
+</code></pre>
+<p>当你既想要 Lamport 的安全性，又希望时间戳近似挂钟时间（方便人工阅读日志以及时序索引工具使用）时，HLC 是现代的默认选择。</p>
+<hr/>
+<h2 id="5-worked-example-naive-broken-fixed-messenger">5. 实例演练：朴素设计 → 失效 → 修复（Messenger）</h2>
+<h3 id="the-scenario">场景描述</h3>
+<p>Alice 和 Bob 的双人聊天。Alice 的手机处于不稳定的蜂窝连接状态。Alice 连续发送两条消息：</p>
+<pre><code>T = 100ms : Alice taps "Did you see the email?"      (msg1)
+T = 101ms : Alice taps "Reply when you can"          (msg2)
+</code></pre>
+<p>在单条健康的 TCP 连接中，这两条消息会按序到达——TCP 本身是 FIFO 的。msg2 比 msg1 先到达服务器的现实情形包括：</p>
+<ul>
+<li><strong>msg1 发送失败并进入重试队列</strong> ，而 msg2 通过新建的套接字发送。两条消息经由不同的负载均衡应用服务器竞争。</li>
+<li><strong>客户端在 msg1 和 msg2 之间重新连接</strong> （蜂窝切换至 WiFi、应用退至后台后恢复）。新连接落到不同的服务器上。</li>
+<li><strong>Alice 使用两台设备</strong> （手机和笔记本电脑），它们是独立的——作为单独的边界情形在下方讨论。</li>
+</ul>
+<p>这是常见的失效形态。"单条 TCP 连接数据包乱序到达"并不是——在一条连接内假定为 FIFO。</p>
+<h3 id="the-naive-design">朴素设计</h3>
+<p>发送服务在收到消息时用应用服务器的挂钟时间打戳，并写入全局分片消息存储。由于 msg1 走了更慢的重试路径，msg2 实际上先到达系统：</p>
+<pre><code>App server B receives msg2 at B's clock = 250ms  -&gt; store as ts=250
+App server A receives msg1 at A's clock = 280ms  -&gt; store as ts=280
+                                              ^ msg1's retry took longer than msg2's first send
+</code></pre>
+<p>Bob 的客户端查询时 <code>messages where conv_id = X order by ts asc</code> 并看到：</p>
+<pre><code>[250ms] "Reply when you can"
+[280ms] "Did you see the email?"
+</code></pre>
+<p>Bob 感到困惑。回复出现在问题之前。时钟偏移是 <em>非</em> 这里的根本原因——即使时钟完全同步，接收时间戳反映的也是到达顺序，而非 Alice 的发送顺序。挂钟只会使情况更糟：服务器间 50ms 的 NTP 偏差甚至可以在到达顺序正确的情况下导致排序颠倒。</p>
+<h3 id="why-naive-timestamps-fail">为何朴素时间戳方案会失败</h3>
+<ol>
+<li><strong>到达时间不等于发送时间。</strong> 重试、重连和路由差异意味着后发的消息可能先到达。</li>
+<li><strong>挂钟各自独立漂移</strong> ，情况雪上加霜。即便有 NTP，主机间 ±5ms 的误差也是正常的；NTP 中断时可达 ±50ms；跨地区则可达数百毫秒。</li>
+<li><strong>事件在因果上是有序的</strong> （Alice 从她的单台设备上严格先发了 msg1 再发 msg2），但存储层将这一信息丢弃了。</li>
+<li><strong>没有单一序列化器</strong>，因此没有任何机器有权说"msg1 排在前面"。</li>
+</ol>
+<h3 id="fix-1-per-conversation-single-partition-with-monotonic-sequence">修复方案一：带单调序列号的按会话单分区</h3>
+<p>这里自然的排序范围是会话。按 <code>conversation_id</code>对会话日志进行分区。同一会话的所有写入都流向同一个 Kafka 分区 / Spanner 目录 / 日志分片。分片所有者为每条消息分配单调递增的按会话序列号。</p>
+<pre><code>                  +----------------------+
+   Alice phone --&gt;| Conversation Router  | -- hash(conv_id) --&gt; shard 17
+   Bob   phone --&gt;|                      |
+                  +----------------------+
+                                                |
+                                                v
+                                +-------------------------------+
+                                | Conversation shard 17 (leader)|
+                                |                               |
+                                |   seq=42 msg1 "Did you see..."|
+                                |   seq=43 msg2 "Reply when..." |
+                                |   ...                         |
+                                +-------------------------------+
+</code></pre>
+<p>在分片内，序列号按消息到达主节点的顺序分配。Bob 读取 <code>where conv_id=X order by seq asc</code> ，无论各服务器间的挂钟漂移如何，都能看到正确的顺序。</p>
+<p>剩余问题：如果 msg1 和 msg2 乱序到达主节点（msg2 先到，因为 msg1 的重试更慢）怎么办？那么 seq=42 是"方便时回复我"，seq=43 是"你看到那封邮件了吗？"。分片自身的顺序仍然一致（Bob 在每台设备上看到的顺序相同），但不符合 Alice 的意图。</p>
+<h3 id="fix-2-client-session-sequence-number">修复方案二：客户端会话序列号</h3>
+<p>让客户端为每条消息打上 <code>(client_session_id, client_seq)</code>戳。客户端在每次发送消息时递增 <code>client_seq</code> 。分片用此信息 <strong>在同一发送方的一批消息中排序</strong>：如果同一客户端会话的两条消息到达分片时乱序，则按 <code>client_seq</code> 排序，即使到达顺序不同。</p>
+<pre><code class="language-python"># Client side
+class ChatClient:
+    def __init__(self, session_id: str) -&gt; None:
+        self.session_id = session_id
+        self.client_seq = 0
+
+    def send(self, conv_id: str, body: str) -&gt; dict:
+        self.client_seq += 1
+        return {
+            "conv_id": conv_id,
+            "body": body,
+            "session_id": self.session_id,
+            "client_seq": self.client_seq,
+        }
+
+# Shard side, when assigning the durable per-conversation sequence:
+def assign_seq(shard_state, msg):
+    # Buffer briefly to absorb out-of-order arrivals from the same session.
+    # Then assign the next shard sequence in (session_id, client_seq) order.
+    shard_state.pending.append(msg)
+    ready = shard_state.flush_in_order()  # sorts by (session, client_seq)
+    for m in ready:
+        m["seq"] = shard_state.next_seq()
+        shard_state.log.append(m)
+</code></pre>
+<p>这样，Alice 的两条消息——即便乱序到达分片——也会在定序前按 <code>client_seq</code> 重新排列。Bob 看到的是 Alice 意图中的顺序。</p>
+<h3 id="edge-case-alice-has-two-devices">边界情形：Alice 使用两台设备</h3>
+<p>现在 Alice 同时用手机和笔记本电脑向同一会话发送消息。两台设备有各自独立的 <code>client_seq</code> 计数器。它们是真正的并发——哪条 Alice 的消息先来并没有"正确答案"。分片以到达主节点的顺序打破平局（实际上是一个 Lamport 时间戳），该会话对所有查看者保持一致，即便从全新设备重新加载也能获得相同的顺序。在不用跨设备协调来拖慢每次发送的前提下，这已经是最优解。</p>
+<h3 id="why-not-spanner-a-single-global-sequencer">为什么不用 Spanner / 单一全局序列化器？</h3>
+<p>可以使用 Spanner 风格的 TrueTime 为每条消息分配全局有序的时间戳。对于银行账本场景（需要跨账户全序）这是可行的。对于聊天来说，这是过度设计——产品只需要按会话排序，而 TrueTime 每次写入会增加约 10–14ms 的提交等待延迟。按会话分片方案以十分之一的延迟满足需求。</p>
+<h3 id="summary-table">汇总表</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>机制</th>
+<th>强制保证的内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>客户端</td>
+<td>会话序列号。</td>
+<td>单台设备一批消息内的顺序。</td>
+</tr>
+<tr>
+<td>在 N 个 Dispatcher 实例间对</td>
+<td>按会话单调序列号。</td>
+<td>会话内所有写入方的全局顺序。</td>
+</tr>
+<tr>
+<td>跨分片</td>
+<td>无需保证。</td>
+<td>我们接受不保证跨会话顺序。</td>
+</tr>
+<tr>
+<td>跨区域</td>
+<td>每个会话单一主节点地区。</td>
+<td>单一事实来源；从节点复制该序列号。</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h2 id="6-variants-and-how-to-choose">6. 变体及如何选择</h2>
+<table>
+<thead>
+<tr>
+<th>技术</th>
+<th>检测冲突？</th>
+<th>自动合并？</th>
+<th>全序？</th>
+<th>存储成本</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单分区 / 单写入方</td>
+<td>N/A — 不存在冲突。</td>
+<td>N/A。</td>
+<td>是，在分区内。</td>
+<td>低。</td>
+<td>单会话聊天、单账户账本、带服务端的单文档编辑。</td>
+</tr>
+<tr>
+<td>Lamport 时间戳</td>
+<td>否（无法区分并发与顺序）。</td>
+<td>否。</td>
+<td>是，但采用任意打破平局的规则。</td>
+<td>每个事件一个整数。</td>
+<td>轻量级日志排序；复制状态机的输入排序。</td>
+</tr>
+<tr>
+<td>向量时钟</td>
+<td>是（精确的 happens-before）。</td>
+<td>否（必须在应用代码中合并）。</td>
+<td>否（仅偏序）。</td>
+<td><code>O(writers)</code> 每对象存储；需要定期剪枝。</td>
+<td>Dynamo 风格存储、支持 sibling 解析的多主 KV 存储。</td>
+</tr>
+<tr>
+<td>CRDT（G-Counter、OR-Set、LWW-Reg、RGA）</td>
+<td>隐式解析。</td>
+<td>是（数学上可证明）。</td>
+<td>否。</td>
+<td>状态较大；删除感知型 CRDT 需要 tombstone。</td>
+<td>离线优先应用、多地域计数器、点对点协同编辑器。</td>
+</tr>
+<tr>
+<td>Operational Transform</td>
+<td>是（服务端解析）。</td>
+<td>是，通过变换函数实现。</td>
+<td>是（服务端线性化之后）。</td>
+<td>操作日志 + 变换函数。</td>
+<td>服务端中介的富文本编辑器（Google Docs、Etherpad）。</td>
+</tr>
+<tr>
+<td>单一 sequencer（Snowflake）</td>
+<td>否。</td>
+<td>否。</td>
+<td>近似——可按时间排序，但同一毫秒内来自不同机器的事件按任意 machine-ID 打破平局，而非按因果关系排序。</td>
+<td>每个事件仅占极小的 ID 空间。</td>
+<td>全局唯一可排序 ID（推文 ID、广告点击 ID）。在竞争下需要真正全序时，不可替代共识协议。</td>
+</tr>
+<tr>
+<td>HLC</td>
+<td>有效是（通过 Lamport 部分）。</td>
+<td>否。</td>
+<td>是（字典序）。</td>
+<td>每个事件两个整数。</td>
+<td>CockroachDB、YugabyteDB；现代多地域 SQL。</td>
+</tr>
+<tr>
+<td>共识（Paxos、Raft）</td>
+<td>N/A。</td>
+<td>N/A。</td>
+<td>是，强一致。</td>
+<td>Quorum 写入延迟。</td>
+<td>银行账本、严格一次不变量、主节点选举。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="decision-flowchart">决策流程图</h3>
+<pre><code>Does your product need a global total order across unrelated keys?
+   YES -&gt; Consensus per shard (Spanner / CockroachDB) or single sequencer.
+   NO  -&gt; Continue.
+
+Can you partition by an ordering scope (conversation, document, account)?
+   YES -&gt; Per-scope single writer. A monotonic sequence number assigned by
+          the leader is usually sufficient — STOP here. This covers most
+          chat apps, per-document editing with a central server, per-account
+          ledgers within one region.
+   NO  -&gt; Continue (true multi-master).
+
+Do concurrent writes have a deterministic merge rule?
+   YES, mathematical merge   -&gt; CRDT.
+   YES, transform-based      -&gt; OT (need server) or RGA CRDT.
+   NO, app must resolve      -&gt; Vector clocks + sibling presentation.
+</code></pre>
+<p>对该流程图的资深工程师级解读是：大多数面试题在第二个方框处即可终止。进入向量时钟、CRDT 或 OT 环节，意味着该设计确实存在真正的多主写入——这本身是一项选择（通常由离线优先或跨地域 active-active 需求驱动）。如果题目不要求这些，就不必为之付出代价。</p>
+<hr/>
+<h2 id="7-failure-modes-and-operations">7. 故障模式与运维</h2>
+<table>
+<thead>
+<tr>
+<th>失败</th>
+<th>具体表现</th>
+<th>需监控的指标</th>
+<th>缓解措施</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>向量时钟无限增长</td>
+<td>单个对象的 VC 包含数百个写入方 ID。</td>
+<td><code>p99_vector_clock_size</code>.</td>
+<td>剪除超出保留窗口的条目；将写入方上限限制为 <code>K</code> 个；对未使用的条目进行 tombstone 标记。</td>
+</tr>
+<tr>
+<td>CRDT 状态爆炸</td>
+<td>OR-Set 携带数百万条已删除项的 tombstone。</td>
+<td><code>crdt_state_bytes_per_object</code>.</td>
+<td>基于因果稳定性进行周期性垃圾回收（Riak 的 "reap" 机制）；切换为 delta-CRDT。</td>
+</tr>
+<tr>
+<td>Sequencer 故障</td>
+<td>Kafka 分区主节点（或作用域主节点）下线，导致该作用域的写入被阻塞。（Snowflake 是每台机器独立的，某个实例故障不会阻塞写入——客户端可路由到其他生成器。）</td>
+<td><code>sequencer_unavailability_seconds</code>.</td>
+<td>快速主节点选举（Raft）；按 key range 配置多个 sequencer，ID 空间不重叠；客户端采用带退避的重试策略。</td>
+</tr>
+<tr>
+<td>Wall clock 偏差破坏 HLC</td>
+<td>时钟向后跳跃；HLC <code>max(now, prev)</code> 可屏蔽该问题，但日志中操作看起来顺序错乱。</td>
+<td><code>clock_skew_ms_p99</code>.</td>
+<td>使用 chrony + 多时间源的 NTP；对偏差 &gt; 50ms 发出告警；拒绝 wall clock 超出阈值的未来时间戳事件。</td>
+</tr>
+<tr>
+<td>乱序投递至单分区日志</td>
+<td>客户端重试导致 msg2 在 msg1 之前到达。</td>
+<td><code>out_of_order_arrival_rate</code>.</td>
+<td>客户端会话 seq + 主节点处的有界重排缓冲区。</td>
+</tr>
+<tr>
+<td>Lamport 时间戳碰撞</td>
+<td>两个事件具有相同的 Lamport 时间戳；按节点 ID 打破平局可能导致某节点饥饿。</td>
+<td><code>lamport_tie_rate</code>.</td>
+<td>周期性时钟跳跃以分散节点 ID；启动时随机化节点 ID。</td>
+</tr>
+<tr>
+<td>并发 CRDT 语义令用户困惑</td>
+<td>在一个地域先 Add 后 Delete，在另一个地域先 Delete 后 Add，最终收敛结果为"存在"还是"已删除"取决于所选 CRDT。</td>
+<td>用户反馈的"我的修改消失了"工单。</td>
+<td>选择符合产品预期的 CRDT（Add-wins OR-Set 与 Remove-wins），并记录说明；在 UI 中提示"此内容存在并发编辑"。</td>
+</tr>
+<tr>
+<td>OT 变换函数 bug</td>
+<td>TP1 被违反；两个客户端产生分歧。</td>
+<td>对比服务端日志回放与客户端状态之间的差异。</td>
+<td>对每个（op, op）组合进行基于属性的测试；对新变换函数进行金丝雀发布；在状态偏离时回退到服务端快照。</td>
+</tr>
+<tr>
+<td>Snowflake ID 在时钟回拨时发生碰撞</td>
+<td>两个事件拥有相同的 ID。</td>
+<td><code>id_collision_count</code>.</td>
+<td>当 wall clock 向后时拒绝发放 ID；利用 machine-ID 位保证安全；在生成器内部使用 HLC。</td>
+</tr>
+<tr>
+<td>跨地域复制延迟破坏 read-your-write</td>
+<td>用户在 <code>us-east</code>写入，从 <code>eu-west</code>读取，却看不到自己的写入。</td>
+<td><code>replication_lag_p99_ms</code>.</td>
+<td>在写入地域使用带 TTL 的 sticky session；客户端侧 write-through 缓存；客户端携带显式因果令牌以过滤过期副本。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-discipline">运维规范</h3>
+<ul>
+<li><strong>始终将排序元数据</strong> （Lamport 时间戳、向量时钟、HLC）写入应用日志，即使当前不对其采取动作。没有这些数据，正确性偏差是不可见的。</li>
+<li><strong>配备回放工具</strong> 能够从事件日志重新推导当前状态。CRDT 和 OT 系统必须支持此能力，以便用于故障恢复。</li>
+<li><strong>在产品规格中预先确定合并策略。</strong> "最后写入者胜"是伪装成工程决策的产品决策；应由产品经理拍板。</li>
+<li><strong>在集成测试中测试乱序投递</strong> 通过在边界处刻意重排消息到达顺序来复现。大多数排序 bug 只有在特定重排场景下才可复现。</li>
+</ul>
+<hr/>
+<h2 id="8-combinations-with-other-patterns">8. 与其他模式的组合</h2>
+<p>此模式很少单独被解决。最强的资深工程师答案会将其与以下内容结合：</p>
+<ul>
+<li><strong><a href="/zh/system-design-patterns/strong-consistency-under-contention/">strong-consistency-under-contention.md</a></strong> — 当排序范围是一个账户或一个文档，且不仅需要顺序还需要线性一致性时，你将从单分区单写入方升级为共识（Paxos/Raft）。适用于银行账本、票务库存以及任何"禁止双重支付"不变量。</li>
+<li><strong><a href="/zh/system-design-patterns/idempotency-exactly-once/">idempotency-exactly-once.md</a></strong> — 因果顺序加重试等于易产生重复的系统。每次有序写入都需要幂等键（客户端会话 + 客户端 seq 是天然的选择）。没有幂等性，重试的写入将以不同位置的重复事件出现在顺序中。</li>
+<li><strong><a href="/zh/system-design-patterns/fan-out-write-amplification/">fan-out-write-amplification.md</a></strong> — 当你将一条消息扇出到多个接收方（群聊、Twitter 时间线）时，每个扇出目标有自己的投递顺序。将每源顺序（此模式）与每目标合并顺序（扇出模式）结合起来。</li>
+<li><strong><a href="/zh/system-design-patterns/coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a></strong> — 单一 sequencer / 分区主节点本身是一个通过租约或共识解决的"严格一次执行"问题。两种模式共享租约原语。</li>
+<li><strong><a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a></strong> — 每键单写入方在一个键接收大部分流量时（"Justin Bieber"聊天室、最频繁编辑的 Google Doc）会成为热键瓶颈。你可能需要在逻辑键内部进行子分片。</li>
+<li><strong><a href="/zh/system-design-patterns/real-time-aggregation/">real-time-aggregation.md</a></strong> — 在聚合器处的乱序到达（来自慢速地域的广告点击计数延迟到达）通过水位线和事件时间窗口解决。聚合管道依赖于你在此处建立的上游排序保证。</li>
+<li><strong><a href="/zh/system-design-patterns/backpressure-flow-control/">backpressure-flow-control.md</a></strong> — 处于负载下的单写入方分区需要显式背压；否则主节点处的重排缓冲区将无限增长，排序保证随之降级。</li>
+<li><strong><a href="/zh/system-design-patterns/durability-at-scale/">durability-at-scale.md</a></strong> — 有序日志是事实来源；持久性不可妥协。复制日志（Kafka、Bookkeeper）是标准基础设施。</li>
+</ul>
+<hr/>
+<h2 id="9-likely-interviewer-probes">9. 面试官可能追问的问题</h2>
+<ol>
+<li><strong>"你提到了每会话 Kafka 分区。当一个会话变得如此热门，以至于单个分区无法跟上时，会发生什么？"</strong> — 首先检查你是否真的面临这个问题：单个 Kafka 分区每秒可处理数万条消息，这足以覆盖绝大多数真实世界的群聊。如果你确实遇到了（50 万成员的 Discord 频道在直播期间），按 <code>(conv_id, sub_partition_id)</code> 进行子分片，并在读取时用 Lamport 时间戳合并，这样每发送方的顺序得以保留，而跨发送方的顺序则是尽力而为。这里向量时钟是过度设计——产品只需要"来自同一发送方的消息有序"，而非成对并发检测。</li>
+<li><strong>"两个用户从不同大洲编辑同一个 Google Doc 单元格。请带我了解 OT 与 CRDT 的处理过程。"</strong> — OT 将两个操作都路由到中央服务端进行线性化并相互变换；变换函数 <code>T(a, b)</code> 针对每个 op 对手工编写，且必须满足 TP1。CRDT 让每个客户端在本地应用后再进行 gossip，合并逻辑内置于数据结构中（RGA 文本使用位置标识符，确保插入不会碰撞）。真实的权衡：OT 的每文档状态较小，但变换代码容易出 bug，一个变换错误会无声地导致客户端分歧；CRDT 的每文档状态较大（每个字符都携带标识符，任何人删除的字符都以 tombstone 形式保留，直到被垃圾回收），但收敛证明是结构性的，而非代码层面的。Google Docs 出于历史原因使用 OT；更新的协同编辑器（Figma、Linear、Notion 块）倾向于 CRDT，因为库（Yjs、Automerge）已经吸收了状态管理复杂性，从而避免了 TP1 的 bug 风险。</li>
+<li><strong>"你的向量时钟永远增长。你如何限制它？"</strong> — 剪除在 <code>T</code> （通常为数天）内无活动的条目。对极陈旧的写入方接受偶发的误报并发报告。许多生产系统还会设置上限为 <code>K</code> 个条目并淘汰 LRU。</li>
+<li><strong>"Spanner 的 TrueTime 相比 HLC 提供了什么额外保证？"</strong> — TrueTime 通过对时钟不确定性区间执行 commit-wait，为整个数据库提供外部一致性排序。HLC 只对存在交互的事件进行排序（Lamport 语义）；它不提供外部一致性。Spanner 每次提交需支付约 10ms 的代价；CockroachDB / HLC 无需 commit-wait，但无法保证外部一致性。</li>
+<li><strong>"当写入发往主地域时，如何在跨地域实现 read-your-own-write？"</strong> — 写入时向客户端颁发因果令牌（Lamport 时间戳、HLC 或写入提交位置）。读取请求携带该令牌；副本若复制位置落后于令牌则拒绝服务，将请求重定向到更新的副本或短暂等待。</li>
+<li><strong>"请谈谈 CRDT 垃圾回收。为什么它很难？"</strong> — OR-Set 中的删除操作必须以 tombstone 的形式持久保存，直到所有副本都已接收并确认它（因果稳定性）。追踪因果稳定性需要中央协调或完整的向量时钟传播。没有 GC，tombstone 永远增长，状态将爆炸。</li>
+<li><strong>"你正在使用按时间排序的 Snowflake ID。时钟回拨时会出什么问题？"</strong> — ID 变得非单调；按 ID 排序会产生违反因果顺序的重排。缓解措施：时钟向后时拒绝发放 ID（阻塞至回拨持续时间结束）；在生成器内使用 HLC；或将基于时间的 ID 与 Lamport 时间戳配对使用。</li>
+</ol>
+<hr/>
+<h2 id="10-common-traps-stronger-moves">10. 常见陷阱 → 更优方案</h2>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"我直接给所有内容加上 <code>time.now()</code> 时间戳排序就好了。"</td>
+<td>命名一个映射到排序范围的分区键；为每个分区的单一写入方分配单调序列号。</td>
+</tr>
+<tr>
+<td>"我会在全局使用 Spanner 实现全序。"</td>
+<td>只在不变量确实需要的地方（账本、库存）支付全序的代价。对聊天 / Feed / 文档使用更廉价的按作用域排序。</td>
+</tr>
+<tr>
+<td>"向量时钟解决一切问题。"</td>
+<td>向量时钟检测冲突，但不解析冲突。明确声明应用的合并规则（LWW、集合并集、应用回调）。</td>
+</tr>
+<tr>
+<td>"我们用 OT 做协同编辑。"</td>
+<td>OT 本身是正确的，但变换函数以容易出 bug 著称；如果团队规模较小，建议使用经过实战检验的 CRDT 库（Yjs、Automerge）。</td>
+</tr>
+<tr>
+<td>"客户端重试没问题，不需要幂等键。"</td>
+<td>将排序与幂等性结合： <code>(session_id, client_seq)</code> 作为去重键；重试的写入占据相同的槽位，而不是新槽位。</td>
+</tr>
+<tr>
+<td>"我让 wall clock 偏差通过 NTP 自行解决。"</td>
+<td>将时钟偏差视为对抗性因素。对任何影响排序的时间戳使用 HLC；对偏差 &gt; 50ms 发出告警。</td>
+</tr>
+<tr>
+<td>"单 Kafka 分区提供全序——搞定。"</td>
+<td>单分区同时也是该键的单一瓶颈和单点故障。讨论子分片和主节点故障转移方案。</td>
+</tr>
+<tr>
+<td>"CRDT 自动合并，所以产品从构建上就是正确的。"</td>
+<td>CRDT 在机械层面收敛，但收敛目标未必符合用户意图（Add-wins vs Remove-wins）。与产品确认语义。</td>
+</tr>
+<tr>
+<td>"我们按数据库自增 ID 排序。"</td>
+<td>DB 自增 ID 是每数据库级别的，而非每键级别，在多主模式下会失效。使用每作用域序列号或 HLC。</td>
+</tr>
+<tr>
+<td>"Sequencer 是单点故障——我们不要有单点。"</td>
+<td>单一逻辑 sequencer 可以通过 Raft 实现高可用。正确的问题是吞吐量，而非可用性。</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h2 id="11-staff-level-answer-checklist">11. Staff 级别回答清单</h2>
+<ul>
+<li>[ ] 你命名了 <strong>排序范围</strong> 产品所需的（每会话、每文档、每账户），而非"全局顺序"。</li>
+<li>[ ] 你区分了 <strong>全序</strong> 与 <strong>因果序</strong> 并选择了满足不变量的更廉价方案。</li>
+<li>[ ] 你从 {单分区、Lamport、向量时钟、CRDT、OT、sequencer、HLC、共识} 中选择了一种方案，并基于产品需求（而非流行词）给出了理由。</li>
+<li>[ ] 你将 <strong>wall clock 偏差</strong> 视为真实对手并说明了你的防御措施（HLC、单调 seq、排序键中不使用 wall clock）。</li>
+<li>[ ] 你展示了如何将 <strong>客户端会话序列号</strong> 与服务端排序结合，以处理传输中的乱序问题。</li>
+<li>[ ] 你命名了 <strong>冲突解析策略</strong> （LWW、集合并集、应用回调、CRDT 语义），并指出这是产品决策。</li>
+<li>[ ] 你将 <strong>跨地域的 read-your-own-write</strong> 通过因果令牌或 sticky 写入实现。</li>
+<li>[ ] 你至少命名了一个 <strong>运维指标</strong> （向量时钟大小、复制延迟、乱序到达率、sequencer 可用性）。</li>
+<li>[ ] 你承认了 <strong>多设备问题</strong> （来自同一用户的两台设备是真正的并发），并给出了打破平局的规则。</li>
+<li>[ ] 你将此模式与 <strong>幂等性</strong> 结合用于重试，以及 <strong>严格一次执行</strong> 用于 sequencer / 主节点。</li>
+<li>[ ] 你指出了 <strong>降级路径</strong> 当主机制退化时的处理方式（sequencer 宕机、向量时钟过大、CRDT 状态爆炸）。</li>
+</ul>
+<hr/>
+<h2 id="12-cross-references">12. 交叉引用</h2>
+<h3 id="pattern-siblings">模式兄弟</h3>
+<ul>
+<li><a href="/zh/system-design-patterns/strong-consistency-under-contention/">strong-consistency-under-contention.md</a> — 当排序演变为线性一致性时。</li>
+<li><a href="/zh/system-design-patterns/idempotency-exactly-once/">idempotency-exactly-once.md</a> — 重试 + 排序 = 需要去重键。</li>
+<li><a href="/zh/system-design-patterns/fan-out-write-amplification/">fan-out-write-amplification.md</a> — 每源顺序 × 每目标顺序。</li>
+<li><a href="/zh/system-design-patterns/coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a> — 单主节点分区是一个协调问题。</li>
+<li><a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a> — 单分区顺序遇到热键。</li>
+<li><a href="/zh/system-design-patterns/real-time-aggregation/">real-time-aggregation.md</a> — 针对乱序事件时间数据的水位线机制。</li>
+<li><a href="/zh/system-design-patterns/durability-at-scale/">durability-at-scale.md</a> — 作为事实来源的有序日志。</li>
+<li><a href="/zh/system-design-patterns/backpressure-flow-control/">backpressure-flow-control.md</a> — 有界重排缓冲区。</li>
+<li><a href="/zh/system-design-patterns/cache-stampede-read-amplification/">cache-stampede-read-amplification.md</a> — 用于避免读取过期缓存的因果令牌。</li>
+<li><a href="/zh/system-design-patterns/search-and-ranking/">search-and-ranking.md</a> — 跨分片的索引更新排序。</li>
+<li><a href="/zh/system-design-patterns/geo-spatial-queries/">geo-spatial-queries.md</a> — 多地域对附近好友 Feed 的写入。</li>
+</ul>
+<h3 id="question-docs-where-this-pattern-is-load-bearing">此模式作为核心支撑的问题文档</h3>
+<ul>
+<li><a href="/zh/common-backend-systems/design-facebook-messenger/">Facebook Messenger</a> — 带单调 seq 的每会话日志；通过每设备游标实现多设备同步。</li>
+<li><a href="/zh/common-backend-systems/design-whatsapp/">WhatsApp</a> — 相同基础设施，端到端加密层在传输格式之上进行排序。</li>
+<li><a href="/zh/common-backend-systems/design-google-docs/">Google Docs</a> — 通过中央服务端的 Operational Transform，或点对点的 CRDT（RGA）。</li>
+<li><a href="/zh/common-backend-systems/design-a-collaborative-whiteboard-like-miro/">协同白板（Miro）</a> — OT 或 CRDT 用于二维图形操作。</li>
+<li><a href="/zh/common-backend-systems/design-twitter/">Twitter</a> — Snowflake ID 用于全局可排序的推文 ID；每用户时间线排序。</li>
+<li><a href="/zh/common-backend-systems/design-twitter-timeline/">Twitter 时间线</a> — 按生产者合并扇出，按接收方排序。</li>
+<li><a href="/zh/common-backend-systems/design-the-stripe-payment-gateway/">Stripe 支付网关</a> — 支付状态转换的因果排序；幂等键。</li>
+<li><a href="/zh/common-backend-systems/design-a-payment-system/">支付系统</a> — 银行账本语义：借记和贷记的严格排序。</li>
+<li><a href="/zh/common-backend-systems/design-an-ad-click-aggregator/">广告点击聚合器</a> — 乱序事件时间到达；水位线；HLC。</li>
+<li><a href="/zh/common-backend-systems/amazon-dynamo/">Amazon Dynamo</a> — 规范的向量时钟 sibling 解析。</li>
+<li><a href="/zh/common-backend-systems/apache-kafka/">Apache Kafka</a> — 每分区全序作为基础原语。</li>
+<li><a href="/zh/common-backend-systems/design-discord/">Discord</a> — 每频道排序，支持高吞吐量。</li>
+<li><a href="/zh/common-backend-systems/design-a-live-comment-streaming-service-like-twitch-chat/">直播评论流</a> — 按房间序列化，扇出分发。</li>
+</ul>
+<h3 id="external-references-worth-naming-in-an-interview">面试中值得提及的外部参考资料</h3>
+<ul>
+<li>Lamport，《Time, Clocks, and the Ordering of Events in a Distributed System》（1978）——奠基性论文。</li>
+<li>DeCandia 等，《Dynamo: Amazon's Highly Available Key-value Store》（2007）——生产环境中的向量时钟。</li>
+<li>Shapiro 等，《A Comprehensive Study of Convergent and Commutative Replicated Data Types》（2011）——CRDT 分类体系。</li>
+<li>Kulkarni 等，《Logical Physical Clocks》（2014）——HLC 论文，CockroachDB / YugabyteDB 的基础。</li>
+<li>Corbett 等，《Spanner: Google's Globally Distributed Database》（2012）——TrueTime 与外部一致性。</li>
+<li>Sun &amp; Ellis，《Operational Transformation in Real-Time Group Editors》（1998）——OT 正确性准则。</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

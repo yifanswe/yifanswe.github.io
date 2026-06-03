@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>大规模持久性 — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/system-design-patterns/">← 返回系统设计模式</a>
+<h1 class="article-title">大规模持久性</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/05/31  ·  系统设计模式
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p>设计存储系统，使你接受的字节永远不会消失，即使在 PB 级规模下，磁盘常规故障、位静默腐烂，以及整个机架或区域可能同时消失的情况下。</p>
+</blockquote>
+<p>该模式是应用于批量存储的持久性优先视角。术语参见 Staff System Design Glossary。相关问题文档：</p>
+<ul>
+<li><a href="/zh/common-backend-systems/design-amazon-s3/">Amazon S3</a> ——十一个九的持久性、纠删码、跨区域复制。</li>
+<li><a href="/zh/common-backend-systems/hadoop-distributed-file-system/">Hadoop Distributed File System (HDFS) / Google File System (GFS)</a> ——块复制、机架感知放置、BlockScanner。</li>
+<li><a href="/zh/common-backend-systems/google-bigtable/">Google BigTable</a> ——持久性委托给 GFS；SSTables + commit log。</li>
+<li><a href="/zh/common-backend-systems/design-dropbox/">Dropbox</a> ——文件同步、块级去重、持久备份。</li>
+<li><a href="/zh/common-backend-systems/design-youtube/">YouTube</a> ——多区域视频存储，含冷存储层。</li>
+<li><a href="/zh/common-backend-systems/design-instagram/">Instagram</a> ——照片存储持久性。</li>
+<li><a href="/zh/common-backend-systems/amazon-dynamo/">Amazon Dynamo</a> ——仲裁存储中的复制与反熵。</li>
+</ul>
+<hr/>
+<h2 id="1-the-fundamental-hardness">1. 根本难点</h2>
+<p>十一个九的持久性—— <code>99.999999999%</code> ——是 Amazon Simple Storage Service (S3) 所宣传的数字。单位很重要：它是 <em>每对象、每年</em> 的预期损失概率为 <code>10^-11</code>，而非每系统的正常运行时间数字。字面意思是：如果你存储了 10,000,000,000（一百亿）个对象，每年预期丢失的数量是 <code>0.1</code> (<code>10^10 * 10^-11</code>）。等价地说，从一个拥有 10,000 个对象的存储桶中丢失单个对象的预期时间大约是 10,000,000 年。注意这也与 <em>可用性</em> — S3 宣称十一个九的持久性，但只有四个九的可用性；持久性表示"我们仍然保有您的数据"，可用性表示"您现在可以读取它们"。这是两个不同的设计问题，对应不同的缓解手段。</p>
+<p>简单的回答是"存三份副本"。在 GB 量级完全没问题，直到大约数十 PB 的规模也确实可行—— <code>3x</code> 跨三个可用区（AZ），配合数据校验，理论上可以达到十一个九。但它不再是正确答案的地方在于存储成本。原始数据量 100 PB 时， <code>3x</code> 需要 300 PB 的磁盘；在 EB 量级， <code>3x</code> 意味着每年数亿美元的磁盘开销，而纠删码可以将其削减一半。面试问题不是"副本方案错了吗"——而是"在什么规模下成本核算能够证明纠删码的复杂性是合理的，以及如何在真实故障相关性下捍卫持久性数字"。旋转磁盘的行业年化故障率（AFR）通常为 <code>1-4%</code>；在 10 万块磁盘的规模下，每天大约损失 <code>3-11</code> 每天，系统必须在下一个巧合故障窗口到来之前完成修复。故障是相关的，而非独立的。一个机架交换机宕机会拖垮 40 个节点。一次电源相位跳闸会影响半个数据中心。一次固件推送错误可能导致整个集群中某型号的驱动器全部损坏。独立故障模型掩盖了所有真正的风险。</p>
+<p>比特腐烂——磁盘上发生的静默数据损坏，字节翻转但不触发读取错误——是真实存在的。对大规模集群的研究（Bairavasundaram et al.，FAST 2008；Google 的《What does an exabyte of storage smell like?》）将静默损坏率估计在 <code>10^-14</code> 。 <code>10^-15</code> 每比特读取。在 EB 量级，静默损坏每天都会发生。如果从不读取数据，就不会发现——直到读取时才发现，而此时本应用于修复的奇偶校验也已损坏。持久性不是一次性编码决策，而是持续的验证工作。</p>
+<p>因此，面试问题不是"你知道什么是副本"。而是"如何叠加各层——副本、纠删码、跨地域复制、数据校验、反熵、持久性 Write-Ahead Log (WAL)、持久性等级——使得在真实故障模型（相关的机架故障、区域性灾难、静默损坏、修复风暴）下，你能用算术而非直觉，向面试官捍卫 <code>1-10^-11</code> 年度数据丢失数字。"</p>
+<hr/>
+<h2 id="2-how-to-recognize-it-in-the-interview">2. 如何在面试中识别此类问题</h2>
+<h3 id="prompt-phrases">提示性短语</h3>
+<ul>
+<li>"绝对不能丢失数据。"</li>
+<li>"十一个九的持久性。"</li>
+<li>"客户付费让我们永久保存这些数据。"</li>
+<li>"PB 级" / "EB 级" / "数十亿个对象。"</li>
+<li>"备份"、"归档"、"合规保留"、"法律留存"。</li>
+<li>"能够承受区域故障。"</li>
+<li>"存储成本是主要开销"（暗示纠删码压力）。</li>
+<li>"以追加为主"、"一写多读"（暗示对象存储、Blob 存储）。</li>
+</ul>
+<h3 id="architectural-smells">架构异味</h3>
+<ul>
+<li>存储是成本瓶颈，而非 Central Processing Unit (CPU) 或网络。</li>
+<li>数据量大且不可变或仅追加（视频、照片、日志、备份）。</li>
+<li>读取流量突发或冷数据为主；大多数字节很少被访问。</li>
+<li>单个对象丢失是客户可感知的故障或合规事故。</li>
+<li>系统按要求跨多个可用区（AZ）或区域部署。</li>
+</ul>
+<h3 id="example-interview-prompts-where-this-is-core">该类型为核心的面试题示例</h3>
+<ol>
+<li>设计 S3 / 全球规模的对象存储。</li>
+<li>设计 GFS / HDFS / 用于分析的分布式文件系统。</li>
+<li>设计 YouTube 或 Netflix 视频存储（含冷数据分层）。</li>
+<li>设计类似 Instagram 或 Facebook Haystack 的图片存储系统。</li>
+<li>设计 Dropbox / Google Drive（分块文件同步，带持久性后端）。</li>
+<li>设计备份 / 归档服务（类 Glacier 的冷存储）。</li>
+<li>设计区块链账本或仅追加的审计日志。</li>
+<li>设计指标 / 日志长期存储，类似 Datadog 的归档层。</li>
+</ol>
+<hr/>
+<h2 id="3-60-second-spoken-framing">3. 60 秒口头框架</h2>
+<blockquote>
+<p>不变量是：我们已向客户确认的任何字节，必须以极高概率在任意单个机架故障中存活，并以高概率在任意单个可用区故障中存活；若客户为此付费，还应能从区域级丢失中恢复。我将通过叠加三层来达到十一个九：在区域内跨故障域使用纠删码以实现高性价比的冗余，使用异步跨区域复制应对区域级灾难，以及持续的后台数据校验加 Merkle 树反熵以在冗余耗尽前发现比特腐烂。我会在元数据路径上保留持久性 Write-Ahead Log，确保飞行中的写入不会在故障转移时丢失，并将冷数据分层至更廉价的介质，在保持相同持久性目标的同时接受更差的延迟。我想推导的数学是：在相关机架故障加修复时间下，单个对象的年度丢失概率，因为这正是决定纠删码参数的因素。 <code>M+K</code>.</p>
+</blockquote>
+<hr/>
+<h2 id="4-canonical-toolkit">4. 标准工具箱</h2>
+<h3 id="41-replication-nx-copies">4.1 副本（<code>Nx</code> 份）</h3>
+<p>保留 <code>N</code> 在不同故障域上保存相同副本。读取可访问任意副本；写入发送至全部 <code>N</code> （或一个法定人数 <code>W</code>).</p>
+<ul>
+<li>优点：简单，读取速度快（无需解码），修复速度快（只需复制一个块），易于推理。</li>
+<li>缺点： <code>Nx</code> 存储开销。在 <code>3x</code> 和 100 PB 时，这意味着 200 PB 的"浪费"磁盘。</li>
+<li>适合场景：小对象（编码开销主导数据本身）、热数据（任意副本均可服务）、低延迟写入（无需奇偶计算）。</li>
+</ul>
+<h3 id="42-erasure-coding-reed-solomon-m-k">4.2 纠删码（Reed-Solomon <code>M + K</code>)</h3>
+<p>将一个对象拆分为 <code>M</code> 个数据块；计算 <code>K</code> 个奇偶块；将全部 <code>M+K</code> 个块存储在不同故障域上。容忍任意 <code>K</code> 个块丢失。存储开销为 <code>(M+K)/M</code>.</p>
+<p>常见配置：</p>
+<table>
+<thead>
+<tr>
+<th>Scheme</th>
+<th>开销</th>
+<th>容忍</th>
+<th>使用方</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>3x</code> 副本</td>
+<td><code>3.00x</code></td>
+<td>2 次丢失</td>
+<td>HDFS 默认、Dynamo、Cassandra</td>
+</tr>
+<tr>
+<td>Reed-Solomon <code>6+3</code></td>
+<td><code>1.50x</code></td>
+<td>3 次丢失</td>
+<td>HDFS 纠删码、Ceph</td>
+</tr>
+<tr>
+<td>Reed-Solomon <code>10+4</code></td>
+<td><code>1.40x</code></td>
+<td>4 次丢失</td>
+<td>S3 大对象</td>
+</tr>
+<tr>
+<td>Reed-Solomon <code>12+4</code></td>
+<td><code>1.33x</code></td>
+<td>4 次丢失</td>
+<td>Facebook f4 温存储</td>
+</tr>
+<tr>
+<td>Reed-Solomon <code>17+3</code></td>
+<td><code>1.18x</code></td>
+<td>3 次丢失</td>
+<td>Google ColossusFS（典型）</td>
+</tr>
+</tbody>
+</table>
+<p>优点：与副本相比，在相同容错能力下存储成本更低。 <code>10+4</code> 能够承受任意 4 块丢失，开销仅为 <code>1.4x</code> ；等效副本容错能力需要 <code>5x</code>.</p>
+<p>缺点（这不是免费的午餐——在面试中要明确指出）：</p>
+<ul>
+<li><strong>读取尾延迟。</strong> 一次读取必须访问 <code>M</code> 个块；一个慢速分片会拖慢整个读取。副本方案可以对最快的 <code>N</code> 个副本进行对冲——纠删码无法做到，除非过度读取（获取 <code>M+1</code> 竞争），这会消耗网络带宽。纠删码读取 p99 在结构上比副本方案更差。</li>
+<li><strong>修复放大。</strong> 重建一个块需要读取 <code>M</code> 个其他块。在 <code>10+4</code>时，单磁盘丢失修复需要跨网络传输 <code>10x</code> 副本修复数据量的倍数。在 PB 量级，这可能成为主要的网络开销。</li>
+<li><strong>写入延迟与 CPU。</strong> 编码是 Galois 域矩阵乘法（每字节开销低，但非零）；写入需要等待 <code>M+K</code> 个块放置到 <code>M+K</code> 个故障域，而不是 <code>N</code> 个副本。写入提交点取决于最慢的 <code>M+K</code>，而不是最快的 <code>N</code>.</li>
+<li><strong>小对象开销。</strong> 块元数据和 <code>M+K</code> 个放置记录对于小于约 1 MB 的对象可能超过数据本身。生产对象存储会通过副本旁路路径处理小对象。</li>
+</ul>
+<h3 id="43-conceptual-python-sketch-of-reed-solomon-mk">4.3 Reed-Solomon 的 Python 概念草图 <code>M+K</code></h3>
+<p>实际实现（Jerasure、ISA-L、Backblaze 的 <code>reedsolomon</code>）在 Galois 域 <code>GF(2^8)</code>上运算。其核心是 Vandermonde 矩阵乘法：编码将数据块视为向量，并与一个 <code>(M+K) × M</code> 矩阵相乘，该矩阵的上方 <code>M × M</code> 块是单位矩阵（因此输出的前 <code>M</code> 行等于原始数据，使其成为 <em>系统</em> 码）。任意 <code>M</code> 行（来自全部 <code>M+K</code> 行输出）构成可逆矩阵，因此任意 <code>M</code> 个幸存块均可重建原始数据。</p>
+<pre><code class="language-python"># Conceptual only. Real code uses GF(2^8) arithmetic, not floats.
+import numpy as np
+
+def vandermonde_systematic(m: int, k: int) -&gt; np.ndarray:
+    """Return an (m+k) x m generator matrix whose top m rows are I_m."""
+    # Top: identity so encoded chunks 0..m-1 equal original data (systematic).
+    top = np.eye(m)
+    # Bottom: a Vandermonde-style parity matrix. Any m rows of the
+    # full (m+k) x m matrix must be invertible; Vandermonde guarantees this.
+    bottom = np.array([[(i + 1) ** j for j in range(m)]
+                       for i in range(k)], dtype=float)
+    return np.vstack([top, bottom])
+
+def encode(data_chunks: list[bytes], m: int, k: int) -&gt; list[bytes]:
+    """Encode m data chunks into m+k chunks. m original + k parity."""
+    G = vandermonde_systematic(m, k)
+    # Each chunk treated as a byte vector; multiply column-wise.
+    data_matrix = np.stack([np.frombuffer(c, dtype=np.uint8)
+                            for c in data_chunks])
+    encoded = G @ data_matrix      # (m+k) x chunk_size
+    return [row.astype(np.uint8).tobytes() for row in encoded]
+
+def decode(surviving_chunks: dict[int, bytes], m: int, k: int) -&gt; list[bytes]:
+    """Recover the original m data chunks from any m of the m+k chunks."""
+    G = vandermonde_systematic(m, k)
+    indices = sorted(surviving_chunks)[:m]
+    # Submatrix of the rows we received; invert it to solve for data.
+    sub_G = G[indices, :]
+    sub_data = np.stack([np.frombuffer(surviving_chunks[i], dtype=np.uint8)
+                         for i in indices])
+    recovered = np.linalg.solve(sub_G, sub_data)
+    return [row.astype(np.uint8).tobytes() for row in recovered]
+</code></pre>
+<p>生产代码不使用浮点数——那会丢失信息且不确定性。它们使用 <code>GF(2^8)</code> 域算术，其中加法是 <code>XOR</code> ，乘法是小表查找。概念要点：编码是矩阵乘法，解码是对幸存行求解线性方程组。</p>
+<h3 id="44-ascii-layout-of-mk-63-example">4.4 ASCII 布局（ <code>M+K</code> (<code>6+3</code> 示例）</h3>
+<pre><code>Object 1 GiB, M=6 data + K=3 parity
+=============================================================
+
+   chunk_0   chunk_1   chunk_2   chunk_3   chunk_4   chunk_5
+   ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐
+   │ D0  │  │ D1  │  │ D2  │  │ D3  │  │ D4  │  │ D5  │   &lt;- data (systematic)
+   └─────┘  └─────┘  └─────┘  └─────┘  └─────┘  └─────┘
+   ┌─────┐  ┌─────┐  ┌─────┐
+   │ P0  │  │ P1  │  │ P2  │                              &lt;- parity
+   └─────┘  └─────┘  └─────┘
+
+Placement across 9 racks in 3 Availability Zones:
+
+   AZ-1                  AZ-2                  AZ-3
+   ┌────┬────┬────┐     ┌────┬────┬────┐     ┌────┬────┬────┐
+   │R1  │R2  │R3  │     │R4  │R5  │R6  │     │R7  │R8  │R9  │
+   │ D0 │ D1 │ D2 │     │ D3 │ D4 │ D5 │     │ P0 │ P1 │ P2 │
+   └────┴────┴────┘     └────┴────┴────┘     └────┴────┴────┘
+
+Failure of ANY rack -&gt; 1 chunk lost; tolerable (K=3 allowed).
+Failure of ANY AZ   -&gt; 3 chunks lost; AT THE EDGE; one more rack
+                      failure during repair = data loss.
+
+Lesson: K should exceed the largest correlated failure domain you
+want to lose. K=3 with 3 AZs is too tight; production uses K&gt;=4 or
+spreads chunks across MORE AZs to avoid losing K chunks at once.
+</code></pre>
+<h3 id="45-geo-replication-cross-region-async">4.5 异地复制（跨区域、异步）</h3>
+<p>在本地编码完成后，异步将持久化对象复制到第二个区域。默认是"最终在两个区域内持久化"；某些存储类别会同步提交到两个区域，以获得更高的恢复点目标（RPO）保证。</p>
+<p>异步/同步的选择是持久性与延迟之间的直接权衡——不要回避这个问题：</p>
+<ul>
+<li><strong>异步跨区域。</strong> 成本低，写入延迟保持在本地（单区域提交）。代价是非零 RPO：在区域突然丢失时，尚未传输的尾部写入会丢失。仅当产品能够容忍区域丢失事件中秒到分钟级的写入丢失时，才是合理选择。</li>
+<li><strong>同步跨区域。</strong> 每次提交的写入延迟现在包含跨区域往返时延（RTT） <code>60-200 ms</code> （美东到美西）。RPO 为零，但吞吐量下降，写入尾延迟大幅增加。用于监管要求（金融账本、医疗）以及真正无法接受非零 RPO 的产品。</li>
+<li><strong>跨区域复制并不是在同一持久性数字上增加"额外的九"。</strong> 它是针对 <em>不同的</em> 故障模式（区域丢失）的独立防御手段。所宣传的十一个九持久性是每个对象的磁盘/机架指标；跨区域复制支撑的是区域性灾难下的 RPO/恢复时间目标（RTO）。</li>
+</ul>
+<h3 id="46-write-ahead-log-wal-checkpoints">4.6 Write-Ahead Log (WAL) + 检查点</h3>
+<p>每次状态变更在应用到内存状态之前，都先追加到持久化日志中。崩溃后，从最后一个检查点开始向前重放日志。WAL 本身必须是持久化的——通常是 <code>3x</code> 副本或写入持久化日志服务（Apache BookKeeper、AWS Kinesis、Apache Kafka 配合 <code>acks=all</code>).</p>
+<ul>
+<li>BigTable：每次写入在 memtable 更新被确认前，都会先写入 GFS 提交日志。Tablet server 崩溃后，会在新服务器上重放提交日志。</li>
+<li>Spanner、CockroachDB：Raft 日志即 WAL。</li>
+<li>WAL 确保 <em>进行中</em> 飞行中的写入在故障后能够存活——单纯的副本机制无法保证这一点，因为仅被一个副本确认的写入可能会丢失。</li>
+</ul>
+<h3 id="47-background-scrubbing-bit-rot-detection">4.7 后台数据校验 / 比特腐烂检测</h3>
+<p>持续读取每个块，验证其存储的校验和（通常为 Cyclic Redundancy Check 32 (CRC32C) 或 256 位 Secure Hash Algorithm (SHA-256)），并在不匹配时重新复制。每 14-30 天对整个集群进行一次全量校验。若不进行校验，奇偶校验也会损坏，届时只有在读取时才会发现数据丢失——而那时已为时太晚。</p>
+<p>数据校验并非免费。在 100 PB 上进行 30 天校验周期，意味着持续 <code>~38 Gbps</code> 的后台读取（<code>100 PB / 30 days</code>），这会与同一磁盘上的服务 I/O 竞争。生产系统将校验速率限制在磁盘带宽的一小部分（通常为 <code>&lt; 5%</code>），对冷数据层接受更长的周期。面试中的诚实做法：数据校验对持久性是强制的，但它是 I/O 预算中真实且持续的开销，而不是旁路进程。</p>
+<pre><code>Scrub loop per disk:
+  for chunk in chunks_on_disk:
+      stored_hash = chunk.metadata.sha256
+      computed = sha256(chunk.bytes)
+      if stored_hash != computed:
+          mark_chunk_corrupt(chunk)
+          schedule_repair(chunk)        # reconstruct from peers
+          alert("silent corruption", disk_id, chunk.id)
+</code></pre>
+<h3 id="48-merkle-trees-anti-entropy">4.8 Merkle 树 / 反熵</h3>
+<p>每个副本或块组维护其内容的 Merkle 树。对等节点交换树摘要；不匹配项可识别出具体的分歧键，而无需交换完整状态。Dynamo 和 Cassandra 使用 Merkle 反熵修复长期分歧；S3 使用类似机制验证跨区域副本的一致性。参见 <a href="/zh/common-backend-systems/amazon-dynamo/">Amazon Dynamo</a> 了解规范性描述。</p>
+<h3 id="49-multi-az-writes-with-quorum">4.9 多 AZ 写入与法定人数</h3>
+<p>当 <code>W</code> 个副本中的 <code>N</code> 个（分布在 <code>N</code> 个不同 AZ 上）已持久化写入时，该写入才被视为持久。常见配置： <code>N=3, W=2</code> （当 3 个 AZ 中的 2 个确认后返回）或 <code>N=5, W=3</code> （Spanner / Aurora 风格）。关键在于，持久性提交不能仅从单个 AZ 完成。</p>
+<h3 id="410-durability-classes-tiering">4.10 持久性等级 / 分层</h3>
+<p>并非每个字节都值得以热数据层的成本追求十一个九。生产对象存储暴露以下等级：</p>
+<table>
+<thead>
+<tr>
+<th>存储类</th>
+<th>持久性</th>
+<th>可用性</th>
+<th>检索</th>
+<th>成本</th>
+<th>模拟程序启动时会进行的重定基址操作。</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>S3 Standard</td>
+<td>11 个九（多 AZ）</td>
+<td>4 个九</td>
+<td>毫秒级</td>
+<td><code>1.0x</code></td>
+<td>活跃数据</td>
+</tr>
+<tr>
+<td>S3 Standard-IA（低频访问）</td>
+<td>11 个九（多 AZ）</td>
+<td>3 个九</td>
+<td>毫秒级</td>
+<td><code>0.55x</code></td>
+<td>备份数据</td>
+</tr>
+<tr>
+<td>S3 One Zone-IA</td>
+<td>11 个九 <em>以 AZ 存活为前提</em></td>
+<td>2 个九</td>
+<td>毫秒级</td>
+<td><code>0.45x</code></td>
+<td>可再生数据</td>
+</tr>
+<tr>
+<td>S3 Glacier Instant Retrieval</td>
+<td>11 个九（多 AZ）</td>
+<td>4 个九</td>
+<td>毫秒级</td>
+<td><code>0.25x</code></td>
+<td>即时读取归档</td>
+</tr>
+<tr>
+<td>S3 Glacier Deep Archive</td>
+<td>11 个九（多 AZ）</td>
+<td>不适用</td>
+<td>小时</td>
+<td><code>0.05x</code></td>
+<td>冷归档</td>
+</tr>
+</tbody>
+</table>
+<p>需要特别指出的是：S3 One Zone-IA <em>非</em> 能够在 AZ 丢失中存活。其十一个九的数字仅适用于存活 AZ 内部的每对象故障；它与多 AZ 等级的持久性并不等价。这是为 <code>0.45x</code> 成本所付出的明确代价。</p>
+<p>冷数据迁移策略（生命周期规则）会自动移动数据："30 天未访问后，移至 IA；90 天后，移至 Glacier。"在 100 PB 规模下节省的总费用相当可观；运营风险是从 Glacier 恢复的延迟（数分钟到数小时），以及客户突然需要取回冷数据时的检索费用激增。Glacier 与 Standard 具有相同的持久性 <em>等级</em>；差异在于检索延迟和每 GB 的检索成本。</p>
+<h3 id="411-lineage-write-fence-for-in-flight-writes-during-failover">4.11 故障转移中飞行写入的 Lineage / Write-Fence</h3>
+<p>当主节点故障、备用节点接管时，必须确保不丢失主节点已确认但尚未复制的写入。两种技术协同工作：</p>
+<ul>
+<li><strong>Write fence。</strong> 旧主节点的写入在新主节点接管的瞬间即被拒绝（通过 Chubby / ZooKeeper / Etcd 中的租约到期，或元数据侧的 fencing token 递增）。这防止了脑裂——旧主节点在失去领导权后无法继续确认写入——但仅凭此无法挽救在 fence 之前已确认的写入。</li>
+<li><strong>WAL 上的 Lineage。</strong> 每次写入携带一个单调递增的 Log Sequence Number (LSN)。写入只有在被 WAL 副本的法定人数复制后，才向客户端确认 <em>after</em> 已被复制到 WAL 副本的法定人数。新主节点在接管时读取法定人数可见的最高已提交 LSN，并从最后一个检查点向前重放。任何未出现在 WAL 副本法定人数中的内容从未被确认，因此客户端必须重试（在幂等性保证下这是安全的）。</li>
+</ul>
+<p>两者的结合至关重要：fence 阻止旧主节点创建新的已确认写入，WAL 法定人数不变量保证所有 <em>先前</em> 已确认的写入对选举胜出者可见。</p>
+<p>与 <a href="/zh/system-design-patterns/idempotency-exactly-once/">幂等性 / 恰好一次语义</a> 配对——故障转移后重试的客户端需要幂等写入以避免重复。</p>
+<h3 id="412-local-reconstruction-codes-lrc-tiered-parity">4.12 本地重建码（LRC）——分层奇偶</h3>
+<p>纯 Reed-Solomon 修复成本高昂：重建一个块需要读取 <code>M</code> 个其他块。在 EB 量级，修复带宽主导网络预算。 <strong>本地重建码</strong> （Azure Storage、Facebook f4 采用）在数据块的小子组上添加一层 <em>本地</em> 奇偶，并在整个条带上添加 <em>全局</em> 奇偶。</p>
+<pre><code>LRC (12,2,2):  12 data chunks, 2 local parity, 2 global parity
+                = 16 chunks total, overhead 1.33x
+
+   group A: D0..D5  ─►  LA  (local parity for group A)
+   group B: D6..D11 ─►  LB  (local parity for group B)
+   all:     D0..D11 ─►  G0, G1  (global parity)
+
+   Single chunk loss in group A: rebuild from D0..D5 + LA  (6 reads)
+                                 instead of all 12 + globals (12 reads)
+   Two chunk losses: must use global parity; still recoverable.
+</code></pre>
+<p>单块故障（绝大多数情况）仅需读取 <code>M/2</code> 个块，而不是 <code>M</code>个，修复带宽减半。与纯 Reed-Solomon 的权衡：LRC 以略微弱化的最坏情况容错能力换取大幅降低的常见情况修复开销。Reed-Solomon <code>12+4</code> 容忍 <em>任何</em> 4 块丢失；LRC <code>(12,2,2)</code> 在某些配置下才能容忍任意 4 块丢失——跨越两个本地组的对抗性丢失在丢失少于 4 块时可能无法恢复。当单块丢失修复带宽是瓶颈时（EB 量级典型场景），LRC 是正确选择；当最坏情况容错能力是首要考量时，纯 Reed-Solomon 是正确选择。面试中应指出权衡，而不是声称 LRC 严格更优。</p>
+<hr/>
+<h2 id="5-worked-example-naive-broken-fixed">5. 工作示例：朴素方案 → 问题 → 修复</h2>
+<h3 id="scenario">场景</h3>
+<p>一个 100 PB 的对象存储，10 万块旋转磁盘，每块 <code>4 TB</code> ，AFR 为 <code>4%</code>，分布在一个区域的 <code>3</code> 个可用区中。修复带宽预算为 <code>10 Gbps</code> 每节点。平均对象大小为 <code>1 MB</code>，因此 <code>~100 billion objects</code>.</p>
+<h3 id="naive-3x-replication-across-3-azs">朴素方案： <code>3x</code> 跨 3 个 AZ 的副本</h3>
+<p>成本计算：</p>
+<ul>
+<li>原始数据：100 PB。</li>
+<li>已存储：300 PB（<code>3x</code>).</li>
+<li>在 <code>$0.02 / GB / month</code> 原始数据，月度成本： <code>300 * 10^6 * $0.02 = $6M/month</code>.</li>
+<li>网络：写入会放大 <code>3x</code>；读取不会。</li>
+</ul>
+<p>持久性数学（粗略估算）：</p>
+<ul>
+<li><code>100,000</code> 磁盘，AFR <code>4%</code> → 预期 <code>4,000</code> 每年发生磁盘故障， <code>~11</code> 每天。</li>
+<li>一块 4 TB 的磁盘保存 <code>~4 * 10^6</code> 个数据块（<code>1 MB</code> 每块大小）；每个数据块有 2 个存活副本。</li>
+<li>修复一块磁盘所需时间： <code>4 TB / 10 Gbps ≈ 55 minutes</code> 纯传输时间；实际上由于资源争用和元数据处理，需要数小时。</li>
+<li>在 AFR 下每块磁盘每小时的故障概率 <code>4%</code> 是 <code>~4.6 * 10^-6</code>。若某个特定数据块永久丢失，两个存活副本必须在修复窗口内都发生故障。在（错误但对健全性验证有用的）独立故障假设下，1 小时窗口内该联合概率为 <code>~(4.6 * 10^-6)^2 ≈ 2 * 10^-11</code> 每个数据块每次故障事件。乘以 <code>~4 * 10^9</code> 每块磁盘每年的总事件数，在 <em>独立故障</em> 假设下，最终数值远低于十一个九。</li>
+</ul>
+<p>因此， <code>3x</code> 在独立故障分析表上看起来不错。分析表的谬误之处：</p>
+<h3 id="broken-correlated-failures-repair-storms">问题：相关性故障 + 修复风暴</h3>
+<ul>
+<li><strong>相关性故障</strong>：HDFS 默认将副本放置为 <code>(local, remote-rack, remote-rack-same)</code>。一次机架断电会导致 3 个副本中的 2 个丢失。如果第三块磁盘有哪怕一个过时数据块（未被发现的比特腐烂），数据就会丢失。AFR 不再是合适的模型——机架故障率才是，而且它主要由电源、网络、固件和人为错误决定，而非磁盘机械故障。</li>
+<li><strong>修复风暴</strong>：单个数据中心的一次网络事件同时导致 100 块磁盘下线。此时需要在整个集群中修复 400 TB 数据，同时与线上流量争夺相同的网络和 CPU 资源。修复窗口从 1 小时延长至 24 小时；持久性在风暴期间下降约 24 倍。风暴期间的并发故障此时已成大概率事件。</li>
+<li><strong>存储成本</strong>: <code>$6M/month</code> 仅仅存储比特就需要这些成本。硬件更新和电力冷却使总成本超出 <code>$10M/month</code>。CFO 询问为何不能提高效率。</li>
+</ul>
+<h3 id="fixed-reed-solomon-63-cross-az-placement-scrub-cross-region">修复方案：Reed-Solomon <code>6+3</code> + 跨可用区部署 + 数据清洗 + 跨区域复制</h3>
+<p><strong>本地编码</strong>: <code>6+3</code> Reed-Solomon，数据块放置 <code>1 per rack across 9 racks</code> 分布式 <code>3 racks per AZ</code>.</p>
+<ul>
+<li>存储开销： <code>1.5x</code> 而非 <code>3x</code>。已节省 <code>150 PB</code> 磁盘空间。直接成本节省： <code>~$3M/month</code>.</li>
+<li>容错性：可承受任意 3 个数据块的丢失。可承受任意一个机架的丢失（1 个数据块）。可承受可用区丢失（3 个数据块），但仅处于临界状态——修复期间再发生一次机架故障就会导致数据丢失。因此实际上需要将参数提升到 <code>6+4</code> 或 <code>10+4</code> （或将数据块分布在更多可用区），以实现可用区丢失加修复期间的容错。</li>
+</ul>
+<p><strong>后台数据清洗</strong>：每个数据块每 14 天被读取一次并计算校验和。比特腐烂在奇偶校验耗尽前被发现并重新编码。若没有数据清洗，只有在读取时才能发现损坏——而 90% 的对象是冷数据。</p>
+<p><strong>跨区域异步复制</strong>：按存储桶选择启用；第二个区域保存一份完整的编码副本。RPO：通常为秒级。只需翻转一个存储桶级别的配置即可在区域丢失时恢复。</p>
+<p><strong>持久性数学，修复后的配置</strong>:</p>
+<ul>
+<li>每块磁盘每小时的故障概率： <code>~4.6 * 10^-6</code> （来自 AFR <code>4%</code>).</li>
+<li>在（剩余 8 个数据块中有 4 个（在 <code>6+3</code>，一个数据块丢失后）在 1 小时修复窗口内独立失效的概率： <code>C(8, 4) * (4.6 * 10^-6)^4 ≈ 3 * 10^-20</code>。按 8760 小时年化，乘以 <code>~10^11</code> 个对象，该值仍安全低于 <code>10^-11</code> 每个对象每年。</li>
+<li>该数值是 <em>下限</em> 在独立故障假设下的结果。真正的风险是相关性机架/可用区故障，这也是为什么数据块放置方案需要分布在 <code>9</code> 个不同故障域中，且 <code>K</code> 的选取需大于任何单个机架或可用区持有的数据块数量。当 <code>K=3</code> 且有 3 个可用区（每个可用区 3 个数据块）时，一个完整可用区的丢失将不留任何余量；设计应调整到 <code>6+4</code> 或分布在更多可用区。</li>
+<li>跨区域异步复制是一种独立的威胁模型——它以显式的秒级恢复点目标（RPO）来抵御区域丢失（尾部未复制的写入处于风险中）。它不是额外几个九，而是针对不同故障模式的一个不同数字。</li>
+</ul>
+<p>总计：磁盘/机架故障下可靠的十一个九，加上针对区域丢失的显式 RPO。成本为区域内 <code>1.5x</code> 加跨区域 <code>1x</code> 跨区域 = <code>~2.5x</code> 总计，相较于朴素的 <code>3x</code> 单区域方案。擦除编码的复杂性是否物有所值取决于规模：在 100 PB 时，节省的存储空间为 <code>~$3M/month</code> 磁盘空间，足以支付实施和运营 EC 的工程成本。在 10 PB 时，节省的空间仅为 <code>~$300K/month</code> 。 <code>3x</code> 此时副本复制可能才是团队层面的正确答案。</p>
+<hr/>
+<h2 id="6-variants-and-how-to-choose">6. 变体方案与如何选择</h2>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>存储开销</th>
+<th>容错性</th>
+<th>写入延迟</th>
+<th>读取延迟</th>
+<th>修复成本</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>3x</code> 副本复制，可用区内</td>
+<td><code>3x</code></td>
+<td>2 块磁盘</td>
+<td>低</td>
+<td>低</td>
+<td>低（复制一个块）</td>
+<td>单可用区工作负载、热数据库</td>
+</tr>
+<tr>
+<td><code>3x</code> 副本复制，跨可用区</td>
+<td><code>3x</code></td>
+<td>1 个可用区 + 额外磁盘</td>
+<td>中等</td>
+<td>低</td>
+<td>中（跨可用区网络）</td>
+<td>HDFS 默认，Dynamo / Cassandra</td>
+</tr>
+<tr>
+<td>Reed-Solomon <code>6+3</code></td>
+<td><code>1.5x</code></td>
+<td>3 个数据块</td>
+<td>中等</td>
+<td>中（解码 <code>M</code>)</td>
+<td>高（<code>M</code> 个数据块每次修复）</td>
+<td>大型对象、温数据层</td>
+</tr>
+<tr>
+<td>Reed-Solomon <code>10+4</code></td>
+<td><code>1.4x</code></td>
+<td>4 个数据块</td>
+<td>中等</td>
+<td>中等</td>
+<td>高</td>
+<td>S3 Standard 大型对象</td>
+</tr>
+<tr>
+<td>Reed-Solomon <code>17+3</code></td>
+<td><code>1.18x</code></td>
+<td>3 个数据块</td>
+<td>中等</td>
+<td>中等</td>
+<td>极高</td>
+<td>Colossus，深度温数据</td>
+</tr>
+<tr>
+<td>分层：热数据副本复制 + 冷数据 EC</td>
+<td>因情况而异</td>
+<td>混合</td>
+<td>低（热数据）</td>
+<td>低（热数据）</td>
+<td>混合</td>
+<td>具有生命周期策略的对象存储</td>
+</tr>
+<tr>
+<td>冷归档（Glacier 类）</td>
+<td><code>~1.4x</code> 存储在磁带</td>
+<td>4 个数据块</td>
+<td>秒级（写入）</td>
+<td>小时级（读取）</td>
+<td>极高</td>
+<td>合规、备份</td>
+</tr>
+</tbody>
+</table>
+<h3 id="sync-vs-async-geo-replication">同步与异步地理复制</h3>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>RPO</th>
+<th>写入延迟</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>同步（多区域仲裁）</td>
+<td>0</td>
+<td>区域间 RTT（60-200 ms）</td>
+<td>金融账本、支付</td>
+</tr>
+<tr>
+<td>异步 + 监控</td>
+<td>秒级</td>
+<td>本地</td>
+<td>大多数对象存储、blob 存储</td>
+</tr>
+<tr>
+<td>异步 + 重新锚定保证</td>
+<td>分钟级</td>
+<td>本地</td>
+<td>备份、归档</td>
+</tr>
+<tr>
+<td>手动 / 批量灾难恢复</td>
+<td>小时</td>
+<td>本地</td>
+<td>冷归档</td>
+</tr>
+</tbody>
+</table>
+<h3 id="when-to-switch-from-replication-to-erasure-coding">何时从副本复制切换到擦除编码</h3>
+<p>诚实的阈值是成本，而非持久性——两种方案在正确部署后都能达到十一个九。</p>
+<ul>
+<li><strong>规模门槛。</strong> 在约 10 PB 原始数据以下， <code>3x</code> 跨可用区的副本复制完全够用；EC 节省的存储空间无法抵消工程成本、运营复杂度和更差的读取尾延迟。在个位数 PB 时，团队层面的正确决策通常是不 <em>非</em> 引入擦除编码。</li>
+<li><strong>对象大小 <code>&gt; ~1 MB</code>.</strong> 低于这一规模，数据块元数据和 <code>M+K</code> 放置记录可能超过数据本身的大小；小对象应走副本复制的旁路路径。S3 内部对小对象和大对象采用不同的处理路径。</li>
+<li><strong>读取流量对延迟不敏感。</strong> 解码会增加延迟，更重要的是，EC 读取在结构上具有更差的尾延迟（需要等待最慢的 <code>M</code> 个分片，且无法通过快速副本进行对冲）。热点、延迟敏感的数据通常即使在大规模场景下也保持副本复制。</li>
+<li><strong>修复流量可被吸收。</strong> EC 修复会将网络使用量放大 <code>~M</code>。请确认集群网络在低峰期有足够带宽，能在故障相关性预算窗口内完成修复。</li>
+<li><strong>存储成本占预算主导。</strong> 一旦磁盘成为最大支出项， <code>1.4x</code> vs <code>3x</code> 在数百 PB 规模下每年意味着数百万美元——此时 EC 的复杂性才物有所值。</li>
+</ul>
+<hr/>
+<h2 id="7-failure-modes-and-operations">7. 故障模式与运维</h2>
+<table>
+<thead>
+<tr>
+<th>失败</th>
+<th>需监控的指标</th>
+<th>缓解措施</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>磁盘故障（单块驱动器）</td>
+<td>AFR，缺失数据块计数</td>
+<td>后台重新复制；提高部署多样性。</td>
+</tr>
+<tr>
+<td>静默数据损坏（比特腐烂）</td>
+<td>数据清洗不匹配率</td>
+<td>持续数据清洗；从奇偶校验重新编码。</td>
+</tr>
+<tr>
+<td>相关性机架故障</td>
+<td>机架故障率；每个机架的欠复制数量</td>
+<td>跨机架放置约束； <code>K</code> 超过故障域中机架数量。</td>
+</tr>
+<tr>
+<td>可用区故障</td>
+<td>可用区可用性，每次可用区事件的数据块丢失量</td>
+<td>跨可用区放置； <code>K &gt;=</code> 每个可用区的数据块数。</td>
+</tr>
+<tr>
+<td>区域故障</td>
+<td>跨区域复制延迟</td>
+<td>异步地理复制；经过演练的灾难恢复手册。</td>
+</tr>
+<tr>
+<td>修复风暴（大规模磁盘丢失）</td>
+<td>修复积压量，修复带宽利用率</td>
+<td>限速修复；优先修复欠复制最严重的数据块；预留修复容量。</td>
+</tr>
+<tr>
+<td>过时元数据（数据块映射错误）</td>
+<td>元数据与数据的审计差异</td>
+<td>Merkle 反熵；定期全量审计。</td>
+</tr>
+<tr>
+<td>故障转移期间飞行中的写入丢失</td>
+<td>故障转移时 WAL 延迟，丢失写入计数器</td>
+<td>具有血缘关系的持久 WAL；客户端幂等性。</td>
+</tr>
+<tr>
+<td>修复期间热磁盘过载</td>
+<td>每块磁盘 QPS，修复导致的延迟</td>
+<td>将修复源分散到多块磁盘；限制速率。</td>
+</tr>
+<tr>
+<td>全集群固件缺陷</td>
+<td>按驱动器型号统计的全集群错误率</td>
+<td>在同一放置组中使用多元化的驱动器厂商/型号。</td>
+</tr>
+<tr>
+<td>操作员误删（误操作）</td>
+<td>删除速率峰值</td>
+<td>版本控制 + 软删除 + 删除保护 + 延迟垃圾回收（GC）。</td>
+</tr>
+<tr>
+<td>勒索软件 / 污染加密</td>
+<td>版本控制变更频率</td>
+<td>对象锁定、不可变窗口、气隙备份。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-rules-of-thumb">运维经验法则</h3>
+<ul>
+<li>修复必须比 <code>K</code> 次并发数据块丢失的平均故障间隔时间（MTBF）更快完成；否则你的持久性将入不敷出。</li>
+<li>数据清洗间隔应短于比特腐烂耗尽奇偶校验预算所需的时间。</li>
+<li>放置引擎必须编码故障域层级结构： <code>disk -&gt; node -&gt; rack -&gt; AZ -&gt; region</code>. <code>K</code> 必须超过你能承受丢失的最大故障域中的数据块数量。</li>
+<li>始终对欠复制数量和修复积压增长进行告警，而非仅对修复速率告警——一个高修复速率但能跟上的情况是正常的；低修复速率但积压持续增长则是致命的。</li>
+<li>至少每季度进行一次故障转移演练。未经测试的故障转移是虚构的故障转移。很多区域丢失灾难恢复计划在第一次真实事故发生前只停留在纸面上。</li>
+<li>在每个客户级别跟踪持久性事件。即使总体十一个九的数字达标，单个存储桶丢失一个对象也是一次客户信任事件。</li>
+<li>维护一份丢失对象处置手册。当一个对象真正无法恢复时，你需要向客户提供：（a）哪个对象，（b）丢失的确切时间，（c）哪些冗余层失效，（d）将采取什么措施以防止再次发生。S3 对每次丢失对象事件都会发放积分并撰写事故备忘录。</li>
+</ul>
+<h3 id="a-worked-metric-set">一套实用的指标集</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>定义</th>
+<th>告警</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>欠复制数据块</td>
+<td>存活副本数低于目标值的数据块</td>
+<td>若持续增长则触发紧急告警；若非零则创建工单 <code>&gt;1h</code></td>
+</tr>
+<tr>
+<td>修复积压字节数</td>
+<td>待重新编码/重新复制的总字节数</td>
+<td>若增长速率超过吞吐量则触发紧急告警</td>
+</tr>
+<tr>
+<td>数据清洗覆盖率 <code>%</code></td>
+<td>过去 30 天内已清洗的集群占比</td>
+<td>若低于阈值则触发紧急告警 <code>&lt; 95%</code></td>
+</tr>
+<tr>
+<td>静默损坏率</td>
+<td>每 TB 读取的数据清洗不匹配次数</td>
+<td>趋势图表；调查峰值</td>
+</tr>
+<tr>
+<td>跨区域复制延迟（p99）</td>
+<td>写入到跨区域持久化之间的秒数</td>
+<td>若低于阈值则触发紧急告警 <code>&gt; RPO_target</code></td>
+</tr>
+<tr>
+<td>WAL 延迟（副本）</td>
+<td>副本落后于主节点的字节数</td>
+<td>若低于阈值则触发紧急告警 <code>&gt; threshold</code>；阻塞故障转移</td>
+</tr>
+<tr>
+<td>丢失对象数</td>
+<td>无法被重建的对象</td>
+<td>始终触发紧急告警；进行事故复盘</td>
+</tr>
+<tr>
+<td>年化数据丢失率</td>
+<td>每存储字节每年丢失的字节数</td>
+<td>跟踪与十一个九目标的差距</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h2 id="8-combinations-with-other-patterns">8. 与其他模式的组合</h2>
+<ul>
+<li><strong><a href="/zh/system-design-patterns/idempotency-exactly-once/">幂等性 / 恰好一次语义</a></strong> — 故障转移后的飞行中写入恢复需要客户端幂等重试。WAL 给了系统恢复的机会；幂等键给了客户端在不产生重复副作用的情况下重试的机会。</li>
+<li><strong><a href="/zh/system-design-patterns/strong-consistency-under-contention/">竞争下的强一致性</a></strong> — 一次持久化写入尚未对读者可见，这是一致性问题，而非持久性问题。S3 于 2020 年通过收紧元数据服务，在保持相同持久性栈的前提下，从最终一致性升级为写后强一致性读。</li>
+<li><strong><a href="/zh/system-design-patterns/coordination-exactly-one-execution/">协调 / 精确单次执行</a></strong> — Chubby / ZooKeeper / Etcd 的租约提供了 fencing token，使基于 WAL 血统的故障转移得以安全进行。</li>
+<li><strong><a href="/zh/system-design-patterns/ordering-causal-consistency/">排序 / 因果一致性</a></strong> — WAL 排序（LSN）是故障转移安全的根本保障。该原语同样支撑了上层系统的因果一致性。</li>
+<li><strong><a href="/zh/system-design-patterns/hot-key-skew/">热键倾斜</a></strong> — 带热前缀的持久化存储在故障期间会出现修复流量倾斜；感知前缀的放置策略和自适应分区至关重要。</li>
+<li><strong><a href="/zh/system-design-patterns/fan-out-write-amplification/">扇出写放大</a></strong> — <code>3x</code> replication 是 <code>3x</code> 写放大；erasure coding 是 <code>(M+K)/M</code> 字节但 <code>K</code> 独立奇偶校验计算。跨地域会再增加 <code>1x</code>。请相应规划写带宽余量。</li>
+<li><strong><a href="/zh/system-design-patterns/cache-stampede-read-amplification/">缓存击穿 / 读放大</a></strong> — Erasure-coded 读具有固有的 <code>M</code>倍读放大；在冷 EC 存储前部署 CDN 或热副本层可吸收这一开销。</li>
+<li><strong><a href="/zh/system-design-patterns/backpressure-flow-control/">背压 / 流量控制</a></strong> — 修复流量必须对线上流量施加背压；否则修复风暴会侵蚀客户端 SLO。</li>
+</ul>
+<hr/>
+<h2 id="9-likely-interviewer-probes">9. 面试官可能的追问</h2>
+<ol>
+<li>
+<p><strong>"请用算术推导 S3 为何能宣称十一个九。"</strong> 预期回答：首先明确单位——十一个九是 <code>10^-11</code> <em>每个对象每年</em>，而非系统可用性数字，且与 S3 的四个九 <em>可用性</em>分开。然后：编码率 <code>M+K</code>，故障域多样性，修复时间数学（<code>P(K coincident failures during the repair window)</code>），位腐烂清洗，以及跨地域复制作为针对地域丢失的独立防线，并有其自身的 RPO。</p>
+</li>
+<li>
+<p><strong>"如何选择 Reed-Solomon 中的 <code>M</code> 。 <code>K</code> ？"</strong> 预期回答：存储开销目标（<code>(M+K)/M</code>），容错预算（<code>K</code> 大于最大相关故障域），读放大成本（较小的 <code>M</code> = 较低读放大但更多开销），以及修复放大（较大的 <code>M</code> = 每次修复需读取更多块）。具体示例： <code>10+4</code> 用于热数据， <code>17+3</code> 用于冷数据。</p>
+</li>
+<li>
+<p><strong>"为什么不直接用 <code>5x</code> 或 <code>7x</code> replication 而不用 erasure coding？"</strong> 预期回答：在多 PB 规模下，成本（<code>5x</code> vs <code>~1.4x</code>）是关键，并且 <code>5x</code> replication 只有在这 5 份副本分布在 5 个不相关故障域时才有效——此时等效的 erasure code 能以更低成本提供相同保护。 <code>3x</code> replication 是正确选择，因为存储节省无法抵偿 EC 的修复放大和读尾延迟成本。</p>
+</li>
+<li>
+<p><strong>"清洗实际上是如何工作的？生产环境的清洗计划是什么样的？"</strong> 预期回答：写入时按块存储 CRC32C / SHA-256；清洗以节流速率读取块，重新计算后比对；若不匹配，则从对等节点重新编码并重新放置。清洗频率 <code>14-30</code> 天；冷层清洗频率更低。节流至 <code>&lt; 5%</code> 的磁盘带宽。</p>
+</li>
+<li>
+<p><strong>"一次写入已向客户端确认，然后主节点宕机。如何保证数据不丢失？"</strong> 预期回答：持久化存储上的 Write-Ahead Log，在 ack 前写入；故障转移等待新主节点追上最高已提交的 Log Sequence Number；fencing token 阻止旧主节点继续 ack 更多写入。另加客户端幂等性，处理跨越故障转移的重试。</p>
+</li>
+<li>
+<p><strong>"修复风暴期间会发生什么？"</strong> 预期回答：节流、按当前冗余级别优先排序（仅剩 <code>M</code> 个存活块的数据块优先修复）、修复带宽预留、对修复积压增长率告警，以及为何修复速度必须快于下一次同时发生 <code>K</code>次故障的时间间隔的数学推导。</p>
+</li>
+<li>
+<p><strong>"跨地域复制如何与强一致性交互？"</strong> 预期回答：通常为异步（因此跨地域是最终一致的），由地域层提供强一致性。同步跨地域存在（Spanner），但每次写入都需承担跨地域 RTT 代价。对于对象存储，异步 + 监控 + RPO <code>&lt; 1 minute</code> 是常态。</p>
+</li>
+<li>
+<p><strong>"如何抵御勒索软件或恶意内部人员？"</strong> 预期回答：对象版本控制（每次覆盖写入都是新版本，旧版本在保留窗口内保留）、对象锁 / Write-Once-Read-Many（WORM）用于合规存储桶、基于角色的删除限制、MFA-Delete（删除操作需多因素认证），以及凭据无法从生产控制平面访问的气隙备份。持久性不仅要抵御硬件故障，还要抵御操作员和攻击者。</p>
+</li>
+<li>
+<p><strong>"如果放置引擎本身存在 bug 怎么办？"</strong> 预期回答：定期执行放置审计作业，遍历元数据并验证每个块的实际位置是否满足放置约束（跨机架、跨 AZ）。悄悄将块同地放置的 bug 最为危险，因为在相关故障发生前，持久性数字会给出误导性结果。将放置审计视为与清洗并列的一等持久性机制。</p>
+</li>
+</ol>
+<hr/>
+<h2 id="10-common-traps-stronger-moves">10. 常见陷阱 → 更强的应对方案</h2>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"<code>3x</code> replication 就足够了。"</td>
+<td>区分独立故障与相关故障；说明在机架故障下同地放置的 <code>3x</code> 个副本只能提供约 1 个九的真实持久性。添加跨 AZ 放置，再通过 erasure coding 控制成本。</td>
+</tr>
+<tr>
+<td>"只需存更多副本。"</td>
+<td>在规模化场景下，这是不可承受的。 <code>Reed-Solomon M+K</code> 能以 <code>(M+K)/M</code> 的开销提供相同的容错级别。</td>
+</tr>
+<tr>
+<td>"磁盘就是会坏；AFR 能解释一切。"</td>
+<td>真正的风险是相关故障：机架交换机、电源相位、固件缺陷、数据中心事件、人为错误。独立故障数学模型掩盖了这些风险。</td>
+</tr>
+<tr>
+<td>"Replication = 持久性。"</td>
+<td>对已 <em>committed</em> 状态的 replication 才是存储数据的持久性。 <em>运行中数量</em> 数据需要持久化的 Write-Ahead Log。否则主节点崩溃可能丢失已确认的写入。</td>
+</tr>
+<tr>
+<td>"我们有 replication，所以不需要清洗。"</td>
+<td>没有清洗，位腐烂会悄悄耗尽奇偶校验；你只会在读取时发现丢失，为时已晚。清洗是持久性的连续时间组件，而非一次性设置。</td>
+</tr>
+<tr>
+<td>"到处都用 erasure coding。"</td>
+<td>小对象在元数据和块管理上要承担编码开销；小对象用 replication，大对象用编码。热数据可能需要复制前端以避免 <code>M</code>倍读放大。</td>
+</tr>
+<tr>
+<td>"跨地域复制 = <code>2x</code> 持久性。"</td>
+<td>异步跨地域存在 RPO <code>&gt; 0</code> ——地域灾难可能导致最近几秒的写入丢失。请明确说明这一点并准备好应急手册。</td>
+</tr>
+<tr>
+<td>"备份就是持久性。"</td>
+<td>备份快照是抵御逻辑损坏、勒索软件和操作员错误的防线；它们无法替代 replication / EC。属于独立的威胁模型。</td>
+</tr>
+<tr>
+<td>"Glacier 只是慢一点的存储。"</td>
+<td>Glacier 与 S3 Standard 具有相同的持久性目标。权衡在于检索延迟和成本，而非持久性。与生命周期策略配合使用。</td>
+</tr>
+<tr>
+<td>"我直接用云厂商的 <code>eleven nines</code>."</td>
+<td>面试官希望看到你自己设计出 <em>与</em> 十一个九，而不是调用一个服务。请讲解编码率、故障域放置、清洗节奏和修复数学。</td>
+</tr>
+<tr>
+<td>"我们用 <code>Nx</code> replication，不用操心这些。"</td>
+<td>量化平均数据丢失时间（MTTDL）：是 <code>N</code>，AFR、修复时间和故障域多样性的函数。给出算术推导。</td>
+</tr>
+<tr>
+<td>"修复是自动的，所以我们很安全。"</td>
+<td>展示修复积压指标、修复带宽预算和欠复制直方图。修复积压持续增长是即将发生数据丢失的先行指标。</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h3 id="bonus-probe-what-is-the-dominant-cost-in-your-durability-story-disk-network-cpu-or-operations">额外追问："你的持久性方案中主要成本是什么——磁盘、网络、CPU 还是运营？"</h3>
+<p>强力回答：取决于存储层级。热层——磁盘占主导（replication 或 <code>M+K</code> 开销乘以 PB 规模）。冷归档——磁带和冷却占主导；编码 CPU 每个对象只需一次。 <code>M</code> 块跨机架拖动。当清洗、修复、审计和 DR 演练需要专职 SRE / 存储可靠性工程师时，运营占主导——在 EB 规模下确实如此。指出成本维度能让面试官看出你不只是设计过这一层，还真正运营过它。</p>
+<hr/>
+<h2 id="11-staff-level-answer-checklist">11. Staff 级别回答清单</h2>
+<ul>
+<li>[ ] 以多少个九表述持久性目标，并换算为每个对象的年度丢失概率。</li>
+<li>[ ] 识别故障域层次结构： <code>disk → node → rack → AZ → region</code>.</li>
+<li>[ ] 选择冗余方案（<code>Nx</code> replication 或 Reed-Solomon <code>M+K</code>）并从存储成本和读放大角度论证选择。</li>
+<li>[ ] 使 <code>K</code> 超过你承诺容忍的最大相关故障域。</li>
+<li>[ ] 将块分布在多样化的故障域中；在放置引擎中编码放置约束，而不是写在注释里。</li>
+<li>[ ] 添加后台清洗，节奏短于奇偶校验耗尽时间线。</li>
+<li>[ ] 对进行中的写入使用持久化 Write-Ahead Log；故障转移等待 WAL 追齐。</li>
+<li>[ ] 添加跨地域复制，并明确 RPO 目标。</li>
+<li>[ ] 定义持久性等级 / 分层与生命周期策略；冷层不降低持久性，仅增加延迟。</li>
+<li>[ ] 跟踪修复积压和欠复制数量；对增长率告警，而非绝对值。</li>
+<li>[ ] 通过版本控制、对象锁和不可变性窗口防御操作员错误和勒索软件。</li>
+<li>[ ] 推导算术：每块故障概率、修复时间、同时故障概率和最终每个对象的持久性数字。</li>
+<li>[ ] 为每种故障模式命名指标（相关机架故障、位腐烂、修复风暴、地域丢失、进行中写入丢失）。</li>
+<li>[ ] 提及运营实践：清洗计划、修复节流、DR 演练、全机群供应商 / 固件多样性。</li>
+</ul>
+<hr/>
+<h2 id="12-cross-references">12. 交叉参考</h2>
+<p>本模式集内部：</p>
+<ul>
+<li><a href="/zh/system-design-patterns/idempotency-exactly-once/">幂等性 / 恰好一次语义</a> — 故障转移期间的客户端重试。</li>
+<li><a href="/zh/system-design-patterns/strong-consistency-under-contention/">竞争下的强一致性</a> — 持久性与可见性。</li>
+<li><a href="/zh/system-design-patterns/coordination-exactly-one-execution/">协调 / 精确单次执行</a> — 主节点交接的 fencing token。</li>
+<li><a href="/zh/system-design-patterns/ordering-causal-consistency/">排序 / 因果一致性</a> — WAL Log Sequence Numbers。</li>
+<li><a href="/zh/system-design-patterns/fan-out-write-amplification/">扇出写放大</a> — Replication 和 EC 都是写放大。</li>
+<li><a href="/zh/system-design-patterns/hot-key-skew/">热键倾斜</a> — 故障事件期间的修复流量倾斜。</li>
+<li><a href="/zh/system-design-patterns/cache-stampede-read-amplification/">缓存击穿 / 读放大</a> — EC 读放大 <code>M</code>倍。</li>
+<li><a href="/zh/system-design-patterns/backpressure-flow-control/">背压 / 流量控制</a> — 修复流量与线上流量的节流。</li>
+<li><a href="/zh/system-design-patterns/real-time-aggregation/">实时聚合</a> — 持久性事件的指标。</li>
+<li><a href="/zh/system-design-patterns/search-and-ranking/">搜索与排序</a>, <a href="/zh/system-design-patterns/geo-spatial-queries/">地理空间查询</a> — 通常构建在持久化对象存储之上。</li>
+</ul>
+<p>基于持久化存储的问题文档：</p>
+<ul>
+<li><a href="/zh/common-backend-systems/design-amazon-s3/">Amazon S3</a> — 十一个九，Reed-Solomon <code>10+4</code>，异步跨地域。</li>
+<li><a href="/zh/common-backend-systems/hadoop-distributed-file-system/">Hadoop 分布式文件系统（HDFS）</a> — <code>3x</code> 具有机架感知放置的块 replication；HDFS Erasure Coding 用于温数据。</li>
+<li><a href="/zh/common-backend-systems/google-bigtable/">Google BigTable</a> — Tablet 将 SSTable 和提交日志存储在 GFS 上；BigTable 将持久性委托给底层文件系统。</li>
+<li><a href="/zh/common-backend-systems/amazon-dynamo/">Amazon Dynamo</a> — 基于 Quorum 的 replication；Merkle 树反熵。</li>
+<li><a href="/zh/common-backend-systems/apache-cassandra/">Apache Cassandra</a> — Dynamo 风格的 replication 调优；hinted handoff；读修复。</li>
+<li><a href="/zh/common-backend-systems/apache-kafka/">Apache Kafka</a> — 用于持久化日志的 In-Sync Replica（ISR）replication。</li>
+<li><a href="/zh/common-backend-systems/design-dropbox/">Dropbox</a> — 在持久化后端上的分块去重存储。</li>
+<li><a href="/zh/common-backend-systems/design-youtube/">YouTube</a> — 具有冷归档的多层视频存储。</li>
+<li><a href="/zh/common-backend-systems/design-netflix/">Netflix</a> — 基于持久化对象存储的内容分发。</li>
+<li><a href="/zh/common-backend-systems/design-instagram/">Instagram</a> — 照片存储持久性。</li>
+<li><a href="/zh/common-backend-systems/design-google-docs/">Google Docs</a>, <a href="/zh/common-backend-systems/design-dropbox/">Google Drive / Dropbox</a> — 文档和文件持久性。</li>
+</ul>
+<p>外部阅读：</p>
+<ul>
+<li>Amazon S3 持久性博客文章（及 <code>1-10^-11</code> 推导过程）。</li>
+<li>"一个 EB 的存储闻起来是什么味道？"（Google）。</li>
+<li>Bairavasundaram 等，"An Analysis of Data Corruption in the Storage Stack"（FAST 2008）。</li>
+<li>Backblaze 驱动器统计季报。</li>
+<li>HDFS Erasure Coding 设计文档。</li>
+<li>Facebook 的 f4 论文（"基于 Reed-Solomon 的温 BLOB 存储 <code>10+4</code>").</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

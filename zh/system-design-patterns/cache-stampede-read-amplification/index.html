@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>缓存击穿 / 读放大 — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/system-design-patterns/">← 返回系统设计模式</a>
+<h1 class="article-title">缓存击穿 / 读放大</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/05/31  ·  系统设计模式
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p>热 key 的缓存未命中会在同一时刻将所有并发读者发送到源端，将一个缺失条目转变为对数据库的自我发起的拒绝服务攻击。该模式是将 N 个并发未命中合并为一次源端拉取、并保持热条目常驻缓存从而避免未命中的工具箱。关于基础术语（Time-To-Live (TTL)、Content Delivery Network (CDN)、cache-aside 等），请参阅 Staff System Design Glossary。</p>
+<p>以该模式为重心的核心问题文档：\n- <a href="/zh/common-backend-systems/design-a-distributed-cache-like-redis/">设计类 Redis 的分布式缓存</a>
+- <a href="/zh/common-backend-systems/design-a-flash-sale-for-an-e-commerce-site/">Design a Flash Sale for an E-commerce Site</a>
+- <a href="/zh/common-backend-systems/design-google-news-as-a-global-aggregator/">设计 Google News 全球聚合器</a>
+- <a href="/zh/common-backend-systems/design-twitter-timeline/">设计 Twitter Timeline</a>
+- <a href="/zh/common-backend-systems/design-youtube/">设计 YouTube</a>
+- <a href="/zh/common-backend-systems/design-ticketmaster/">设计 Ticketmaster</a>
+- <a href="/zh/common-backend-systems/design-typeahead-autocomplete/">Design Typeahead Autocomplete</a></p>
+</blockquote>
+<hr/>
+<h2 id="1-the-fundamental-hardness">1. 核心难点</h2>
+<p>缓存存在的原因在于，源端——通常是关系型数据库、搜索索引或对象存储——无法以可接受的延迟或成本支撑稳态读取速率。现代 Web 应用的每秒读取量可比数据库所能承受的高出两到四个数量级。因此，整个架构隐式地赌命中率保持高位。在稳态下，这个赌注没有问题。但一旦某个热条目在缓存中缺失，而前端不知道如何减速，这个赌注就会失效。</p>
+<p>故障的形态是 <strong>thundering herd（惊群效应）</strong>：在时刻 T，热 key 过期（或被逐出，或从未被写入，或刚刚失效）。在 T 到 T + Round-Trip-Time (RTT)-to-origin 这段时间内，每个并发读者都看到未命中并独立发起一次源端拉取。损害是两个数字的乘积——并发未命中者数量 × 每次未命中的源端成本——仅当该乘积饱和某个下游资源时才真正造成问题。具体示例：某个 key 在缓存层接收 50,000 QPS，源端查询耗时 30 毫秒，在这段空隙内会有约 1,500 个并发未命中者；若数据库连接池为 200、到数据库的稳态 QPS 为 50，那么这单个缺失 key 就会向连接池注入 30 倍于设计预算的请求。数据库饱和，延迟攀升，前端超时并重试，重试叠加在未命中之上，系统进入级联故障。原本应保护数据库的缓存，反而成了摧毁它的导火索。</p>
+<p>推论是边界条件： <strong>对于并发未命中数量少的冷 key，朴素的 cache-aside 完全可行。</strong> 一个接收 5 QPS、数据库查询耗时 10 毫秒的 key，在过期时产生约 0.05 个并发未命中者——根本不存在需要缓解的惊群效应。惊群缓解技术在真正热门且查询代价高的 key 上才值得引入复杂度。Staff 级别的回答往往是："朴素 cache-aside 对 99% 的 key 来说是正确答案；以下是我会添加 single-flight 的少数场景。"</p>
+<p>故障的变体具有相同形状但触发条件不同。 <strong>cold start（冷启动）</strong> 在部署或节点重启后以空缓存开始，每个首次请求都是未命中——持续数分钟直到工作集预热完毕。 <strong>mass eviction（大规模逐出）</strong> （缓存集群 OOM、逐出整代数据、或故障转移后新节点本地内存为冷态）在功能上等同于没有部署的冷启动。 <strong>flash crowd（瞬时人群）</strong> 首次将某个 key 推入热门范围——缓存可能有该 key，但上游 CDN 层没有，源端盾牌同时收到每个 CDN 边缘节点的首次请求。 <strong>synchronized expiry（同步过期）</strong> ——所有在部署时以相同 TTL 写入的条目——在 T + TTL 时演变为同步未命中风暴。</p>
+<p>该模式保护的更深层不变量是 <strong>每次缓存未命中对应的源端工作量有界</strong>。朴素情况下，一次未命中等于一次源端拉取——但前提是你将同一 key 的并发未命中合并处理。下面整个工具箱的目标，就是在竞争情况下使这一命题成立，并降低未命中概率使工具箱鲜少触发。</p>
+<hr/>
+<h2 id="2-how-to-recognize-it-in-the-interview">2. 如何在面试中识别背压问题</h2>
+<h3 id="prompt-phrases-that-signal-this-pattern">触发该模式的提示语</h3>
+<ul>
+<li>"缓存结果。"</li>
+<li>"从缓存提供，回退到数据库。"</li>
+<li>"读多写少。"</li>
+<li>"减少数据库负载。"</li>
+<li>"病毒式内容 / 热门 / 突发新闻。"</li>
+<li>"黑五 / 超级碗 / 发布日流量。"</li>
+<li>"部署后冷启动。"</li>
+<li>"热行 / 热 key / 热 URL。"</li>
+<li>"边缘缓存 / CDN / 源端盾牌。"</li>
+<li>"TTL 为 N 秒。"</li>
+<li>"逐出策略 / Least Recently Used (LRU) / Least Frequently Used (LFU)。"</li>
+</ul>
+<h3 id="architectural-smells-in-stated-requirements">需求描述中的架构异味</h3>
+<ul>
+<li>读写比约超过 50:1，因此缓存是显而易见的成本杠杆。</li>
+<li>单一实体（帖子、视频、商品、行情）被大量读者访问——这意味着该 key 的未命中后面有一群等待者。</li>
+<li>源端延迟远高于缓存延迟（数据库查询 20 毫秒，缓存 0.5 毫秒——惊群窗口是缓存命中窗口的 40 倍）。</li>
+<li>产品具有"病毒式传播"或"热门"功能——工作负载分布从定义上就是重尾的。</li>
+<li>提到了多级缓存（CDN、边缘、应用本地、分布式缓存）——每个边界都是潜在的惊群面。</li>
+<li>面试官问"缓存故障时会怎样"——他们希望听到优雅降级，而非"我们回退到数据库"。</li>
+<li>面试官提及失效、部署或预热——他们希望听到冷启动的处理方案。</li>
+</ul>
+<h3 id="example-design-x-prompts-where-this-is-the-core-hardness">以此为核心难点的"设计 X"示例题</h3>
+<table>
+<thead>
+<tr>
+<th>题目</th>
+<th>为何缓存惊群是核心</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>设计类 Redis 的分布式缓存</td>
+<td>缓存本身必须防御热 key、大规模逐出以及对自身客户端的惊群攻击。Single-flight、热 key 副本和租约令牌是核心手段。</td>
+</tr>
+<tr>
+<td>Design a Flash Sale</td>
+<td>售卖开始时商品页读取量飙升至数百万 QPS；库存行是单一热 key；读放大问题是公开路径上最主要的扩展性难题。</td>
+</tr>
+<tr>
+<td>设计 Google News 全球聚合器</td>
+<td>突发新闻被全球每位读者同时读取；对规范文章的 CDN 源端盾牌未命中是灾难性的。</td>
+</tr>
+<tr>
+<td>设计 Twitter Timeline</td>
+<td>名人推文对象、热门话题和浏览量计数器都是惊群面；每用户时间线缓存本身也是冷启动隐患。</td>
+</tr>
+<tr>
+<td>设计 YouTube</td>
+<td>病毒式视频元数据和推荐 feed；CDN 边缘节点对新上热门视频的未命中会让源端遭遇惊群。</td>
+</tr>
+<tr>
+<td>设计 Ticketmaster</td>
+<td>高需求演出的座位图和活动详情页在开票时是热 key；冷队列启动具有相同形态。</td>
+</tr>
+<tr>
+<td>Design Typeahead Autocomplete</td>
+<td>前 100 个前缀补全远比长尾热；在新闻事件期间对"covid"或"election"的热 key 未命中会将惊群流量发向搜索后端。</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h2 id="3-60-second-spoken-framing">3. 60秒口头框架</h2>
+<blockquote>
+<p>我所设计要防范的风险是读放大——一次热 key 缓存未命中演变为大量相同的源端查询洪流。但在采用技术手段之前，我会先界定问题范围：对于 QPS 适中且查询代价低廉的长尾 key，朴素 cache-aside 是正确答案。只有在真正热门且源端查询代价高昂的 key 上，缓解措施才值得引入复杂度。对于这类 key，我会采取纵深防御。第一，进程内 single-flight：每个 key 一把锁，使每个应用实例只有一个请求者访问源端，其余等待——这将源端 QPS 上限控制在 N 个应用实例数量级，而非并发读者数。第二，概率性提前过期，使热 key 在过期前异步刷新，而不是在过期那一刻才刷新——当热 key 的 QPS 乘以源端查询代价会饱和下游连接池时，此方法有具体依据。第三，stale-while-revalidate，即未命中时仍向客户端返回旧值，同时在后台重新拉取——需要产品能明确说明的陈旧度 SLO 作为依据。第四，分层缓存——Content Delivery Network、边缘、应用本地 Least Recently Used 缓存、分布式缓存、源端——使每层为下一层遮挡惊群。只有当进程内 single-flight 的 N 个实例仍会压垮源端时，我才会考虑分布式 single-flight（Redis 锁）。在运营层面，我会对相对基线的源端 QPS、按 key 类别的缓存命中率以及 fan-out 因子（每个 single-flight 槽的并发等待者数）设置告警。我最不希望看到的是缓存集群故障转移触发大规模逐出冷启动，而应用与数据库之间没有任何限速。</p>
+</blockquote>
+<hr/>
+<h2 id="4-canonical-toolkit">4. 标准工具集</h2>
+<h3 id="41-single-flight-request-coalescing">4.1 Single-flight / 请求合并</h3>
+<p><strong>定义。</strong> 当 N 个并发请求对同一 key 未命中时，只有其中一个—— <em>主节点</em> ——实际调用源端。其余 N-1 个—— <em>从节点</em> ——阻塞在一个 per-key future 上，并接收相同的响应。N 次源端拉取合并为一次。</p>
+<pre><code>T=0   100 readers all miss key "post:42"
+        │
+        ▼
+   try acquire lock("post:42")
+        │
+        ├── reader 0 acquires lock ──► fetch from origin ──► populate cache ──► return
+        │
+        └── readers 1..99 wait on future ──► get same value when ready
+                                              (zero origin queries from them)
+</code></pre>
+<p><strong>Python 示意（asyncio）。</strong> 一个 per-key <code>asyncio.Lock</code> 加上一个 per-key <code>Future</code> 用于广播结果。锁使请求者串行化；future 允许从节点搭便车而无需重新获取锁。</p>
+<pre><code class="language-python">import asyncio
+from typing import Awaitable, Callable, TypeVar
+
+V = TypeVar("V")
+
+
+class SingleFlight:
+    """Coalesce concurrent calls for the same key into one origin fetch."""
+
+    def __init__(self) -&gt; None:
+        # key -&gt; Future holding the in-flight result. Presence of the entry
+        # is itself the "someone is already fetching" signal.
+        self._inflight: dict[str, asyncio.Future[V]] = {}
+        # A coarse lock around the dict; per-key locking is via the future.
+        self._mu = asyncio.Lock()
+
+    async def do(self, key: str, fetch: Callable[[], Awaitable[V]]) -&gt; V:
+        async with self._mu:
+            existing = self._inflight.get(key)
+            if existing is not None:
+                fut = existing
+                is_leader = False
+            else:
+                fut = asyncio.get_running_loop().create_future()
+                self._inflight[key] = fut
+                is_leader = True
+
+        if not is_leader:
+            return await fut  # follower: just wait
+
+        # Leader: actually do the work, then publish the result.
+        try:
+            value = await fetch()
+            fut.set_result(value)
+            return value
+        except Exception as exc:
+            fut.set_exception(exc)
+            raise
+        finally:
+            async with self._mu:
+                # Remove the inflight entry so the next miss starts a new fetch.
+                self._inflight.pop(key, None)
+</code></pre>
+<p><strong>分布式变体——以及需要指出的不对称性。</strong> 一个 per-key <code>asyncio.Lock</code> 仅在单个进程内合并请求。进程内版本成本极低：一个 dict 和一把锁，每次调用的开销为微秒级。跨进程版本则 <em>本质上不同</em>：它需要一个分布式锁——通常是短生命周期的 Redis <code>SET key:lock NX PX 5000</code> 加上唯一令牌——这会在每条未命中路径上额外增加一次缓存往返，同时还需要处理锁 TTL vs 源端 p99 延迟、锁持有者身份识别，以及锁持有者宕机时的正确性问题。从节点要么轮询缓存 key（若缓存 RTT 为个位数毫秒则可接受），要么订阅 pub/sub 频道。</p>
+<p>诚实的表述：如果你有 200 台应用服务器，且同一 key 在所有服务器上同时未命中，进程内 single-flight 会产生 200 次源端拉取（每台一次），而非 1 次。这是否可接受取决于具体情况。若源端能轻松承受 200 QPS 的突发（中位热 key 的缓存未命中，查询代价适中），到此为止即可——分布式协调是不必要的复杂度。只有当 200 个并发源端拉取确实造成危害时——通常意味着查询代价高昂（数百毫秒）或源端已接近容量上限——才考虑使用 Redis 锁。</p>
+<p><strong>面试中需要指出的细节。</strong>
+- 主节点可能宕机。设置有限的锁 TTL，使崩溃的主节点能解除从节点的阻塞——但 TTL 必须大于源端 p99 延迟，否则会出现重复拉取。\n- 主节点的拉取可能很慢。从节点必须有自己的截止时间；如果主节点耗时过长，从节点应放弃（最好返回旧值），而不是无限期阻塞用户请求。\n- Single-flight 对 <em>不同的</em> 并发缺失的不同 key 无效——它只合并相同 key 的未命中。热 key 倾斜是输入问题；参见 <a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a>.</p>
+<h3 id="42-probabilistic-early-expiration-xfetch-vattani-et-al">4.2 概率性提前过期（XFetch / Vattani 等人）</h3>
+<p><strong>定义。</strong> 读取缓存中某个值的读者，会以随 TTL 趋近过期而增大的概率，主动提前刷新该值而非直接返回。到条目真正过期时，几乎可以确定它已被刷新，因此不会出现同步未命中事件。</p>
+<p><strong>数学原理（来自 Vattani, Chierichetti, Lowenstein, 2015 年——"Optimal Probabilistic Cache Stampede Prevention"）。</strong> 每个缓存条目存储上次计算的时间以及计算耗时（delta）。读取时：</p>
+<pre><code>should_refresh_early  iff   now - delta * beta * ln(rand()) &gt;= expiry
+</code></pre>
+<p>其中 <code>beta</code> 是调优常数（通常 <code>beta = 1</code>), <code>rand()</code> 在...中均匀分布 <code>(0, 1)</code>，以及 <code>delta</code> 是该 key 的历史拉取延迟。由于 <code>ln(rand())</code> 是负数且无下界，当该值接近 TTL 时不等式很少成立 <code>now</code> 远未到达 <code>expiry</code>，并随着 <code>now</code> 趋近而以递增的概率变为真。 <code>expiry</code>。获取代价高昂的条目（较大的 <code>delta</code>）会更早刷新，这恰恰是正确的策略——它们在硬缓存未命中时重新计算的成本最高。</p>
+<pre><code class="language-python">import math
+import random
+import time
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Optional
+
+
+@dataclass
+class CacheEntry:
+    value: object
+    delta: float       # how long the last fetch took, in seconds
+    expiry: float      # absolute unix time at which this becomes hard-stale
+
+
+async def get_with_early_expiration(
+    cache,
+    key: str,
+    fetch: Callable[[], Awaitable[object]],
+    ttl: float,
+    beta: float = 1.0,
+) -&gt; object:
+    entry: Optional[CacheEntry] = await cache.get(key)
+    now = time.time()
+
+    if entry is None or now &gt;= entry.expiry:
+        # Hard miss path. Combine with single-flight to avoid a herd here.
+        return await _refresh(cache, key, fetch, ttl)
+
+    # Early-expiration test. As now approaches entry.expiry, the chance of
+    # this test firing grows; for an entry that just refreshed, it almost
+    # never fires.
+    if now - entry.delta * beta * math.log(random.random()) &gt;= entry.expiry:
+        # Refresh in background; serve the current (still-valid) value now.
+        asyncio.create_task(_refresh(cache, key, fetch, ttl))
+
+    return entry.value
+
+
+async def _refresh(cache, key, fetch, ttl):
+    started = time.time()
+    value = await fetch()
+    delta = time.time() - started
+    await cache.set(
+        key,
+        CacheEntry(value=value, delta=delta, expiry=time.time() + ttl),
+        ttl=ttl,
+    )
+    return value
+</code></pre>
+<p><strong>为什么这是资深工程师的做法。</strong> 提前过期是 <em>与羊群效应解耦的</em>：每个读取者独立掷骰子。不需要跨进程或数据中心的同步。整体效果是：任何单个读取者触发硬未命中的概率趋近于零，而稳态刷新率为每个 key 每个 TTL 一次刷新。与 single-flight 结合，可确保即使在罕见的硬未命中情况下也只发起一次请求。</p>
+<h3 id="43-stale-while-revalidate-swr-and-stale-if-error">4.3 Stale-while-revalidate（SWR）与 stale-if-error</h3>
+<p><strong>定义。</strong> 当缓存条目的 TTL 过期时，不要删除它，而是将其标记为过期（stale）。读取过期条目时，立即向用户返回过期值，同时触发后台刷新。用户永远不会因等待源站而阻塞。</p>
+<pre><code>read at T=0 (entry fresh):    cache HIT, return fresh value.
+read at T=TTL+1 (stale):      cache HIT (stale), return stale value
+                              + kick off background refresh.
+read at T=TTL+2 (refresh in flight): cache HIT (stale), return stale
+                              + DO NOT kick off another refresh
+                              (single-flight on the refresh job).
+read at T=TTL+5 (refresh done): cache HIT (fresh again), return fresh.
+</code></pre>
+<p><strong>Stale-if-error</strong> 是其近亲：如果后台刷新失败（源站宕机、超时），则继续返回过期值而不是报错，即使已超出名义上的过期时间。你愿意接受的新鲜度预算，就是保持可用性的代价。</p>
+<p><strong>Python 示例（装饰器形式）。</strong></p>
+<pre><code class="language-python">import asyncio
+import time
+from functools import wraps
+
+
+def swr_cache(cache, ttl: float, stale_extension: float):
+    """
+    Stale-while-revalidate decorator.
+
+    - For `ttl` seconds, the cached value is fresh.
+    - For an additional `stale_extension` seconds, the cached value is stale
+      but still served while a background refresh runs.
+    - After ttl + stale_extension, it is hard-expired.
+    """
+    inflight: dict[str, asyncio.Task] = {}
+
+    def decorator(fetch):
+        @wraps(fetch)
+        async def wrapper(key: str, *args, **kwargs):
+            entry = await cache.get(key)
+            now = time.time()
+
+            if entry is None:
+                # Hard miss: must block on origin (still coalesce via single-flight).
+                value = await fetch(key, *args, **kwargs)
+                await cache.set(key, {"value": value, "stored_at": now}, ttl=ttl + stale_extension)
+                return value
+
+            age = now - entry["stored_at"]
+
+            if age &lt; ttl:
+                # Fresh.
+                return entry["value"]
+
+            # Stale but still within stale_extension. Serve stale, refresh async.
+            if key not in inflight:
+                async def refresh():
+                    try:
+                        v = await fetch(key, *args, **kwargs)
+                        await cache.set(key, {"value": v, "stored_at": time.time()},
+                                        ttl=ttl + stale_extension)
+                    finally:
+                        inflight.pop(key, None)
+
+                inflight[key] = asyncio.create_task(refresh())
+
+            return entry["value"]
+        return wrapper
+    return decorator
+</code></pre>
+<p><strong>何时使用。</strong> 适用于值可重新计算、但允许数秒钟过期的场景。新闻文章、社交媒体帖子正文、商品详情页、推荐信息流、搜索结果页——这些都适合 SWR。该模式已内置于 HTTP <code>Cache-Control</code> 指令（<code>stale-while-revalidate</code>, <code>stale-if-error</code>）中，并被 Fastly、Cloudflare 等 CDN 原生支持。</p>
+<p><strong>何时应避免使用。</strong> 库存数量、账户余额，以及任何"过期五秒即为正确性违规"的场景。请参阅 <a href="/zh/system-design-patterns/strong-consistency-under-contention/">strong-consistency-under-contention.md</a> 代替。</p>
+<h3 id="44-background-refresh-async-warming">4.4 后台刷新 / 异步预热</h3>
+<p><strong>定义。</strong> 将缓存填充与用户请求完全解耦。由 cron job、Kafka 消费者或长驻 worker 按计划重新计算热点 key 并写入缓存。面向用户的读取路径应当 <em>始终命中缓存</em>；缓存未命中是需要告警的事件。</p>
+<p><strong>何时使用。</strong>
+- 热点 key 集合已知且有界——比如前 1,000 个热门话题、未来 50 场在售活动的座位图、首页轮播的元数据。\n- 重新计算代价高昂（每个 key 需要数秒——太慢，无法在未命中时内联执行）。\n- 新鲜度要求足够宽松，可以接受定期刷新（热门话题每 10 秒，排行榜每 60 秒）。</p>
+<p><strong>架构图。</strong></p>
+<pre><code>            ┌──────────────────────────┐
+            │  Hot-key registry        │
+            │  (Redis sorted set       │
+            │   of top-N keys)         │
+            └────────────┬─────────────┘
+                         │ produces refresh jobs
+                         ▼
+            ┌──────────────────────────┐
+            │  Refresh workers         │
+            │  (consume Kafka /        │
+            │   cron schedule)         │
+            └────────────┬─────────────┘
+                         │ writes
+                         ▼
+            ┌──────────────────────────┐
+            │  Distributed cache       │
+            └────────────┬─────────────┘
+                         │
+            ┌────────────▼─────────────┐
+            │  User request path:      │
+            │  cache MUST hit          │
+            └──────────────────────────┘
+</code></pre>
+<p><strong>风险。</strong> 后台刷新本身很脆弱。如果热点 key 注册表有误（某个新 key 变热但未被纳入），用户路径将遭遇硬未命中，你又回到了 single-flight 的问题。如果刷新 worker 缓慢或失败，缓存会悄无声息地变得陈旧。请将 SWR 或 single-flight 作为降级保障与之配合使用。</p>
+<h3 id="45-tiered-caching">4.5 分层缓存</h3>
+<p><strong>定义。</strong> 在用户与源站之间堆叠多级缓存。每一层过滤掉流向下一层的流量。</p>
+<pre><code>user ─► CDN edge (geo-near)
+          │ miss
+          ▼
+       CDN origin shield (one POP per region)
+          │ miss
+          ▼
+       Application local Least Recently Used cache (per process)
+          │ miss
+          ▼
+       Distributed cache (Memcached / Redis cluster)
+          │ miss
+          ▼
+       Origin database
+</code></pre>
+<p><strong>为何有效。</strong> 每一层距离雪崩触发点最多只有一次缓存未命中之遥，但每一层也会折叠其所在层 <em>上方</em> 的羊群流量。200 个接入点（POP）的 CDN 边缘节点共用一个源站 shield，意味着数据库每次未命中每个地域最多收到一次请求，而不是 200 次。应用层本地 LRU 缓存进一步在单台服务器内折叠流量：一个进程上的 100 个并发请求共享本地命中。</p>
+<p><strong>资深核心要点。</strong> <em>每一层都必须有自己的羊群保护机制。</em> 仅对应用层做 single-flight 是不够的。CDN 必须启用 origin shield（Cloudflare 称之为"tiered cache"，Fastly 称之为"shield"），以折叠跨边缘节点的并发未命中。分布式缓存必须对热点 key 做副本复制，以限制对任意一个 Redis 分片的请求速率。</p>
+<p><strong>分层带来的代价。</strong> 每一层都有自己的 TTL、自己的失效逻辑和自己的一致性边界。对文章正文的一次修正，必须依次传播经过 CDN 边缘 → CDN origin shield → 应用层本地 LRU → 分布式缓存 → 源站；如果某一层的 TTL 过长且失效通道未能覆盖，该层就会持续返回过期数据。实践中，这意味着你需要付出：每一层的显式 purge API（CDN purge、应用本地缓存清除、Redis DEL），或对齐 TTL 以限制最坏情况下的过期窗口，或基于版本的缓存 key（key 包含内容哈希，新版本创建新 key，旧版本自然老化）。增加一层缓存并非免费——它是一层运维复杂度，而不仅仅是一层性能提升。</p>
+<h3 id="46-negative-caching">4.6 负向缓存</h3>
+<p><strong>定义。</strong> 同样缓存"未找到"的答案。如果某个 key 在源站不存在，不要让每次未命中都重新查询源站来确认它是否仍然不存在。存储一个带有短 TTL 的墓碑（tombstone）。</p>
+<p><strong>何时物有所值。</strong> 负向缓存的成本很低（只是多存一个 <code>SET</code> 带哨兵值），因此成本收益门槛不高——但并非普遍需要。受益的 key 是那些未命中本身代价高昂的 <em>高昂</em> （全文搜索找不到结果时仍会扫描整个索引），或未命中量 <em>被对抗性地放大</em> （爬虫遍历 <code>/user/&lt;random&gt;</code>，攻击者探测 <code>/api/v1/&lt;garbage&gt;</code>）。对于索引列上的普通主键查找，"未找到"路径本身已经很快——加墓碑没问题，但很少是决定性的优化。404 路径也是羊群效应容易隐匿的地方——命中率看起来正常，但数据库其实正被大量返回零行的查询轰炸，因此值得按结果类型（而非仅按未命中率）对未命中进行监控。</p>
+<pre><code class="language-python">NOT_FOUND_SENTINEL = "__NF__"
+
+async def get_user(user_id: int):
+    cached = await redis.get(f"user:{user_id}")
+    if cached == NOT_FOUND_SENTINEL:
+        return None
+    if cached is not None:
+        return deserialize(cached)
+
+    user = await db.fetch_user(user_id)
+    if user is None:
+        # Short TTL — the user might be created soon.
+        await redis.set(f"user:{user_id}", NOT_FOUND_SENTINEL, ex=60)
+        return None
+
+    await redis.set(f"user:{user_id}", serialize(user), ex=3600)
+    return user
+</code></pre>
+<p><strong>细节注意。</strong> 墓碑的 TTL 应该短——如果该实体后来被创建，你希望缓存在一分钟内能感知到。哨兵值必须是明确的哨兵，而不能是空字符串，以便区分"我们知道它不存在"和"我们还没有查询过"。</p>
+<h3 id="47-lease-tokens-memcached-style">4.7 租约令牌（Memcached 风格）</h3>
+<p><strong>定义。</strong> 一种协议级原语，部分缓存将其暴露出来，以使 single-flight 成为缓存本身的属性，而非依赖每个客户端库实现。缓存未命中时，缓存将向第一个客户端发放 <em>租约令牌</em> ——一张允许重新计算的授权令牌。后续的未命中者要么等待值的返回，要么被告知"已有人持有租约，请退避并在 N 毫秒后重试"。</p>
+<p>Memcached 的 <code>gets</code>/<code>cas</code> 带租约机制（根据 Facebook 的 <code>mcrouter</code> 论文《Scaling Memcache at Facebook》，NSDI 2013）正是如此。租约防止 N 个未命中者同时写入同一 key，而等待协议防止 N 个未命中者同时调用源站。</p>
+<p><strong>为何资深候选人应了解这一点。</strong> 这是"我们将 single-flight 内置到缓存中，因为客户端侧合并在规模化时太容易出错"的标准引用文献。</p>
+<hr/>
+<h2 id="5-worked-example-naive-broken-fixed">5. 实际案例：朴素设计 → 崩溃 → 修复</h2>
+<h3 id="setup">场景设定</h3>
+<p>某新闻网站刚刚发布了一篇病毒式传播的文章。文章正文以 <code>article:12345</code> 为 key 缓存在 Redis 中，TTL 为 5 分钟。正午时分，应用层正以每秒 5,000 次的速率为该文章提供读取服务（上游 CDN 吸收了公开流量中绝大部分的每秒 50,000 次请求——对于单个 key 的 50K QPS， <em>第一个</em> 的修复方向是确保 CDN 和边缘层确实被命中；应用缓存是最后防线，而非前门）。文章首次缓存于上午 11:55。构建文章正文的查询是跨多表的 join <code>articles</code>, <code>authors</code>，以及 <code>topics</code> ——在正常负载下 p50 约为 30 毫秒，p99 约为 200 毫秒。</p>
+<p>（如果没有 CDN 层——比如这是一个绕过 CDN 的已登录个性化视图——同样的分析适用于原始数字；数量级会变化，但技术手段相同。）</p>
+<h3 id="naive-design-vanilla-cache-aside">朴素设计：原始 cache-aside 模式</h3>
+<pre><code class="language-python">async def get_article(article_id: int):
+    cached = await redis.get(f"article:{article_id}")
+    if cached is not None:
+        return deserialize(cached)
+    article = await db.query_article(article_id)
+    await redis.set(f"article:{article_id}", serialize(article), ex=300)
+    return article
+</code></pre>
+<h3 id="what-goes-wrong">问题所在</h3>
+<p>在下午 12:00:00， <code>article:12345</code> 的 TTL 触发过期。下一个读取请求（12:00:00.001）发现缓存未命中，查询数据库（30 毫秒），并将结果写入缓存。在这 30 毫秒内，每秒 5,000 次读取 × 0.030 秒 = <strong>150 个并发读取者</strong> 同样发现缓存为空，并各自向数据库发出查询。</p>
+<p>文章获取查询经过精心调优，能够处理数据库约 50 QPS 的稳态流量（主要是长尾文章，而非热点文章）。150 个并发请求同时打到一个拥有 200 个连接的连接池，已经会挤占其他查询；与正常负载叠加后超出连接池预算；在查询规划器的锁竞争上排队；该查询的 p99 从 200 毫秒上升至 5 秒。应用层的 HTTP 超时触发；客户端重试；重试请求到达负载均衡器；负载均衡器将更多并发请求推送给应用层；应用层打开更多数据库连接；数据库拒绝连接；应用层返回 503。整个站点宕机，原因仅仅是 <em>一个缓存 key 过期</em>.</p>
+<p>（注意校准：150 个并发未命中在一个 30 毫秒的查询上是 <em>真正的</em> 雪崩。如果查询是 5 毫秒而非 30 毫秒，你会得到 25 个并发请求者——令人烦恼但可能可以承受。这次雪崩之所以真正破坏系统，是因为乘法效应：热点 key × 高代价查询 × 与其他流量共享的连接池。）</p>
+<p>第二天情况更糟。运维人员将 TTL 延长至 30 分钟，归咎于 TTL 设置问题。现在缓存每隔 30 分钟才发生一次未命中，未命中时的雪崩效应依然相同，而且现在的过期窗口也长达 30 分钟——速报团队抱怨更正内容需要半小时才能传播出去。</p>
+<h3 id="fixed-design-probabilistic-early-expiration-single-flight-swr">改进设计：概率性提前过期 + single-flight + SWR</h3>
+<p>我们叠加工具箱中的三种技术。</p>
+<pre><code class="language-python">import asyncio
+import math
+import random
+import time
+
+from typing import Optional
+
+SINGLE_FLIGHT = SingleFlight()  # from section 4.1
+
+
+async def get_article(article_id: int):
+    key = f"article:{article_id}"
+    entry: Optional[dict] = await redis.get_json(key)
+    now = time.time()
+
+    if entry is None:
+        # Hard miss. In-process single-flight only. With N application instances
+        # the origin can still see up to N concurrent fetches on a hard miss;
+        # that's intentional — we accept N origin queries to avoid the extra
+        # round-trip and complexity of a distributed lock. Add a Redis lock here
+        # only if N origin queries is still too many.
+        return await SINGLE_FLIGHT.do(key, lambda: _fetch_and_store(article_id, key))
+
+    age = now - entry["stored_at"]
+    ttl = 300                # 5 minutes "fresh"
+    stale_window = 60        # extra minute of "stale but servable"
+
+    if age &gt;= ttl + stale_window:
+        # Hard stale, treat as miss.
+        return await SINGLE_FLIGHT.do(key, lambda: _fetch_and_store(article_id, key))
+
+    if age &gt;= ttl:
+        # Stale-while-revalidate: serve stale, refresh in background.
+        asyncio.create_task(
+            SINGLE_FLIGHT.do(key, lambda: _fetch_and_store(article_id, key))
+        )
+        return entry["value"]
+
+    # Fresh. Probabilistic early expiration: refresh early with rising
+    # probability as we approach the TTL.
+    delta = entry["delta"]
+    expiry = entry["stored_at"] + ttl
+    if now - delta * math.log(random.random()) &gt;= expiry:
+        asyncio.create_task(
+            SINGLE_FLIGHT.do(key, lambda: _fetch_and_store(article_id, key))
+        )
+
+    return entry["value"]
+
+
+async def _fetch_and_store(article_id: int, key: str):
+    started = time.time()
+    article = await db.query_article(article_id)
+    delta = time.time() - started
+    await redis.set_json(
+        key,
+        {"value": article, "stored_at": time.time(), "delta": delta},
+        ex=300 + 60,
+    )
+    return article
+</code></pre>
+<h3 id="what-changes">1M</h3>
+<ul>
+<li>在 11:59:30，某个幸运的读取者随机得到一个较小的随机数，触发提前刷新。缓存以新的 <code>stored_at</code>写入，没有用户阻塞，没有羊群效应。</li>
+<li>在 12:00:00，之前的"过期"时刻到来，但很可能值已经通过提前过期机制完成了刷新。如果没有，SWR 窗口生效：下一个读取者看到过期条目，立即返回，同时触发一次后台刷新——同样由 single-flight 合并。</li>
+<li>后台刷新对数据库的访问恰好是 <em>每个应用实例一次</em> （因为 <code>SingleFlight</code> 所示为进程内实现）。有 N 台应用服务器时，最多发起 N 次并发请求，而不是 1 次——如果 N 较小（比如 20）且查询耗时 30 毫秒，这是可以接受的。如果还需要跨进程合并，可以在进程内 single-flight 之上再叠加第 4.1 节中的 Redis 锁。</li>
+<li>主节点实例上的其他 149 个并发读取者看到过期条目并正常提供服务；在其他 N-1 个实例上，从节点的行为方式相同。</li>
+<li>数据库每次刷新周期大约看到 N 次查询（每个应用实例一次），而不是 150 次。对于 N=20，这是 7.5 倍的降低——足以将数据库从级联故障区域中拉出来。</li>
+</ul>
+<p>如果我们进一步想要更保险——比如这是超级碗级别的事件，每次刷新一次查询的风险仍然太高——可以增加一个每 30 秒运行的后台预热器，访问前 100 篇文章，使缓存在稳态下 <em>永远</em> 不会接近过期时间。见第 4.4 节。</p>
+<h3 id="what-we-paid">我们付出的代价</h3>
+<ul>
+<li>代码复杂度上升——我们现在有三种相互作用的机制（PEE、SWR、single-flight）加上一个 worker。</li>
+<li>过期窗口：读取者最多可能看到 60 秒的过期数据。产品团队需要接受这一点。</li>
+<li>额外元数据：我们为每个条目存储 <code>stored_at</code> 。 <code>delta</code> ，这会略微增加缓存值的大小。</li>
+</ul>
+<p>这个权衡是值得的。系统能够在病毒式传播事件中保持稳定。</p>
+<hr/>
+<h2 id="6-variants-and-how-to-choose">6. 变体及如何选择</h2>
+<table>
+<thead>
+<tr>
+<th>技术</th>
+<th>适用场景</th>
+<th>不适用场景</th>
+<th>隐性代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single-flight（per-key 锁）</td>
+<td>同一 key 上的并发未命中需要合并。对任何有热点 key 的读穿缓存默认启用。</td>
+<td>未命中分布在多个 <em>不同的</em> key 上（存在热点 key 倾斜，而非雪崩）。请使用 <a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a>.</td>
+<td>从节点的尾延迟增长：它们要等待主节点的完整源站延迟。需要从节点侧的超时机制。</td>
+</tr>
+<tr>
+<td>概率性提前过期</td>
+<td>TTL 是触发器；你希望将刷新负载随机分散到时间轴和各客户端上。</td>
+<td>冷启动（没有可提前刷新的条目）。驱逐导致的未命中（缓存忘记了该条目）。</td>
+<td>每个条目必须存储 <code>delta</code> 。 <code>stored_at</code>；并非所有缓存 schema 都支持不封装直接存储。</td>
+</tr>
+<tr>
+<td>Stale-while-revalidate</td>
+<td>产品可以接受数秒到一分钟的过期；用户因等待源站而阻塞是不可接受的。</td>
+<td>库存、余额，以及任何过期即为错误的场景。</td>
+<td>"新鲜度预算"需要传达给产品负责人和可观测系统，以便在刷新 worker 卡住超过 10 分钟时触发告警。</td>
+</tr>
+<tr>
+<td>后台刷新 / 预热</td>
+<td>热点 key 集合小、已知且重新计算代价高昂。热门话题前列、首页模块、排行榜。</td>
+<td>热点 key 集合无界或不可预测（长尾内容突然病毒式传播）。</td>
+<td>需要运维 worker 集群；若热点 key 注册表与现实产生偏差，系统会变脆弱。</td>
+</tr>
+<tr>
+<td>分层缓存</td>
+<td>读流量地理分布广泛；多层缓存面天然存在（CDN + 边缘 + 应用 + 分布式缓存）。</td>
+<td>单地域小型系统；分层增加延迟和运维成本。</td>
+<td>每一层都有自己的失效逻辑；要让一条错误条目在四层中都被清除是困难的。</td>
+</tr>
+<tr>
+<td>负向缓存</td>
+<td>查找模式包含大量"这个是否存在"的查询；404 路径访问量大。</td>
+<td>基于用户 ACL 检查，负向答案会泄露权限状态。</td>
+<td>一致性：如果实体后来被创建，缓存必须能快速感知。</td>
+</tr>
+<tr>
+<td>租约令牌（缓存层）</td>
+<td>你控制缓存服务器（Memcached），或使用原生支持租约的缓存。</td>
+<td>大多数开箱即用的 Redis 部署不暴露此接口。</td>
+<td>应用代码必须理解租约协议；在测试中更难模拟。</td>
+</tr>
+<tr>
+<td>优雅降级（stale-if-error）</td>
+<td>缓存未命中的长尾主要由源站中断导致，而非仅仅是过期。</td>
+<td>强一致性不变式。</td>
+<td>需要一个硬性上限，规定在请求失败前最多可以提供多旧的数据。</td>
+</tr>
+</tbody>
+</table>
+<p>一个值得向面试官逐步讲解的决策树：</p>
+<pre><code>Is the workload read-heavy with a hot key set?
+├─ No  ── caching is not the dominant lever; focus elsewhere.
+└─ Yes ── you need stampede protection.
+          │
+          Is the hot key set bounded and known?
+          ├─ Yes ── background refresh + warming, with single-flight as fallback.
+          └─ No  ── probabilistic early expiration + single-flight + SWR.
+                    │
+                    Is the product OK with stale reads?
+                    ├─ Yes ── add SWR for graceful degradation.
+                    └─ No  ── single-flight only; accept tail latency on miss.
+                             Then check if the consistency requirement is real;
+                             consider [strong-consistency-under-contention.md].
+</code></pre>
+<hr/>
+<h2 id="7-failure-modes-and-operations">7. 故障模式与运维</h2>
+<p>在阅读下表之前关于分类的说明：这些并非都是严格设计模式意义上的"缓存雪崩"问题。它们是 <em>一类故障事件</em> ，是带有缓存前置的系统所会遇到的，但其缓解措施来自不同的工具箱：</p>
+<ul>
+<li><strong>设计模式类问题</strong> （本文）：冷启动、同步过期风暴、single-flight 中的慢主节点、首次病毒式传播 key 上的雪崩。Single-flight、jitter、SWR 和提前过期是解决方案。</li>
+<li><strong>运维类问题</strong>：大规模驱逐、缓存故障转移触发冷路径。解决方案是合理容量规划、副本预热和故障处理手册——而非设计变更。</li>
+<li><strong>热点 key 倾斜类问题</strong>：热点 key 放大（单个 key 承载超过 10% 的流量）。交叉参考 <a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a>；答案是副本复制和负载分散，而非 single-flight。</li>
+<li><strong>安全类问题</strong>：缓存投毒。校验、schema 检查和紧急失效——这是正确性/信任问题，而非负载问题。</li>
+<li><strong>CDN 类问题</strong>：病毒内容上的 origin shield 未命中。解决方案是 CDN 配置（分层缓存、shielding），而非应用层 single-flight。</li>
+</ul>
+<p>它们被列在一起，因为它们都会出现在同一个值班监控仪表板上。判断你面对的是哪一类，是解决问题的一半。</p>
+<table>
+<thead>
+<tr>
+<th>故障模式</th>
+<th>观测现象</th>
+<th>指标</th>
+<th>缓解措施</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>部署后冷启动</td>
+<td>缓存命中率从 95% 骤降至接近零；源站 QPS 峰值飙升 20 倍；p99 延迟上升。</td>
+<td><code>cache_hit_rate</code> 按层划分， <code>origin_qps</code>.</td>
+<td>在提供流量前预热热点 key；通过流量迁移进行分阶段发布；持久化本地缓存以在重启后存活。</td>
+</tr>
+<tr>
+<td>大规模驱逐</td>
+<td>命中率出现断崖式下跌且与部署无关；通常与缓存集群的内存压力相关。</td>
+<td><code>cache_evictions_per_second</code>, <code>cache_memory_usage</code>.</td>
+<td>对缓存进行合理容量规划；隔离热点租户；对缓存内容进行准入控制。</td>
+</tr>
+<tr>
+<td>热点 key 放大</td>
+<td>单个 key 承载超过 10% 的缓存流量；一个 Redis 分片 CPU 占用达 100% 而其他分片闲置。</td>
+<td>per-key QPS 直方图，per-shard CPU。</td>
+<td>将热点 key 复制到多个分片；客户端侧跨副本负载均衡；参见 <a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a>.</td>
+</tr>
+<tr>
+<td>缓存投毒</td>
+<td>某个读取者写入了错误值（堆栈跟踪、错误对象、零计数）；后续所有读取者都读到该错误值。</td>
+<td>缓存命中的错误率，schema 校验失败数。</td>
+<td>写入缓存前校验值；绝不缓存异常或不完整响应；首次写入使用短 TTL；提供按模式紧急失效的操作能力。</td>
+</tr>
+<tr>
+<td>同步过期风暴</td>
+<td>每次部署都以相同的 TTL 写入条目；每次部署后 T + TTL 分钟，发生大规模未命中事件。</td>
+<td>缓存 key 的 <code>time_until_expiry</code> 分布情况。</td>
+<td>对 TTL 添加 jitter（<code>ttl = base + uniform(-jitter, jitter)</code>）；避免同时进行批量预热。</td>
+</tr>
+<tr>
+<td>首次病毒式传播 key 上的雪崩</td>
+<td>从未热过的长尾 key 突然变热；尚不在缓存中；羊群直接冲击源站。</td>
+<td>按 key 统计源站 QPS，per-key-QPS 直方图中突然出现的新条目。</td>
+<td>以纵深防御方式部署 single-flight；对 per-key 源站查询进行速率限制；建立热度检测流水线，提前预热 key。</td>
+</tr>
+<tr>
+<td>single-flight 中的慢主节点</td>
+<td>某个主节点缓慢（到源站的网络抖动）；999 个从节点全部阻塞在其后面；尾延迟恶化。</td>
+<td><code>followers_per_leader</code> 延迟直方图， <code>single_flight_wait_p99</code>.</td>
+<td>为每个从节点设置超时截止时间；若主节点超出预算，让从节点提供过期数据；熔断并让某个从节点接管。</td>
+</tr>
+<tr>
+<td>缓存故障转移触发冷路径</td>
+<td>Redis 主节点发生故障转移；新主节点本地内存为冷；写入积压；客户端看到未命中；源站遭受羊群冲击。</td>
+<td>Redis <code>failover_count</code>，故障转移事件附近的缓存命中率。</td>
+<td>使用有预热内存的副本；在应用层对源站进行速率限制；在故障转移期间使用熔断器卸载流量。</td>
+</tr>
+<tr>
+<td>病毒内容上的 origin shield 未命中</td>
+<td>每个地域对 CDN 的第一次请求；shield 没有该内容；所有地域的羊群同时冲击源站。</td>
+<td>CDN origin shield 命中率，病毒事件期间的源站 QPS。</td>
+<td>启用 Cloudflare "tiered cache" 或 Fastly "shielding"；在源站侧部署 single-flight 作为兜底。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="metrics-dashboard-a-staff-candidate-names">资深候选人应报出的指标仪表板</h3>
+<ul>
+<li><strong>按层划分的缓存命中率。</strong> 随时间的趋势，并在部署边界处进行异常检测。</li>
+<li><strong>源站的缓存未命中 QPS。</strong> 这是雪崩中飙升 100 倍的数字。对变化率（rate-of-change）告警，而不是对绝对值告警。</li>
+<li><strong>Per-key QPS 分布。</strong> 长尾热点 key 是正常的；单个 key 超过总流量的 5% 则是值得做副本复制的热点 key。</li>
+<li><strong>Single-flight 扇出。</strong> 每主节点的从节点数量直方图。p99 &gt; 100 意味着你频繁在合并大批羊群——如果它在正常工作，这是好事；但这也意味着你的 TTL 或驱逐策略让未命中频繁发生。</li>
+<li><strong>过时服务计数。</strong> 你在新鲜 TTL 之后提供过期数据的频率。出现峰值意味着刷新 worker 出现了问题。</li>
+<li><strong>合并延迟惩罚。</strong> 从节点等待时间的 p99。如果从节点的等待时间超过了它们自己直接调用源站所需的时间，single-flight 的调优有问题。</li>
+</ul>
+<hr/>
+<h2 id="8-combinations-with-other-patterns">8. 与其他模式的组合</h2>
+<p>该模式与其他多个模式存在交叉。某些组合是自然的，某些则需要谨慎处理。</p>
+<ul>
+<li>
+<p><strong><a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a>.</strong> 缓存击穿（cache stampede）和热点键倾斜（hot-key skew）是相关但不同的问题。击穿是关于 <em>时间上的</em> 缓存未命中集中（同一个键在短时间窗口内被并发请求同时未命中）。倾斜是关于 <em>空间上的</em> 流量集中在某个缓存分片上。单次飞行（single-flight）在每个应用实例层面消除时间上的并发爆发（分布式 single-flight 进一步跨实例合并，但代价是一次锁往返延迟）；副本和负载分散则解决缓存分片上的空间集中问题。一篇热门帖子通常同时需要 <em>新旧两个</em>：single-flight 处理热点文章内容因 TTL 到期引发的缓存未命中，以及热点键副本防止持有该键的缓存分片在稳态读 QPS 下被压垮。</p>
+</li>
+<li>
+<p><strong><a href="/zh/system-design-patterns/fan-out-write-amplification/">fan-out-write-amplification.md</a>.</strong> 写时扇出为每个接收者构建独立缓存（timeline:user_42）。这些缓存与其他缓存一样面临相同的击穿风险：当时间线缓存过期或被驱逐时，重建过程需要查询一批上游存储。混合推拉系统的拉取路径对名人帖子天然存在缓存击穿风险。</p>
+</li>
+<li>
+<p><strong><a href="/zh/system-design-patterns/strong-consistency-under-contention/">strong-consistency-under-contention.md</a>.</strong> SWR（stale-while-revalidate）和 stale-if-error 是明确的设计决策，以 <em>牺牲一致性</em> 换取可用性和防止羊群效应。如果你的不变量要求强一致性（库存、支付授权），则不能使用 SWR；只能使用 single-flight，并接受缓存未命中时请求阻塞。通常更好的做法是将读取从强一致性路径中剥离（使用允许一定延迟的独立展示缓存），并在另一条路径上维护权威校验。</p>
+</li>
+<li>
+<p><strong><a href="/zh/system-design-patterns/idempotency-exactly-once/">idempotency-exactly-once.md</a>.</strong> Single-flight 要求 fetch 操作可安全重试——如果主节点在处理过程中失败并由从节点接管，源端 fetch 可能执行两次。对于纯读操作这没有问题。但对于"执行带副作用的昂贵计算后再缓存"（例如先扣款再缓存），需要源端保证幂等性。</p>
+</li>
+<li>
+<p><strong><a href="/zh/system-design-patterns/backpressure-flow-control/">backpressure-flow-control.md</a>.</strong> 当羊群真的冲破防线时，应用调用源端的速率必须受控——通过准入控制、信号量或令牌桶。Single-flight 是乐观方案；在缓存→源端路径上加速率限制是当 single-flight 不够时的悲观方案。</p>
+</li>
+<li>
+<p><strong><a href="/zh/system-design-patterns/coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a>.</strong> 分布式 single-flight（跨进程的按键主节点选举）是"选举一个 worker 执行此任务"的特例，两者模式相通。Redis <code>SETNX</code> 加 TTL、ZooKeeper 临时节点以及 etcd 租约都是其变体。</p>
+</li>
+<li>
+<p><strong><a href="/zh/system-design-patterns/durability-at-scale/">durability-at-scale.md</a>.</strong> 缓存不是持久化存储。如果缓存集群丢失全部状态，源端必须能够承受冷启动期间的流量，直到缓存重新填充完毕。源端的容量规划必须按"缓存离线"模式来设计，即使那是一种降级模式。</p>
+</li>
+</ul>
+<hr/>
+<h2 id="9-likely-interviewer-probes">9. 面试官可能追问的问题</h2>
+<p>以下是 Staff 级面试官可能深入追问的问题，每一条都应有实质性的回答。</p>
+<ol>
+<li>
+<p><strong>"你会为文章正文缓存设置多长的 TTL，为什么？"</strong> 谈论新鲜度与未命中率之间的权衡。说明会对 TTL 加抖动以避免同步过期。提到使用 SWR 可以将 <em>新鲜窗口</em> 与 <em>服务窗口</em> 解耦——例如可以设置 5 分钟新鲜期、10 分钟允许返回过期数据、30 分钟硬性过期。</p>
+</li>
+<li>
+<p><strong>"你的 Redis 集群故障转移到从节点时会发生什么？"</strong> 承认从节点通常本地 CPU 缓存是冷的（即使复制了键，JIT 和连接池也是冷的）。讨论故障转移期间读流量涌向从节点、应用与源端之间的熔断器防止雷鸣效应，以及验证应用客户端库是否做了合理的连接池管理。</p>
+</li>
+<li>
+<p><strong>"Single-flight 如何在 N 台应用服务器之间协作？"</strong> 这是跨进程协调问题。介绍使用 Redis <code>SET key:lock NX PX 5000</code> 加唯一令牌、从节点自旋轮询（当缓存 RTT 较低时开销很小），或使用 pub/sub 进行完成通知。提及失败场景：主节点宕机时锁的 TTL 必须长于源端 p99，但又要足够短以便在几秒内解除对从节点的阻塞。</p>
+</li>
+<li>
+<p><strong>"使用概率性提前过期 <code>beta=1</code> ——每个键的预期刷新频率是多少？"</strong> QPS 越高，单位时间内的随机抽样次数越多，这会使 <em>预期行为</em> 刷新时间在 TTL 窗口内提前（极热键接近 TTL/2，冷键接近 TTL）。该论文实际证明的属性并非"每个 TTL 周期恰好刷新一次，与 QPS 无关"——而是任何读者发生硬未命中的 <em>概率</em> （即观察到 <code>now &gt;= expiry</code> 而非先触发提前刷新）随 QPS 呈指数衰减。这才是期望的属性：热键自我保护，冷键大多不打扰。能够区分"刷新频率"（随 QPS 缓慢增长）与"硬未命中概率"（随 QPS 指数衰减）是 Staff 级信号。</p>
+</li>
+<li>
+<p><strong>"缓存未命中和缓存击穿有什么区别？"</strong> 未命中本身没问题——单独来看只是一次源端 fetch。击穿是带有 <em>并发性</em>的未命中：N 个请求并行地对同一个键未命中。相关指标不是"未命中率"，而是"每个唯一键的并发未命中数"。</p>
+</li>
+<li>
+<p><strong>"你提到了负缓存（negative caching）。有什么安全风险？"</strong> 如果用户是否存在是隐私敏感信号，那么与正向 TTL 不同的空值 TTL 会泄露信息。此外，攻击者若能以高速率制造不存在的键，可以用墓碑记录（tombstone）填满缓存内存（通过缓存污染实施拒绝服务攻击）。应按命名空间限速，并使用缓存准入策略（如 TinyLFU）拒绝一次性访问的键进入缓存。</p>
+</li>
+<li>
+<p><strong>"你如何防止缓存本身成为瓶颈？"</strong> 热键跨分片副本化、客户端在副本间负载均衡（轮询或带负载上界的一致性哈希），以及应用本地 LRU 作为顶层过滤器。缓存本质上也是一个分布式系统，同样存在其他系统面临的热分片问题。</p>
+</li>
+</ol>
+<hr/>
+<h2 id="10-common-traps-stronger-moves">10. 常见陷阱 → 更优方案</h2>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"我直接缓存就好了。"</td>
+<td>"我会在缓存未命中时配合 single-flight、带抖动的 TTL 和 stale-while-revalidate 来缓存，并对源端 QPS 设置告警，作为缓存失效的前置指标。"</td>
+</tr>
+<tr>
+<td>对所有键统一设置 TTL。</td>
+<td>带抖动的 TTL（<code>base + uniform(-base*0.1, base*0.1)</code>）以防止同步过期风暴。</td>
+</tr>
+<tr>
+<td>通过增大 TTL 来"降低数据库负载"。</td>
+<td>增大 TTL 并不能解决击穿问题——只是让击穿变得更少发生但规模更大。加入概率性提前过期，使数据库负载与 TTL 无关保持恒定。</td>
+</tr>
+<tr>
+<td>使用单一全局 Redis 集群承担所有缓存。</td>
+<td>分层缓存：CDN、应用本地 LRU、分布式缓存、源端。每一层屏蔽下一层；任意一层故障不会拖垮整个系统。</td>
+</tr>
+<tr>
+<td>"缓存失效很难，所以我就用短 TTL 算了。"</td>
+<td>缓存失效确实很难，但短 TTL 是用一个问题（数据陈旧）换两个问题（数据陈旧 <em>加上</em> 击穿加上源端负载）。应使用写时定向失效，配合适度的 TTL 和 SWR。</td>
+</tr>
+<tr>
+<td>"缓存未命中时回退查数据库。"</td>
+<td>缓存未命中时回退查数据库，同时配合 single-flight、速率限制、熔断器，以及源端出错时返回过期数据。回退路径本身必须有羊群防护，否则缓存不是资产而是负担。</td>
+</tr>
+<tr>
+<td>源端失败时缓存异常。</td>
+<td>永远不要缓存异常、错误响应或不完整结果。只缓存格式正确的成功响应。错误是临时的；缓存它们会将瞬时中断变为持久故障。</td>
+</tr>
+<tr>
+<td>热点键只用一台缓存服务器。</td>
+<td>将热点键复制到 N 个分片；客户端随机或按哈希选择副本；消除单分片热点。</td>
+</tr>
+<tr>
+<td>当数学表明进程内 single-flight 不够时，仍假设它足够。</td>
+<td>计算 N 台实例 × 每次 fetch 代价 与源端预算的关系。若 200 台应用服务器各自发出一次源端查询（而非总共只发一次）仍会压垮数据库，则应使用按键 Redis 锁（携带唯一令牌持有者）的分布式 single-flight。若 N 次并发 fetch 可以接受，则止步于进程内方案——分布式锁有其自身的正确性和延迟成本。</td>
+</tr>
+<tr>
+<td>纯 cache aside，无 SWR，无提前过期。</td>
+<td>Cache aside + 提前过期 + SWR + single-flight：分层防御体系，任意一层配置有误也不会把系统拖垮。</td>
+</tr>
+<tr>
+<td>只在稳态下测试缓存行为。</td>
+<td>至少每月执行一次部署热身负载测试（完全重启、冷缓存、全量峰值流量）。这样发现的 bug 正是会让你的网站宕机的那种。</td>
+</tr>
+<tr>
+<td>把 CDN 当成神奇的黑盒。</td>
+<td>了解源端屏蔽（origin shielding）和 Vary 头；一个不经意的 <code>Vary: Cookie</code> 会让缓存命中率接近于零。</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h2 id="11-staff-level-answer-checklist">11. Staff 级别回答清单</h2>
+<p>当面试官追问读放大或"病毒级规模下会发生什么"时，你的回答应不假思索地覆盖以下要点：</p>
+<ul>
+<li>[ ] 用真实名称指出失败模式：缓存击穿（cache stampede）、雷鸣效应（thundering herd）、读放大（read amplification）。这些词汇本身就是 Staff 级信号。</li>
+<li>[ ] 先界定问题范围再选技术：缓存击穿缓解措施适用于并发未命中数乘以源端代价确实会压垮某个资源的键。对于有廉价查询的中位键，朴素的 cache-aside 就够了——能说出这一点本身就是 Staff 级做法。</li>
+<li>[ ] 区分 <em>时间上的</em> 击穿（同一键在过期或驱逐时的并发未命中）与 <em>空间上的</em> 热键倾斜（某个分片持有被大量访问的键）。说明两者需要不同的解决方案，且通常同时存在。</li>
+<li>[ ] 推荐进程内 single-flight（asyncio 锁）作为所有有昂贵后端查询的热键的默认方案；只有当数学表明 N 台实例的进程内方案对源端仍然过重时，才选用跨进程 single-flight（Redis 锁或租约令牌）。</li>
+<li>[ ] 推荐概率性提前过期以平滑负载曲线，并引用 Staff 级参考文献 Vattani 等人的论文或 Memcached 的租约令牌。</li>
+<li>[ ] 将 stale-while-revalidate 和 stale-if-error 定性为可用性工具，同时说明它们以数据陈旧换取可用性——确认产品可以接受。</li>
+<li>[ ] 勾勒分层缓存架构（CDN → 应用本地 LRU → 分布式缓存 → 源端），并指出每一层都需要自己的击穿防护。</li>
+<li>[ ] 将冷启动单独列为一种失败模式，需要预热或流量渐进切换来应对，而不仅仅是稳态缓存设计。</li>
+<li>[ ] 列出关键指标：命中率、源端 QPS、单键 QPS、single-flight 扇出数、返回过期数据次数。对变化率告警，而非绝对值。</li>
+<li>[ ] 承认缓存污染风险：永远不缓存异常，校验缓存值，提供按模式失效的应急操作。</li>
+<li>[ ] 关联相关模式：热键倾斜、扇出、强一致性、背压。</li>
+<li>[ ] 明确说明权衡："我们在这里选择可用性而非新鲜度，因为产品可以接受此读路径上 60 秒的数据陈旧；如果不能接受，我会有不同的处理方式。"</li>
+<li>[ ] 提及 TTL 抖动以打破同步过期，以及有界的从节点等待截止时间，防止慢主节点拖累延迟。</li>
+<li>[ ] 如果问题足够复杂，勾勒有缓存和无缓存的容量规划——证明源端必须在"缓存冷启动"模式下存活，可能以降级只读状态运行。</li>
+</ul>
+<hr/>
+<h2 id="12-cross-references">12. 交叉引用</h2>
+<p>兄弟模式文档：</p>
+<ul>
+<li><a href="/zh/system-design-patterns/fan-out-write-amplification/">fan-out-write-amplification.md</a> — 写侧放大；每接收者时间线缓存本身也是击穿面。</li>
+<li><a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a> — 空间热键集中；本时间模式的空间对应模式。</li>
+<li><a href="/zh/system-design-patterns/strong-consistency-under-contention/">strong-consistency-under-contention.md</a> — SWR / 过期数据服务何时 <em>非</em> 被允许；决策树的另一分支。</li>
+<li><a href="/zh/system-design-patterns/idempotency-exactly-once/">idempotency-exactly-once.md</a> — 当 single-flight 主节点可能崩溃并被接管时所必需的。</li>
+<li><a href="/zh/system-design-patterns/coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a> — 分布式 single-flight 的主节点选举。</li>
+<li><a href="/zh/system-design-patterns/backpressure-flow-control/">backpressure-flow-control.md</a> — 对缓存→源端路径限速，作为悲观兜底方案。</li>
+<li><a href="/zh/system-design-patterns/durability-at-scale/">durability-at-scale.md</a> — 源端必须在缓存离线模式下存活。</li>
+<li><a href="/zh/system-design-patterns/real-time-aggregation/">real-time-aggregation.md</a> — 热点计数器和聚合在缓存未命中时面临同样的击穿问题。</li>
+<li><a href="/zh/system-design-patterns/search-and-ranking/">search-and-ranking.md</a> — 热门前缀和趋势查询缓存是击穿面。</li>
+</ul>
+<p>此模式出现的相关问题文档：</p>
+<ul>
+<li><a href="/zh/common-backend-systems/design-a-distributed-cache-like-redis/">设计类 Redis 的分布式缓存</a> — 缓存本身防御击穿。</li>
+<li><a href="/zh/common-backend-systems/design-a-flash-sale-for-an-e-commerce-site/">Design a Flash Sale</a> — 上线流量下的库存和商品详情缓存。</li>
+<li><a href="/zh/common-backend-systems/design-google-news-as-a-global-aggregator/">Design Google News</a> — 通过 CDN 分层分发病毒式传播的文章。</li>
+<li><a href="/zh/common-backend-systems/design-youtube/">设计 YouTube</a> — 病毒视频元数据和推荐 Feed 缓存。</li>
+<li><a href="/zh/common-backend-systems/design-twitter-timeline/">设计 Twitter Timeline</a> — 名人帖子、热门话题、浏览计数器。</li>
+<li><a href="/zh/common-backend-systems/design-ticketmaster/">设计 Ticketmaster</a> — 高需求活动开售瞬间。</li>
+<li><a href="/zh/common-backend-systems/design-typeahead-autocomplete/">Design Typeahead Autocomplete</a> — 新闻事件期间的热门前缀自动补全。</li>
+</ul>
+<p>基础阅读：</p>
+<ul>
+<li>Staff System Design Glossary — Time-To-Live、cache-aside、write-through、驱逐策略。</li>
+<li>Staff System Design Interview Playbook — 45 分钟流程与语言模式。</li>
+</ul>
+<p>值得引用的外部权威参考：</p>
+<ul>
+<li>Vattani, Chierichetti, Lowenstein，"Optimal Probabilistic Cache Stampede Prevention"（2015）。</li>
+<li>Nishtala 等人，"Scaling Memcache at Facebook"（NSDI 2013）— 租约令牌与 Mcrouter。</li>
+<li>Fastly / Cloudflare / Akamai 关于源端屏蔽和分层缓存的官方文档。</li>
+<li>Hypertext Transfer Protocol RFC 5861 — <code>stale-while-revalidate</code> 。 <code>stale-if-error</code> cache-control 指令。</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

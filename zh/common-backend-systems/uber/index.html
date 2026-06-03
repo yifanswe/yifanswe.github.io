@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Uber — Rideshare Backend (walkthrough) — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">Uber — Rideshare Backend (walkthrough)</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<p><strong>难度：</strong> Hard · <strong>总耗时：</strong> ~45 min · <strong>框架：</strong> Hello Interview Delivery</p>
+<p><strong>一句话场景：</strong> 构建 Uber。乘客发起用车请求；系统将其与附近司机匹配；双方可看到对方的实时位置；送达后完成支付。月活乘客1亿，司机500万，每天2000万次行程，峰值约每秒1500次行程，约100万司机并发以4 Hz频率上报GPS。</p>
+<hr/>
+<h2 id="1-requirements-5-min">1. 需求（约 5 分钟）</h2>
+<p><strong>功能需求</strong>
+- 乘客从出发地到目的地发起用车请求；系统匹配一位可用司机。 - 行程中双方可看到对方的实时位置。 - 完成后完成支付。</p>
+<p>我会推迟 Uber Eats、动态定价深度设计、司机入驻/背景调查，以及仅提及但不深入设计拼车（UberPool）。</p>
+<p><strong>非功能需求</strong>
+- 匹配延迟 p99 &lt; 5秒——乘客无法等太久。 - 实时位置更新在1秒内完成。 - 行程状态机（已请求 → 已匹配 → 进行中 → 已完成）需要强一致性。 - 区域隔离——某一城市的故障不影响其他城市。 - 高可用——涉及资金交易。</p>
+<p><strong>容量估算</strong>
+- 100万并发司机 × 4 Hz GPS = 每秒400万次 GPS 写入。 - 峰值每秒1500次行程。 - 每次行程：约30分钟 × 240次ping/分钟 = 每次行程持久化7200次 GPS ping。 - 实时位置状态很小：100万司机 × 约80 B最新位置记录 ≈ 主节点80 MB，含副本数百 MB。主要成本在于数据流：每秒400万次ping × 约100 B ≈ 400 MB/秒，压缩/复制前约35 TB/天。 - 行程状态很小：每天2000万次行程 × 约1 KB/行程 ≈ 主节点20 GB/天；需要事务正确性，数据量不大。</p>
+<hr/>
+<h2 id="2-core-entities-2-min">2. 核心实体（约 2 分钟）</h2>
+<ul>
+<li><strong>乘客</strong> — <code>rider_id</code>.</li>
+<li><strong>场景</strong> — <code>driver_id</code>，当前位置、状态（离线/可用/行程中）、当前行程。</li>
+<li><strong>行程</strong> — <code>ride_id, rider, driver, origin, destination, status, fare</code>.</li>
+<li><strong>GPSPing</strong> — <code>(driver_id or rider_id), lat, lng, ts</code>.</li>
+</ul>
+<hr/>
+<h2 id="3-api-5-min">3. API（约 5 分钟）</h2>
+<pre><code>POST  /v1/rides                  { origin, destination }   → { ride_id, status: requested }
+GET   /v1/rides/{id}             → Ride
+WS    /v1/rides/{id}/stream      → push: state changes + counterparty location
+
+POST  /v1/drivers/location       { lat, lng }   (auth: driver)
+POST  /v1/drivers/rides/{id}/{action}    // accept, pickup, dropoff
+</code></pre>
+<p>从令牌获取用户。行程状态转换按 <code>(ride_id, action)</code>.</p>
+<p>游标不对外暴露；服务端拥有行程状态机。客户端仅提交动作，每个动作在当前持久化状态允许时才被接受。</p>
+<hr/>
+<h2 id="5-high-level-design-1015-min">5. 高层设计（约 10–15 分钟）</h2>
+<p>我会按城市/区域对世界进行分区。每个区域基本上是自治的。</p>
+<ol>
+<li><strong>行程服务。</strong> 拥有行程状态机。按 <code>ride_id</code>分片，但路由确保同一区域的所有行程落在区域集群上。</li>
+<li><strong>司机位置服务。</strong> 司机以4 Hz POST GPS → 摄入写入区域 Redis 地理空间索引（<code>GEOADD</code>）以及 Kafka 供下游消费者使用（分析、反欺诈、行程记录）。</li>
+<li><strong>Matching 服务。</strong> 在用车请求时触发： - 查询乘客所在 S2 单元格 + 环内的附近司机（廉价的 GEORADIUS）。 - 筛选可用司机（状态 = 可用）。 - 评分：到接客点的 ETA × 司机接单率 × 溢价意愿。 - 向顶级候选人发送邀约；拒绝/超时后转到下一位。</li>
+<li><strong>基于关注关系的 feed。采用类似 FB News Feed 的混合推/拉模式，但规模更小：关注时推送 → 被关注者的评论出现在关注者的 feed 列表中。大多数用户关注人数 &lt; 100；按需读取方案可行。</strong> 司机应用通过持久 WS 或推送渠道接收邀约。司机在约15秒内接受，否则邀约重新路由。</li>
+<li><strong>行程追踪器。</strong> 匹配成功后，乘客和司机共享一个连接到行程频道的 WS；一方的 ping 扇出到另一方。</li>
+<li><strong>定价服务。</strong> 在创建行程时，根据启发式方法估算费用（基础费 + 按公里 + 按分钟 + 该单元格的溢价倍数）。送达时根据实际行程数据最终结算。</li>
+<li><strong>支付。</strong> 不在详细设计范围内，但在架构图中需体现。送达后通过支付网关完成扣款。</li>
+</ol>
+<p>端到端叙述：Alice 点击"呼叫 UberX" → 行程服务写入行程行（状态=已请求）并询问匹配器 → 匹配器 GEORADIUS 查找附近司机，选择42号司机 → 推送邀约通知 → 42号接受 → 行程状态 → <code>matched</code>，司机已分配。双方应用开启 WS 连接到行程频道。42号司机位置 ping 流 → 摄入 → 扇出到 Alice 的 WS。到接客点时，司机点击"已接客" → 行程状态 → <code>in_progress</code>。送达时，行程状态 → <code>completed</code>，费用最终结算，支付完成。</p>
+<h3 id="system-components-diagram">系统组件图</h3>
+<pre><code class="language-text">+------------------------+          +------------------------+
+| Rider App              |          | Driver App             |
++-----+------------------+          +-----+------------------+
+      |                               |
+POST /v1/rides, WS /v1/rides/{id}/stream
+                                      POST /v1/drivers/location
+                                      POST /v1/drivers/rides/{id}/accept
+      v                               v
++----------------------------------------------------------------+
+| API Gateway / Regional Routing                                 |
++------------+----------------------+----------------------------+
+             |                      |
+             v                      v
++---------------------+      +----------------------+    +----------------+
+| Ride Service        |&lt;----&gt;| Matching Service     |&lt;--&gt;| Location Svc   |
+| state machine       |      | offer leasing        |    | GPS ingest     |
++----------+----------+      +----------+-----------+    +-------+--------+
+           |                            |                        |
+           | ride events                | offer push              | GPS pings
+           v                            v                        v
++-----------------------------------------------------------------------+
+| Async / Event Row                                                     |
+| Notification/Offer Gateway -&gt; driver offer WS                         |
+| Kafka ride_events + GPS stream -&gt; Pricing / Payment / Analytics       |
+| trip traces compacted into object/columnar GPS history                |
++--------------------------+--------------------------------------------+
+                           |
+                           v
++-----------------------------------------------------------------------+
+| Stores / Caches                                                       |
+| geo:{region}:{s2_cell} Redis geo/zset member=driver_id TTL 10s        |
+| driver:{driver_id}:status KV {available,on_trip,ride_id,version}      |
+| offer:{driver_id} -&gt; ride_id Redis NX EX 15                           |
+| rides:{region} SQL/Spanner row, sharded by region + ride_id           |
+| Kafka ride_events keyed by ride_id; GPS history by region,date        |
++------------------------------+----------------------------------------+
+                               |
+                               | geo/status miss or stale GPS
+                               v
+                      +-------------------------+
+                      | Wider S2 ring search    |
+                      | pause affected cells    |
+                      +-------------------------+
+
+Primary write: ride request -&gt; match -&gt; offer lease -&gt; accept CAS -&gt; events.
+Primary read: ride WS -&gt; latest state + counterparty location + replay by seq.
+</code></pre>
+<hr/>
+<h2 id="6-deep-dives-10-min">6. 深度探讨（约 10 分钟）</h2>
+<p><strong>具体存储契约。</strong></p>
+<table>
+<thead>
+<tr>
+<th>存储</th>
+<th>键/数据结构</th>
+<th style="text-align: right;">条目大小 + TTL</th>
+<th>分片键</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>司机地理位置</td>
+<td><code>geo:{region}:{s2_cell}</code> Redis geo/zset 成员=<code>driver_id</code></td>
+<td style="text-align: right;">约40 B/成员，TTL 10秒</td>
+<td><code>region+s2_cell</code></td>
+</tr>
+<tr>
+<td>司机状态</td>
+<td><code>driver:{driver_id}:status</code> KV <code>{available,on_trip,ride_id,version}</code></td>
+<td style="text-align: right;">约100 B，在线期间 TTL</td>
+<td><code>driver_id</code></td>
+</tr>
+<tr>
+<td>邀约租约</td>
+<td><code>offer:{driver_id}</code> → <code>ride_id</code> 与 <code>NX EX 15</code></td>
+<td style="text-align: right;">约40 B，TTL 15秒</td>
+<td><code>driver_id</code></td>
+</tr>
+<tr>
+<td>行程真实状态</td>
+<td><code>rides:{region}</code> SQL/Spanner 行</td>
+<td style="text-align: right;">约1 KB，保留多年</td>
+<td><code>region, ride_id</code></td>
+</tr>
+<tr>
+<td>行程事件日志</td>
+<td>Kafka <code>ride_events</code></td>
+<td style="text-align: right;">约200 B/事件，热数据7–30天</td>
+<td><code>ride_id</code></td>
+</tr>
+<tr>
+<td>GPS 历史记录</td>
+<td>按日期 + 区域分区的对象/列式存储</td>
+<td style="text-align: right;">压缩后约20–100 B/ping，热数据30–90天</td>
+<td><code>region, date</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>各存储容量估算。</strong> 热点匹配器状态相比数据流非常小： <code>1M online drivers × 40 B × 3</code> 地理条目约120 MB，含副本的状态行约300 MB。邀约租约极小：即使是 <code>1500 rides/sec × 15 s × 40 B × 3</code> 也不超过3 MB。行程真实状态为 <code>20M rides/day × 1 KB × 3</code> ，约60 GB/天。昂贵的路径是 GPS 历史记录和 Kafka 保留： <code>4M pings/sec × 100 B</code> 压缩/复制前约35 TB/天，因此我将最新位置存储在 Redis 中，Kafka 中保留较短时间，并将行程轨迹压缩归档到列式对象存储。</p>
+<p><strong>用车请求路径追踪。</strong> 客户端 → 行程服务创建 <code>rides</code> 行，状态为 <code>requested</code> → 匹配器并行查询 Redis 地理索引中的附近 S2 单元格 → 并行读取顶级候选司机状态 → 写入 <code>offer:{driver_id}</code> 租约，附带 <code>NX EX 15</code> → 推送邀约通知 → 司机接受调用行程服务 → 行程服务通过一次事务/比较并交换操作有条件地更新行程 <code>requested→matched</code> 和司机 <code>available→on_trip</code> → 向 Kafka 发出 <code>ride.matched</code> 事件。若第一位司机超时，租约到期，匹配器尝试下一位候选人。</p>
+<p><strong>Hot and cold API paths。</strong></p>
+<table>
+<thead>
+<tr>
+<th>API path</th>
+<th>Hot path</th>
+<th>Cold/fallback path</th>
+<th>游标/会话状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /v1/rides</code></td>
+<td>创建行程行 → 并行查询附近地理单元格 → 租借司机 → 推送邀约</td>
+<td>稀疏郊区扩展 S2 环并返回更长的 ETA，同时保持行程 <code>requested</code></td>
+<td>ride_id、匹配器尝试次数、邀约租约</td>
+</tr>
+<tr>
+<td>司机接受</td>
+<td>验证 <code>offer:{driver_id}</code> → 在一个区域内对行程和司机状态进行 CAS</td>
+<td>若租约已过期，返回过期邀约，应用获取当前状态</td>
+<td>邀约租约令牌、行程状态版本</td>
+</tr>
+<tr>
+<td><code>WS /rides/{id}/stream</code></td>
+<td>行程频道发送状态变更 + 对方最新位置</td>
+<td>重连时，从上次序列号起重放行程事件，并发送最新已知位置</td>
+<td>每连接的最后一个事件序列号</td>
+</tr>
+<tr>
+<td><code>POST /drivers/location</code></td>
+<td>更新 Redis 地理位置/状态，并将 ping 追加到 Kafka</td>
+<td>若 Kafka 存在延迟，保留最新的 Redis 更新，但降级分析/行程轨迹功能</td>
+<td>心跳时间戳；司机状态版本号</td>
+</tr>
+</tbody>
+</table>
+<p><strong>每秒 400 万次 GPS 写入的地理索引。</strong> 每个区域使用 Redis 地理空间索引。若单个 Redis 达到上限，则将该区域的 Redis 分片为多个单元。写操作为 <code>GEOADD driver:region:cell</code>；读操作为 <code>GEOSEARCH</code>。每次操作亚毫秒级，适合全内存存储。</p>
+<p>为何选择 Redis/S2 而非 PostGIS 或 Elasticsearch：此路径写入频繁、数据保留时间短，需要在数秒内找到最近的活跃司机。PostGIS 适合持久化空间查询，但无法支持每秒 400 万次的高频易变写入；Elasticsearch 增加了索引延迟和更高的刷新成本。持久化的 GPS 轨迹写入 Kafka/对象存储，而非热点匹配器。</p>
+<p>对于行程真实状态，我会选用区域化 SQL/Spanner 风格的存储，而非 Cassandra，因为状态机需要条件转换，司机分配不能出现重复预订。Cassandra 适合仅追加的事件历史，但的真实状态来源 <code>requested→matched→completed</code> 需要事务或强比较并设置（compare-and-set）语义。</p>
+<p><strong>匹配算法。</strong> 简单的最近司机贪心策略不公平。更好的做法：每 1–2 秒进行批量匹配，收集一个单元格内的待处理请求和可用司机，运行二部图分配以最小化总 ETA。可提及匈牙利算法或拍卖式匹配作为生产环境的选择。此外，一名司机可同时向多名乘客发出邀约，但以第一个接受者为准。</p>
+<p><strong>司机分配的并发控制。</strong> 同一区域的两个行程请求可能选中同一名司机。使用 Redis <code>SET driver:42:offered ride:99 NX EX 15</code> 在邀约发出期间对司机进行 15 秒租约锁定。若司机拒绝，租约到期后重新纳入候选。</p>
+<p><strong>GPS 扇出。</strong> 一次行程包含 1 名司机和 1 名乘客——每次行程的扇出为 1:1。挑战在于写入速率（每秒 400 万次），而非扇出。按区域使用写入 Worker，采用无状态直写到 Redis 的方式。持久化到 Kafka 用于分析，再归档到冷存储。</p>
+<p><strong>行程状态机。</strong> 由行程服务负责。每次转换均为单行更新并附带状态检查（<code>UPDATE rides SET status='completed' WHERE id=X AND status='in_progress'</code>），以强制执行合法转换。每次转换时向 Kafka 发送事件，供下游服务消费。</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>允许的下一个状态</th>
+<th>数据真实来源</th>
+<th style="text-align: right;">延迟目标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>requested</code></td>
+<td><code>matched</code>, <code>canceled</code></td>
+<td>行程行 + 匹配器尝试</td>
+<td style="text-align: right;">首次邀约时间 &lt;5 秒</td>
+</tr>
+<tr>
+<td><code>matched</code></td>
+<td><code>driver_arrived</code>, <code>canceled</code></td>
+<td>行程行 + 司机状态</td>
+<td style="text-align: right;">立即 CAS</td>
+</tr>
+<tr>
+<td><code>driver_arrived</code></td>
+<td><code>in_progress</code>, <code>canceled_no_show</code></td>
+<td>行程行</td>
+<td style="text-align: right;">&lt;500 毫秒</td>
+</tr>
+<tr>
+<td><code>in_progress</code></td>
+<td><code>completed</code>, <code>support_intervention</code></td>
+<td>行程行 + 行程 ping</td>
+<td style="text-align: right;">&lt;500 毫秒</td>
+</tr>
+<tr>
+<td><code>completed</code></td>
+<td>terminal</td>
+<td>行程行 + 支付幂等性</td>
+<td style="text-align: right;">支付可能异步结算</td>
+</tr>
+</tbody>
+</table>
+<p>面试要点："位置可以最终一致；行程状态机不能，因为那里涉及资金、安全和司机分配。"</p>
+<p><strong>预计到达时间预测。</strong> v1：haversine 距离 × 城市平均速度 + 缓冲时间。v2：来自了解实时交通状况的地图服务的路由 ETA。v3：以历史行程时间为输入的 ML 模型。每个层级都增加延迟和复杂度；我们会从 v1 开始，并说明升级路径。</p>
+<p><strong>价格波动（Surge pricing）。</strong> 按 S2 单元格的滚动供需比；波动倍率 = 该比率的分段函数。每分钟重新计算，写入 Redis 缓存，定价服务在创建行程时读取。在乘客发起请求前展示波动价格。</p>
+<p><strong>双索引框架。</strong> 司机按位置建立索引用于匹配（<code>geo:{region}:{s2_cell}</code>），按身份建立索引用于正确性保障（<code>driver:{driver_id}:status</code>）。匹配时同时读取两者：地理索引找出候选人，但司机状态行决定该司机是否真正可被分配。这是针对两种访问模式优化的同一份活跃司机数据集。</p>
+<p><strong>故障模式。</strong>
+- 司机端应用在行程中崩溃：服务端的 <code>last_ping &gt; 30s</code> 触发检查；乘客看到"正在尝试重新连接"。- 支付过程中发生网络分区：支付在 <code>ride_id</code>上具有幂等性，将被重试。- 乘客在匹配后、接客前取消：收取小额取消费，司机重新释放。</p>
+<table>
+<thead>
+<tr>
+<th>情形</th>
+<th>模式</th>
+<th>数据源</th>
+<th style="text-align: right;">延迟预算</th>
+<th>回退</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>市中心热点单元</td>
+<td>批量匹配</td>
+<td>Redis 地理位置 + 司机状态</td>
+<td style="text-align: right;">匹配 &lt;5 秒</td>
+<td>扩大单元格范围，缩短邀约超时时间，每 1 秒进行一次批量分配</td>
+</tr>
+<tr>
+<td>郊区稀疏区域</td>
+<td>更大范围搜索</td>
+<td>相邻 S2 环 + ETA 服务</td>
+<td style="text-align: right;">匹配 &lt;10 秒</td>
+<td>显示较长 ETA，保持行程请求状态，允许乘客免费取消</td>
+</tr>
+<tr>
+<td>司机 GPS 数据过期</td>
+<td>降级追踪</td>
+<td>上次 ping + 路线估算</td>
+<td style="text-align: right;">UI 更新 &lt;1 秒</td>
+<td>短暂外推；30 秒后将司机标记为不可用</td>
+</tr>
+<tr>
+<td>Redis 地理位置分片宕机</td>
+<td>保守回退</td>
+<td>最后已知状态 + Kafka 延迟监控</td>
+<td style="text-align: right;">本地暂停匹配</td>
+<td>停止受影响单元格的新匹配；已有行程继续进行</td>
+</tr>
+<tr>
+<td>支付网关缓慢</td>
+<td>异步扣款</td>
+<td>行程完成事件 + 支付幂等性</td>
+<td style="text-align: right;">用户收据可能延迟</td>
+<td>将行程标记为已完成，重试扣款，如需人工审核则通知用户</td>
+</tr>
+</tbody>
+</table>
+<p><strong>区域隔离。</strong> 每个城市拥有独立的行程/匹配/Redis 技术栈。跨区域故障被隔离。全局服务仅用于身份认证、行程历史聚合和支付。</p>
+<p><strong>我会推迟的内容。</strong> UberPool 匹配（多站点优化）、司机热力图、费用分摊、预约出行、司机路线优化、欺诈检测。</p>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

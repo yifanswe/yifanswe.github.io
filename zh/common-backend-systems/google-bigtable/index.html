@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Google Bigtable — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">Google Bigtable</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p><strong>对这些术语不熟悉？</strong> 请参阅 <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a>。Bigtable， <a href="../hadoop-distributed-file-system/">HDFS / GFS</a>，以及 <a href="../design-a-distributed-lock-manager-like-chubby/">Chubby</a> 紧密关联——建议一起阅读。</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. 基础知识与解题思路</h2>
+<h3 id="what-this-question-is-testing">本题考察点</h3>
+<p>Bigtable（2006 年论文）是列族分布式存储的典范。其难点在于：将一张按行键排序的表分区到数千台服务器上，同时支持快速随机读取和顺序扫描，并保持强的单行一致性。</p>
+<p>其不变量如下：</p>
+<blockquote>
+<p>每一行在任意时刻仅归属于一个 tablet；对某行的读写请求均发往其当前的 tablet server；tablet 在分裂和迁移过程中不会丢失数据，也不会出现重复所有权；底层 GFS 存储提供持久性；Chubby 负责协调所有权。</p>
+</blockquote>
+<p>在 ICT5 / L6+ 级别，面试官测试的是你能否清晰表述：按行键分片的 tablet 模型、SSTable + commit log + GFS 存储、tablet server 架构、Chubby 在协调中的角色，以及列族数据模型。</p>
+<h3 id="60-second-interview-framing">60 秒面试框架</h3>
+<p>口述版本：</p>
+<blockquote>
+<p>我将 Bigtable 描述为一个稀疏、分布式、持久化的多维有序映射，以 row+column+timestamp 为键。表被分区为 tablet——即连续的行键范围——每个 tablet 归属于一台 tablet server。Tablet 以 SSTable 形式存储在 GFS 上以保证持久性。Master 负责将 tablet 分配给 server；Chubby 通过租约协调成员关系和独占所有权。核心设计决策包括：tablet 所有权语义、GFS 上的 SSTable 存储、locality group 以及 Chubby 的角色。</p>
+</blockquote>
+<h3 id="requirements-the-paper-sets">论文设定的需求</h3>
+<p>功能性需求：</p>
+<ul>
+<li>多维有序映射： <code>(row_key, column_family:column_qualifier, timestamp) → value</code>.</li>
+<li>行键范围查询。</li>
+<li>单行原子更新（在一行内进行读-改-写）。</li>
+<li>按时间戳版本化。</li>
+<li>列族共享压缩。</li>
+</ul>
+<p>非功能性需求：</p>
+<ul>
+<li>跨数千台服务器的 PB 级数据。</li>
+<li>低延迟随机读写。</li>
+<li>高吞吐量顺序扫描。</li>
+<li>强的单行一致性。</li>
+<li>分布式，但原始论文中为单区域。</li>
+</ul>
+<h3 id="scale-assumptions">规模假设</h3>
+<table>
+<thead>
+<tr>
+<th>领域</th>
+<th>假设</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>数据</td>
+<td>每张表 PB 级数据。</td>
+</tr>
+<tr>
+<td>服务器</td>
+<td>数千台 tablet server。</td>
+</tr>
+<tr>
+<td>每张表的 tablet 数量</td>
+<td>数百万。</td>
+</tr>
+<tr>
+<td>Tablet 大小</td>
+<td>分裂前约 100-200 MB。</td>
+</tr>
+<tr>
+<td>每行的 cell 数量</td>
+<td>最多可达数十亿（但通常远少于此）。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="core-concepts">核心概念</h3>
+<h4 id="data-model">数据模型</h4>
+<pre><code class="language-text">Table
+  └── Row (uniquely identified by row_key, sorted lex)
+       └── Column Family
+            └── Column Qualifier
+                 └── Timestamp
+                      └── Value
+</code></pre>
+<p>每个 cell 可存储多个带时间戳的版本；旧版本按策略进行垃圾回收。</p>
+<p>示例（Webtable）：</p>
+<pre><code>row_key:        com.google.www
+column family:  contents
+column quals:   t1, t2, t3 (different timestamps)
+value:          HTML content at each time
+</code></pre>
+<p>行键按字典序排序。将 URL 反转（"com.google.www"）可将相关 URL 归组在一起，从而实现高效的前缀扫描。</p>
+<p>面试用语：</p>
+<blockquote>
+<p>行键设计是 Bigtable 中最重要的单一决策。字典序排序意味着相关行存储在同一个 tablet 中——扫描高效，但需注意避免顺序键导致的热 tablet 问题。</p>
+</blockquote>
+<h4 id="column-families">列族</h4>
+<p>在建表时定义。同一族内的列共享：- 存储（磁盘上每族一个 SSTable）。- 压缩。- 访问控制。</p>
+<p>族内的列限定符是动态的——写入时无需修改 schema 即可添加新列。</p>
+<p>这种设计在存储层将频繁访问的列与不常访问的列分离开来。</p>
+<h4 id="tablets">Tablet</h4>
+<p>Tablet 是一段连续的行范围： <code>[start_row, end_row)</code>.</p>
+<ul>
+<li>初始时每张表只有一个 tablet。</li>
+<li>当 tablet 增长超过阈值（约 100-200 MB）时，将分裂为两个。</li>
+<li>每个 tablet 归属于且仅归属于一台 tablet server。</li>
+<li>Tablet 是分布的基本单元。</li>
+</ul>
+<p>一个 tablet 由以下部分组成：- GFS 上的 commit log。- memtable（内存中的近期写入）。- GFS 上的多个 SSTable。</p>
+<h4 id="sstables">SSTable</h4>
+<p>持久化、有序、不可变的字符串到字符串映射，以文件形式存储在 GFS 上。</p>
+<ul>
+<li>以 row key + column family + qualifier + timestamp 为索引。</li>
+<li>按块组织；使用 bloom filter 加速不存在键的快速判断。</li>
+<li>创建后不可修改；压缩操作会生成新的 SSTable。</li>
+</ul>
+<h4 id="compaction">压缩</h4>
+<ul>
+<li><strong>Minor compaction：</strong> memtable 刷写到磁盘上的一个新 SSTable。</li>
+<li><strong>Merging compaction：</strong> 合并若干 SSTable 以减少数量。</li>
+<li><strong>Major compaction：</strong> 将所有 SSTable 合并为一个；清除墓碑标记。</li>
+</ul>
+<h3 id="high-level-architecture">高层架构</h3>
+<pre><code class="language-text">                +-------------+
+   Client  --&gt;  | Bigtable    |
+                | Master      |  (one)
+                +------+------+
+                       |
+                       v
+       Chubby (membership, root tablet location)
+                       |
+                       v
+           +-------------------------+
+           |  Tablet Servers (many)  |
+           |  - serve tablets        |
+           |  - read/write SSTables  |
+           +-----+---------+----+----+
+                 |         |    |
+                 v         v    v
+                  GFS (SSTables + commit logs)
+</code></pre>
+<h3 id="core-components">核心组件</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>职责</th>
+<th>关键细节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Master</td>
+<td>将 tablet 分配给 tablet server；负载均衡；schema 变更。</td>
+<td>每集群一个。</td>
+</tr>
+<tr>
+<td>Tablet server</td>
+<td>持有一组 tablet；服务读写请求。</td>
+<td>数量较多。</td>
+</tr>
+<tr>
+<td>GFS</td>
+<td>存储 SSTable 和 commit log。</td>
+<td>底层持久化存储。</td>
+</tr>
+<tr>
+<td>Chubby</td>
+<td>存储 master/tablet server 存活状态；根 tablet 位置；schema。</td>
+<td>唯一的协调服务。</td>
+</tr>
+<tr>
+<td>客户端库</td>
+<td>缓存 tablet 位置；直接与 tablet server 通信。</td>
+<td>大量缓存。</td>
+</tr>
+<tr>
+<td>压缩</td>
+<td>后台 SSTable 合并。</td>
+<td>每个 tablet 独立进行。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="tablet-location-hierarchy">Tablet 位置层级</h3>
+<p>要定位持有给定行键的 tablet，Bigtable 使用三级层级结构：</p>
+<pre><code>Chubby file -&gt; root tablet -&gt; METADATA tablets -&gt; user tablets
+</code></pre>
+<ul>
+<li>Chubby 文件存储根 tablet 的位置。</li>
+<li>根 tablet（特殊，永不分裂）存储 METADATA tablet 的位置。</li>
+<li>METADATA tablet 存储所有用户 tablet 的位置。</li>
+</ul>
+<p>客户端积极缓存；缓存未命中时逐级向下查找。三级查找，但首次之后会被缓存。</p>
+<h3 id="write-path">写入路径</h3>
+<ol>
+<li>客户端将变更请求发往对应的 tablet server（通过缓存查找定位）。</li>
+<li>Tablet server 将 commit log 写入 GFS（持久性）。</li>
+<li>插入 memtable（内存中的有序映射）。</li>
+<li>返回成功。</li>
+</ol>
+<p>Memtable 刷写（minor compaction）：- 当 memtable 达到大小阈值时，刷写到 GFS 上的一个新 SSTable。- 截断 commit log 至已刷写的位置。</p>
+<h3 id="read-path">读取路径</h3>
+<ol>
+<li>客户端向 tablet server 发送读取请求。</li>
+<li>Tablet server 从 memtable 和所有相关 SSTable 中读取数据。</li>
+<li>合并结果（每个 cell 取最新时间戳）。</li>
+<li>应用所有可见的墓碑标记。</li>
+<li>返回行数据。</li>
+</ol>
+<p>Bloom filter 可跳过不包含查询键的 SSTable。</p>
+<p>范围扫描：按键顺序对 SSTable 进行顺序读取并合并。</p>
+<h3 id="tablet-split">Tablet 分裂</h3>
+<p>当 tablet 增长超过阈值时：</p>
+<ol>
+<li>Tablet server 选择一个分裂点（中间行键）。</li>
+<li>更新 METADATA 以反映两个新的 tablet 范围。</li>
+<li>原有 SSTable 仍对两个 tablet 均有效（它们按行范围建立索引）。</li>
+<li>客户端缓存在下次访问时失效。</li>
+</ol>
+<p>分裂速度快——仅是元数据变更。物理数据不会被复制；SSTable 被共享，直到发生压缩。</p>
+<h3 id="tablet-reassignment">Tablet 重新分配</h3>
+<p>当 tablet server 发生故障时，master 通过 Chubby 检测到后，将 tablet 重新分配给其他 server。</p>
+<ol>
+<li>Master 检测到 tablet server 故障（Chubby 租约到期）。</li>
+<li>对故障 server 上的每个 tablet，master 将其分配给新的 server。</li>
+<li>新 server 从 GFS 读取该 tablet 的 commit log 和 SSTable。</li>
+<li>将未提交的日志条目重放到新的 memtable 中。</li>
+<li>准备就绪，开始服务。</li>
+</ol>
+<p>Chubby 的作用：确保只有一个 master，确保每个 tablet 在同一时刻只有一台 server 持有所有权。</p>
+<h3 id="chubbys-role">Chubby 的角色</h3>
+<ul>
+<li>Master 选举（确保只有一个 master）。</li>
+<li>Tablet server 成员管理（每台 server 持有唯一的 Chubby 锁；释放锁即视为宕机）。</li>
+<li>Schema 存储。</li>
+<li>根 tablet 位置。</li>
+</ul>
+<p>没有 Chubby，Bigtable 将无法运行。</p>
+<h3 id="locality-groups">Locality Group</h3>
+<p>Locality group 是一组存储在磁盘上同一位置的列族。</p>
+<ul>
+<li>默认情况下，每个列族构成独立的 locality group。</li>
+<li>频繁一起访问的列族可共享一个 locality group，以减少磁盘 IO。</li>
+<li>Locality group 可加载至内存，实现极快的访问速度。</li>
+</ul>
+<h3 id="compression">压缩</h3>
+<p>按列族压缩，分两阶段：1. 首先进行键编码，利用有序特性压缩。2. 然后进行内容编码（Bentley-McIlroy、Snappy 等）。</p>
+<p>压缩比通常可达 10:1。</p>
+<h3 id="single-row-transactions">单行事务</h3>
+<p>Bigtable 支持在单行内进行原子性的读-改-写：</p>
+<pre><code>ApplyMutation(row_key, mutations, condition)
+</code></pre>
+<p>Tablet server 对该行加锁，原子性地应用变更。不支持跨行原子性。</p>
+<h3 id="multi-row-transactions">多行事务</h3>
+<p>原生不支持。上层服务（Megastore、Spanner）通过额外的协调机制在其基础上添加了此功能。</p>
+<h3 id="scaling-and-partitioning">扩展与分区</h3>
+<table>
+<thead>
+<tr>
+<th>关注点</th>
+<th>策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>热行</td>
+<td>应用层分片（对键添加后缀）。</td>
+</tr>
+<tr>
+<td>热 tablet</td>
+<td>自动分裂。</td>
+</tr>
+<tr>
+<td>Server 故障</td>
+<td>由 Chubby + master 重新分配。</td>
+</tr>
+<tr>
+<td>存储</td>
+<td>GFS 负责持久性和副本复制。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">一致性模型</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>一致性</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>每行写入</td>
+<td>强一致（tablet server 串行化）</td>
+<td>单一所有者。</td>
+</tr>
+<tr>
+<td>跨行</td>
+<td>无（不支持分布式事务）</td>
+<td>设计取舍。</td>
+</tr>
+<tr>
+<td>GFS 存储</td>
+<td>强一致（3 副本复制）</td>
+<td>底层保障。</td>
+</tr>
+<tr>
+<td>Tablet 所有权</td>
+<td>通过 Chubby 保证强一致</td>
+<td>最多一个所有者。</td>
+</tr>
+<tr>
+<td>Schema 变更</td>
+<td>通过 Chubby 保证强一致</td>
+<td>原子性。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">故障模式与缓解措施</h3>
+<table>
+<thead>
+<tr>
+<th>故障模式</th>
+<th>缓解措施</th>
+<th>监控指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tablet server 故障。</td>
+<td>Master 重新分配；新 server 从 GFS 加载数据。</td>
+<td>重新分配耗时。</td>
+</tr>
+<tr>
+<td>Master 故障。</td>
+<td>Chubby 选举新 master。</td>
+<td>选举耗时。</td>
+</tr>
+<tr>
+<td>Chubby 中断。</td>
+<td>Bigtable 对新操作不可用；现有租约陆续到期。</td>
+<td>Chubby 可用性。</td>
+</tr>
+<tr>
+<td>GFS 局部故障。</td>
+<td>GFS 处理副本复制；Bigtable 继续运行。</td>
+<td>GFS 健康状态。</td>
+</tr>
+<tr>
+<td>热 tablet。</td>
+<td>自动分裂；应用层分片。</td>
+<td>每个 tablet 的 QPS。</td>
+</tr>
+<tr>
+<td>Compaction 风暴。</td>
+<td>限速；平滑处理。</td>
+<td>待处理的压缩任务。</td>
+</tr>
+<tr>
+<td>分裂竞争。</td>
+<td>METADATA 写入已协调。</td>
+<td>冲突计数。</td>
+</tr>
+<tr>
+<td>操作进行中租约到期。</td>
+<td>检测；中止；重试。</td>
+<td>租约到期事件。</td>
+</tr>
+<tr>
+<td>Schema 变更竞争。</td>
+<td>Chubby 负责协调。</td>
+<td>Schema 版本。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">运维指标</h3>
+<p>正确性：</p>
+<ul>
+<li>Tablet 所有权唯一性（零重复所有者）。</li>
+<li>写入丢失（零）。</li>
+</ul>
+<p>容量：</p>
+<ul>
+<li>每台 server 的 tablet 数量。</li>
+<li>待处理的压缩任务。</li>
+<li>GFS 带宽。</li>
+</ul>
+<p>业务层面：</p>
+<ul>
+<li>每张表的读写 QPS。</li>
+<li>延迟。</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">需要指出的权衡</h3>
+<ul>
+<li>强的单行一致性，无多行事务：这是一个清晰的设计取舍。</li>
+<li>行键设计决定一切；顺序键存在热 tablet 风险。</li>
+<li>列族在存储层实现分离，但需要在建表时提前定义 schema。</li>
+<li>Compaction 是必要的，但代价较高；可调节。</li>
+<li>三级位置查找增加了初始延迟；积极的客户端缓存可缓解此问题。</li>
+<li>单 master 在精简版实现中是单点故障（SPOF）；通过 Chubby 实现故障转移。</li>
+<li>依赖 GFS 和 Chubby——两者均需正常运行，Bigtable 才能工作。</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">常见陷阱与更优做法</h3>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>时序数据使用顺序行键。</td>
+<td>使用哈希前缀或反转时间戳以避免热点 tablet。</td>
+</tr>
+<tr>
+<td>使用单一巨型列族。</td>
+<td>按访问模式划分 locality group。</td>
+</tr>
+<tr>
+<td>在应用层实现多行事务。</td>
+<td>承认局限性；在上层叠加 Megastore/Spanner。</td>
+</tr>
+<tr>
+<td>忽略 compaction。</td>
+<td>定期执行 major compaction；清理 tombstone。</td>
+</tr>
+<tr>
+<td>硬编码 tablet 位置。</td>
+<td>使用带客户端缓存的 METADATA 层级结构。</td>
+</tr>
+<tr>
+<td>单一 Chubby 文件。</td>
+<td>每个集群使用多个锁文件。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">面试官可能深入探讨的方向</h3>
+<table>
+<thead>
+<tr>
+<th>深入方向</th>
+<th>优秀回答要点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tablet 分裂</td>
+<td>仅修改元数据；SSTable 共享直至 compaction。</td>
+</tr>
+<tr>
+<td>Tablet 重新分配</td>
+<td>Chubby + master + GFS 日志重放。</td>
+</tr>
+<tr>
+<td>压缩</td>
+<td>Minor、merging、major；tombstone 处理。</td>
+</tr>
+<tr>
+<td>列族</td>
+<td>存储分离；locality group。</td>
+</tr>
+<tr>
+<td>行键设计</td>
+<td>避免热点 tablet；提升范围查询效率。</td>
+</tr>
+<tr>
+<td>Chubby 集成</td>
+<td>Master 选举、tablet 归属、schema 管理。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff 级别回答检查清单</h3>
+<ul>
+<li>稀疏多维映射：行 + 列 + 时间戳。</li>
+<li>基于 tablet 的分区。</li>
+<li>GFS 上的 SSTable 提供持久性。</li>
+<li>使用 Chubby 进行协调。</li>
+<li>Memtable + commit log + SSTable 架构。</li>
+<li>Tablet 分裂仅为元数据操作。</li>
+<li>列族 + locality group。</li>
+<li>单行强一致性；不支持多行事务。</li>
+</ul>
+<h3 id="interview-phrase">面试用语</h3>
+<blockquote>
+<p>Bigtable 是一个以行键分片的分布式有序映射。Tablet——连续的行键范围——是分布的基本单元，每个 tablet 归一个 tablet server 所有。存储层使用 GFS 上的 SSTable；commit log 保证持久性；Chubby 协调归属关系。单行一致性为强一致；不原生支持多行事务。行键设计和列族结构决定了系统性能。</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. 模拟面试</h2>
+<p><strong>面试官：</strong> 描述 Bigtable。</p>
+<p><strong>候选人：</strong> 以 (row, column, timestamp) 为键的分布式有序映射，稀疏、持久、多维。表按 tablet 分区——连续的行键范围，每个约 100-200 MB。每个 tablet 由一个 tablet server 负责。存储使用 GFS 上的 SSTable。Commit log 保证持久性。Chubby 协调 master 选举和 tablet 归属。单行写入强一致；不支持跨行事务。</p>
+<p><strong>面试官：</strong> 介绍一次写入的完整流程。</p>
+<p><strong>候选人：</strong> 客户端将写操作发送至负责该行所在 tablet 的 tablet server（通过 METADATA 层级结构查找，并缓存结果）。Tablet server 将写操作追加到 GFS 上的 commit log（保证持久性），并插入内存中的 memtable（有序）。返回成功。Memtable 写满时刷新为新的 SSTable（minor compaction）。Commit log 截断至已刷新的位置。随时间推移，每个 tablet 会积累多个 SSTable；compaction 负责合并它们。</p>
+<p><strong>面试官：</strong> 读取路径。</p>
+<p><strong>候选人：</strong> 读请求发往 tablet server。Server 从 memtable 和相关 SSTable 读取数据（Bloom filter 跳过不包含目标键的 SSTable），按时间戳合并所有数据（每个 cell 取最新值），应用 tombstone，并返回结果。对于范围查询，按行序顺序读取；跨 SSTable 的合并保持有序输出。</p>
+<p><strong>面试官：</strong> Tablet 分裂。</p>
+<p><strong>候选人：</strong> 当 tablet 数据超过阈值（约 200 MB）时，tablet server 选取一个分裂点——通常是中位行键——并更新 METADATA：原 tablet 范围拆分为两个。SSTable 不做物理复制，而是按行范围索引，在 compaction 之前同时服务于两个分区。分裂很快——仅为元数据操作。</p>
+<p><strong>面试官：</strong> Tablet server 故障。</p>
+<p><strong>候选人：</strong> Tablet server 持有 Chubby 锁。当其崩溃或租约到期时，锁释放，master 检测到该事件。对于故障 server 上的每个 tablet，master 将其分配给另一个 tablet server。新 server 从 GFS 读取该 tablet 的 commit log 和 SSTable，将未刷新的日志条目重放至新的 memtable，然后开始提供服务。整个接管过程在数秒内完成；GFS 保证持久性，数据不会丢失。</p>
+<p><strong>面试官：</strong> Chubby 的作用。</p>
+<p><strong>候选人：</strong> 仅用于协调，不在数据路径上。Master 选举：同一时刻只有一个 master。Tablet server 成员管理：每个 server 持有唯一的 Chubby 锁，锁丢失即代表 server 宕机。Schema 存储。Root tablet 位置（METADATA 层级结构的入口）。Bigtable 离开 Chubby 无法运行。</p>
+<p><strong>面试官：</strong> 行键设计。</p>
+<p><strong>候选人：</strong> 最重要的单项决策。行键按字典序排序；相关行位于同一或相邻 tablet，从而支持高效范围扫描。Webtable 经典地使用反转 URL（"com.google.www"）将相关站点归组。但顺序键（如时间戳）会产生热点 tablet——所有写入集中于同一 tablet server。解决方案：使用哈希前缀或反转时间戳进行分散。</p>
+<p><strong>面试官：</strong> 列族。</p>
+<p><strong>候选人：</strong> 在建表时定义。同一列族内，列共享存储（每个 tablet 每个列族一个 SSTable）、压缩和访问控制。列族内的列限定符是动态的——写入时即可添加，无需修改 schema。在存储层将频繁访问的列与不频繁访问的列分离。Locality group 可将多个列族并置，共享磁盘 IO。</p>
+<p><strong>面试官：</strong> Compaction。</p>
+<p><strong>候选人：</strong> 三种类型。Minor compaction：memtable 刷新为新 SSTable。Merging compaction：合并多个 SSTable 以减少数量。Major compaction：将所有 SSTable 合并为一个，清除 tombstone。权衡：SSTable 越少 = 磁盘占用更多但读取更快；SSTable 越多 = 读取更慢。按工作负载调优。</p>
+<p><strong>面试官：</strong> 不支持跨行事务？</p>
+<p><strong>候选人：</strong> 这是设计决策。上层服务（Megastore、Spanner）通过 Paxos/两阶段提交在其上提供跨行事务支持。Bigtable 保持单 tablet 设计的简洁性。对于大多数场景，单行原子性已足够；需要更多能力的应用可在上层叠加实现。</p>
+<p><strong>面试官：</strong> Locality group。</p>
+<p><strong>候选人：</strong> Locality group 是一组存储在一起的列族。默认每个列族一个 group。可配置：将通常一起访问的列族归为一组——例如页面元数据和内容——以减少磁盘 IO。常驻内存的 group 保存在 RAM 中以实现极快访问。</p>
+<p><strong>面试官：</strong> 压缩。</p>
+<p><strong>候选人：</strong> 按列族或 locality group 配置。两阶段：利用有序键的键编码，再进行内容压缩（Bentley-McIlroy + Snappy 或类似算法）。压缩比通常达 10:1，尤其对于网页等高度冗余的数据。</p>
+<p><strong>面试官：</strong> 总结。</p>
+<p><strong>候选人：</strong> Bigtable 是一个以行键分片的分布式有序映射。Tablet 对表进行分区，每个 tablet 由一个 tablet server 负责。GFS 上的 SSTable 提供持久存储；commit log + memtable 架构处理写入；compaction 维持读取性能。Chubby 协调归属关系。单行强一致性；不原生支持多行事务。行键设计至关重要。优势在于线性扩展和高效范围查询；局限在于不支持跨行事务，以及行键设计不当导致热点 tablet 的风险。</p>
+<h2 id="3-practice-notes">3. 练习备注</h2>
+<h3 id="five-minute-version">五分钟版本</h3>
+<ol>
+<li>稀疏多维映射：(row, col_fam:qual, ts)。</li>
+<li>Tablet（行键范围）对表进行分区。</li>
+<li>每个 tablet 由一个 tablet server 负责。</li>
+<li>GFS 上的 SSTable；commit log + memtable。</li>
+<li>Compaction（minor / merging / major）。</li>
+<li>Chubby 用于协调；master 分配 tablet。</li>
+<li>列族 + locality group 用于存储布局。</li>
+<li>单行强一致；不支持跨行事务。</li>
+</ol>
+<h3 id="one-minute-closeout">一分钟结尾陈述</h3>
+<blockquote>
+<p>Bigtable 是一个以行键分片的分布式有序映射。Tablet 是连续的行键范围，每个由一个 tablet server 负责。存储层使用 GFS 上的 SSTable；commit log 保证持久性；memtable 保存最近写入；compaction 合并 SSTable。Chubby 协调 master 选举和 tablet 归属。单行强一致性；不原生支持多行事务。行键设计决定性能——顺序键存在热点 tablet 风险。</p>
+</blockquote>
+<h3 id="best-interview-phrases">最佳面试用语</h3>
+<ul>
+<li>"行键设计是 Bigtable 中最重要的单项决策。"</li>
+<li>"Tablet 是元数据；分裂是元数据操作，而非数据复制。"</li>
+<li>"Memtable + commit log + SSTable + compaction 是本论文所普及的 LSM 模式。"</li>
+<li>"Chubby 位于控制平面，而非数据平面。"</li>
+<li>"单行强一致性；多行事务需要上层支持。"</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

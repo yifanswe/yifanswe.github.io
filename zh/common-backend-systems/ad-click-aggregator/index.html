@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Ad Click Aggregator（全流程解析） — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">Ad Click Aggregator（全流程解析）</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<p><strong>难度：</strong> Hard · <strong>总耗时：</strong> ~45 min · <strong>框架：</strong> Hello Interview Delivery</p>
+<p><strong>一句话场景：</strong> 构建一个统计广告点击量的系统。展示广告上的每次点击都经过我们的系统路由。我们对其进行归因（关联到哪条广告、哪个活动），去除机器人刷量，并聚合统计数据供广告主在仪表盘查看。实时仪表盘秒级更新，精确计数在一小时内完成。每天 100 亿次点击，平均约 115k/秒，重大活动期间峰值约 1M/秒。</p>
+<hr/>
+<h2 id="1-requirements-5-min">1. 需求（约 5 分钟）</h2>
+<p><strong>功能需求</strong>
+- 点击经过我们的系统；记录带属性的点击事件。\n- 按广告/活动/广告主维度聚合计数，支持按分钟/小时/天粒度。\n- 仪表盘展示近实时计数。</p>
+<p>我会暂不考虑曝光量、归因模型（末次触点 vs 多触点）以及深度账单对账。</p>
+<p><strong>非功能需求</strong>
+- 实时计数近似正确（约 5 秒延迟）；精确计数在 1 小时内完成。\n- 幂等点击摄入——对已去重的点击绝不重复计数。\n- 高可用性——每个未统计的点击都是潜在的未收取收入。\n- 能够应对超级碗当天 10 倍的流量峰值。</p>
+<p><strong>容量估算</strong>
+- 每天 100 亿次点击 × 每事件约 500 B = 每天约 5 TB 原始数据。\n- 聚合数据：每天约 1000 万个唯一（ad_id × 分钟）桶。多个汇总粒度。\n- 平均摄入速率约 115k 点击/秒；设计峰值约 1M/秒。以 3× 副本、7 天 Kafka 保留期计算，压缩前约 105 TB。原始事件存储是主要成本；聚合桶体积很小。</p>
+<hr/>
+<h2 id="2-core-entities-2-min">2. 核心实体（约 2 分钟）</h2>
+<ul>
+<li><strong>Click（点击）</strong> — <code>click_id, ad_id, campaign_id, advertiser_id, user_id, ts, ip, ua, referrer</code>.</li>
+<li><strong>Aggregate bucket（聚合桶）</strong> — <code>(ad_id, minute) → count</code>。同理适用于 <code>(campaign, minute)</code>, <code>(advertiser, minute)</code>等。</li>
+<li><strong>Dedup record（去重记录）</strong> — <code>click_id</code> （已签名）以防止重复使用。</li>
+</ul>
+<hr/>
+<h2 id="3-api-5-min">3. API（约 5 分钟）</h2>
+<pre><code>GET   /click/{signed_token}                  // user-facing redirect; we record then 302 to ad URL
+
+// Internal dashboard:
+GET /v1/advertisers/{id}/stats?range=1h     → { per_ad: { count }, totals }
+</code></pre>
+<p>签名 token 包含 <code>ad_id, campaign_id, exp, nonce, HMAC</code>.</p>
+<p>统计游标基于时间而非偏移量： <code>{advertiser_id, start_minute, end_minute, rollup_level, last_bucket}</code> 以避免在新桶仍在变化时分页结果漂移。</p>
+<hr/>
+<h2 id="4-data-flow-5-min">4. 数据流（约 5 分钟）</h2>
+<p>用户点击广告 → 经由我们重定向 → 点击事件发布到 Kafka → 去重 → 流聚合器计算每分钟汇总 → 写入 OLAP（在线分析处理）存储 → 仪表盘从 OLAP + Redis "实时计数"层读取，提供亚秒级新鲜度。</p>
+<hr/>
+<h2 id="5-high-level-design-1015-min">5. 高层设计（约 10–15 分钟）</h2>
+<ol>
+<li><strong>点击摄入端点。</strong> 接收 <code>GET /click/{token}</code> → 校验 HMAC → 向 Kafka 发出 <code>Click</code> 事件 → 立即 302 重定向到广告主的目标 URL。302 是用户可见的动作；计数在同一请求内以 fire-and-forget 方式完成。</li>
+<li><strong>Kafka。</strong> 按 <code>ad_id</code> 分区，使同一广告的所有点击有序地落在同一分区上。较长的保留期（如 7 天）支持重放。</li>
+<li><strong>去重服务。</strong> 过滤掉在窗口期内（如 24 小时）已见过的重复 <code>click_id</code>的流处理器。由 Redis set 或 RocksDB 支撑的 Flink 状态提供支持。</li>
+<li><strong>聚合流水线。</strong> Flink 任务消费去重后的事件，维护以 <code>(ad_id, minute)</code>为键的滚动窗口（1 分钟），并输出到：\n   - <strong>实时层：</strong> Redis 计数器（<code>INCRBY</code> 每分钟）用于实时仪表盘。\n   - <strong>持久层：</strong> OLAP 存储（ClickHouse 或 Druid）用于小时级及以上聚合和历史查询。</li>
+<li><strong>仪表盘。</strong> API 查询 Redis 获取实时窗口数据，查询 ClickHouse 获取更早的数据。时间范围查询跨两层进行扇出。</li>
+<li><strong>对账。</strong> 批处理任务每小时从原始 Kafka topic 运行 → 精确计数 → upsert 到 ClickHouse（修正流处理层的任何漂移）。</li>
+<li><strong>机器人过滤。</strong> ML 模型 + 启发式规则在去重流上将点击分类为有效/机器人。机器人点击单独计数（保留用于分析，从广告主对外展示的总数中排除）。</li>
+</ol>
+<p>端到端叙述：用户点击横幅广告 → 浏览器访问 <code>gad.com/click/eyJhbGciO...</code> → 摄入服务校验 HMAC，将 Click 事件发送到 Kafka，在 50 ms 内返回 302 到目标 URL。Flink 消费并去重（click_id 未见过），在 Redis 中递增每分钟桶并写入 ClickHouse。广告主打开仪表盘 → 看到本分钟点击数实时更新（来自 Redis），过去一小时的历史数据来自 ClickHouse。</p>
+<h3 id="system-components-diagram">系统组件图</h3>
+<pre><code class="language-text">                       +-------------------------------+
+                       | CLIENTS                       |
+                       | browser click / advertiser UI |
+                       +-----------+-------------------+
+                                   |
+                 +-----------------+------------------+
+                 |                                    |
+      GET /click/{signed_token}          GET /v1/advertisers/{id}/stats
+                 |                                    |
+                 v                                    v
+        +-------------------+                  +---------------+
+        | Click Ingest /    | -- 302 -------&gt;  | Advertiser    |
+        | Redirect Service  |                  | Landing Page  |
+        +---------+---------+                  +---------------+
+                  | publish Click(ad_id, click_id)
+                  v
+        +-------------------------------------------------------+
+        | ASYNC / EVENT ROW                                    |
+        | Kafka click_raw[hash(ad_id)+salt] -&gt; Flink Dedup +   |
+        | Bot Filter -&gt; Flink 1-min Aggregator -&gt; Reconcile Job |
+        +---------+--------------------+------------------------+
+                  |                    | uses
+                  |                    v
+                  |          +-------------------+
+                  |          | Bot Model / Rules |
+                  |          +-------------------+
+                  v
+        +-------------------------------------------------------+
+        | STORE / CACHE GROUP                                  |
+        | Redis live:{ad_id}:{minute} integer counter, TTL 2 h  |
+        | Redis live:{ad_id}:{salt}:{minute} for hot ads        |
+        | RocksDB dedup:{click_id}, bot:{click_id}, TTL 24 h    |
+        | ClickHouse (day, advertiser_id, ad_id, minute) rows   |
+        | S3 s3://clicks/dt=YYYY-MM-DD/hour=HH/ Parquet events |
+        +--------------------------+----------------------------+
+                                   ^
+                                   | Redis open-bucket miss /
+                                   | repair from replay
+                                   |
+                         +---------+---------+
+                         | Stats API         |
+                         | ClickHouse closed |
+                         | buckets + Redis   |
+                         | live overlay      |
+                         +-------------------+
+</code></pre>
+<p>具体写入路径：</p>
+<ol>
+<li>浏览器调用 <code>GET /click/{token}</code>；摄入服务校验 HMAC 并提取 <code>click_id</code>, <code>ad_id</code>, <code>campaign_id</code>, <code>advertiser_id</code>，以及目标 URL。</li>
+<li>摄入服务仅在 Kafka 发布失败时将 <code>click_id</code> 写入生产者重试队列；正常路径将其发布到 Kafka topic <code>click_raw</code> ，按 <code>hash(ad_id)</code>.</li>
+<li>Flink 消费 <code>click_raw</code>，检查以 <code>click_id</code>，并将有效事件输出到 <code>click_valid</code>.</li>
+<li>聚合器更新 Redis 实时计数器，并将分钟级行写入 ClickHouse。Redis 和 ClickHouse 写入可以并行进行，因为 ClickHouse 行通过 <code>(ad_id, minute, version)</code>.</li>
+<li>仪表盘读取 ClickHouse 获取已关闭的时间窗口数据，读取 Redis 获取当前开放分钟的数据，然后在客户端进行合并。</li>
+</ol>
+<p>仪表盘读取路径：</p>
+<ol>
+<li>Stats API 对广告主进行鉴权并解析 <code>{range, granularity, cursor}</code>；分片键为 <code>advertiser_id</code> ，用于查询路由和授权。</li>
+<li>查询 ClickHouse 获取已关闭的桶，按 <code>day</code> ，按 <code>(advertiser_id, campaign_id?, ad_id?)</code>.</li>
+<li>并行地，读取 Redis 键 <code>live:{ad_id}:{minute}</code> ，仅针对开放的分钟窗口；如果广告数量较多，则按 Redis 分片批量处理，并将扇出限制在广告主的活跃广告集范围内。</li>
+<li>在 Redis 未命中时，返回仅来自 ClickHouse 的结果，并将开放桶标记为临时性；下一次轮询通常会从 Redis 或首个刷入的 ClickHouse 行中补全。</li>
+<li>游标状态不透明且由服务端签发： <code>{advertiser_id, range_start, range_end, granularity, last_bucket, freshness_cutoff}</code>。游标固定 <code>freshness_cutoff</code> ，使第 2 页在分钟桶仍在变化时不会漂移。</li>
+</ol>
+<p>热路径与冷路径仪表盘对比：</p>
+<pre><code>Hot recent range:  client -&gt; Stats API -&gt; Redis live counters
+                                      \-&gt; ClickHouse closed buckets
+
+Cold old range:    client -&gt; Stats API -&gt; ClickHouse only -&gt; object archive only for audit export
+
+Replay repair:     Kafka/S3 raw -&gt; batch recon job -&gt; ClickHouse replace partition
+</code></pre>
+<hr/>
+<h2 id="6-deep-dives-10-min">6. 深度探讨（约 10 分钟）</h2>
+<p><strong>幂等性 / 去重。</strong> 每次点击在 token 中都带有唯一 nonce 签名。两种去重路径：\n- <strong>在摄入端：</strong> 将 nonce 与最近 nonce 的 Redis 布隆过滤器进行比对；若已见过则拒绝。布隆过滤器的假阳性会丢弃少量合法点击（概率极低，可接受）。\n- <strong>在流中：</strong> Flink 按 <code>click_id</code>，在 24 小时窗口内去重。精度更高，但会先将重复项接收进 Kafka。\n我默认使用流内去重以保证精度，摄入端去重仅用于粗粒度的机器人缓解。</p>
+<p>具体存储方案：</p>
+<table>
+<thead>
+<tr>
+<th>存储</th>
+<th>键模式</th>
+<th>值 / 数据结构</th>
+<th style="text-align: right;">条目大小</th>
+<th>TTL / 保留期</th>
+<th>分片键</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Kafka 原始数据</td>
+<td><code>click_raw[{partition}]</code></td>
+<td>仅追加的点击事件</td>
+<td style="text-align: right;">~500 B/事件</td>
+<td>热数据 7 天</td>
+<td><code>hash(ad_id)</code> 加盐以处理热点广告</td>
+</tr>
+<tr>
+<td>Flink 去重状态</td>
+<td><code>dedup:{click_id}</code></td>
+<td>RocksDB bool + 事件分钟</td>
+<td style="text-align: right;">~40 B</td>
+<td>24 小时</td>
+<td><code>hash(click_id)</code></td>
+</tr>
+<tr>
+<td>Redis 实时计数器</td>
+<td><code>live:{ad_id}:{minute}</code></td>
+<td>整数计数器</td>
+<td style="text-align: right;">~32 B</td>
+<td>2 小时</td>
+<td><code>hash(ad_id)</code></td>
+</tr>
+<tr>
+<td>ClickHouse 分钟行</td>
+<td><code>(day, advertiser_id, ad_id, minute)</code></td>
+<td>按有效/机器人/来源的计数</td>
+<td style="text-align: right;">~80-120 B</td>
+<td>2 年聚合数据</td>
+<td><code>advertiser_id</code>，按天分区</td>
+</tr>
+<tr>
+<td>原始冷归档</td>
+<td><code>s3://clicks/dt=YYYY-MM-DD/hour=HH/</code></td>
+<td>压缩 Parquet 事件行</td>
+<td style="text-align: right;">~150-250 B 压缩后</td>
+<td>90 天以上</td>
+<td>date/hour</td>
+</tr>
+<tr>
+<td>机器人决策缓存</td>
+<td><code>bot:{click_id}</code></td>
+<td>valid/bot 原因码</td>
+<td style="text-align: right;">~32 B</td>
+<td>24 小时</td>
+<td><code>hash(click_id)</code></td>
+</tr>
+</tbody>
+</table>
+<p>容量计算：每天 100 亿原始事件 × 500 B = 5 TB/天。Kafka × 3 副本 × 7 天 = 105 TB 未压缩，通常压缩后约 35-60 TB。去重状态为一天的点击 ID：100 亿 × 40 B × 副本/开销 ≈ 0.5-1 TB RocksDB 状态。若机器人决策缓存存于 Flink 状态外，则另需约 100 亿 × 32 B ≈ 320 GB（不含开销），因此通常将其折叠进流状态。Redis 实时计数器体积极小：每天 1000 万桶 × 32 B × 仅保留 2 小时 ≈ 几 GB。ClickHouse 聚合数据保留 2 年：每天 1000 万桶 × 100 B × 730 ≈ 730 GB（副本和压缩前）。原始事件流才是账单的大头。</p>
+<p>双视图模式是核心架构决策：原始点击是不可变的内容日志，而 Redis 和 ClickHouse 是基于同一日志构建的服务索引。Redis 按 <code>(ad_id, open_minute)</code> 索引以保证新鲜度；ClickHouse 按 <code>(advertiser_id, day, minute)</code> 索引以支持仪表盘扫描。它们不是相互竞争的数据源，重放可以重建两者。</p>
+<p><strong>恰好一次 vs 近似计数。</strong> 亚秒级仪表盘：来自 Redis 的近似计数。经对账的精确计数：Kafka → ClickHouse 的每小时批处理，采用 upsert 语义。广告合同通常要求对账后的数字；仪表盘上的免责声明只是小字注脚。</p>
+<p><strong>为什么选择 Kafka + Flink + ClickHouse。</strong> Kafka 是持久化重放日志；Redis Streams 或 Pub/Sub 无法在此规模下提供 7 天重放，Kinesis/Pulsar 如果是公司标准也同样可行。Flink 的价值在于核心难点是有键的窗口状态和重放，而不仅仅是队列消费。ClickHouse 比 MySQL 更适合仪表盘扫描，因为查询是对 <code>(advertiser_id, time)</code>的列式范围扫描；Druid 是最接近的替代品，如果需要内置汇总/服务能力则选 Druid，如果能自己管理 schema 则 ClickHouse 更简单。</p>
+<p><strong>故障下的聚合正确性。</strong> Flink 结合 RocksDB 状态 + Kafka 数据源，在任务失败时从偏移量重放。通过两阶段提交或以 <code>(window, ad_id)</code>.</p>
+<p><strong>机器人过滤。</strong> 启发式规则：相同 IP 爆发、无 Referer、可疑 UA、无曝光即点击、曝光后点击过快。加上基于标注机器人流量训练的模型。被过滤的点击单独存储以供分析，但不计入计费数量。</p>
+<p><strong>热键（超级碗广告）。</strong> 一条广告在一分钟内获得 1000 万次点击。按 Kafka 进行分区 <code>ad_id</code> 进行 Kafka 分区会将它们都落到同一分区上——可能导致饱和。缓解措施：对热点广告的分区键加盐（<code>hash(ad_id) + small random</code>），并在聚合时进行合并。检测方式：监控分区 lag。</p>
+<p>热点广告状态机：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>模式</th>
+<th>来源 / 写入模式</th>
+<th>延迟目标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>正常</td>
+<td>未加盐</td>
+<td><code>partition = hash(ad_id)</code></td>
+<td>仪表板延迟 &lt;5 s</td>
+</tr>
+<tr>
+<td>检测到热点</td>
+<td>已加盐</td>
+<td><code>partition = hash(ad_id, salt_0..15)</code></td>
+<td>合并期间延迟 &lt;10 s</td>
+</tr>
+<tr>
+<td>极端</td>
+<td>实时采样 + 事后精确计算</td>
+<td>Redis 实时计数器采样；Kafka 保留所有事件</td>
+<td>实时近似值，每小时精确值</td>
+</tr>
+<tr>
+<td>恢复</td>
+<td>压缩盐值</td>
+<td>将加盐的桶合并为正常的 ClickHouse 行</td>
+<td>下一个已关闭窗口</td>
+</tr>
+</tbody>
+</table>
+<p>仪表板新鲜度状态机：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>模式</th>
+<th>数据源</th>
+<th>降级方案 / 延迟预算</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>新鲜的已开放分钟</td>
+<td>实时覆盖层</td>
+<td>Redis <code>live:{ad_id}:{minute}</code> + ClickHouse 已关闭的桶</td>
+<td>API p99 &lt;500 ms</td>
+</tr>
+<tr>
+<td>Redis 耗尽</td>
+<td>仅含已关闭桶的临时数据</td>
+<td>仅 ClickHouse</td>
+<td>&lt;1 s，已开放桶标记为临时</td>
+</tr>
+<tr>
+<td>流延迟</td>
+<td>延迟新鲜度截止时间</td>
+<td>ClickHouse 数据截至最后提交的水位线</td>
+<td>仪表板按水位线延迟，而非错误的总计数</td>
+</tr>
+<tr>
+<td>对账修复</td>
+<td>替换已修正的分区</td>
+<td>每小时从原始日志/归档进行批量处理</td>
+<td>分钟级，用于计费真实数据</td>
+</tr>
+</tbody>
+</table>
+<p>边缘压力测试：</p>
+<table>
+<thead>
+<tr>
+<th>边缘</th>
+<th>设计方案</th>
+<th>预算</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>休眠广告主打开一个跨度一年的仪表板</td>
+<td>跳过 Redis，通过以下方式扫描 ClickHouse <code>advertiser_id</code> 以及按日期分区；使用固定值分页 <code>freshness_cutoff</code></td>
+<td>第一页 &lt;2 s</td>
+</tr>
+<tr>
+<td>仪表板翻页超出已缓存的实时窗口</td>
+<td>游标自然切换到仅含已关闭桶的 ClickHouse 数据</td>
+<td>稳定的分页顺序</td>
+</tr>
+<tr>
+<td>某个明星广告商的突发写入</td>
+<td>对 Kafka 和 Redis 计数器键进行加盐处理，格式为 <code>live:{ad_id}:{salt}:{minute}</code>，然后在刷新时合并盐值</td>
+<td>实时延迟 &lt;10 s</td>
+</tr>
+<tr>
+<td>多区域漂移</td>
+<td>本地摄入，异步复制原始日志，通过以下方式对账 <code>(click_id, event_time)</code> 在主区域</td>
+<td>区域仪表板可能有延迟；计费通过对账保证准确</td>
+</tr>
+<tr>
+<td>Flink 部署后冷启动</td>
+<td>从检查点恢复 RocksDB 状态；Redis 实时计数器通过重放当前窗口数据重新填充</td>
+<td>亚分钟级新鲜度恢复</td>
+</tr>
+</tbody>
+</table>
+<p><strong>面试核心要点：</strong> 仪表板可以展示临时的实时覆盖层，但计费数据应始终能从不可变的点击日志中复现。</p>
+<p><strong>面试核心要点：</strong> 我会让重定向路径保持高可用性，让计数路径可重放。用户可见的点击应快速完成；金额准确性来源于幂等重放和对账，而非试图同步执行每项聚合。</p>
+<p><strong>延迟预算。</strong> 摄入延迟必须 &lt; 100 ms，以保证重定向响应迅速。Kafka 发布是异步的—— <code>acks=1</code> 在生产者侧可将发布延迟控制在 5 ms 以内。点击事件的发送可以采用即发即忘模式，并在生产者侧故障时（罕见）通过重试队列处理。</p>
+<p><strong>回填 / 重放。</strong> 如果聚合出现故障，可从 Kafka 重放。在相同输入流和相同窗口的条件下，聚合结果是确定性的，因此重新运行会产生相同的数字。</p>
+<p><strong>多租户 / 分片。</strong> ClickHouse 按日期 + advertiser_id 分区。热门广告商在查询负载较重时获得专用分片；小型广告商共享分片。</p>
+<p><strong>代价。</strong> 原始事件按 5 TB/天存储 90 天，共 450 TB。聚合数据占比极小。原始事件在 7 天后迁移至冷存储；聚合数据保持热存储。</p>
+<p><strong>点击归因（触点）。</strong> 广告点击可能在之后导致购买行为。归因是下游关注点：通过可配置窗口的 join 将点击事件与最终转化事件流式处理。此处不在完整设计范围之内。</p>
+<p><strong>我会推迟的内容。</strong> 曝光计数（类似管道，但流量更高）、高级归因窗口、广告欺诈检测深度分析、实时预算控制（中途停止广告系列）。</p>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Payment System — Stripe / PayPal Class (walkthrough) — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">Payment System — Stripe / PayPal Class (walkthrough)</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<p><strong>难度：</strong> Hard · <strong>总耗时：</strong> ~45 min · <strong>框架：</strong> Hello Interview Delivery</p>
+<p><strong>一句话场景：</strong> 构建一个支付系统。商家通过我们的 API 向客户卡片收费；我们路由到卡网络（Visa/MC）或钱包，结算资金，处理退款和争议，且绝不丢失或重复收费。每天 1 亿笔交易，峰值约 5k/秒，平均交易金额 $30。围绕资金的故障模式才是面试的核心。</p>
+<hr/>
+<h2 id="1-requirements-5-min">1. 需求（约 5 分钟）</h2>
+<p><strong>功能需求</strong>
+- 商家提交收费意图（客户支付方式 + 金额）。 - 系统向卡网络发起授权，捕获资金，返回成功/失败。 - 退款和部分退款。 - 终态事件的 Webhook 回调通知商家。</p>
+<p>我会推迟处理周期性账单、订阅、多币种转换和欺诈模型细节。</p>
+<p><strong>非功能需求</strong>
+- <strong>正确性高于一切。</strong> 绝不重复收费，绝不静默丢弃收费请求。 - 所有写操作均幂等——网络会重试；我们也必须重试而不重复资金流动。 - 账本余额强一致性。 - 每次状态转换的持久审计日志（合规要求）。 - p99 收费 &lt; 2 s（大部分时间是卡网络耗时）。 - 高可用——支付中断意味着每个商家的真实营收损失。</p>
+<p><strong>容量估算</strong>
+- 每天 1 亿笔 = 平均 1200/秒，峰值 5k/秒。 - 交易记录约 7 年保留期（PCI/监管要求）。 - 热流量并不算大；保留的资金历史才是。1 亿/天 × 7 年 ≈ 2550 亿笔交易。 - 若每笔交易产生约 4 条账本分录，每条约 250 B，账本存储约 255 TB 原始数据，含 3 副本约 765 TB（索引/冷压缩前）。账本 + 审计是主要成本。</p>
+<hr/>
+<h2 id="2-core-entities-2-min">2. 核心实体（约 2 分钟）</h2>
+<ul>
+<li><strong>PaymentIntent</strong> ——商家订单： <code>intent_id, merchant_id, amount, currency, customer_id, status</code>.</li>
+<li><strong>Charge</strong> ——资金移动的一次尝试： <code>charge_id, intent_id, status, network_ref</code>.</li>
+<li><strong>LedgerEntry</strong> ——复式记账： <code>(account, debit/credit, amount, ref)</code>。权威来源。</li>
+<li><strong>PaymentMethod</strong> ——令牌化的卡片/钱包句柄。</li>
+<li><strong>退款</strong> ——对收费的部分或全额冲销。</li>
+</ul>
+<hr/>
+<h2 id="3-api-5-min">3. API（约 5 分钟）</h2>
+<pre><code>POST  /v1/payment_intents                { amount, currency, payment_method, customer }   (Idempotency-Key header required)   → PaymentIntent
+POST  /v1/payment_intents/{id}/confirm                                                                                       → Charge
+POST  /v1/charges/{id}/refunds            { amount }                                                                          → Refund
+GET   /v1/charges/{id}
+POST  /v1/webhooks/{merchant_id}/events                                                                                       // outgoing
+</code></pre>
+<p><strong>每个改变状态的请求都必须携带 Idempotency-Key。</strong> 这是基石。</p>
+<hr/>
+<h2 id="5-high-level-design-1015-min">5. 高层设计（约 10–15 分钟）</h2>
+<ol>
+<li><strong>API Gateway。</strong> Auth、限流、idempotency-key 中间件：查找 <code>(merchant_id, key)</code> → 若已见过则返回缓存响应，否则放行。</li>
+<li><strong>PaymentIntent 服务。</strong> 在强一致性存储（Spanner 级别，或每分片有主节点的分片 MySQL）中写入 intent 行。状态机： <code>requires_payment_method → requires_confirmation → processing → succeeded | failed</code>.</li>
+<li><strong>授权服务。</strong> 确认后，构建网络消息（ISO 8583 或处理器 API 的 HTTP），路由到卡网络适配器。发送前持久化出站尝试；持久化响应。超时时标记为 <code>unknown</code> （而非 <code>failed</code>）并稍后对账——永远不要在超时时假设失败，那会导致重复收费。</li>
+<li><strong>账本服务。</strong> 复式记账。每次资金移动 = 一个账户借方 + 另一个账户贷方，总计必须平衡。示例： - 授权：pending_authorization（客户）↔ pending_capture（商家应付款）。 - 捕获：pending_capture → merchant_balance；客户 pending → settled。 - 退款：冲销分录。 存储于仅追加的账本表中，按账户分区。</li>
+<li><strong>Webhook 服务。</strong> 终态时，将投递任务加入商家 Webhook URL 队列。以退避方式重试最长 3 天；持久化队列。</li>
+<li><strong>网络适配器。</strong> 按卡网络或处理器（如 Visa、Stripe Connect）划分。每个适配器管理自己的连接池、消息格式和重试策略。</li>
+<li><strong>对账。</strong> 每日批处理任务拉取当天网络结算文件，与我们的账本比对，标记差异。</li>
+<li><strong>审计日志。</strong> 每次状态转换追加到不可变日志（Kafka 配置超长保留期 + 冷存储）。</li>
+</ol>
+<p>端到端叙述：商家携带幂等键 K 调用 <code>POST /payment_intents</code> 。网关检查；未见过。写入 intent 行（status=<code>requires_confirmation</code>）。商家调用 <code>/confirm</code> → 授权服务向 Visa 发送 ISO 8583 消息 → Visa 在 800 ms 内响应批准 → 账本写入复式分录（客户待处理：−$30；商家应付款：+$30）→ intent.status=<code>succeeded</code> → 触发 Webhook。两天后，来自 Visa 的结算文件到达 → 对账确认记录匹配 → 账本分录变为 settled。</p>
+<h3 id="system-components-diagram">系统组件图</h3>
+<pre><code class="language-text">                         +------------------------------+
+                         | MERCHANT + CARD NETWORKS    |
+                         +----------+-----------+-------+
+                                    |           |
+        POST /payment_intents       |           | settlement files
+        POST /confirm, /refunds     |           v
+                                    v    +------+--------+
+                         +----------+---+| Reconciliation|
+                         | Gateway /    || Service       |
+                         | Idempotency  |+------+--------+
+                         +------+-------+       |
+                                |               | compare
+                                v               v
+                         +------+-------+  +----+---------+
+                         | PaymentIntent|  | Ledger       |
+                         | Service      |  | Service      |
+                         +------+-------+  +----+---------+
+                                |               ^
+                         confirm/refund         | balanced entries
+                                v               |
+                         +------+-------+       |
+                         | Authorization|-------+
+                         | Service      |
+                         +------+-------+
+                                | persisted request before send
+                                v
+                         Network Adapter --&gt; Visa / MC / Wallets
+                                |
+                                v terminal event
+        +----------------------------------------------------------+
+        | STORE / CACHE                                            |
+        | idem:{merchant_id}:{key} status + response pointer       |
+        | pi:{intent_id} strongly consistent intent row            |
+        | ch:{charge_id} network request/response/status           |
+        | ledger:{account_id}:{seq} append-only debit/credit entry |
+        | webhook:{merchant_id}:{event_id} outbox delivery row     |
+        | audit/yyyy/mm/dd/{partition} immutable event stream      |
+        +-----------+-----------------------------+----------------+
+                    | old charge/history miss     ^ outbox retry
+                    v                             |
+          +-------------------+          +--------+-------+
+          | Cold archive      |          | Webhook        |
+          | + audit storage   |          | Service        |--&gt; merchant webhook
+          +-------------------+          +----------------+
+</code></pre>
+<hr/>
+<h2 id="6-deep-dives-10-min">6. 深度探讨（约 10 分钟）</h2>
+<p><strong>具体存储与分片键。</strong></p>
+<table>
+<thead>
+<tr>
+<th>存储</th>
+<th>键模式</th>
+<th>数据结构 / 条目</th>
+<th>TTL / 保留期</th>
+<th>分片键</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>幂等性</td>
+<td><code>idem:{merchant_id}:{key}</code></td>
+<td>状态 + 响应哈希/正文指针，1–4 KB</td>
+<td>24–72 小时热存储，7 天持久化</td>
+<td><code>(merchant_id, key)</code></td>
+</tr>
+<tr>
+<td>PaymentIntent</td>
+<td><code>pi:{intent_id}</code></td>
+<td>强一致性行，金额/状态/客户，约 1 KB</td>
+<td>7 年</td>
+<td><code>merchant_id</code> + <code>intent_id</code></td>
+</tr>
+<tr>
+<td>收费尝试</td>
+<td><code>ch:{charge_id}</code></td>
+<td>网络请求/响应引用/状态，约 1 KB</td>
+<td>7 年</td>
+<td><code>charge_id</code></td>
+</tr>
+<tr>
+<td>账本</td>
+<td><code>ledger:{account_id}:{seq}</code></td>
+<td>仅追加借贷分录，约 250 B</td>
+<td>7 年热/温存储，更长归档</td>
+<td><code>account_id</code></td>
+</tr>
+<tr>
+<td>Outbox/webhook</td>
+<td><code>webhook:{merchant_id}:{event_id}</code></td>
+<td>目标/状态/尝试次数/正文指针，约 1 KB</td>
+<td>重试 3 天，状态保留 90 天</td>
+<td><code>merchant_id</code></td>
+</tr>
+<tr>
+<td>审计日志</td>
+<td><code>audit/yyyy/mm/dd/{partition}</code></td>
+<td>不可变事件流/对象记录，约 500 B/事件</td>
+<td>7 年以上</td>
+<td>日期 + 分区</td>
+</tr>
+</tbody>
+</table>
+<p>账本是内容和真相来源；缓存和幂等键是控制平面的安全护栏。我会明确避免将 Redis 作为任何资金移动的权威存储。</p>
+<p><strong>各存储容量估算。</strong></p>
+<table>
+<thead>
+<tr>
+<th>存储 / 索引</th>
+<th>Math</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>幂等性</td>
+<td>1 亿/天 × 2 KB 均值 × 3 ≈ 600 GB（24 小时）；最多约 1.8 TB（72 小时）</td>
+<td>热安全护栏，TTL 有界</td>
+</tr>
+<tr>
+<td>PaymentIntent</td>
+<td>2550 亿（7 年）× 1 KB × 3 ≈ 765 TB</td>
+<td>冷年份压缩/归档</td>
+</tr>
+<tr>
+<td>收费尝试</td>
+<td>2550 亿 × 1 KB × 3 ≈ 765 TB</td>
+<td>包含网络引用，不含完整 PAN/卡数据</td>
+</tr>
+<tr>
+<td>账本</td>
+<td>2550 亿笔 × 4 条分录 × 250 B × 3 ≈ 765 TB</td>
+<td>权威资金历史</td>
+</tr>
+<tr>
+<td>Webhook outbox</td>
+<td>1 亿/天 × 1 KB × 90 天 × 3 ≈ 27 TB（若状态热存储）</td>
+<td>活跃重试集合小得多</td>
+</tr>
+<tr>
+<td>审计日志</td>
+<td>2550 亿笔 × ~5 个事件 × 500 B × 3 ≈ 1.9 PB 原始数据</td>
+<td>冷对象存储 + 压缩带来主要节省</td>
+</tr>
+<tr>
+<td>结算文件</td>
+<td>1 亿/天 × 200 B ≈ 20 GB/天原始数据</td>
+<td>批量对账输入</td>
+</tr>
+</tbody>
+</table>
+<p>Kafka 适合审计/事件扇出，但它不是账本。outbox 行首先与状态转换一起提交，然后 broker 投递可以重试。这样可确保持久支付状态先于异步通知。</p>
+<p><strong>确认收费路径。</strong>
+1. 网关对商家进行认证并检查 <code>idem:{merchant_id}:{key}</code>；若同一键有其他请求正在进行，则等待或返回最终结果。 2. PaymentIntent 服务 CAS 更新 <code>requires_confirmation → processing</code> 对于 <code>pi:{intent_id}</code>。 3. 在允许的情况下并行加载保险库中的令牌化支付方式并进行欺诈/风险检查；任一失败则 intent 转为 <code>failed</code> 并附审计事件。 4. 授权服务在向网络发送任何内容之前写入 <code>ch:{charge_id}</code> ：将 <code>network_request_persisted</code> 。 5. 网络适配器发送授权/捕获请求。批准响应触发账本事务：客户待处理借方和商家应付款贷方必须一起提交。 6. Intent/Charge 转为终态，outbox 写入 <code>webhook:{merchant_id}:{event_id}</code>，幂等记录存储精确响应。 7. 若适配器超时，charge 保持 <code>unknown</code>；重试/对账以 <code>network_ref</code>为键，而非创建第二笔收费。</p>
+<p><strong>退款和读取路径。</strong>
+1. 退款请求检查 <code>idem:{merchant_id}:{refund_key}</code> 并读取 <code>ch:{charge_id}</code> 上检查 <code>charge_id</code>。 2. 服务验证 <code>refunded_amount + requested_amount &lt;= charge.amount</code>，然后创建 <code>refund:{refund_id}</code> 并在发送网络退款请求之前持久化出站尝试。 3. 网络批准后，账本在分片 <code>account_id</code>上写入冲销复式分录；收费的物化 <code>refunded_amount</code> 通过 CAS 更新。 4. <code>GET /v1/charges/{id}</code> 读取 <code>ch:{charge_id}</code>, <code>pi:{intent_id}</code>，以及并行的账本摘要。若收费时间超过热保留窗口，API 回落到冷存档，可能返回更慢但仍完整的审计历史。 5. 客户端携带的唯一会话状态是幂等键。商家交易导出的分页使用不透明游标 <code>{merchant_id, created_at, charge_id}</code> ，因此导出不依赖资金历史的偏移扫描。</p>
+<p><strong>双索引框架。</strong> 账本以账户为键，因为余额按账户计算。商家仪表盘以 <code>merchant_id</code> 。 <code>created_at</code>为键按交易索引。这是对同一资金事件的两个索引；仪表盘索引可以有延迟，但账本不能。</p>
+<p><strong>幂等性——核心所在。</strong> 每个变更端点接受一个 <code>Idempotency-Key</code>。服务端存储 <code>(merchant_id, key) → response, status</code> ，有效期 ≥24 小时。重复请求返回缓存响应而不重新执行。键存储使用 Redis 集群 + 持久化后端。关键在于：键锁定操作——相同键的飞行中请求等待（带超时）；后续请求返回结果。网络必然会重试；我们必须安全地吸收重试。</p>
+<p><strong>超时 = "未知"，而非"失败"。</strong> 若卡网络调用超时，真相未知。将收费标记为 <code>failed</code> 并接受重试可能导致重复收费。应标记为 <code>processing/unknown</code>；稍后通过网络的 stand-in advice 或结算文件进行对账。商家看到 <code>pending</code>；客户不会被收费两次。</p>
+<p><strong>复式账本。</strong> 每次资金移动是一对平衡的分录。借方总额 = 贷方总额，永远如此。账户余额通过派生（分录之和）或物化（为性能）获得。审计不变量：在任意快照下，所有账户之和为零。这可以发现否则会隐藏的 Bug。</p>
+<p><strong>状态机。</strong> PaymentIntent 状态转换由 CAS 更新严格控制： <code>UPDATE intent SET status='succeeded' WHERE id=X AND status='processing'</code>。非法转换返回错误。每次转换都向审计日志发出事件。</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>数据真实来源</th>
+<th>允许的下一个状态</th>
+<th>恢复行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>requires_confirmation</code></td>
+<td><code>pi:{intent_id}</code></td>
+<td><code>processing</code>, <code>canceled</code></td>
+<td>使用相同键安全重试确认</td>
+</tr>
+<tr>
+<td><code>processing</code></td>
+<td>intent + charge 行</td>
+<td><code>succeeded</code>, <code>failed</code>, <code>unknown</code></td>
+<td>超时时不暴露为失败</td>
+</tr>
+<tr>
+<td><code>unknown</code></td>
+<td>charge 行 + 网络引用</td>
+<td><code>succeeded</code>, <code>failed</code></td>
+<td>通过网络 advice/结算文件对账</td>
+</tr>
+<tr>
+<td><code>succeeded</code></td>
+<td>账本已提交</td>
+<td>仅退款/争议流程</td>
+<td>不可变成功；无法向后转换</td>
+</tr>
+<tr>
+<td><code>failed</code></td>
+<td>charge 终态原因</td>
+<td>新 intent 或新确认尝试</td>
+<td>无账本移动</td>
+</tr>
+</tbody>
+</table>
+<p>为何使用 Spanner 级别的存储而非 Cassandra：我们需要事务性状态转换和账本不变量，而非写入吞吐量。若能将账户/商家写入保持在本地，每分片一个主节点的分片 MySQL 是合理替代；Cassandra 更适合仅追加的审计，而非权威余额。</p>
+<p><strong>精确一次 Webhook 投递。</strong> 商家的 Webhook 端点也可能失败。出站投递已持久化；以指数退避方式重试，最长 3 天；商家需根据事件 ID 去重（我们会附带）。</p>
+<p><strong>PCI 合规。</strong> 卡号（PAN）仅经过令牌化服务，该服务将其加密存储于隔离的保险库中。应用代码只看到令牌。这降低了我们的 PCI 范围。</p>
+<p><strong>故障转移与持久性。</strong> 单区域故障不得丢失任何 intent。多区域主主架构，使用无冲突状态模型：intent_id 包含区域 + 随机组件；账本按区域存储热写入，全局对账。</p>
+<p><strong>退款。</strong> 退款 = 一个独立状态机，镜像原始收费的逆过程。基于退款专用键幂等。网络退款调用 → 冲销原始分录的账本分录。部分退款需谨慎计算——追踪 refunded_amount，永不超过 charge.amount。</p>
+<p><strong>争议 / 退款纠纷。</strong> 客户报告欺诈 → 网络发送争议事件。我们从商家余额中冻结争议金额，启动证据收集流程。完整设计超出范围。</p>
+<p><strong>对账。</strong> 每日批处理：拉取网络结算文件 → 与我们的收费记录进行关联 → 断言匹配 → 将不匹配项标记供人工审核。这是主要的正确性检查；某天未完成对账即视为故障事件。</p>
+<p><strong>热点商户。</strong> 黑色星期五：某商户每秒处理 1000 笔请求。其意向单按 merchant_id 分片，导致单个分片承受全部负载。必要时对热点商户进行预分片，拆分为多个子分片。</p>
+<p><strong>边缘压力测试。</strong></p>
+<table>
+<thead>
+<tr>
+<th>边缘</th>
+<th>故障模式</th>
+<th>兜底方案 / 不变量</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>网络超时</td>
+<td>扣款真相未知</td>
+<td>保留 <code>unknown</code>；通过对账来确认 <code>network_ref</code>，切勿盲目发起第二次扣款</td>
+</tr>
+<tr>
+<td>幂等键已过期</td>
+<td>商户在 TTL 后重试</td>
+<td>要求客户端在重新确认前，先通过意向单/订单引用进行查询</td>
+</tr>
+<tr>
+<td>热点商户</td>
+<td>单个分片过载</td>
+<td>按以下字段预分片 <code>(merchant_id, sub_shard)</code> 同时保持账本账户余额平衡</td>
+</tr>
+<tr>
+<td>多区域漂移</td>
+<td>同一意向单在两个区域被确认</td>
+<td>使用区域级意向单所有者或对以下字段执行全局 CAS <code>pi:{intent_id}</code> 防止重复提交</td>
+</tr>
+<tr>
+<td>冷数据归档读取</td>
+<td>查询 5 年前的扣款记录</td>
+<td>从归档中获取扣款记录及账本事件；p99 延迟可能达到秒级，不在结账路径上</td>
+</tr>
+</tbody>
+</table>
+<p>"员工级别的核心要点：网络可以是模糊的，但我的账本不能；超时会产生未知状态，绝不应发起可能导致重复扣款的第二次尝试。"</p>
+<p><strong>我会推迟的内容。</strong> 订阅/周期性扣款、多币种外汇、支付方式的存储与复用、欺诈评分深度、手续费与分润、子商户市场流程（Connect）。</p>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

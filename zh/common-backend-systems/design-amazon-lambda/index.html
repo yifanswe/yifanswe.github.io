@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>设计 Amazon Lambda — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">设计 Amazon Lambda</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p><strong>对这些术语不熟悉？</strong> 请参阅 <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> ，了解常见系统设计术语的中英文解释。</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. 基础知识与解题思路</h2>
+<h3 id="what-this-question-is-testing">本题考察点</h3>
+<p>AWS Lambda 是无服务器计算：部署一个函数，获得一个端点，按调用次数计费。难点在于冷启动延迟、在共享硬件上实现安全的多租户隔离、从零快速扩展到数千并发调用，以及可靠的事件源集成。</p>
+<p>其不变量如下：</p>
+<blockquote>
+<p>每个与已部署函数匹配的调用请求都在隔离环境中执行，使用配置好的代码和运行时，在函数超时时限内完成，并将结果或错误返回给调用方；并发调用独立扩展；资源限制（内存、CPU、网络）得到强制执行；每次调用的 secrets 和 IAM 身份均正确无误。</p>
+</blockquote>
+<p>在 ICT5 / L6+ 级别，面试官考察的是你能否设计 micro-VM 隔离（Firecracker）、冷启动优化、从零到 N 的自动扩缩容、事件源映射（S3、SQS、Kinesis 触发器），以及在共享集群上进行资源调度的推理能力。</p>
+<h3 id="60-second-interview-framing">60 秒面试框架</h3>
+<p>口述版本：</p>
+<blockquote>
+<p>我会将 Lambda 设计为四个核心系统：存储代码和配置的函数注册表、基于 micro-VM（Firecracker）的隔离执行层、在 worker 集群中扩展调用的请求路由器，以及触发函数的事件源。关键设计决策包括冷启动优化、隔离模型、集群调度，以及与同步（API Gateway）和异步（S3、SQS、EventBridge）触发器的集成。</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">首先明确需求</h3>
+<p>功能性需求：</p>
+<ul>
+<li>部署函数：代码、运行时、内存、超时、环境变量。</li>
+<li>同步调用（API 调用）或异步调用（事件）。</li>
+<li>自动扩缩容：空闲零成本；支持数千并发。</li>
+<li>每次调用的日志记录和指标采集。</li>
+<li>每个函数的 IAM 身份。</li>
+<li>VPC 网络连接。</li>
+<li>多运行时支持（Node、Python、Java、Go、自定义）。</li>
+<li>层（Layers）与依赖项。</li>
+</ul>
+<p>非功能性需求：</p>
+<ul>
+<li>冷启动：1 秒以内；热启动：50 ms 以内。</li>
+<li>并发：每个函数支持数千并发。</li>
+<li>隔离：强隔离（不同租户共享硬件）。</li>
+<li>按实际计费毫秒数付费。</li>
+<li>每个区域高可用。</li>
+<li>限制执行。</li>
+</ul>
+<p>以下内容超出范围，除非被特别询问：</p>
+<ul>
+<li>SnapStart 预热详情。</li>
+<li>容器镜像部署（简要介绍）。</li>
+<li>Step Functions / 编排。</li>
+<li>Lambda@Edge。</li>
+</ul>
+<h3 id="scale-assumptions">规模假设</h3>
+<table>
+<thead>
+<tr>
+<th>领域</th>
+<th>假设</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>函数</td>
+<td>数千万（跨所有客户）。</td>
+</tr>
+<tr>
+<td>调用次数</td>
+<td>每年数万亿次。</td>
+</tr>
+<tr>
+<td>并发数</td>
+<td>数百万（跨所有客户）。</td>
+</tr>
+<tr>
+<td>平均执行时长</td>
+<td>100ms-30s。</td>
+</tr>
+<tr>
+<td>查找：</td>
+<td>每个函数 128 MB-10 GB。</td>
+</tr>
+<tr>
+<td>Worker 集群</td>
+<td>数十万台主机。</td>
+</tr>
+</tbody>
+</table>
+<p>瓶颈：突发负载下的冷启动延迟和 worker 集群调度。</p>
+<h3 id="core-product-model">核心产品模型</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>职责</th>
+<th>需求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>函数注册表</td>
+<td>代码、配置、版本。</td>
+<td>部署时强一致性。</td>
+</tr>
+<tr>
+<td>调用路由器</td>
+<td>将请求匹配到 worker。</td>
+<td>亚毫秒级决策。</td>
+</tr>
+<tr>
+<td>Worker 集群</td>
+<td>托管 micro-VM。</td>
+<td>多租户。</td>
+</tr>
+<tr>
+<td>Micro-VM</td>
+<td>隔离的执行环境。</td>
+<td>Firecracker。</td>
+</tr>
+<tr>
+<td>调度器</td>
+<td>将调用分配到 worker。</td>
+<td>装箱优化 + 冷启动感知。</td>
+</tr>
+<tr>
+<td>事件源</td>
+<td>触发函数。</td>
+<td>带重试的异步处理。</td>
+</tr>
+<tr>
+<td>日志 / 指标</td>
+<td>按调用采集。</td>
+<td>异步处理。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">高层架构</h3>
+<pre><code class="language-text">Caller --invoke--&gt; API Gateway / Direct
+                          |
+                          v
+                  +-----------------+
+                  | Invocation API  |
+                  +--------+--------+
+                          |
+                          v
+                  +-----------------+
+                  | Scheduler /     |
+                  | Router          |
+                  +--------+--------+
+                          |
+              +-----------+-----------+
+              |                       |
+              v                       v
+        Warm Worker            Cold Start
+        (existing micro-VM)    (provision micro-VM)
+              |                       |
+              +-----------+-----------+
+                          |
+                          v
+                  +-----------------+
+                  | Function Code   |
+                  | Executes        |
+                  +--------+--------+
+                          |
+                          v
+                  Return result
+                          |
+                          v
+                  Logs / Metrics → async pipeline
+</code></pre>
+<h3 id="core-components">核心组件</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>职责</th>
+<th>关键细节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>函数注册表</td>
+<td>版本化的函数代码 + 配置。</td>
+<td>代码存储在类 S3 存储中；元数据存储在 KV 中。</td>
+</tr>
+<tr>
+<td>代码包存储</td>
+<td>函数代码 zip 包或容器镜像。</td>
+<td>冷启动时拉取到 worker。</td>
+</tr>
+<tr>
+<td>层存储</td>
+<td>共享依赖项。</td>
+<td>跨函数缓存。</td>
+</tr>
+<tr>
+<td>调用 API</td>
+<td>接收调用；进行路由。</td>
+<td>无状态。</td>
+</tr>
+<tr>
+<td>调度器</td>
+<td>选择 worker + 决定冷启动还是热启动。</td>
+<td>优化部署和复用。</td>
+</tr>
+<tr>
+<td>Worker 主机</td>
+<td>运行大量 micro-VM 的 Linux 主机。</td>
+<td>多租户。</td>
+</tr>
+<tr>
+<td>Firecracker</td>
+<td>轻量级 micro-VM。</td>
+<td>启动时间约 125ms。</td>
+</tr>
+<tr>
+<td>Runtime API</td>
+<td>micro-VM 内部的函数轮询调用请求。</td>
+<td>跨调用复用。</td>
+</tr>
+<tr>
+<td>日志代理</td>
+<td>采集 stdout/stderr 和结构化日志。</td>
+<td>发送到 CloudWatch。</td>
+</tr>
+<tr>
+<td>指标发射器</td>
+<td>每次调用：执行时长、内存、错误。</td>
+<td>异步处理。</td>
+</tr>
+<tr>
+<td>事件源映射</td>
+<td>轮询事件源（SQS、Kinesis 等）并触发调用。</td>
+<td>每个事件源一个映射。</td>
+</tr>
+<tr>
+<td>IAM 集成</td>
+<td>每次调用提供凭证。</td>
+<td>在执行角色内部。</td>
+</tr>
+<tr>
+<td>VPC / 网络</td>
+<td>函数的网络管道。</td>
+<td>客户 VPC 中的 ENI。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">数据模型</h3>
+<h4 id="function">函数</h4>
+<pre><code class="language-text">Function(
+  function_arn,
+  function_name,
+  version,                  // $LATEST or numbered version
+  runtime,                  // nodejs18, python3.11, custom
+  handler,                  // entry point
+  code_ref,                 // S3 URI or container image
+  layers: [layer_arn],
+  memory_mb,
+  timeout_s,
+  env_vars,
+  vpc_config?,
+  execution_role,
+  reserved_concurrency?,
+  created_at,
+  updated_at,
+  version
+)
+</code></pre>
+<h4 id="invocation-request">调用请求</h4>
+<pre><code class="language-text">Invocation(
+  request_id,
+  function_arn,
+  version,
+  payload,
+  invocation_type,          // sync, async, event
+  client_context,
+  source,                   // direct, api_gateway, s3, sqs, ...
+  start_time,
+  end_time,
+  status_code,
+  duration_ms,
+  billed_ms,
+  memory_used_mb,
+  error?
+)
+</code></pre>
+<h4 id="execution-environment">执行环境</h4>
+<pre><code class="language-text">ExecutionEnvironment(
+  env_id,
+  function_arn,
+  version,
+  worker_host,
+  micro_vm_id,
+  state,                    // warm, cold, terminating
+  last_used,
+  invocations_handled
+)
+</code></pre>
+<h3 id="apis">API</h3>
+<pre><code class="language-text"># Management
+POST   /functions
+PUT    /functions/{name}
+DELETE /functions/{name}
+
+# Invocation
+POST   /functions/{name}/invocations
+       Body: payload
+       Returns: result (sync) or queued (async)
+
+# Event sources
+POST   /event-source-mappings
+</code></pre>
+<h3 id="function-deployment">函数部署</h3>
+<ol>
+<li>开发者打包代码（zip 包或容器镜像）。</li>
+<li>上传到代码存储。</li>
+<li>在注册表中创建/更新函数。</li>
+<li>发布函数元数据。</li>
+<li>可选：通过 SnapStart 或预置并发进行预热。</li>
+</ol>
+<h3 id="invocation-path">调用路径</h3>
+<p>同步调用（调用方等待结果）：</p>
+<ol>
+<li>调用方通过 API 或 SDK 发起调用。</li>
+<li>调用 API 进行身份验证，校验 payload 大小。</li>
+<li>路由到调度器。</li>
+<li>调度器决策： <strong>热启动：</strong> 当前函数存在可用的 micro-VM → 将调用路由到该 micro-VM。 <strong>冷启动：</strong> 无可用热环境 → 选择 worker，创建 micro-VM，拉取代码，初始化运行时，然后执行调用。</li>
+<li>函数在 micro-VM 内部执行。</li>
+<li>结果通过调用 API 返回给调用方。</li>
+<li>执行环境保留以供复用（热启动），或根据空闲策略终止。</li>
+</ol>
+<p>异步调用（事件驱动）：</p>
+<ol>
+<li>调用方发起调用；请求进入队列。</li>
+<li>异步调用队列。</li>
+<li>Worker 从队列中取出任务；执行路径与同步调用相同。</li>
+<li>失败时：按策略重试；耗尽后进入死信队列。</li>
+</ol>
+<h3 id="cold-start-optimization">冷启动优化</h3>
+<p>冷启动 = 创建 micro-VM、拉取代码、初始化运行时、执行初始化代码所花费的时间。</p>
+<p>组成部分： - Micro-VM 创建：约 125ms（Firecracker）。 - 代码下载：取决于包大小。 - 运行时初始化：与语言相关（Java 最慢）。 - 用户初始化代码：取决于函数。</p>
+<p>优化措施： <strong>Worker 预热：</strong> 保持预先启动的 micro-VM 池，随时可加载任意代码。 <strong>代码缓存：</strong> worker 缓存最近使用的函数代码。 <strong>快照（SnapStart）：</strong> 持久化初始化完成后的热态；从快照恢复而非重新初始化。 <strong>预置并发：</strong> 客户付费保持 N 个环境处于热启动状态。 <strong>容器镜像层缓存：</strong> 适用于基于镜像的函数。</p>
+<p>面试用语：</p>
+<blockquote>
+<p>冷启动是核心性能挑战。Micro-VM 本身启动约需 125ms；其余时间消耗在代码拉取和初始化上。SnapStart 从初始化完成后的快照恢复，大幅缩短了可变部分的耗时。</p>
+</blockquote>
+<h3 id="isolation-firecracker-micro-vms">隔离：Firecracker Micro-VM</h3>
+<p>在共享硬件上实现多租户需要强隔离。</p>
+<ul>
+<li>单靠 Linux 容器不够——内核边界对跨租户场景过于渗透。</li>
+<li>基于 KVM 的 micro-VM 提供硬件级隔离。</li>
+<li>Firecracker 是专为无服务器场景构建的精简 VMM（虚拟机监视器）：每个 VM 内存开销约 125 MB，启动时间约 125ms。</li>
+<li>每个调用环境是一个独立的 VM，拥有独立的内核、隔离的网络和文件系统。</li>
+<li>Worker 可托管数百个 micro-VM。</li>
+</ul>
+<h3 id="worker-fleet-scheduling">Worker 集群调度</h3>
+<p>Worker 是运行 Firecracker 的通用主机。</p>
+<p>每次调用的调度器决策： - 是否存在该函数的热环境？ - 若有，路由到该环境。 - 若无，选择有容量的 worker 创建新环境。 - 容量 = 可用内存、CPU、网络。</p>
+<p>装箱优化：worker 应高效利用，避免过度承诺资源。</p>
+<p>函数隔离： - 一个 worker 可托管来自多个租户的多个函数。 - 每个租户的 micro-VM 相互隔离。 - 租户间无共享内存。</p>
+<h3 id="event-source-mappings">事件源映射</h3>
+<p>对于事件触发器：</p>
+<ul>
+<li><strong>S3：</strong> S3 服务在对象创建/删除事件时调用 Lambda。</li>
+<li><strong>SQS：</strong> Lambda 轮询 SQS，批量处理消息，调用函数。成功后确认消费。</li>
+<li><strong>Kinesis：</strong> Lambda 按顺序轮询分片，批量处理消息。</li>
+<li><strong>DynamoDB Streams：</strong> 与 Kinesis 类似。</li>
+<li><strong>EventBridge：</strong> 基于规则的事件路由到 Lambda。</li>
+<li><strong>API Gateway：</strong> 同步的 HTTP 到 Lambda 集成。</li>
+</ul>
+<p>事件源映射将源事件转换为调用，并处理正确的 payload 格式、重试、批处理和顺序（如适用）。</p>
+<h3 id="concurrency-limits">并发限制</h3>
+<p>每个函数： - 预留并发：专属配额（不可超出，但有保障）。 - 非预留：共享区域资源池。 - 突发限制：每个区域每分钟最多扩展到 N。</p>
+<p>每账户：区域并发限制（默认 1000，可申请提升）。</p>
+<h3 id="scaling-and-partitioning">扩展与分区</h3>
+<table>
+<thead>
+<tr>
+<th>数据</th>
+<th>分区策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>函数注册表</td>
+<td>每账户，每区域</td>
+</tr>
+<tr>
+<td>代码存储</td>
+<td>对象存储（类 S3）</td>
+</tr>
+<tr>
+<td>Worker 集群</td>
+<td>按区域池化；跨可用区分布</td>
+</tr>
+<tr>
+<td>事件源映射</td>
+<td>每个映射</td>
+</tr>
+<tr>
+<td>日志 / 指标</td>
+<td>每个函数；异步流水线</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">一致性模型</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>一致性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>函数部署</td>
+<td>强一致性（区域内）</td>
+</tr>
+<tr>
+<td>调用路由</td>
+<td>无状态；函数变更后最终一致</td>
+</tr>
+<tr>
+<td>日志 / 指标</td>
+<td>异步，持久化</td>
+</tr>
+<tr>
+<td>并发追踪</td>
+<td>近似值（令牌桶风格）</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">多区域策略</h3>
+<ul>
+<li>每个区域相互独立。</li>
+<li>函数按区域部署。</li>
+<li>跨区域调用通过互联网 / API 进行。</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">故障模式与缓解措施</h3>
+<table>
+<thead>
+<tr>
+<th>故障模式</th>
+<th>缓解措施</th>
+<th>监控指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>冷启动峰值。</td>
+<td>预热；预置并发；SnapStart。</td>
+<td>冷启动率。</td>
+</tr>
+<tr>
+<td>Worker 主机故障。</td>
+<td>排空；重新调度 micro-VM。</td>
+<td>Worker 健康状态。</td>
+</tr>
+<tr>
+<td>函数代码损坏。</td>
+<td>版本管理；回滚。</td>
+<td>部署失败。</td>
+</tr>
+<tr>
+<td>租户资源占用过高。</td>
+<td>并发限制；CPU/内存上限。</td>
+<td>每租户资源利用率。</td>
+</tr>
+<tr>
+<td>事件源背压。</td>
+<td>限流；死信队列；重试。</td>
+<td>事件源延迟。</td>
+</tr>
+<tr>
+<td>异步重试风暴。</td>
+<td>有界重试；死信队列。</td>
+<td>重试率。</td>
+</tr>
+<tr>
+<td>网络分区到 VPC。</td>
+<td>直接使用 ENI；重试。</td>
+<td>VPC 网络连接。</td>
+</tr>
+<tr>
+<td>热点函数（突发流量尖峰）。</td>
+<td>突发限制；自动扩缩容。</td>
+<td>并发数与限制。</td>
+</tr>
+<tr>
+<td>跨租户逃逸。</td>
+<td>Firecracker 隔离；安全审查。</td>
+<td>异常行为。</td>
+</tr>
+<tr>
+<td>日志量爆炸。</td>
+<td>限流；采样；成本告警。</td>
+<td>每函数日志量。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">运维指标</h3>
+<p>正确性：</p>
+<ul>
+<li>调用成功率。</li>
+<li>冷启动率。</li>
+<li>限流速率。</li>
+</ul>
+<p>容量：</p>
+<ul>
+<li>每秒每区域调用次数。</li>
+<li>Worker 集群利用率。</li>
+<li>冷启动延迟 p99。</li>
+</ul>
+<p>业务层面：</p>
+<ul>
+<li>每客户函数数量。</li>
+<li>每函数调用次数。</li>
+<li>每次调用成本。</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">需要指出的权衡</h3>
+<ul>
+<li>Firecracker 开销 vs 容器速度：隔离性更强，启动较慢。</li>
+<li>预热会产生空闲计算成本，冷启动则带来延迟。</li>
+<li>严格的并发限制可防止成本失控，但会阻塞突发流量。</li>
+<li>SnapStart 可节省冷启动时间，但灵活性受限。</li>
+<li>按函数预留并发可提供保障，但会分割容量。</li>
+<li>更激进的 Worker 装箱可提升利用率，但存在嘈杂邻居风险。</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">常见陷阱与更优做法</h3>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>基于容器的跨租户隔离。</td>
+<td>使用 Micro-VM（Firecracker）实现硬件级隔离。</td>
+</tr>
+<tr>
+<td>每次调用启动一个 VM。</td>
+<td>暖环境复用 + 暖池。</td>
+</tr>
+<tr>
+<td>同步冷启动。</td>
+<td>预热 + SnapStart + 预置并发。</td>
+</tr>
+<tr>
+<td>无按租户限制。</td>
+<td>并发上限 + 令牌桶。</td>
+</tr>
+<tr>
+<td>同步 VPC ENI 配置。</td>
+<td>每函数预配置 ENI。</td>
+</tr>
+<tr>
+<td>单一全球区域。</td>
+<td>按区域部署。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">面试官可能深入探讨的方向</h3>
+<table>
+<thead>
+<tr>
+<th>深入方向</th>
+<th>优秀回答要点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>冷启动</td>
+<td>Firecracker 启动、代码拉取、运行时初始化、SnapStart。</td>
+</tr>
+<tr>
+<td>隔离性</td>
+<td>Micro-VM vs 容器；Firecracker 设计。</td>
+</tr>
+<tr>
+<td>调度</td>
+<td>装箱并复用暖环境；感知冷启动。</td>
+</tr>
+<tr>
+<td>事件源</td>
+<td>轮询 vs 推送；重试；死信队列。</td>
+</tr>
+<tr>
+<td>并发</td>
+<td>预留 vs 非预留；突发限制。</td>
+</tr>
+<tr>
+<td>多租户</td>
+<td>资源上限；嘈杂邻居缓解。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff 级别回答检查清单</h3>
+<ul>
+<li>函数注册表 + 代码存储 + Worker 集群 + 调度器。</li>
+<li>Firecracker Micro-VM 隔离。</li>
+<li>配合空闲策略的暖环境复用。</li>
+<li>冷启动优化（预热、SnapStart）。</li>
+<li>异步触发的事件源映射。</li>
+<li>按租户并发限制。</li>
+<li>每次调用的 IAM 鉴权。</li>
+<li>异步日志与指标管道。</li>
+</ul>
+<h3 id="interview-phrase">面试用语</h3>
+<blockquote>
+<p>Lambda 的本质是将请求路由到 Firecracker Micro-VM 集群。性能挑战是冷启动；安全挑战是在共享硬件上实现多租户隔离；扩缩容挑战是从零开始响应突发流量。架构层面的答案是：用暖池和 SnapStart 解决冷启动，用 Firecracker 实现隔离，用按租户令牌桶实现公平共享。</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. 模拟面试</h2>
+<p><strong>面试官：</strong> 设计 AWS Lambda。</p>
+<p><strong>候选人：</strong> 四个核心系统：保存代码和配置的函数注册表、接收请求的调用 API、将调用分配到 Worker 的调度器、承载 Firecracker Micro-VM 的 Worker 集群。不变量是每个匹配的调用都在隔离环境中以配置的代码运行，受资源限制约束，返回结果或错误。性能挑战是冷启动；安全挑战是租户隔离。</p>
+<p><strong>面试官：</strong> 带我梳理一次调用流程。</p>
+<p><strong>候选人：</strong> 调用方通过函数名发起调用。调用 API 完成身份验证、校验 payload，并路由到调度器。调度器检查该函数和版本是否存在暖执行环境：若存在，则将调用路由至此——延迟低于 50ms。若不存在，则触发冷启动：选择有容量的 Worker，配置 Firecracker Micro-VM（约 125ms），从代码存储拉取函数代码，初始化运行时，运行用户初始化代码，然后执行调用。结果返回给调用方；执行环境保留以供复用。</p>
+<p><strong>面试官：</strong> 为什么选择 Firecracker？</p>
+<p><strong>候选人：</strong> 在共享硬件上实现多租户隔离。单纯的 Linux 容器共享内核——对于跨租户来说渗透性太强。基于 KVM 的 Micro-VM 提供硬件级隔离。Firecracker 是专为 Serverless 设计的轻量级 VMM：内存开销约 125 MB，启动时间约 125ms。每个调用环境都有自己的内核、独立网络和独立文件系统。Worker 可以承载数百个此类环境。</p>
+<p><strong>面试官：</strong> 冷启动优化？</p>
+<p><strong>候选人：</strong> 有多种技术手段。Worker 预热：预先启动好的 Micro-VM 池，可随时加载任意函数代码（节省启动时间）。Worker 上的代码缓存：最近使用的函数代码保留在缓存中。SnapStart：对初始化后的状态拍摄快照，从快照恢复而非重新运行初始化——消除了可变的初始化时间。预置并发：客户付费以始终保持 N 个环境处于热态。对于容器镜像，层缓存可减少镜像拉取时间。</p>
+<p><strong>面试官：</strong> 某函数突然收到 10,000 个并发调用。</p>
+<p><strong>候选人：</strong> 突发限制负责处理这种情况。初始暖环境池服务最早的那批请求。新调用在有容量的 Worker 上触发冷启动。调度器在整个集群上进行装箱。每个区域每分钟有突发限制；超出后触发限流。客户可申请提高限制。若设置了预留并发，则该值为保障配额。</p>
+<p><strong>面试官：</strong> 调度决策？</p>
+<p><strong>候选人：</strong> 每次调用时，调度器依次检查：（1）该函数和版本是否有暖环境？若有，发送至此。（2）若无，选择一个有可用容量（内存、CPU、网络）的 Worker。（3）避免嘈杂邻居——不在同一主机上打包过多高内存租户。（4）对重复调用的相似函数族进行亲和性调度。决策耗时在毫秒以下。</p>
+<p><strong>面试官：</strong> 事件源？</p>
+<p><strong>候选人：</strong> 事件源映射将源事件转换为调用。S3 在对象事件时直接调用。SQS：Lambda 服务轮询队列、批量消费消息并调用函数。Kinesis/DynamoDB Streams：按顺序轮询分片。EventBridge：基于规则的路由。API Gateway：同步 HTTP 转 Lambda。每种集成都处理适合该源的重试、批处理、顺序保证和死信队列语义。</p>
+<p><strong>面试官：</strong> 某函数持续失败。</p>
+<p><strong>候选人：</strong> 对于异步调用：按指数退避重试，直至达到配置的上限（通常为 2 次）。耗尽后，消息进入按函数配置的死信队列（SQS 或 SNS）。对于同步调用：错误返回给调用方，由调用方处理。指标暴露错误率；告警通知客户。</p>
+<p><strong>面试官：</strong> VPC 连通性？</p>
+<p><strong>候选人：</strong> 函数可在客户 VPC 中运行。每个函数版本需要在 VPC 子网中分配弹性网络接口（ENI）。最初，每次冷启动时的 ENI 配置会增加显著延迟；现代 Lambda 会为每个函数预先配置 ENI 以避免此惩罚。</p>
+<p><strong>面试官：</strong> 每次调用的 IAM？</p>
+<p><strong>候选人：</strong> 函数拥有一个执行角色（IAM 角色）。调用时，Lambda 通过环境变量将该角色的临时凭证提供给函数。函数使用这些凭证调用其他 AWS 服务。凭证与执行环境生命周期绑定；每个暖环境持有可刷新的凭证。</p>
+<p><strong>面试官：</strong> 多区域？</p>
+<p><strong>候选人：</strong> 每个区域相互独立。函数按区域部署。跨区域调用通过互联网/API 进行。多区域部署需要客户在每个区域自行部署（或使用 Lambda@Edge 实现全球边缘函数）。</p>
+<p><strong>面试官：</strong> 总结。</p>
+<p><strong>候选人：</strong> 函数注册表 + 代码存储 + 调度器 + 承载 Firecracker Micro-VM 的 Worker 集群。冷启动是性能挑战，通过暖池、代码缓存和 SnapStart 加以缓解。Firecracker 为多租户提供硬件级隔离。事件源映射将触发器转换为带重试和死信队列的调用。每函数和每账户的并发限制可防止成本失控。调度器在 Worker 集群上执行装箱。</p>
+<h2 id="3-practice-notes">3. 练习备注</h2>
+<h3 id="five-minute-version">五分钟版本</h3>
+<ol>
+<li>明确需求：部署、调用、扩缩容、隔离。</li>
+<li>不变量：每次调用以配置的代码在隔离环境中运行；受资源限制。</li>
+<li>函数注册表 + 代码存储 + 调度器 + Worker 集群。</li>
+<li>Firecracker Micro-VM 实现硬件级隔离。</li>
+<li>暖环境复用；冷启动优化（预热、SnapStart）。</li>
+<li>事件源映射转换触发器。</li>
+<li>每函数和每账户的并发限制。</li>
+<li>按区域部署；跨区域通过 API。</li>
+</ol>
+<h3 id="one-minute-closeout">一分钟结尾陈述</h3>
+<blockquote>
+<p>Lambda 的本质是将请求路由到 Firecracker Micro-VM 集群。函数注册表保存代码；调度器选择暖环境或配置冷环境；Firecracker 在共享硬件上隔离租户。冷启动是核心性能挑战，通过预热、SnapStart 和预置并发加以缓解。事件源映射处理带重试和死信队列的异步触发。每函数和每账户并发限制防止成本失控。通过部署实现多区域覆盖。</p>
+</blockquote>
+<h3 id="best-interview-phrases">最佳面试用语</h3>
+<ul>
+<li>"Firecracker 以接近容器的速度提供硬件级隔离。"</li>
+<li>"冷启动有很多环节；SnapStart 消除了可变的初始化时间。"</li>
+<li>"调度器在保障隔离和避免嘈杂邻居的同时进行装箱。"</li>
+<li>"事件源将触发器转换为带有合适重试语义的调用。"</li>
+<li>"多租户需要按租户的资源上限和并发限制。"</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

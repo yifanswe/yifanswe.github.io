@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>分布式缓存 — Redis/Memcached 专项（演练） — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">分布式缓存 — Redis/Memcached 专项（演练）</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<p><strong>难度：</strong> Hard · <strong>总耗时：</strong> ~45 min · <strong>框架：</strong> Hello Interview Delivery</p>
+<p><strong>一句话场景：</strong> 从零构建一个分布式内存缓存。客户端 PUT/GET 键，缓存跨多个节点分片，在内存压力下进行淘汰，在节点故障后以最少数据丢失的方式存活，并以亚毫秒延迟提供服务。目标：100 节点集群每秒 1000 万次操作，1 TB 热工作集。</p>
+<hr/>
+<h2 id="1-requirements-5-min">1. 需求（约 5 分钟）</h2>
+<p><strong>功能需求</strong>
+- <code>GET(key) → value</code>, <code>PUT(key, value, ttl?)</code>, <code>DELETE(key)</code>。- 可选 <code>INCR</code>, <code>EXPIRE</code>，在范围允许时支持 list/hash 操作。- 跨 N 个节点的集群自动分区。- 内存满时的淘汰策略。</p>
+<p>我会推迟实现 pub/sub、脚本，以及持久化数据库模式。</p>
+<p><strong>非功能需求</strong>
+- p99 延迟 &lt; 1 ms（DC 内），p99 &lt; 5 ms（跨 DC）。- 每秒 1000 万次操作跨集群。- 单节点故障时不影响可用性；纯缓存场景下可接受数据丢失。- 线性扩展：增加一个节点，容量增加约 1%。</p>
+<p><strong>容量估算</strong>
+- 100 个节点 × 32 GB RAM = 3.2 TB 总量；约 1 TB 热工作集。- 键/值大小：较小（平均键 50 B，平均值 500 B）。稳定状态下约 20 亿个对象。- 考虑元数据开销（哈希表条目、TTL、LRU 指针、内存分配器空洞），550 B 的逻辑对象在 RAM 中约占 700-900 B。在 20 亿对象规模下，复制前真实内存占用约 1.4-1.8 TB。</p>
+<hr/>
+<h2 id="2-core-entities-2-min">2. 核心实体（约 2 分钟）</h2>
+<ul>
+<li><strong>键</strong> — 不透明字节，哈希到一个分区。</li>
+<li><strong>入口</strong> — <code>{ key, value, expires_at, last_access }</code>.</li>
+<li><strong>分区</strong> — 分配给某个节点的范围/哈希桶。</li>
+<li><strong>节点</strong> — 在内存中持有分区的进程。</li>
+<li><strong>集群拓扑</strong> — 从键到所属节点的映射。</li>
+</ul>
+<hr/>
+<h2 id="3-api-5-min">3. API（约 5 分钟）</h2>
+<p>基于 TCP 的二进制协议（类似 Redis 的 RESP 或 Memcached 二进制协议）。示意：</p>
+<pre><code>GET    key                          → value | nil
+SET    key value [EX seconds]       → OK
+DEL    key                          → 1 | 0
+INCR   key                          → integer
+EXPIRE key seconds                  → 1 | 0
+</code></pre>
+<p>客户端持有集群拓扑并直接路由到所属节点。</p>
+<p>客户端发送可选的 <code>client_topology_version</code>。如果某节点收到针对它不再拥有的 vnode 的请求，则返回 <code>MOVED {node, topology_version}</code> 以便客户端刷新拓扑并重试一次。</p>
+<hr/>
+<h2 id="5-high-level-design-1015-min">5. 高层设计（约 10–15 分钟）</h2>
+<ol>
+<li><strong>集群拓扑 — 一致性哈希。</strong> 键空间映射到一个环。每个节点拥有一段连续范围。添加节点时占用一段范围；移除节点时归还一段范围。使用虚拟节点实现（每个物理节点拥有约 100 个 vnode），使负载均匀分布。</li>
+<li><strong>客户端路由。</strong> 客户端从协调者（基于 Gossip 或小型 etcd/ZooKeeper 集群）获取拓扑，缓存后直接将请求路由到所属节点。收到 <code>MOVED</code> 重定向时，刷新拓扑。</li>
+<li><strong>节点内部结构。</strong> 每个节点运行一个事件循环进程：- 内存中的哈希表（开放寻址或链式）存放条目。- 淘汰策略（LRU、LFU、allkeys-lru）。LRU 通过双向链表 + 哈希表实现；LFU 通过近似频率计数器实现。- TTL 过期：读时懒惰过期 + 周期性扫描。- 每节点单线程执行以简化实现（Redis 模型）或分片线程（Memcached 线程模型）。</li>
+<li><strong>为高可用进行复制。</strong> 每个分区有一个主节点 + 1-2 个副本。写入到主节点；异步复制到副本。主节点故障时，副本通过协调者晋升。</li>
+<li><strong>集群协调者。</strong> 跟踪节点活跃性（心跳/Gossip），晋升副本，在添加/删除节点时重新平衡。轻量级 Raft 集群（etcd 风格）持有权威拓扑。</li>
+<li><strong>多层服务（可选）。</strong> 客户端 SDK 拥有 L1 进程内缓存（毫秒级预算）；缓存集群为 L2。</li>
+</ol>
+<p>端到端描述：客户端需要键 <code>user:42</code>。哈希到环位置 0x4A3，映射到 vnode V37，由节点 N7 拥有。客户端 TCP 连接到 N7（已连接池化），发送 <code>GET user:42</code> → N7 哈希表查找 → 找到条目，检查过期时间，更新 LRU → 返回值。总计约 200 µs。</p>
+<h3 id="system-components-diagram">系统组件图</h3>
+<pre><code class="language-text">                       +-------------------------------+
+                       | CLIENT SDKS                   |
+                       | app L1 cache + conn pools     |
+                       +-----------+-------------------+
+                                   |
+       GET key / SET key value ttl | topology fetch / MOVED refresh
+                                   v
+       +-------------------+   +-------------------------------+
+       | Coordinator       |--&gt;| topology_version: vnode -&gt;    |
+       | Quorum (Raft)     |   | primary, replicas             |
+       +---------+---------+   +-------------------------------+
+                 | publishes / promotes
+                 v
+       +-------------------+        async replication log        +----------------+
+       | Cache Node N7     |------------------------------------&gt;| Replica Nodes  |
+       | primary V37       | vnode:37:offset mutations          | failover       |
+       +---------+---------+                                     +----------------+
+                 |
+                 v
+       +----------------------------------------------------------+
+       | STORE / CACHE GROUP                                     |
+       | entry table hash(key) -&gt; entry pointer                   |
+       | raw key bytes -&gt; value pointer, expires_at, flags        |
+       | TTL wheel / expiry buckets, LRU/LFU metadata             |
+       | replication log vnode:{id}:offset, seconds-minutes lag   |
+       | topology_version map, few MB in coordinator and clients  |
+       +-------------------------+--------------------------------+
+                                 |
+                                 | GET miss / expired entry
+                                 v
+                         +---------------+
+                         | Caller        |
+                         | Backing Store |
+                         | then SET fill |
+                         +---------------+
+</code></pre>
+<p>具体节点数据结构：</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>键模式</th>
+<th>值 / 数据结构</th>
+<th style="text-align: right;">：当索引达到 50 GB 时滚动更新（每个分片）。</th>
+<th>TTL / 保留期</th>
+<th>分片键</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>条目表</td>
+<td><code>hash(key)</code></td>
+<td>哈希表槽 -&gt; 条目指针</td>
+<td style="text-align: right;">~16 B/slot</td>
+<td>键存在时</td>
+<td>vnode hash</td>
+</tr>
+<tr>
+<td>条目对象</td>
+<td>raw key bytes</td>
+<td>value pointer, expiry, flags, LRU links</td>
+<td style="text-align: right;">~80-150 B overhead + value</td>
+<td>键 TTL 或淘汰</td>
+<td>vnode hash</td>
+</tr>
+<tr>
+<td>TTL 索引</td>
+<td>expiry bucket</td>
+<td>timing wheel / min-heap of keys</td>
+<td style="text-align: right;">~8-16 B/key with TTL</td>
+<td>until expiry</td>
+<td>node-local</td>
+</tr>
+<tr>
+<td>LRU/LFU state</td>
+<td>entry pointer</td>
+<td>linked list pointers or tiny freq counter</td>
+<td style="text-align: right;">~8-24 B/key</td>
+<td>while resident</td>
+<td>node-local</td>
+</tr>
+<tr>
+<td>拓扑</td>
+<td><code>topology_version</code></td>
+<td>vnode -&gt; primary, replicas</td>
+<td style="text-align: right;">few MB</td>
+<td>until next rebalance</td>
+<td>coordinator</td>
+</tr>
+<tr>
+<td>复制日志</td>
+<td><code>vnode:{id}:offset</code></td>
+<td>recent writes for replicas</td>
+<td style="text-align: right;">value-sized</td>
+<td>seconds-minutes</td>
+<td>vnode</td>
+</tr>
+</tbody>
+</table>
+<p>GET 路径：</p>
+<ol>
+<li>客户端使用缓存的拓扑将键哈希到 vnode，并直接发送到主节点 N7。</li>
+<li>N7 验证拓扑版本和所有权，然后进行一次哈希表查找。</li>
+<li>若找到，则检查 <code>expires_at</code>；过期条目被删除并以 nil 返回。</li>
+<li>若仍有效，则更新近似的近期/频率元数据并返回字节。</li>
+<li>在 <code>MOVED</code> 或超时，客户端刷新拓扑并重试新主节点；不进行广播。</li>
+</ol>
+<p>SET 路径：</p>
+<ol>
+<li>客户端将键哈希到 vnode 并发送 <code>SET key value ttl</code> 到主节点，携带其 <code>client_topology_version</code>.</li>
+<li>主节点检查所有权，写入条目表，安装/更新 TTL 元数据，并将变更追加到 vnode 复制日志。</li>
+<li>它异步将变更发送到由 <code>vnode:{id}:offset</code>键控的副本；若写入持久性模式为 <code>cache-fast</code>，则在主节点内存写入后返回。</li>
+<li>对于 <code>cache-safe</code>，则等待一个副本确认或 1-2 ms 预算后返回 <code>OK</code> 或 <code>TRY_AGAIN</code>.</li>
+<li>拓扑变更时，主节点在变更前返回 <code>MOVED</code> ，以便客户端重试新所属节点。</li>
+</ol>
+<p>热路径 vs 冷路径查找：</p>
+<pre><code>Hot hit:   client L1 -&gt; owner node hash table -&gt; value
+Cold miss: client L1 miss -&gt; owner node miss -&gt; caller backing store -&gt; SET refill
+Moved:     client -&gt; old owner -&gt; MOVED(version) -&gt; topology refresh -&gt; new owner
+Failed:    client -&gt; timeout -&gt; replica/new primary after coordinator promotion
+</code></pre>
+<hr/>
+<h2 id="6-deep-dives-10-min">6. 深度探讨（约 10 分钟）</h2>
+<p><strong>一致性哈希详情。</strong> 单个键通过 SHA-256（截断）映射到 32 位位置。每个节点有约 100 个 vnode，分布在随机位置。添加节点：选取 100 个随机位置，落入这些位置的键从旧所属节点迁移过来。移除节点时，键重新分布到剩余节点。</p>
+<p>每节点容量计算：32 GB RAM 减去 20% 预留给内存分配器碎片、复制缓冲区和 OS，约剩 25 GB 可用。按约 800 B 物理条目大小，每节点约 3100 万条目。100 个节点合计，可用主节点容量约 31 亿条目；有一个副本时约 15.5 亿逻辑条目。主要成本是每条目的 RAM 开销而非原始值字节，因此紧凑的元数据和基于采样的淘汰至关重要。</p>
+<p>复制与元数据计算：有一个异步副本时，1 TB 热工作集变为 2 TB 驻留内存。拓扑元数据很小：10k vnode × 3 个节点 ID × ~8 B 不足 1 MB，加上版本信息。复制日志受滞后量而非保留时长限制；以每秒 1000 万次操作 × 700 B 平均物理变更计算，即使 10 秒滞后也达约 70 GB（集群级别），因此每个节点需要背压机制，避免日志占用缓存值预留的内存。</p>
+<p><strong>为何不直接用 Redis Cluster？</strong> 在生产环境中，除非面试要求从零实现，否则我会使用 Redis/Memcached。此设计借鉴了 Redis 的单线程事件循环以获得可预测的延迟，以及 Memcached 的客户端分片以实现扩展。etcd/ZooKeeper/Raft 用于极小的拓扑元数据；若将每次缓存写入都经过 Raft 会彻底摧毁吞吐量。</p>
+<p>需准备好回答「为何不用 DynamoDB/Cassandra？」——它们是具有毫秒级延迟和磁盘支撑复制的持久键值存储；本系统优化目标是亚毫秒级内存读取，并接受缓存丢失。需准备好回答「为何不使用纯客户端侧一致性哈希，不要协调者？」——这样速度更快，但副本晋升和迁移需要一个权威拓扑版本，否则故障期间客户端会产生分歧。</p>
+<p><strong>扩容期间的迁移。</strong> 当 vnode 从 N7 迁移到 N12 时，两个节点短暂共同拥有它。迁移协议：1. 协调者标记 <code>vnode in migration N7→N12</code>。2. 新写入发送到 N12。3. N7 将现有键流式传输到 N12。4. 完成后，协调者更新拓扑；客户端在下次刷新时看到变更。5. 旧 N7 删除该范围。</p>
+<p>迁移状态机：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>所属节点行为</th>
+<th>客户端行为</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>稳定</td>
+<td>N7 primary</td>
+<td>route to N7</td>
+<td>正常</td>
+</tr>
+<tr>
+<td>迁移中</td>
+<td>writes dual-write or forward to N12; N7 streams snapshot</td>
+<td>旧拓扑仍然有效</td>
+<td>临时额外延迟</td>
+</tr>
+<tr>
+<td>切换</td>
+<td>协调者发布新版本</td>
+<td>客户端收到 <code>MOVED</code> 并刷新</td>
+<td>短暂重试峰值</td>
+</tr>
+<tr>
+<td>清理</td>
+<td>N7 在宽限期后删除 vnode</td>
+<td>仅路由到 N12</td>
+<td>过期客户端被拒绝</td>
+</tr>
+</tbody>
+</table>
+<p>服务降级状态：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>模式</th>
+<th>数据源</th>
+<th>延迟 / 正确性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>hot</td>
+<td>L1 + 主节点命中</td>
+<td>客户端缓存或所有者哈希表</td>
+<td>亚毫秒级，可能因 TTL 过期而陈旧</td>
+</tr>
+<tr>
+<td>warm</td>
+<td>主节点未命中</td>
+<td>调用方回源到后端存储，然后 <code>SET</code> 回填</td>
+<td>调用方承担后端存储的延迟</td>
+</tr>
+<tr>
+<td>副本晋升</td>
+<td>新主节点</td>
+<td>通过最后偏移量异步同步副本状态</td>
+<td>亚秒级故障转移，最新写入可能丢失</td>
+</tr>
+<tr>
+<td>拓扑信息陈旧</td>
+<td>重定向</td>
+<td><code>MOVED</code> 携带新版本</td>
+<td>重试一次</td>
+</tr>
+<tr>
+<td>内存压力</td>
+<td>驱逐</td>
+<td>采样式 LRU/LFU</td>
+<td>正确性以缺失形式保留</td>
+</tr>
+</tbody>
+</table>
+<p><strong>驱逐策略。</strong>
+- <strong>LRU</strong>：按访问时间排列条目的双向链表；O(1) 更新。内存开销：每条目 2 个指针。\n- <strong>LFU</strong>：近似计数器（类似 Redis 的对数计数器）；抵抗扫描攻击。\n- <strong>随机采样 LRU</strong> （Redis 近似方案）：采样 N 个条目，驱逐最旧的。内存开销更低，质量接近 LRU。</p>
+<p><strong>TTL 过期。</strong> 两种策略，配合使用：\n- <strong>惰性过期</strong>：每次 <code>GET</code>，检查 <code>expires_at</code>；若已过期，则删除并返回 nil。\n- <strong>主动过期</strong>：后台任务随机采样带有 TTL 的键并删除已过期的键，限制从未被读取的过期键导致的内存增长。</p>
+<p><strong>热键。</strong> 单个键（<code>feature_flag_X</code>）承受数百万 QPS，会压垮其所在节点。缓解措施：\n- <strong>带 TTL 的客户端侧缓存</strong>：保留 100ms 内的最新值，吸收热读。\n- <strong>将热键复制</strong> 到多个节点，客户端分散读取。\n- <strong>自动检测热键</strong> ：在服务端检测，广播给客户端以启用复制。</p>
+<p>热键回退是显式的：正常模式从一个主节点提供服务；检测到热键后，将只读副本复制到 <code>hot:{key}:{replica_id}</code> 在多个节点上；可接受陈旧的模式允许客户端使用 L1 缓存持续 100-500 ms；写入密集型热键（如计数器）会被拒绝或重定向到其他服务，因为缓存节点不是通用计数器数据库。</p>
+<p>双视图模式在拓扑和数据中均有体现：拓扑在协调器中维护一个强一致性视图，而缓存值是故意弱一致的，且按虚拟节点存储。我绝不会对每个值都要求数据平面共识；只有记录谁拥有该值的映射才需要共识。</p>
+<p><strong>持久性。</strong> 纯缓存：无持久化，完全重启后允许数据丢失。带快照的缓存：周期性 RDB 风格快照 + 写入 AOF 日志，重启时回放。权衡点在于内存写入吞吐量与恢复时间之间。</p>
+<p><strong>跨区域。</strong> 每个地域运行自己的集群（缓存局部性对延迟很重要）。跨地域复制按键选择启用——大多数缓存不需要。对于必须全局可见的会话，使用不同的层（可复制的 K-V 存储）。</p>
+<p><strong>并发模型。</strong> 每节点单线程（Redis 风格）提供简单的正确性和零加锁开销。通过每台机器运行多个进程来利用多核。另一种方案：进程内按线程分片，锁局限于每个分片的结构中。</p>
+<p><strong>故障语义。</strong> 节点宕机会丢失其内存中的内容。有副本时，副本晋升并提供服务；没有副本时，这些键变成冷缓存缺失（对缓存可接受）。客户端在故障转移期间（亚秒级）收到错误，之后成功。</p>
+<p>故障模式表：</p>
+<table>
+<thead>
+<tr>
+<th>情形</th>
+<th>行为</th>
+<th>延迟预算</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>过期键</td>
+<td>读取时惰性删除，返回 nil</td>
+<td>&lt;1 ms</td>
+</tr>
+<tr>
+<td>被驱逐的键</td>
+<td>缺失，调用方回落到后端存储</td>
+<td>调用方自行处理</td>
+</tr>
+<tr>
+<td>主节点故障且有副本</td>
+<td>协调器晋升副本，客户端刷新拓扑</td>
+<td>&lt;1 s 故障转移</td>
+</tr>
+<tr>
+<td>主节点故障且无副本</td>
+<td>键冷缺失，直到重新填充</td>
+<td>可用性保留</td>
+</tr>
+<tr>
+<td>协调器不可用</td>
+<td>客户端保留旧拓扑，不触发再平衡</td>
+<td>现有流量继续</td>
+</tr>
+</tbody>
+</table>
+<p><strong>背压。</strong> 每连接请求限速；CPU 饱和时拒绝请求。内存不足时触发驱逐；若驱逐跟不上，则返回错误而非损坏数据。</p>
+<p><strong>我会推迟的内容。</strong> 多主写入、发布/订阅、Lua 脚本、二级索引、地理空间命令、集群范围事务。</p>
+<p><strong>面试核心要点：</strong> 缓存允许丢失值，但不允许意外演变为分布式数据库。保持拓扑元数据的强协调，保持数据平面读取直接且快速，并明确定义缺失/故障转移行为。</p>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

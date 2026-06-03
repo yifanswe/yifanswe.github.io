@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Notification System — Multi-Channel Delivery (walkthrough) — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">Notification System — Multi-Channel Delivery (walkthrough)</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<p><strong>难度：</strong> Medium · <strong>总耗时：</strong> ~45 min · <strong>框架：</strong> Hello Interview Delivery</p>
+<p><strong>一句话场景：</strong> 构建通知扇出服务。后端服务触发通知；通过推送（iOS/Android）、邮件、SMS 和应用内通知进行投递。10 亿用户，日均约 1 亿条通知，存在大流量突发（例如突发新闻推送在 30 秒内 5000 万次推送）。遵守用户偏好和限流规则。</p>
+<hr/>
+<h2 id="1-requirements-5-min">1. 需求（约 5 分钟）</h2>
+<p><strong>功能需求</strong>
+- 后端服务提交通知事件（接收方、模板、载荷、渠道）。- 系统按渠道渲染消息，应用用户偏好并分发。- 跟踪投递状态（已发送 / 已送达 / 失败）用于重试和上报。</p>
+<p>我会推迟深入讨论营销分析以及用户分群和受众构建工具。</p>
+<p><strong>非功能需求</strong>
+- 高可用性 — 未投递的事务性通知属于真实故障。- 吞吐量：持续支撑 100M/天 = 平均约 1200/秒；吸收 50M/30秒 = 约 1.6M/秒的突发。- 各渠道延迟目标：推送 p95 &lt; 5 秒，邮件 p95 &lt; 30 秒，SMS p95 &lt; 30 秒。- 重试瞬时故障；不允许无声丢弃。- 遵守用户偏好（渠道退订、免打扰时段）。</p>
+<p><strong>容量估算</strong>
+- 10 亿用户；约 30 亿设备 token（Android/iOS/Web）。- 突发通知：30 秒内发送 5000 万条 ≈ 1.6M/秒。- 若平均每个事件扇出到 1.4 个渠道，100M 事件/天会产生约 1.4 亿条投递记录/天。以约 700 B/行 × 90 天 × 3 副本计算，投递状态约占 26 TB，是最大的热数据存储。- 设备 token 量大但变化缓慢：3B × ~200 B × 3 副本 ≈ 1.8 TB（索引前）。</p>
+<hr/>
+<h2 id="2-core-entities-2-min">2. 核心实体（约 2 分钟）</h2>
+<ul>
+<li><strong>NotificationEvent</strong> — <code>event_id, user_id, template_id, payload, channels[], priority</code>.</li>
+<li><strong>Delivery</strong> — <code>delivery_id, event_id, channel, recipient_address, status, attempts</code>.</li>
+<li><strong>UserPreferences</strong> — <code>user_id, channel_opt_ins, quiet_hours, device_tokens[]</code>.</li>
+<li><strong>Template</strong> — <code>template_id, channel-specific bodies, locales</code>.</li>
+</ul>
+<hr/>
+<h2 id="3-api-5-min">3. API（约 5 分钟）</h2>
+<pre><code>POST  /v1/notifications              { user_id, template_id, payload, channels[] }   → { event_id }
+POST  /v1/notifications/bulk         { events[] }                                    → { batch_id }
+GET   /v1/deliveries/{id}            → status
+
+// Outgoing webhooks from providers (Apple, FCM, SES, Twilio):
+POST  /v1/webhooks/provider/{name}   → delivery status update
+</code></pre>
+<p>内部调用方；幂等键为 <code>event_id</code>.</p>
+<hr/>
+<h2 id="4-data-flow-5-min">4. 数据流（约 5 分钟）</h2>
+<p>事件提交 → 用用户偏好进行富化 → 按渠道扇出 → 进入各渠道队列 → 各渠道 worker 池 → 调用供应商 API → 记录状态 → 失败时重试。</p>
+<hr/>
+<h2 id="5-high-level-design-1015-min">5. 高层设计（约 10–15 分钟）</h2>
+<ol>
+<li><strong>Ingestion 服务。</strong> 接收事件。校验后写入事件行（<code>NotificationEvent</code> 存入 Cassandra，按 event_id 分片），并发布到 router 主题。</li>
+<li><strong>Router 服务。</strong> 流消费者，执行以下操作：- 查询用户偏好（使用缓存）。- 过滤已退订渠道。- 应用免打扰时段（根据策略延迟或丢弃）。- 将事件拆分为一条 <code>Delivery</code> 每个存活渠道各一条投递记录。- 将每条投递发布到对应渠道的队列。</li>
+<li><strong>各渠道队列。</strong> Kafka 主题： <code>dispatch.push</code>, <code>dispatch.email</code>, <code>dispatch.sms</code>, <code>dispatch.in_app</code>。各渠道大小不同——推送队列最大。</li>
+<li><strong>各渠道 worker 池。</strong>
+   - <strong>推送 worker：</strong> 按 token 类型分组，批量调用 APNs/FCM（均支持批量），遵守各供应商限流。- <strong>邮件 worker：</strong> 使用邮件供应商（SES、Sendgrid），遵守每域名限流。- <strong>SMS worker：</strong> 遵守每运营商和每国家限流。- <strong>应用内 worker：</strong> 写入用户的应用内通知 Feed（Cassandra 行），若用户已连接则通过 WS 推送。</li>
+<li><strong>供应商回调。</strong> 各供应商返回状态（已发送/已送达/退回等）。Webhook 处理器更新 <code>Delivery</code> 行。</li>
+<li><strong>重试策略。</strong> 各渠道：指数退避加上限。推送瞬时错误：1 小时内重试 3 次。邮件：重试 3 天。放弃后进入死信队列供运维审查。</li>
+<li><strong>按用户限制速率。</strong> "不要每天给同一个人发 10 封邮件。"在 Redis 中按 <code>(user_id, channel)</code> 存储令牌桶。超限则丢弃或合并。</li>
+<li><strong>模板与渲染。</strong> 带本地化变体和载荷变量的模板。在分发时（按语言环境、按渠道）进行渲染。</li>
+</ol>
+<p>端到端叙述：好友请求服务为用户 U 发出通知事件。Router 读取 U 的偏好——已启用推送 + 应用内通知，已关闭邮件；免打扰时段未激活。写入两条投递记录：push 和 in_app。推送投递路由到 APNs worker，该 worker 与其他发往同一推送网关的投递合批，调用 APNs。状态为 <code>sent</code>；随后 APNs webhook 返回 <code>delivered</code>。应用内投递写入 U 的 Feed；若 U 有打开的 WS 连接，则立即广播。</p>
+<h3 id="system-components-diagram">系统组件图</h3>
+<pre><code class="language-text">          +----------------------------------+
+          | PRODUCERS + PROVIDER CALLBACKS  |
+          +-----------+----------------------+
+                 |
+     POST /v1/notifications     |     POST /webhooks/provider/{name}
+     POST /v1/notifications/bulk|                 |
+                 v                 v
+          +-----------+----+    +-------+--------+
+          | Ingestion/API  |    | Webhook        |
+          | + idempotency  |    | Handlers       |
+          +-------+--------+    +-------+--------+
+             |                     |
+          router.normal/high           | update status
+          key=user_id                  v
+             v
+          +-------+--------+
+          | Router / Pref |
+          | Filter        |
+          +-------+--------+
+             |
+          dispatch.push/email/sms/in_app
+             v
+   +----------------+-------+--------+---------------------+
+   |                | Channel Workers |                     |
+   |                +-------+---------+                     |
+   |                        | batch / rate-limit            |
+   |                        v                               |
+   |             APNs / FCM / SES / Twilio                  |
+   +--------------------------------------------------------+
+             |
+             v
+   +--------------------------------------------------------+
+   | STORE / CACHE                                          |
+   | notif_idem:{producer}:{event_id} response pointer      |
+   | notif_event:{event_id} durable event row               |
+   | pref:{user_id} Redis hash; tokens:{user_id} set/list   |
+   | notif_cap:{user_id}:{channel}:{yyyy_mm_dd} token bucket|
+   | delivery:{delivery_id} status/attempts/provider_ref    |
+   | inapp:{user_id}:{yyyy_mm} notification ID list         |
+   | delay:{deliver_at_minute} queue/ZSET for quiet hours   |
+   +-----------+-------------------------------+------------+
+          | pref/token cache miss         ^ retry / DLQ
+          v                               |
+     +-------------------+             +-------+-------+
+     | Preference /      |             | Delayed       |
+     | Token DB          |             | Retry Workers |
+     +-------------------+             +---------------+
+</code></pre>
+<hr/>
+<h2 id="6-deep-dives-10-min">6. 深度探讨（约 10 分钟）</h2>
+<p><strong>具体存储与分片键。</strong></p>
+<table>
+<thead>
+<tr>
+<th>存储</th>
+<th>键模式</th>
+<th>数据结构 / 条目</th>
+<th>TTL / 保留期</th>
+<th>分片键</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>事件记录</td>
+<td><code>notif_event:{event_id}</code></td>
+<td>Cassandra/Dynamo 行，载荷指针 + 模板 + 优先级，约 0.5–1 KB</td>
+<td>保留 30 天，事务类保留 1 年</td>
+<td><code>event_id</code></td>
+</tr>
+<tr>
+<td>投递状态</td>
+<td><code>delivery:{delivery_id}</code></td>
+<td>包含 channel/status/attempts/provider_ref 的行，约 700 B</td>
+<td>按渠道保留 30–90 天</td>
+<td><code>delivery_id</code> 或 <code>(user_id, day)</code> 用于用户查询</td>
+</tr>
+<tr>
+<td>用户偏好缓存</td>
+<td><code>pref:{user_id}</code></td>
+<td>Redis hash，包含 opt-in/免打扰时段/时区，约 300 B</td>
+<td>TTL 1 小时；写入时失效</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>设备 token</td>
+<td><code>tokens:{user_id}</code></td>
+<td>token 记录的集合/列表，约 200 B/token</td>
+<td>直到供应商使其失效</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>应用内 Feed</td>
+<td><code>inapp:{user_id}:{yyyy_mm}</code></td>
+<td>通知 ID + 摘要的宽行/列表，约 150 B/条</td>
+<td>热数据保留 90 天，更早的归档</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>幂等性</td>
+<td><code>notif_idem:{producer}:{event_id}</code></td>
+<td>响应指针/状态，约 200 B</td>
+<td>24–72 小时</td>
+<td><code>(producer, event_id)</code></td>
+</tr>
+<tr>
+<td>延迟投递</td>
+<td><code>delay:{deliver_at_minute}</code></td>
+<td>队列/ZSET，存储 <code>delivery_id</code>s</td>
+<td>直到触发</td>
+<td><code>deliver_at_minute</code></td>
+</tr>
+<tr>
+<td>用户/渠道上限</td>
+<td><code>notif_cap:{user_id}:{channel}:{yyyy_mm_dd}</code></td>
+<td>Redis 令牌桶，约 40 B</td>
+<td>2 天</td>
+<td><code>user_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>Kafka 队列是传输和缓冲层；Cassandra/Dynamo 行才是持久的可查询状态。我会特别指出这一点，因为面试官常常会追问队列是否意外地成了真实来源。</p>
+<p><strong>各存储容量估算。</strong></p>
+<table>
+<thead>
+<tr>
+<th>存储 / 索引</th>
+<th>Math</th>
+<th>主要占用者</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>事件记录</td>
+<td>100M/天 × 0.8 KB × 30 天 × 3 副本 ≈ 7.2 TB</td>
+<td>存储的是载荷指针，而非渲染后的正文</td>
+</tr>
+<tr>
+<td>投递状态</td>
+<td>140M/天 × 700 B × 90 天 × 3 ≈ 26 TB</td>
+<td>最大的热持久存储</td>
+</tr>
+<tr>
+<td>Preference cache</td>
+<td>1 亿活跃用户 × 300 B × Redis 开销/副本 ≈ 100–200 GB 实际内存</td>
+<td>仅活跃用户；冷数据穿透到数据库</td>
+</tr>
+<tr>
+<td>设备 token 数据库</td>
+<td>3B token × 200 B × 3 ≈ 1.8 TB</td>
+<td>稳定但写入量少</td>
+</tr>
+<tr>
+<td>应用内 Feed</td>
+<td>40M/天 × 150 B × 90 天 × 3 ≈ 1.6 TB</td>
+<td>按用户键的索引，非完整内容</td>
+</tr>
+<tr>
+<td>突发队列</td>
+<td>5000 万条投递指针 × 200 B × 3 ≈ 30 GB 原始 Broker 数据</td>
+<td>短暂缓冲，非长期状态</td>
+</tr>
+</tbody>
+</table>
+<p>为什么使用 Cassandra/Dynamo 式行存储而非单一关系型集群：投递写入以追加为主，对 TTL 友好，且天然按 <code>delivery_id</code> 或 <code>(user_id, day)</code>。MySQL 在较小规模下可行，但 26 TB 热状态数据量和突发写入速率促使我倾向宽行或 Dynamo 式存储。Elasticsearch 仅作为报表索引，不应作为投递状态的真实来源。</p>
+<p><strong>提交通知路径（热路径与冷路径）。</strong>
+1. 生产者调用 <code>POST /v1/notifications</code> 与 <code>event_id</code>；Ingestion 在分片 <code>notif_idem:{producer}:{event_id}</code> 上检查 <code>(producer, event_id)</code> ，如为重复提交则返回旧响应。2. Ingestion 写入 <code>notif_event:{event_id}</code> 上检查 <code>event_id</code>，然后将一个小指针发布到 <code>router.normal</code> 或 <code>router.high</code> ，Kafka 分区键为 <code>user_id</code> ，以便每用户的合并与限流保持有序。3. Router 并行获取 <code>pref:{user_id}</code>, <code>tokens:{user_id}</code>，以及 <code>notif_cap:{user_id}:{channel}:{day}</code> 。若偏好/token 缓存未命中，则按 <code>user_id</code>穿透到偏好/token 数据库，回填 Redis，并将缺失 token 标记为显式 <code>failed_no_token</code> 投递，而非无声丢弃推送。4. Router 过滤退订、免打扰时段和每用户上限；每个存活渠道在入队前写入一条 <code>delivery:{delivery_id}</code> 行，并带有辅助查询字段 <code>(user_id, day)</code> 供支持/调试使用。5. 渠道 worker 消费 <code>dispatch.{channel}.{priority}</code>。按供应商/token 类型合批，调用 APNs/FCM/SES/Twilio，并更新 <code>delivery:{delivery_id}</code> 中的 attempt/status/provider_ref。6. 供应商 webhook 使用 <code>(provider_ref, provider_event_id)</code>幂等地更新同一投递行；重试使用持久的 attempt 计数器，而非 worker 内存。7. 冷启动路径：若部署后 router 缓存为空，则降级为数据库读取偏好/token，并通过每用户本地小缓存加队列背压保护数据库。</p>
+<p><strong>双索引框架。</strong> 通知内容以 <code>notif_event:{event_id}</code>的形式写入一次。投递状态按 <code>delivery_id</code> 索引以支持供应商回调，按 <code>(user_id, day)</code> 索引以支持客服/用户历史查询。应用内 Feed 是基于同一 event/delivery ID 的另一个按用户键的视图；应存储摘要和指针，而非每条渲染消息的完整副本。</p>
+<p><strong>突发处理（30 秒内 5000 万条）。</strong> 三个压力点：- <strong>摄入：</strong> 无状态；水平扩展。受网络带宽限制。- <strong>Router：</strong> 无状态；从缓存读取偏好；按需扩展。在已知活动前预热。- <strong>供应商限流：</strong> 无法突破。APNs 和 FCM 每个应用每秒可接受数十万请求；仍需排队后逐步消耗。</p>
+<p>对于超大突发（数秒内 5000 万条），队列负责吸收，worker 池在更长时间窗口内消耗。只要优先级流量不被阻塞，这是可接受的。</p>
+<p>为什么选择 Kafka 而非简单的 Redis 队列或纯 SQS 方案：Kafka 提供有序分区、针对 router bug 的重放能力，以及应对 1.6M/秒突发的消费组扩展能力。SQS/Pub/Sub 适用于更简单的系统，但重放和按优先级分区控制较弱。Redis 队列内存脆弱性过高，无法在 worker 宕机期间保证突发数据不丢失。</p>
+<p><strong>边缘压力测试。</strong></p>
+<table>
+<thead>
+<tr>
+<th>边缘</th>
+<th>故障模式</th>
+<th>降级 / 预算</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>不活跃用户</td>
+<td>偏好/token 未缓存</td>
+<td>按 <code>user_id</code>进行数据库读取，回填 Redis；确保提交 p95 延迟在几百毫秒以内</td>
+</tr>
+<tr>
+<td>热门名人 / 广播</td>
+<td>一个活动产生 5000 万行</td>
+<td>将扇出拆分为 job；保留事务性优先队列</td>
+</tr>
+<tr>
+<td>应用内 Feed 超过 90 天</td>
+<td>热行窗口耗尽</td>
+<td>游标从 <code>inapp:{user_id}:{yyyy_mm}</code> 切换到归档存储；图表/历史记录可以更慢</td>
+</tr>
+<tr>
+<td>供应商上限</td>
+<td>APNs/SMS 触发限流</td>
+<td>在 <code>delay:{deliver_at_minute}</code> 中延迟，按优先级消耗</td>
+</tr>
+<tr>
+<td>多区域漂移</td>
+<td>重复 webhook 或另一区域的重试</td>
+<td>幂等 <code>delivery_id</code> 更新；provider reference 全局唯一</td>
+</tr>
+</tbody>
+</table>
+<p><strong>优先队列。</strong> 关键事务类（密码重置、验证码）vs 营销类（每周摘要）。独立队列 + worker 防止营销高峰延迟事务通知。每个渠道至少有两个优先级。</p>
+<p><strong>去重。</strong> 端到端的幂等性基于 <code>event_id</code> 。Router 存储 <code>(event_id, channel) -&gt; delivery_id</code> ，确保重复提交不会重复发送。</p>
+<p><strong>用户偏好缓存。</strong> 10 亿用户 × 小偏好行 = 数百 GB。在 Redis 集群中缓存热用户；冷用户穿透到 MySQL/Cassandra。偏好变更时通过缓存失效传播更新。</p>
+<p><strong>免打扰时段与时区。</strong> 用户时区存于偏好设置中。Router 计算"当前是否在用户的免打扰时段内？"若是，则推迟事件（写入延迟队列， <code>deliver_at</code> 设为免打扰时段结束时间）。将事务性事件标记为可覆盖免打扰时段。</p>
+<p><strong>合并通知。</strong> 好友 1 分钟内点赞 5 张照片 → 发送一条"5 个赞"通知，而非 5 条独立通知。在 router 层实现：将同一模板的事件在时间窗口内合并为一条。提升互动率，降低用户疲劳。</p>
+<p><strong>每供应商故障转移。</strong> SMS（Twilio + 备选）和邮件（SES + Sendgrid）均有多个供应商。监控每供应商成功率；若某供应商降级则自动切换流量。路由配置支持热重载。</p>
+<p><strong>状态跟踪。</strong> 每条投递行在供应商回调时更新。状态支持发送方侧分析（"我的密码重置邮件送达了吗？"）。各渠道保留时长不同——推送状态通常只保留较短时间；事务类保留 90 天。</p>
+<p><strong>优雅降级状态机。</strong></p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>模式</th>
+<th>数据源</th>
+<th>延迟 / 保留时长</th>
+<th>操作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>已接受</td>
+<td>持久化事件</td>
+<td><code>notif_event:{event_id}</code></td>
+<td>立即</td>
+<td>事件在路由前已安全落盘</td>
+</tr>
+<tr>
+<td>已推迟</td>
+<td>免打扰时段 / 供应商上限</td>
+<td><code>delay:{deliver_at_minute}</code></td>
+<td>分钟到小时</td>
+<td>稍后用相同的投递 ID 唤醒</td>
+</tr>
+<tr>
+<td>供应商降级</td>
+<td>队列排空</td>
+<td>Kafka + 投递尝试次数</td>
+<td>渠道 SLA 可能延长</td>
+<td>保留优先队列；不阻塞事务通知</td>
+</tr>
+<tr>
+<td>重复提交</td>
+<td>幂等返回</td>
+<td><code>notif_idem:{producer}:{event_id}</code></td>
+<td>&lt; 10 ms</td>
+<td>返回原始 <code>event_id</code> / 状态</td>
+</tr>
+<tr>
+<td>永久失败</td>
+<td>死信</td>
+<td><code>delivery:{id}</code> + DLQ</td>
+<td>保留 30–90 天</td>
+<td>暴露失败，不允许无声丢弃</td>
+</tr>
+</tbody>
+</table>
+<p>"我希望面试官记住这句话：供应商是尽力而为的，但我的内部状态不是；每条通知要么已投递，要么已推迟，要么已明确失败。"</p>
+<p><strong>Token 过期。</strong> 移动端 token 在应用卸载后失效。供应商返回 <code>Unregistered</code> → 从数据库中使该 token 失效。定期清理器删除长期未刷新的旧 token。</p>
+<p><strong>多地区。</strong> 每个区域路由到本地供应商；若某区域所有供应商全部降级，则进行跨区域故障转移。供应商限流通常为全局配置，因此需通过共享计数器进行协调。</p>
+<p><strong>我会推迟的内容。</strong> 营销分群、模板 A/B 测试、基于机器学习的最优发送时间、内容审核、超出 locale 模板范围的国际化工具。</p>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

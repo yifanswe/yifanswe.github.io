@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>设计类 Cron 的分布式任务调度器 — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">设计类 Cron 的分布式任务调度器</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p><strong>对这些术语不熟悉？</strong> 请参阅 <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> ，了解常见系统设计术语的中英文解释。</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. 基础知识与解题思路</h2>
+<h3 id="what-this-question-is-testing">本题考察点</h3>
+<p>分布式 cron 不是"如何每五分钟运行一个脚本"。难点在于：在时钟漂移、工作节点在执行过程中崩溃以及调度重叠的情况下，如何在数百台机器上保证正确性。</p>
+<p>其不变量如下：</p>
+<blockquote>
+<p>每个任务的每次调度执行最多发生一次，且（在故障模型允许的范围内）至少发生一次；运行时间超过下次调度时间的长运行任务不会静默地重复执行；故障可见、按策略重试，且不会丢失。</p>
+</blockquote>
+<p>在 ICT5 / L6+ 级别，面试官考查的是：你能否将调度与执行分离，在至少一次投递的基础上设计恰好一次的效果语义，防止调度层的脑裂，以及处理运行时间超过调度间隔的任务。</p>
+<h3 id="60-second-interview-framing">60 秒面试框架</h3>
+<p>口述版本：</p>
+<blockquote>
+<p>我会将分布式 cron 设计为三层：任务目录（定义和调度）、将执行实例物化并分发的调度层，以及幂等执行的工作节点集群。关键决策包括：调度层如何避免脑裂，如何将执行实例表示为"预期执行"表中的持久行，以及如何将至少一次分发与工作节点幂等性结合起来产生恰好一次的效果。我将澄清需求，演示数据模型，然后深入讲解调度器主节点选举和超时处理。</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">首先明确需求</h3>
+<p>功能性需求：</p>
+<ul>
+<li>用户使用 cron 表达式或间隔注册任务，并指定目标操作（HTTP、gRPC、函数、容器镜像）。</li>
+<li>任务可以被启用、禁用、编辑或暂停。</li>
+<li>用户可查看执行历史、当前执行状态和日志。</li>
+<li>支持手动单次运行（立即运行）。</li>
+<li>失败的运行按可配置策略重试：最大重试次数、退避策略、死信处理。</li>
+<li>并发运行策略：允许并发、运行中则跳过、排队并串行执行。</li>
+<li>跨任务依赖（可选）：任务 B 仅在任务 A 成功后运行。</li>
+</ul>
+<p>非功能性需求：</p>
+<ul>
+<li>无静默漏执行：每次调度执行要么运行，要么被明确记录为已错过/已跳过。</li>
+<li>正常运行下，每次执行实例最多执行一次。</li>
+<li>调度触发精度在几秒以内。</li>
+<li>在调度器节点故障时不丢失或重复运行。</li>
+<li>扩展至数百万个任务和每天数千万次运行。</li>
+<li>可审计：记录每个任务的创建者、修改者和触发者。</li>
+</ul>
+<p>除非面试官要求，否则超出范围：</p>
+<ul>
+<li>工作流 DAG（Airflow 风格）；我们设计的是 cron，而非 DAG 引擎。</li>
+<li>工作节点集群内的资源调度（CPU/GPU 分配）。</li>
+<li>超出指针范围的用户侧日志搜索。</li>
+</ul>
+<h3 id="scale-assumptions">规模假设</h3>
+<table>
+<thead>
+<tr>
+<th>领域</th>
+<th>假设</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>任务数</td>
+<td>租户间共有 1000 万个注册任务。</td>
+</tr>
+<tr>
+<td>频率</td>
+<td>部分任务每分钟执行，大多数为每小时或每天执行。</td>
+</tr>
+<tr>
+<td>每日运行次数</td>
+<td>每日 1 亿到 10 亿次任务运行。</td>
+</tr>
+<tr>
+<td>并发峰值</td>
+<td>整点时刻产生惊群效应（数百万个任务在 :00 同时到期）。</td>
+</tr>
+<tr>
+<td>运行时长</td>
+<td>大多数任务在几秒内完成；长运行任务可持续数小时。</td>
+</tr>
+<tr>
+<td>Latency（延迟）</td>
+<td>p99 触发时间在调度时间的几秒以内。</td>
+</tr>
+<tr>
+<td>一致性</td>
+<td>正常运行下，每个任务每次执行最多执行一次。</td>
+</tr>
+</tbody>
+</table>
+<p>瓶颈在于调度时间窗口——大量任务同时到期的那一刻，尤其是在每分钟、每小时和每天的边界时刻。</p>
+<h3 id="core-product-model">核心产品模型</h3>
+<p>三个平面：</p>
+<table>
+<thead>
+<tr>
+<th>平面</th>
+<th>职责</th>
+<th>系统需求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>目录平面</td>
+<td>拥有任务定义、调度配置、租户信息和权限。</td>
+<td>强一致性的 CRUD 操作，支持审计。</td>
+</tr>
+<tr>
+<td>调度平面</td>
+<td>将任务执行实例物化并在正确时间触发。</td>
+<td>高可用、基于主节点选举的服务；持久化的预期执行表。</td>
+</tr>
+<tr>
+<td>执行层</td>
+<td>负责接收已调度的运行任务并幂等地执行的 Worker。</td>
+<td>基于拉取的队列；至少一次投递；可见性超时机制。</td>
+</tr>
+</tbody>
+</table>
+<p>将这两者视为同一组件是最常见的错误。触发与执行必须解耦，因为执行过程缓慢且不可靠，而触发必须保持及时性。</p>
+<h3 id="high-level-architecture">高层架构</h3>
+<pre><code class="language-text">+-----------------+         +--------------------+
+| Job Catalog API |&lt;-------&gt;| Catalog DB         |
+| CRUD + audit    |         | jobs, schedules    |
++--------+--------+         +---------+----------+
+         |                            |
+         | publish job changes        |
+         v                            v
++-------------------+      +---------------------+
+| Scheduler Tier    |-----&gt;| Expected Runs Table |
+| leader-elected    |      | (event_id, due_at)  |
+| materializer      |      +----------+----------+
++---------+---------+                 |
+          | dispatch                  | reconcile
+          v                           v
++-------------------+      +---------------------+
+| Dispatch Queue    |-----&gt;| Worker Pool         |
+| at-least-once     |      | execution + retries |
++-------------------+      +----------+----------+
+                                       |
+                                       v
+                          +-----------------------+
+                          | Run History + Logs    |
+                          +-----------------------+
+</code></pre>
+<h3 id="core-components">核心组件</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>职责</th>
+<th>关键细节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Catalog API</td>
+<td>对作业定义、调度计划和所有者进行 CRUD 操作。</td>
+<td>验证 cron 表达式；追踪 <code>next_run_at</code> projections。</td>
+</tr>
+<tr>
+<td>Catalog DB</td>
+<td>作业定义的权威存储。</td>
+<td>强一致性，规模适中。</td>
+</tr>
+<tr>
+<td>调度层</td>
+<td>计算即将到来的执行时间，将其物化到预期运行表中，并在到期时进行调度分发。</td>
+<td>通过租约实现每个分片的主节点选举；使用 Paxos/Raft/租约协调服务。</td>
+</tr>
+<tr>
+<td>预期运行表</td>
+<td>持久化的运行列表，记录 <code>(job_id, occurrence_id, due_at, status)</code>.</td>
+<td>"何时应运行什么"的权威来源，驱动至少一次投递。</td>
+</tr>
+<tr>
+<td>调度分发队列</td>
+<td>将运行任务从调度器传递给 Worker。</td>
+<td>可见性超时；至少一次投递；基于拉取的读取方式。</td>
+</tr>
+<tr>
+<td>Worker 池</td>
+<td>执行作业并上报结果。</td>
+<td>除运行状态外无状态；通过 occurrence_id 实现幂等。</td>
+</tr>
+<tr>
+<td>运行历史</td>
+<td>记录开始时间、结束时间、状态、重试次数及日志指针。</td>
+<td>仅追加写入；对仪表盘最终一致。</td>
+</tr>
+<tr>
+<td>协调服务</td>
+<td>用于调度器分片的主节点选举。</td>
+<td>ZooKeeper、etcd、Consul 或内置 Raft。</td>
+</tr>
+<tr>
+<td>时间服务</td>
+<td>单调墙上时间的来源。</td>
+<td>NTP 同步；调度器不得超出误差范围地信任本地时钟。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">数据模型</h3>
+<h4 id="job-definition">Job Definition</h4>
+<pre><code class="language-text">Job(
+  job_id,
+  tenant_id,
+  name,
+  schedule,            // cron expression or interval
+  timezone,            // affects cron interpretation
+  action,              // type + payload (http, grpc, container, function)
+  retry_policy,        // max_attempts, backoff, dead_letter
+  concurrency_policy,  // allow, skip, queue
+  timeout,
+  enabled,
+  owner,
+  created_at,
+  updated_at,
+  version
+)
+</code></pre>
+<h4 id="expected-run">Expected Run</h4>
+<pre><code class="language-text">ExpectedRun(
+  occurrence_id,       // deterministic: hash(job_id, due_at)
+  job_id,
+  due_at,
+  status,              // pending, dispatched, in_progress, succeeded, failed, missed, skipped
+  attempt,
+  dispatched_at,
+  picked_up_at,
+  finished_at,
+  worker_id,
+  error_summary,
+  version
+)
+</code></pre>
+<p>主键： <code>(occurrence_id)</code>通常按 <code>due_at</code> 时间桶分区，以便调度器能够高效地扫描时间范围。</p>
+<h4 id="run-attempt">Run Attempt</h4>
+<pre><code class="language-text">RunAttempt(
+  attempt_id,
+  occurrence_id,
+  attempt_number,
+  started_at,
+  ended_at,
+  status,
+  error,
+  log_pointer
+)
+</code></pre>
+<h4 id="scheduler-lease">Scheduler Lease</h4>
+<pre><code class="language-text">SchedulerLease(
+  shard_id,
+  leader_node_id,
+  acquired_at,
+  expires_at,
+  fence_token          // monotonic; used by workers to reject stale leaders
+)
+</code></pre>
+<h3 id="apis">API</h3>
+<p>面向用户：</p>
+<pre><code class="language-text">POST   /jobs
+GET    /jobs/{job_id}
+PATCH  /jobs/{job_id}
+DELETE /jobs/{job_id}
+POST   /jobs/{job_id}/runs            // manual trigger
+GET    /jobs/{job_id}/runs
+GET    /runs/{occurrence_id}
+</code></pre>
+<p>手动触发使用幂等键，以防止 UI 双击创建两次运行。</p>
+<p>内部：</p>
+<pre><code class="language-text">PullDispatch (worker -&gt; queue): returns [(occurrence_id, job_id, action, lease_until)]
+ReportResult (worker -&gt; scheduler): occurrence_id, status, attempt_number, error?
+RenewLease   (worker -&gt; scheduler): occurrence_id, lease_until extension
+</code></pre>
+<h3 id="schedule-materialization">Schedule Materialization</h3>
+<p>调度器不是一个自由运行的 cron 守护进程，而是一个数据库操作器：</p>
+<ol>
+<li>对于每个已启用的作业，从 <code>now</code>.</li>
+<li>插入 <code>ExpectedRun(occurrence_id, job_id, due_at, status=pending)</code> （若尚不存在）。occurrence_id 是 <code>hash(job_id, due_at)</code> 因此它是确定性且幂等的。</li>
+<li>定期地，一个扫描作业遍历预期运行表，查找下一分钟（或调度周期）内到期的行并进行分发。</li>
+<li>分发时，状态转换 <code>pending -&gt; dispatched</code> 以...为键执行条件写入 <code>(occurrence_id, version)</code> 并将任务加入 Worker 队列。</li>
+</ol>
+<p>这种分离至关重要。调度器不是"每分钟决定运行什么"；它将意图物化为持久化行，而分发只是对这些行的状态转换。</p>
+<p>面试用语：</p>
+<blockquote>
+<p>我将预期运行表示为具有确定性 ID 的持久化行。调度器是基于这些行的状态机，而非计时器。这就是我如何在重启后不遗漏或重复运行的原因。</p>
+</blockquote>
+<h3 id="scheduler-leadership-and-split-brain">调度器主节点选举与脑裂问题</h3>
+<p>如果两个调度器节点都认为自己拥有某个分片，同一作业将运行两次。</p>
+<p>解决方案：</p>
+<ul>
+<li>将作业空间按 <code>hash(job_id) % N</code> 分片。</li>
+<li>对每个分片，通过租约服务（etcd、ZooKeeper）选举主节点。</li>
+<li>租约具有 TTL 和单调递增的栅栏令牌。</li>
+<li>每次分发都携带栅栏令牌。</li>
+<li>Worker 和下游队列检查栅栏令牌；过期主节点的分发请求将被拒绝。</li>
+</ul>
+<p>这是栅栏令牌机制，即防止脑裂的标准技术。</p>
+<p>故障场景：</p>
+<ul>
+<li>主节点暂停（GC、网络问题）；租约过期；新主节点接管。部分执行时间可能已被旧主节点分发；重复分发在 Worker 处或条件写入时会因栅栏检查失败而被拒绝。</li>
+<li>租约服务不可用：主节点在当前租约到期后拒绝分发新任务。宁可遗漏后补，也不双重执行。</li>
+</ul>
+<h3 id="dispatch-and-execution">分发与执行</h3>
+<ol>
+<li>调度器将 <code>(occurrence_id, action, fence_token)</code> 到队列。</li>
+<li>Worker 拉取一批任务；设置可见性超时（大于预期作业执行时长加上裕量）。</li>
+<li>Worker 对 expected_runs 执行条件写入： <code>status = in_progress WHERE status = dispatched AND fence_token = expected</code>.</li>
+<li>若条件写入失败，则丢弃该消息（另一个 Worker 已持有它，或调度器已过期）。</li>
+<li>Worker 执行操作。</li>
+<li>工作进程写入 <code>RunAttempt</code> 并更新 <code>ExpectedRun</code> 状态为 <code>succeeded</code> 或 <code>failed</code>.</li>
+<li>成功时，分发消息被确认。</li>
+<li>失败且仍有重试次数时，Worker 创建带退避的延迟重新分发。</li>
+</ol>
+<p>Worker 幂等性：操作载荷本身可能被重试，因此应携带 <code>occurrence_id</code> 以便下游服务能通过它进行去重。</p>
+<h3 id="concurrency-policy-for-slow-jobs">慢作业的并发策略</h3>
+<p>如果一个作业每 5 分钟运行一次但需要 7 分钟完成，执行时间将会重叠。有三种策略：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Allow</td>
+<td>新执行与前一次并行运行。风险：资源争用。</td>
+</tr>
+<tr>
+<td>Skip</td>
+<td>新执行被记录为 <code>skipped</code> 若上一次执行仍在 <code>in_progress</code>.</td>
+</tr>
+<tr>
+<td>Queue</td>
+<td>新执行在每个作业的串行队列中等待，直到前一次执行完成。</td>
+</tr>
+</tbody>
+</table>
+<p>实现：分发时检查该作业最近的 ExpectedRun 行；在 <code>in_progress</code>时应用策略。排队需要一个每作业的 FIFO 队列，对分发进行排序并遵循背压机制。</p>
+<p>面试用语：</p>
+<blockquote>
+<p>重叠是产品决策，而非系统缺陷。我在作业定义上明确策略，并在分发时而非执行时强制执行。</p>
+</blockquote>
+<h3 id="missed-run-handling">遗漏运行的处理</h3>
+<p>如果调度层在某个到期时间段内宕机：</p>
+<ul>
+<li>恢复后，扫描 expected_runs 中 <code>status=pending AND due_at &lt; now - threshold</code>.</li>
+<li>按作业应用遗漏运行策略： <code>run-late</code>, <code>skip</code>，或 <code>run-once</code>.</li>
+<li>使用状态 <code>missed</code> 显式标记跳过的运行，而非静默丢弃。</li>
+</ul>
+<p>对于按分钟调度的作业，长时间宕机后补跑可能会淹没系统。常见策略是"若落后超过 N 次执行，则跳过所有，仅保留最新的一次"。</p>
+<h3 id="retry-policy">重试策略</h3>
+<p>每作业配置：</p>
+<ul>
+<li><code>max_attempts</code>：总重试次数，包含第一次。</li>
+<li><code>backoff</code>：指数退避加抖动；最小/最大延迟。</li>
+<li><code>retry_on</code>：触发重试的错误码列表（网络错误、5xx）；与直接进入死信的永久性错误（4xx、校验错误）相对。</li>
+</ul>
+<p>实现方式：</p>
+<ul>
+<li>失败时，Worker 调度一次新的分发，延迟为 <code>delay = backoff(attempt)</code>.</li>
+<li>新分发携带 <code>attempt_number + 1</code>.</li>
+<li>达到 <code>max_attempts</code>次后，状态变为 <code>failed</code> 并且该运行进入死信表等待运维人员处理。</li>
+</ul>
+<h3 id="scaling-and-partitioning">扩展与分区</h3>
+<table>
+<thead>
+<tr>
+<th>数据</th>
+<th>分区键</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>作业（catalog）</td>
+<td>按 <code>job_id</code> 哈希，或按租户</td>
+<td>读多写少，规模适中。</td>
+</tr>
+<tr>
+<td>预期运行</td>
+<td>按 <code>due_at</code> 时间桶 + 按哈希 <code>occurrence_id</code></td>
+<td>调度器按时间扫描；Worker 按 ID 查找。</td>
+</tr>
+<tr>
+<td>调度分发队列</td>
+<td>每分片分区</td>
+<td>避免整点时刻的全局热点。</td>
+</tr>
+<tr>
+<td>运行历史</td>
+<td>按完成时间分桶</td>
+<td>仅追加；用于分析。</td>
+</tr>
+</tbody>
+</table>
+<p>整点雷鸣群问题：</p>
+<ul>
+<li>使用确定性抖动分散执行时间： <code>due_at = scheduled + hash(job_id) mod jitter_window</code>.</li>
+<li>提前物化下一小时的执行计划，使分发层扫描已有行而非在当时计算。</li>
+<li>Worker 以自身速率拉取；队列吸收突发流量。</li>
+</ul>
+<p>热租户策略：</p>
+<ul>
+<li>拥有数百万作业的租户获得专用调度器分片或独立容量。</li>
+<li>按租户设置分发速率限制，防止单个租户占满 Worker 池。</li>
+</ul>
+<h3 id="consistency-model">一致性模型</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>一致性</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>作业 catalog</td>
+<td>强一致性</td>
+<td>调度计划的编辑必须立即对调度器可见。</td>
+</tr>
+<tr>
+<td>预期运行</td>
+<td>强行级 CAS</td>
+<td>防止重复分发。</td>
+</tr>
+<tr>
+<td>调度分发队列</td>
+<td>至少一次</td>
+<td>Worker 执行最终正确性检查。</td>
+</tr>
+<tr>
+<td>运行历史</td>
+<td>最终一致</td>
+<td>由仪表盘和审计读取。</td>
+</tr>
+<tr>
+<td>日志</td>
+<td>最终一致</td>
+<td>单独存储；历史记录中保存指针。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">多区域策略</h3>
+<p>对大多数作业，每个租户在单一属主 Region 即可满足需求。</p>
+<ul>
+<li>作业 catalog 全局复制，但写入仅路由到每个租户的单一 Region。</li>
+<li>调度器在租户所在 Region 运行；若操作允许，Worker 可全球分布。</li>
+<li>对于针对外部服务的 HTTP/gRPC 操作，Worker 可就近目标服务部署以降低延迟。</li>
+<li>故障转移 Region 保留 catalog 和预期运行表的热副本；在 Region 级别故障时接管。</li>
+</ul>
+<p>避免主动-主动调度器：两个 Region 竞争分发同一执行时间，正是栅栏令牌在本地层面防止的情况，但在此处增加跨 Region 协调会非常脆弱。</p>
+<h3 id="failure-modes-and-mitigations">故障模式与缓解措施</h3>
+<table>
+<thead>
+<tr>
+<th>故障模式</th>
+<th>缓解措施</th>
+<th>监控指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>两个调度器分发同一次执行。</td>
+<td>条件 <code>status</code> 转换 + 栅栏令牌。</td>
+<td>条件写入冲突率，重复执行告警。</td>
+</tr>
+<tr>
+<td>Worker 在操作完成后、上报之前崩溃。</td>
+<td>Worker 操作在 <code>occurrence_id</code>上具有幂等性；上报被重试；状态转换使用 CAS。</td>
+<td>数量 <code>dispatched</code> 超过可见性超时的行；重复结果上报次数。</td>
+</tr>
+<tr>
+<td>作业运行时间超过可见性超时。</td>
+<td>Worker 定期续约租约。</td>
+<td>租约续约失败次数；超过可见性超时的次数。</td>
+</tr>
+<tr>
+<td>整点突发使 Worker 饱和。</td>
+<td>确定性抖动；预物化；按租户速率限制。</td>
+<td>整点时刻分发队列深度；Worker 队列积压。</td>
+</tr>
+<tr>
+<td>catalog 变更与活跃分发竞争。</td>
+<td>调度计划变更更新 <code>version</code>；飞行中的执行继续使用旧版本。</td>
+<td>版本外分发率。</td>
+</tr>
+<tr>
+<td>调度器长时间宕机导致运行遗漏。</td>
+<td>每作业遗漏运行策略；显式 <code>missed</code> 状态。</td>
+<td>超过 <code>due_at</code> 的待处理行（按阈值）。</td>
+</tr>
+<tr>
+<td>退避重试风暴。</td>
+<td>有上限的退避；加入抖动；每作业最大飞行中重试数。</td>
+<td>重试率，死信增长速度。</td>
+</tr>
+<tr>
+<td>租户作业数量激增。</td>
+<td>按租户设置调度器配额；对作业数量增长发出告警。</td>
+<td>租户作业数量与分发份额。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">运维指标</h3>
+<p>正确性指标：</p>
+<ul>
+<li>每次执行的重复执行次数（必须为零）。</li>
+<li>超过 <code>due_at + threshold</code> 的待处理执行次数（遗漏运行信号）。</li>
+<li>超过可见性超时的已分发行数（卡住的运行）。</li>
+<li>catalog 与调度器版本偏差。</li>
+</ul>
+<p>容量指标：</p>
+<ul>
+<li>分发队列深度和消费者延迟。</li>
+<li>调度器触发延迟（从 <code>due_at</code> 到分发的时间）。</li>
+<li>Worker 池利用率和队列等待时间。</li>
+<li>按运行频率排名的 Top-N 作业。</li>
+</ul>
+<p>业务指标：</p>
+<ul>
+<li>按租户划分的作业成功/失败率。</li>
+<li>死信增长速度。</li>
+<li>手动触发量。</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">需要指出的权衡</h3>
+<ul>
+<li>至少一次分发加上幂等 Worker 可实现精确一次的效果，无需分布式事务，但要求操作作者针对幂等性进行设计。</li>
+<li>预物化执行时间使恢复更简单，但会消耗更多存储；纯基于计时器的调度更轻量，但丧失持久性。</li>
+<li>严格的每作业并发策略（跳过、排队）会增加延迟，但可防止资源争用；允许全部并发更简单，但有堆积风险。</li>
+<li>栅栏令牌可防止脑裂，但需要下游配合；并非所有队列都原生支持。</li>
+<li>多 Region 主动-主动调度器难以实现；每租户单一属主方式则简单得多。</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">常见陷阱与更优做法</h3>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>将其视为单一 cron 守护进程。</td>
+<td>三个层面：catalog、调度器、Worker。明确各自的边界。</td>
+</tr>
+<tr>
+<td>让 Worker 决定调度计划。</td>
+<td>先将执行时间物化到持久化表中。</td>
+</tr>
+<tr>
+<td>忽视脑裂问题。</td>
+<td>租约 + 栅栏令牌；下游拒绝过期分发。</td>
+</tr>
+<tr>
+<td>假设精确一次投递。</td>
+<td>至少一次投递 + 通过确定性 occurrence_id 实现幂等操作。</td>
+</tr>
+<tr>
+<td>忘记重叠策略。</td>
+<td>将其设为作业属性，并在调度时强制执行。</td>
+</tr>
+<tr>
+<td>将日志存储在运行表中。</td>
+<td>存储指针；日志存储于对象存储中。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">面试官可能深入探讨的方向</h3>
+<table>
+<thead>
+<tr>
+<th>深入方向</th>
+<th>优秀回答要点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>调度器脑裂</td>
+<td>租约 + 围栏令牌；条件写入；下游校验。</td>
+</tr>
+<tr>
+<td>长时间运行的作业</td>
+<td>租约续期；可见性超时延长；重叠策略。</td>
+</tr>
+<tr>
+<td>漏触发恢复</td>
+<td>待处理扫描；按作业策略；通过 occurrence_id 去重。</td>
+</tr>
+<tr>
+<td>整点雷群效应</td>
+<td>确定性抖动；预物化；按租户配额限流。</td>
+</tr>
+<tr>
+<td>操作幂等性</td>
+<td>将 occurrence_id 传递给操作；建议用户按其去重。</td>
+</tr>
+<tr>
+<td>跨作业依赖</td>
+<td>在 cron 上层展示 DAG 层，或使用简单的"成功后触发"机制。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff 级别回答检查清单</h3>
+<ul>
+<li>分离 catalog、调度和执行平面。</li>
+<li>将预期运行物化为具有确定性 ID 的持久化行。</li>
+<li>使用 leader 选举 + 围栏令牌防止脑裂。</li>
+<li>将至少一次调度与幂等 worker 配对使用。</li>
+<li>为每个作业定义并发策略，并在调度时强制执行。</li>
+<li>定义带有退避、抖动、最大重试次数和死信队列的重试策略。</li>
+<li>明确处理整点雷群效应。</li>
+<li>说明如何检测漏触发运行并按策略处理。</li>
+<li>将审计和运行历史作为独立平面纳入设计。</li>
+</ul>
+<h3 id="interview-phrase">面试用语</h3>
+<blockquote>
+<p>分布式 cron 本质上是一个基于持久化预期运行表的状态机。调度计划将意图物化；调度和执行是由租约、围栏令牌和幂等性保护的状态转换。难点在于脑裂、重叠以及整点峰值突发。</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. 模拟面试</h2>
+<p><strong>面试官：</strong> 设计一个分布式 cron。</p>
+<p><strong>候选人：</strong> 我将设计三个平面：用于存储作业定义的 catalog、用于物化和调度 occurrence 的 scheduling 平面，以及用于执行的 worker 集群。不变量是：在正常操作下，每个已调度的 occurrence 最多执行一次；即使节点故障，也至少执行一次，且不存在静默漏触发。</p>
+<p><strong>面试官：</strong> 如何避免两个节点触发同一个作业？</p>
+<p><strong>候选人：</strong> 调度器层按 <code>hash(job_id) % N</code>. 对于每个分片，一个节点通过从 etcd 或 ZooKeeper 获取租约成为 leader。每个租约携带一个单调递增的围栏令牌，调度器将其附加到每次调度请求中。下游 worker 和预期运行表会拒绝带有过期令牌的调度请求。如果 leader 暂停时间过长，新 leader 接管后，旧 leader 的所有调度请求都会在围栏检查时失败。</p>
+<p><strong>面试官：</strong> 如果调度器崩溃了十分钟怎么办？</p>
+<p><strong>候选人：</strong> 由于预期运行是持久化行，数据不会丢失。恢复时，调度器会扫描 <code>status = pending AND due_at &lt; now</code>. 每行都有按作业设定的漏触发策略：延迟运行、跳过，或只运行一次（仅运行最新的）。对于每分钟运行的作业，"跳过除最新以外的所有"可防止洪峰。漏触发的运行会被明确标记为 <code>missed</code> ，从而出现在审计记录中，而不是被静默丢弃。</p>
+<p><strong>面试官：</strong> 一个作业每五分钟运行一次，但需要七分钟才能完成。会发生什么？</p>
+<p><strong>候选人：</strong> 这是重叠问题，通过按作业设置的并发策略来处理：允许、跳过或排队。调度器检查该作业最新的 ExpectedRun；如果状态为 <code>in_progress</code> 且策略为 <code>skip</code>，则新 occurrence 被标记为 <code>skipped</code>。如果 <code>queue</code>，它在按作业的 FIFO 队列中等待，直到前一个完成。如果策略为 <code>allow</code>，则并行运行。该选择在作业定义中明确指定。</p>
+<p><strong>面试官：</strong> worker 如何知道它是否应该继续运行？</p>
+<p><strong>候选人：</strong> 租约续期。当 worker 接收到一个调度请求时，它会获得一个可见性超时。它定期续期；如果续期失败，则停止执行以避免损坏。如果可见性超时到期，队列会让消息重新可见，另一个 worker 可以接手。预期运行行对 <code>worker_id</code> 。 <code>status</code>使用 CAS，因此若原 worker 已被抢占，其最终写入将失败。</p>
+<p><strong>面试官：</strong> 整点时，有一百万个作业到期，如何防止系统崩溃？</p>
+<p><strong>候选人：</strong> 三种技术。第一，确定性抖动：添加 <code>hash(job_id) mod jitter_window</code> 与 <code>due_at</code> 使作业分散在几秒内触发。第二，提前预物化下一小时的 occurrence；调度器对已有行做范围扫描，而非在触发时实时计算调度。</p>
+<p><strong>面试官：</strong> 如何实现恰好一次语义？</p>
+<p><strong>候选人：</strong> 我不承诺恰好一次的交付；我承诺恰好一次的效果。调度是至少一次的。occurrence_id 是确定性的： <code>hash(job_id, due_at)</code>. worker 将此 ID 传递给操作；用户设计其处理器以按该 ID 去重。 <code>Idempotency-Key: &lt;occurrence_id&gt;</code>. 至少一次交付与幂等执行的组合，带来恰好一次的用户体验。</p>
+<p><strong>面试官：</strong> 如何大规模存储运行历史？</p>
+<p><strong>候选人：</strong> 预期运行表保存当前和近期状态。在完成并经过保留窗口后，行会迁移到按日期分区的归档表或数据仓库中。运行的日志存储在对象存储（S3 或同类产品）中，运行尝试记录中存有指针。catalog 和服务路径从不直接读取日志。</p>
+<p><strong>面试官：</strong> 多区域？</p>
+<p><strong>候选人：</strong> 每个租户使用单一属主区域。catalog 在全球范围内复制以供读取；写入路由到租户的主区域。如果操作面向靠近用户的外部服务，worker 可以全球分布。对于区域故障转移，热备份持有复制状态；发生故障时，租约被撤销，新区域接管。我避免使用主-主调度器，因为调度的正确性要求每个分片有单一的排序权威。</p>
+<p><strong>面试官：</strong> 重试策略是什么？</p>
+<p><strong>候选人：</strong> 按作业配置：最大重试次数、带抖动的指数退避、按错误类型重试。发生可重试失败时，worker 安排带延迟的重新调度。超过最大重试次数后，该 occurrence 被标记为 <code>failed</code> 并进入死信表等待人工审查。不可重试的错误（4xx、校验错误）跳过重试链。</p>
+<p><strong>面试官：</strong> 一个租户注册了一百万个每分钟触发一次的作业，怎么办？</p>
+<p><strong>候选人：</strong> 对作业数量和调度速率实施按租户配额限制。作业数量大的租户获得专用调度器分片。我们对每个租户限制调度速率，以防一个失控租户耗尽 worker 池。最坏情况下，我们通过管理 API 禁用该租户并通知他们。</p>
+<p><strong>面试官：</strong> 如何监控正确性？</p>
+<p><strong>候选人：</strong> 三个维度。正确性：每个 occurrence 的重复执行次数（必须为零）、早于 due_at 的待处理行（漏触发运行）、早于可见性超时的已调度行（卡住的运行）。容量：队列深度、调度器 tick 延迟、worker 利用率。业务：按租户的成功/失败率、死信队列增长、手动触发量。</p>
+<p><strong>面试官：</strong> 总结设计。</p>
+<p><strong>候选人：</strong> 三个平面：catalog、scheduler、worker。调度器是基于预期运行表的状态机，具有确定性 occurrence ID。leader 选举加围栏令牌防止脑裂。至少一次调度结合幂等 worker 带来恰好一次效果。重叠、重试和漏触发策略均按作业设置且明确定义。整点峰值突发通过抖动和预物化处理。单属主区域设计避免跨区域调度竞争。</p>
+<h2 id="3-practice-notes">3. 练习备注</h2>
+<h3 id="five-minute-version">五分钟版本</h3>
+<ol>
+<li>明确：最多执行一次，无静默漏触发，支持重试和重叠策略。</li>
+<li>状态不变量：持久化 occurrence 行，恰好一次效果。</li>
+<li>绘制三个平面：catalog、scheduler、worker。</li>
+<li>解释物化：确定性 occurrence_id。</li>
+<li>解释 leader 选举 + 围栏令牌。</li>
+<li>解释至少一次调度 + 幂等 worker。</li>
+<li>解释重叠策略和漏触发策略。</li>
+<li>收尾：整点突发处理与监控指标。</li>
+</ol>
+<h3 id="one-minute-closeout">一分钟结尾陈述</h3>
+<blockquote>
+<p>分布式 cron 是基于持久化预期运行表的状态机。调度计划将 occurrence 物化；调度和执行是 CAS 状态转换。带围栏令牌的 leader 选举防止双重调度；至少一次交付结合确定性 occurrence ID 和幂等 worker，实现恰好一次效果。重叠、重试和漏触发行为均为按作业策略。最难的情况是整点突发，通过抖动和预物化处理。</p>
+</blockquote>
+<h3 id="best-interview-phrases">最佳面试用语</h3>
+<ul>
+<li>"调度计划将意图物化为持久化行；调度器是这些行上的状态机。"</li>
+<li>"我不承诺恰好一次的交付。我通过确定性 occurrence ID 上的幂等性承诺恰好一次的效果。"</li>
+<li>"围栏令牌将脑裂问题转化为下游拒绝。"</li>
+<li>"重叠是产品决策，而非系统缺陷。"</li>
+<li>"整点问题用确定性抖动解决，而非依赖无限的 worker。"</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

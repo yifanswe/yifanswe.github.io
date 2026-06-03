@@ -1,0 +1,847 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>背压 / 流量控制 — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/system-design-patterns/">← 返回系统设计模式</a>
+<h1 class="article-title">背压 / 流量控制</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/05/31  ·  系统设计模式
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p>背压是一种纪律：当消费者跟不上时，让生产者降速、丢弃或被卸载——而不是让它们之间的队列无限增长直到某处崩溃。参见《Staff 系统设计词汇表》获取共享术语。与以下主题密切相关： <a href="/zh/common-backend-systems/apache-kafka/">Apache Kafka</a>, <a href="/zh/common-backend-systems/design-an-api-rate-limiter/">API 限流器</a>, <a href="/zh/common-backend-systems/design-a-metrics-and-monitoring-system-like-datadog/">指标与监控（Datadog）</a>, <a href="/zh/common-backend-systems/design-an-ad-click-aggregator/">广告点击聚合器</a>, <a href="/zh/common-backend-systems/design-a-web-crawler/">Web 爬虫</a>, <a href="/zh/common-backend-systems/design-a-notification-system/">通知系统</a>，以及 <a href="/zh/common-backend-systems/design-youtube/">YouTube</a>.</p>
+</blockquote>
+<hr/>
+<h2 id="1-the-fundamental-hardness">1. 核心难点</h2>
+<p>这类 bug 的形态始终相同：生产者以速率 <code>lambda</code> （事件/秒）发射工作，消费者以速率 <code>mu</code>消费，而某人——有意或无意——假设 <code>lambda &lt;= mu</code> 将永远成立。事实并非如此。移动端客户端遭遇促销活动，某个 GPU 分片下线，垃圾回收（GC）暂停消费者 800 ms，部署导致消费者数量减半，或上游增速超过运维团队所能察觉的速度。一旦 <code>lambda &gt; mu</code> 持续存在，两者之间的队列便以速率 <code>(lambda - mu)</code> 增长，系统距内存、磁盘或 socket 缓冲区耗尽只剩秒级时间。</p>
+<p>核心难点在于： <strong>无界队列不是"缓冲"，而是加了额外步骤的内存泄漏</strong>。队列吸收了失衡，对延迟仪表板隐藏了问题（写入仍然确认），直到翻车并导致所有消费者同时失败。更糟糕的是，若置之不理，故障模式会发生关联：所有队列在大致相同的时间翻车，所有下游同时出现故障，恢复时需要在实时流量仍在到来的情况下排空数 GB 的积压——一种自我强化的过载。</p>
+<p><strong>Little's Law</strong> 是唯一需要掌握的数学公式，用于奠定讨论基础。对于处于稳态的系统：</p>
+<pre><code>L = lambda * W
+</code></pre>
+<p>其中 <code>L</code> 是系统中的条目数， <code>lambda</code> 是到达率， <code>W</code> 是条目在系统中的平均停留时间。如果你限制了 <code>L</code> （有界队列），而 <code>lambda</code> 持续上升，则 <code>W</code> 必须下降——但若 <code>mu</code> 固定不变，这就不可能——因此容量上限强迫你做出决策：丢弃、拒绝或采样。如果你限制了 <code>W</code> （尾延迟的服务级别目标），而 <code>lambda</code> 上升，你必须要么提高 <code>mu</code> （自动扩容、增加分片），要么缩小 <code>lambda</code> （对上游限流），要么减少每条目的工作量（采样、批处理、丢弃字段）。以下所有背压技术都是对"当算术条件无法满足时，我们牺牲哪个变量"这一问题的不同回答。</p>
+<p><strong>三种不同形态的 <code>lambda &gt; mu</code> 需要三种不同的应对策略。</strong> 混淆它们是面试中最常见的错误：</p>
+<table>
+<thead>
+<tr>
+<th>服务端流：单次请求，多个响应</th>
+<th>示例</th>
+<th>正确应对方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>持续性容量不匹配</strong> （连续数小时2倍负载，且未见终止）</td>
+<td>客户增长速度超过了团队的资源规划能力。</td>
+<td>这不是背压设计问题——而是容量规划问题。增加分片、分区、消费者。背压只能在等待容量扩充期间限制损害程度。</td>
+</tr>
+<tr>
+<td><strong>峰值/突发</strong> （数秒到数分钟内达到10倍，随后回落至基线）</td>
+<td>秒杀活动、突发新闻事件、代码发布。</td>
+<td>有界队列 + 令牌桶 + 负载卸除。这是完整的标准工具集。</td>
+</tr>
+<tr>
+<td><strong>元稳态重试风暴</strong> （持续过载， <em>持续时间超过</em> 原始故障根因）</td>
+<td>30秒的下游故障触发了足够多的重试，使系统再也无法自行排空。</td>
+<td>客户端采用带抖动的指数退避，层间使用熔断器，边缘层强制执行 <code>Retry-After</code> 。原始原因已消失；你必须打破反馈回路。</td>
+</tr>
+</tbody>
+</table>
+<p>这种模式极为残酷，因为 <strong>重试可以将短暂的峰值转变为持续性故障</strong>。一个朴素的客户端重试慢请求，会将 <code>lambda</code> 放大三到四倍，而此时 <code>mu</code> 已经退化——形成正反馈回路。一旦队列（或下游）超过其临界点，仅 <em>重试本身就会</em> 超过 <code>mu</code>，导致系统在原始峰值结束后仍持续过载。这就是 <strong>元稳态过载</strong>：系统存在两个稳定态（健康和过载），并陷入不良状态。唯一的出路是从外部抑制流量（防火墙丢包、负载均衡器排空），直到飞行中的重试衰减为止。生产系统必须结合有界队列、限流器、熔断器和带抖动的指数退避；仅使用其中任何一种都是不够的。</p>
+<hr/>
+<h2 id="2-how-to-recognize-it-in-the-interview">2. 如何在面试中识别背压问题</h2>
+<h3 id="prompt-phrases">提示性短语</h3>
+<ul>
+<li>"……处理……的突发流量……"、"……流量峰值……"、"……峰值负载是平均值的10倍……"</li>
+<li>"生产者的发送速率超过了……"</li>
+<li>"……如果下游变慢或不可用，怎么办？"</li>
+<li>"……在秒杀活动/热点新闻/直播期间吸收流量峰值……"</li>
+<li>"……消费者每秒只能处理X个事件，但……"</li>
+<li>"……防止系统在……时崩溃……"</li>
+<li>"……保护下游……"</li>
+<li>"……优雅降级……"</li>
+</ul>
+<h3 id="architectural-smells">架构异味</h3>
+<ul>
+<li>队列（Kafka topic、Simple Queue Service (SQS)、Redis list、进程内 Python <code>queue.Queue</code>）位于时间尺度差异悬殊的两个服务之间（同步 Hypertext Transfer Protocol (HTTP) 生产者、批量消费者）。</li>
+<li>生产者是你无法控制的客户端（移动应用、第三方 webhook、Internet of Things (IoT) 传感器）。</li>
+<li>消费者的工作量是可变的或耗资源的（GPU 编码、machine learning (ML) 特征提取、第三方 application programming interface (API) 调用）。</li>
+<li>面试官指定了上游速率但未指定下游速率，或反之——他们希望你注意到这一点。</li>
+<li>"最终一致"或"尽力而为"出现在需求中——意味着一定程度的数据丢失是可接受的，从而开放了丢弃策略。</li>
+</ul>
+<h3 id="example-interview-prompts-where-backpressure-is-core">背压是核心考点的面试题示例</h3>
+<ol>
+<li><strong>日志/事件采集管道（Datadog、Splunk）。</strong> 数以十万计的 agent 发送指标；采集集群和下游时序数据库（TSDB）有固定的写入上限。参见 <a href="/zh/common-backend-systems/design-a-metrics-and-monitoring-system-like-datadog/">Metrics and Monitoring</a>.</li>
+<li><strong>广告点击聚合器。</strong> 点击事件呈突发模式到达（活动启动、黄金时段）；聚合管道有固定的窗口刷新开销。参见 <a href="/zh/common-backend-systems/design-an-ad-click-aggregator/">广告点击聚合器</a>.</li>
+<li><strong>网络爬虫 frontier。</strong> Found-Uniform-Resource-Locator (URL) 的速率随已爬取页面数乘数增长；礼貌性限速和下游解析器吞吐量是绑定约束。参见 <a href="/zh/common-backend-systems/design-a-web-crawler/">Web 爬虫</a>.</li>
+<li><strong>通知扇出。</strong> 一条名人帖子可能排队1亿条推送通知；Apple Push Notification service (APNs) 和 Firebase Cloud Messaging (FCM) 有每应用速率限制。参见 <a href="/zh/common-backend-systems/design-a-notification-system/">通知系统</a>.</li>
+<li><strong>视频上传/转码管道。</strong> 峰值时段上传速度超过 GPU 编码器；用户期望在数秒内得到"已上传"反馈，但编码输出可能有延迟。参见 <a href="/zh/common-backend-systems/design-youtube/">YouTube</a>.</li>
+<li><strong>直播评论流。</strong> 直播事件驱动突发输入；每个房间的写入扇出受 socket 和序列化吞吐量限制。参见 <a href="/zh/common-backend-systems/design-a-live-comment-streaming-service-like-twitch-chat/">Live Comment Streaming</a>.</li>
+<li><strong>API 网关/限流器本身。</strong> 经典的"限制流量到后端"用例。参见 <a href="/zh/common-backend-systems/design-an-api-rate-limiter/">API 限流器</a>.</li>
+</ol>
+<p>如果面试官给你一个系统，其中一侧是"大量小事件"，另一侧是"昂贵的批处理/持久化/外部调用"——背压就是深度探讨的重点。</p>
+<hr/>
+<h2 id="3-60-second-spoken-framing">3. 60秒口头框架</h2>
+<blockquote>
+<p>核心问题是生产者每秒能持续产生的事件数超过消费者的消耗能力，因此两者之间的任何队列在负载下都会无限增长。我将从这个不变式出发进行设计： <strong>永不使用无界队列，永不让重试放大过载</strong>。我的工具集包括：带有明确丢弃策略的有界队列、在生产者边缘的令牌桶限流、带有迟滞的自动扩容消费者（防止震荡），以及在下游调用上的熔断器和舱壁隔离（使一个慢依赖不会耗尽所有工作线程）。对于不能丢弃的数据，我将其移至 Kafka 等持久化消息代理，并在边缘通过 <code>503 Retry-After</code>卸除负载。我会告警的指标是队列深度和消费者 lag——而不仅仅是延迟，因为延迟会掩盖过载，直到系统崩溃的那一刻。</p>
+</blockquote>
+<hr/>
+<h2 id="4-canonical-toolkit">4. 标准工具集</h2>
+<p>以下七种技术是资深工程师级别的完整清单。在真实面试中，你需要挑选三到四种适合题目的技术，并解释为什么其他技术对这个问题来说是错误的或冗余的。</p>
+<h3 id="41-bounded-queue-with-drop-policy">4.1 带丢弃策略的有界队列</h3>
+<p>最重要的单一原语。任何两个服务之间的队列都有固定容量（内存预算 × 每条目大小）；当队列满时，你必须选择以下之一：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>故障情况</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>尾部丢弃</strong></td>
+<td>新条目被拒绝（<code>put</code> 返回错误）。</td>
+<td>生产者可以做出响应：稍后重试、回退到较慢的路径、向用户显示错误。</td>
+</tr>
+<tr>
+<td><strong>头部丢弃（丢弃最旧）</strong></td>
+<td>驱逐最旧的条目以腾出空间。</td>
+<td>流式遥测、实时信号中最新数据最有价值的场景（实时指标、聊天）。</td>
+</tr>
+<tr>
+<td><strong>随机丢弃</strong></td>
+<td>随机选择一个条目驱逐。</td>
+<td>避免对任何时间片的系统性偏差；实践中较少使用。</td>
+</tr>
+<tr>
+<td><strong>加权随机早期检测（WRED）</strong></td>
+<td>当队列填充超过阈值时，按优先级/类别加权进行概率性丢弃。</td>
+<td>网络路由器原语（设计用于打破全局 TCP 窗口同步）。仅作为优先级丢弃的灵感借鉴到应用队列中；"早期丢弃"的优势来自于解同步 TCP 发送方，这不适用于非 TCP 消息队列。在应用队列中优先使用显式优先级丢弃。</td>
+</tr>
+<tr>
+<td><strong>优先级丢弃</strong></td>
+<td>优先丢弃最低优先级的类别；保留最高优先级类别直到完全满。</td>
+<td>混合关键性流（付费 &gt; 免费，事务性 &gt; 分析性）。</td>
+</tr>
+</tbody>
+</table>
+<p>带尾部丢弃和丢弃最旧变体的有界队列 Python 示意代码：</p>
+<pre><code class="language-python">import collections
+import threading
+from typing import Optional, Any
+
+class BoundedQueue:
+    """
+    Thread-safe bounded queue with configurable drop policy.
+
+    policy: 'tail_drop' rejects new items; 'drop_oldest' evicts head.
+    Returns (accepted: bool, dropped_item: Optional[Any]) on put.
+    """
+    def __init__(self, capacity: int, policy: str = "tail_drop"):
+        assert policy in ("tail_drop", "drop_oldest")
+        self.capacity = capacity
+        self.policy = policy
+        self.buf: collections.deque = collections.deque()
+        self.lock = threading.Lock()
+        self.not_empty = threading.Condition(self.lock)
+        # Metrics — emit to your monitoring stack.
+        self.dropped_count = 0
+        self.enqueued_count = 0
+
+    def put(self, item: Any) -&gt; tuple[bool, Optional[Any]]:
+        with self.not_empty:
+            if len(self.buf) &lt; self.capacity:
+                self.buf.append(item)
+                self.enqueued_count += 1
+                self.not_empty.notify()
+                return True, None
+            if self.policy == "tail_drop":
+                self.dropped_count += 1
+                return False, item  # caller decides what to do
+            # drop_oldest
+            evicted = self.buf.popleft()
+            self.buf.append(item)
+            self.dropped_count += 1
+            self.not_empty.notify()
+            return True, evicted
+
+    def get(self, timeout: Optional[float] = None) -&gt; Optional[Any]:
+        with self.not_empty:
+            if not self.buf and not self.not_empty.wait(timeout):
+                return None
+            return self.buf.popleft() if self.buf else None
+</code></pre>
+<p><strong>面试级别细节。</strong> 始终明确说明容量并用 Little's Law 来合理化： <code>capacity &gt;= mu * W_acceptable</code> （根据 <em>排空</em> 速率来确定大小，因为一旦超过 <code>mu</code> ，队列纯粹是时移需求的缓冲区）。持有约1秒排空速率的队列是一个缓冲区；容量等于1小时 × 峰值到达率则是一个隐患——以每条目64KB、到达速率10k条目/秒为例，"1小时"缓冲区就是2.3GB的内存，会掩盖过载直到系统倾覆。</p>
+<p><strong>丢弃最旧与尾部丢弃并不对称。</strong> 它们不仅在操作层面不同，在正确性上也有不同含义：</p>
+<ul>
+<li><strong>丢弃最旧</strong> 会悄无声息地改变消费者看到的数据。对于计数器或聚合而言，这是一个 <em>正确性</em> 语义变更：计数被低报而没有任何错误信号传递给任何人。只有当"更旧"真正意味着"过时且无价值"时才使用丢弃最旧——实时遥测、当前聊天状态、最新传感器读数。</li>
+<li><strong>尾部丢弃</strong> 保留已经进入系统的数据，并向生产者返回错误。生产者（或其重试层）成为数据丢失可被观测的地方。对于请求/响应 API 以及任何具有幂等键的数据，这是默认选择。</li>
+</ul>
+<p>坦诚的资深工程师观点：带尾部丢弃和 <code>503 Retry-After</code> 的有界队列，对于大多数系统来说已经足够了。更复杂的丢弃策略（WRED 风格的概率性、优先级感知、key 感知）只有在你有真实的多类别工作负载或网络层约束时，才值得其复杂度。</p>
+<h3 id="42-token-bucket-on-the-producer">4.2 生产者端的令牌桶</h3>
+<p>在源头限流比在汇点限流代价更低。令牌桶允许最多桶容量大小的短暂突发，并以补充速率维持持续流量。</p>
+<pre><code class="language-python">import time
+import threading
+
+class TokenBucket:
+    """
+    Classic token bucket. capacity = max burst, refill_rate = tokens/sec.
+    try_acquire returns True if a token was deducted (request allowed).
+    """
+    def __init__(self, capacity: float, refill_rate: float):
+        self.capacity = float(capacity)
+        self.refill_rate = float(refill_rate)
+        self.tokens = float(capacity)
+        self.last_refill = time.monotonic()
+        self.lock = threading.Lock()
+
+    def _refill(self) -&gt; None:
+        now = time.monotonic()
+        elapsed = now - self.last_refill
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+        self.last_refill = now
+
+    def try_acquire(self, cost: float = 1.0) -&gt; bool:
+        with self.lock:
+            self._refill()
+            if self.tokens &gt;= cost:
+                self.tokens -= cost
+                return True
+            return False
+
+    def acquire_blocking(self, cost: float = 1.0, timeout: float = 1.0) -&gt; bool:
+        deadline = time.monotonic() + timeout
+        while True:
+            with self.lock:
+                self._refill()
+                if self.tokens &gt;= cost:
+                    self.tokens -= cost
+                    return True
+                deficit = cost - self.tokens
+                wait = deficit / self.refill_rate
+            if time.monotonic() + wait &gt; deadline:
+                return False
+            time.sleep(min(wait, deadline - time.monotonic()))
+</code></pre>
+<p>在 <a href="/zh/common-backend-systems/design-an-api-rate-limiter/">API 限流器</a> 文档中关于分布式计数器一致性的深入探讨；这里需要坦诚面对的是参数权衡。令牌桶有两个独立的调节旋钮，它们的方向相反：</p>
+<ul>
+<li><code>refill_rate</code> 是你的持续吞吐量上限——生产者在任何持续窗口内的平均速率不能超过此值。</li>
+<li><code>capacity</code> 是突发容忍度——能无门控通过的最大单次峰值。</li>
+</ul>
+<p>"更宽的突发"（大容量、适中补充速率）让合法峰值通过，但允许行为异常的客户端在一个桶宽时间内猛打下游，之后限速才生效。"更平滑"的桶（小容量、相同补充速率）会削减合法峰值。令牌桶是突发流量 <em>均为</em> 合法时的正确工具；漏桶只有在下游真正无法容忍峰值时才是正确工具（在突发下会锁定的数据库、有严格每秒限制且无突发信用的第三方 API）。</p>
+<h3 id="43-circuit-breaker-state-machine">4.3 熔断器状态机</h3>
+<p>熔断器的价值在于 <strong>级联故障预防</strong>，而不仅仅是"下游变慢"。下游变慢本身可以通过每依赖项超时和舱壁隔离来处理。当对慢依赖的调用 <em>积压工作线程</em> ，且这种耗尽导致同一进程中不相关的调用路径也受影响时，熔断器的复杂度才是值得的——这是经典的同步调用级联：一个不良依赖拖垮整个层级。在以下情况下专门使用熔断器：(a) 你有共享工作线程池，(b) 下游调用可能挂起数秒，(c) 快速失败比等待更可取。对于异步或完全隔离的路径，超时通常就足够了。</p>
+<pre><code class="language-python">import time
+import threading
+from enum import Enum
+
+class State(Enum):
+    CLOSED = "closed"      # normal
+    OPEN = "open"          # short-circuit, do not call downstream
+    HALF_OPEN = "half"     # probe, allow one request through
+
+class CircuitBreaker:
+    """
+    Standard three-state breaker.
+    - CLOSED: count failures; trip to OPEN when failure_rate &gt; threshold.
+    - OPEN: reject immediately for cooldown seconds, then -&gt; HALF_OPEN.
+    - HALF_OPEN: allow one probe; success -&gt; CLOSED, failure -&gt; OPEN.
+    """
+    def __init__(
+        self,
+        failure_threshold: float = 0.5,
+        min_calls: int = 20,
+        cooldown_seconds: float = 30.0,
+    ):
+        self.failure_threshold = failure_threshold
+        self.min_calls = min_calls
+        self.cooldown = cooldown_seconds
+        self.state = State.CLOSED
+        self.failures = 0
+        self.successes = 0
+        self.opened_at = 0.0
+        self.lock = threading.Lock()
+
+    def allow(self) -&gt; bool:
+        with self.lock:
+            if self.state == State.CLOSED:
+                return True
+            if self.state == State.OPEN:
+                if time.monotonic() - self.opened_at &gt;= self.cooldown:
+                    self.state = State.HALF_OPEN
+                    return True  # one probe
+                return False
+            # HALF_OPEN: only the in-flight probe was allowed
+            return False
+
+    def record(self, success: bool) -&gt; None:
+        with self.lock:
+            if self.state == State.HALF_OPEN:
+                if success:
+                    self.state = State.CLOSED
+                    self.failures = self.successes = 0
+                else:
+                    self.state = State.OPEN
+                    self.opened_at = time.monotonic()
+                return
+            if success:
+                self.successes += 1
+            else:
+                self.failures += 1
+            total = self.failures + self.successes
+            if total &gt;= self.min_calls:
+                rate = self.failures / total
+                if rate &gt;= self.failure_threshold:
+                    self.state = State.OPEN
+                    self.opened_at = time.monotonic()
+                # rolling window reset; real impls use a time-windowed counter
+                self.failures = self.successes = 0
+</code></pre>
+<p>提到 <strong>舱壁</strong> 这一配套机制：限制对每个下游服务的并发在途调用数，使一个慢依赖无法耗尽整个工作线程池。舱壁本质上是一个信号量或每依赖项专用线程池。</p>
+<p><strong>需要指出的不对称性。</strong> 开路和半开路转换并非镜像关系。从 <em>关闭 → 开路</em> 按阈值触发能干净地切断负载。从 <em>开路 → 半开路 → 关闭</em> 则存在风险：单次探测成功就将熔断器恢复到全量流量，可能立即使只处理了一个请求（因为之前处于空闲）的下游再次过载。更好的实现是在半开路时逐步提升流量（允许N个并发探测，仅在一个成功窗口后才关闭），并在滑动 <em>时间</em> 窗口而非固定调用次数上采样失败率，以防慢下游通过零星成功来规避阈值。</p>
+<h3 id="44-sampling-and-adaptive-sampling">4.4 采样与自适应采样</h3>
+<p>当数据具有统计性质（指标、追踪、点击事件）且下游跟不上时， <strong>在源头丢弃一部分数据</strong>。两种方式：</p>
+<ul>
+<li><strong>固定速率采样。</strong> 每N个事件保留1个。简单、可预测，偏向于主流流量。</li>
+<li><strong>自适应/尾部采样。</strong> 基于信号动态采样——保留所有错误、保留慢追踪、对快速成功追踪降采样。用于分布式追踪（OpenTelemetry、Jaeger）。</li>
+<li><strong>水库采样。</strong> 当需要统计保证时，从无界流中保留大小为K的均匀随机样本。</li>
+</ul>
+<p>规则是： <strong>在生产者端采样，而非消费者端</strong>。在消费者端采样意味着已经付出了生产、序列化和传输被丢弃数据的代价。</p>
+<h3 id="45-autoscaling-with-hysteresis">4.5 带迟滞的自动扩容</h3>
+<p>基于 <em>队列</em> 信号而非消费者自身的 CPU 来扩容消费者。CPU 相对于队列深度有30-60秒的滞后，这足以导致过冲。使用两个阈值（迟滞）来防止震荡：</p>
+<pre><code>queue_depth &gt; scale_up_threshold for T_up seconds   -&gt; add N workers
+queue_depth &lt; scale_down_threshold for T_down sec   -&gt; remove N workers
+</code></pre>
+<p>推荐选择 <code>T_down &gt; T_up</code> （例如，5分钟 vs 1分钟）和 <code>scale_down_threshold &lt;&lt; scale_up_threshold</code> （例如，容量的20% vs 80%），从而激进地扩容、惰性地缩容。扩容和缩容在实际成本上是不对称的：扩容需要付出容器启动、镜像拉取、JIT 预热、连接池重建和下游缓存预热的代价——通常需要30-180秒，在此期间队列仍在增长。缩容仅释放容量，不会对客户产生急性影响。这种不对称性正是你快速触发扩容、缓慢触发缩容的原因。</p>
+<p><strong>自动扩容不是免费的。</strong></p>
+<ul>
+<li>它也不是即时的。从你触发扩容阈值到新容量开始排空，应假设需要1-3分钟。有界队列和边缘负载卸除器才是支撑你度过这个窗口期的手段；自动扩容是中期解决方案，而非应对峰值的手段。</li>
+<li>当瓶颈在 <em>下游</em>时，它无济于事。向 Kafka topic 添加更多消费者，如果 Kafka 或其背后的数据库已达上限，并没有帮助——你只是将队列存在的位置移走了而已。</li>
+<li>它会消耗你的余量。为了吸收扩容延迟，你必须以足够的富余容量运行，使有界队列能容纳 (lambda - mu) × scale_up_delay 个条目。如果队列设置得太紧，你会在常规扩容事件期间对客户返回503。</li>
+</ul>
+<p><strong>有界自动扩容。</strong> 始终设置最大值。没有上限的自动扩容器会愉快地扩展到无限（或触发你的云账单告警），这是另一种形式的故障。</p>
+<h3 id="46-reactive-streams-credit-based-flow-control">4.6 响应式流/基于信用的流量控制</h3>
+<p>如果你同时控制生产者和消费者 <strong>且连接是长期存在的流式连接</strong>，则运行一个 <strong>基于拉取的协议</strong>：消费者告诉生产者"我有N个信用额度，发给我N个条目"，生产者绝不超出信用额度发送。这正是 Transmission Control Protocol (TCP) 的做法（窗口大小）、gRPC 流式传输通过 <code>MaxConcurrentStreams</code> 提供的功能、HTTP/2 流量控制、RSocket 实现的 <code>request-N</code>，以及 Reactive Streams Java Virtual Machine (JVM) Specification Request (JSR) 所规范的内容（Akka Streams、Project Reactor）。</p>
+<pre><code>Consumer -- request(64) --&gt; Producer
+Consumer &lt;----  item ------ Producer  (1/64 credits consumed)
+Consumer &lt;----  item ------ Producer  (2/64)
+...
+Consumer -- request(32) --&gt; Producer  (top up as work completes)
+</code></pre>
+<p>背压成为协议的属性，而非任何队列的属性。</p>
+<p><strong>基于信用的方式真正优于确认机制的场景。</strong> 具体场景是 <em>长期双向流</em> ——单个连接传递大量消息，且你无法承受每条消息一次往返。例如：推送市场数据的 gRPC 服务端流、两个服务之间的 RSocket 连接、单个 Kafka 消费者 poll 循环内部。对于短期请求/响应，请求/确认模式已经免费提供了背压（生产者在收到上一个响应之前无法发送下一个请求）。</p>
+<p>不要仅仅因为吞吐量高就将基于信用的流量控制引入通用设计。在以下情况下使用它：1. 两端都是你控制的服务（它需要协议层面的配合）。2. 连接是长期存在的（信用状态需要有地方驻留）。3. 每条消息的确认开销过高（消息非常小、速率极高或有严格延迟预算）。</p>
+<p>不要 <strong>非</strong> 在生产者是外部客户端时使用此方案（你无法让5000万移动客户端遵守你的 <code>request-N</code>），或者当每次调用的速率足够低、同步请求/响应已经够用时。</p>
+<h3 id="47-shed-load-at-the-edge">4.7 在边缘卸除负载</h3>
+<p>当其他一切都已饱和时， <strong>尽早以低代价返回错误</strong>。在负载均衡器上设置一个 <code>503 Service Unavailable</code> 加上 <code>Retry-After: 30</code> 请求头的代价是微秒级；让请求流入队列然后超时的代价是数秒和一个工作线程。负载卸除策略：</p>
+<ul>
+<li><strong>静态</strong>：当队列深度 &gt; X 时，以503拒绝新请求。</li>
+<li><strong>自适应（并发限制）</strong>：监控请求延迟；如果延迟上升，动态降低并发上限。Netflix 的 <code>concurrency-limits</code> 库和 Google 的 Site Reliability Engineering (SRE) Workbook 描述了这种方法。</li>
+<li><strong>优先级感知</strong>：优先卸除尽力而为的流量；保留事务性或付费级别的流量。</li>
+</ul>
+<p>始终包含 <code>Retry-After</code> ，并在客户端文档中添加抖动建议。不带抖动的 <code>Retry-After: 30</code> 会在第30秒产生雷群效应。</p>
+<hr/>
+<h2 id="5-worked-example-naive-broken-fixed">5. 实际案例：朴素设计 → 崩溃 → 修复</h2>
+<p><strong>CloudTrail + S3 Access Logs。</strong> 一个可观测性产品的日志采集服务。50,000 台生产主机各自运行一个 agent，平均每秒发送 2 个事件—— <strong>每秒 100,000 个事件（聚合），平均</strong>。峰值在部署和故障期间达到 3 倍（30 万/秒）。下游是一个 Kafka 集群，按当前分区数量设计的持续处理能力为 <strong>每秒 60,000 条消息（持续）</strong> 。每个事件约 500 字节。</p>
+<h3 id="step-1-naive-design">第一步：朴素设计</h3>
+<pre><code>Agents (50k hosts) --HTTPS--&gt; Ingest API (auto-scaled Python workers)
+                                   |
+                                   v
+                         in-process asyncio.Queue
+                                   |
+                                   v
+                         Kafka producer thread
+                                   |
+                                   v
+                         Kafka topic (60k/sec ceiling)
+</code></pre>
+<p>API 接受每一个 POST 请求，将事件放入无界 <code>asyncio.Queue</code>，返回 200。后台协程将队列中的消息排出到 Kafka。</p>
+<h3 id="step-2-how-it-breaks">第二步：系统如何崩溃</h3>
+<table>
+<thead>
+<tr>
+<th>时刻</th>
+<th>故障情况</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T+0</td>
+<td>稳定状态。队列深度在零附近波动。Kafka 生产者以 10 万/秒的余量排出（批量处理良好时低于分区限制）。一切正常。</td>
+</tr>
+<tr>
+<td>T+0:05</td>
+<td>某客户开始部署。其机群日志量在 10 分钟内增至 5 倍。聚合 lambda = 200k/秒。</td>
+</tr>
+<tr>
+<td>T+0:06</td>
+<td>Kafka 生产者成为瓶颈。mu = 60k/秒。队列以（200k - 60k）= 140k 条/秒的速度增长。</td>
+</tr>
+<tr>
+<td>T+0:08</td>
+<td>队列持有 1600 万个事件 × 500 字节 = <strong>8 GB</strong> 内存。Worker 容器触达内存限制。Linux Out-Of-Memory（OOM）killer 回收了该进程。</td>
+</tr>
+<tr>
+<td>T+0:08:01</td>
+<td>负载均衡器将流量故障转移到兄弟节点。它们收到 <em>更多</em> 流量。它们的队列填充更快，数秒内触发 OOM。</td>
+</tr>
+<tr>
+<td>T+0:08:30</td>
+<td>整个采集机群进入 OOM 循环。Agent 看到 503/连接拒绝，开始 <strong>无退避地重试</strong>。有效 lambda 现在是之前的 3 倍。</td>
+</tr>
+<tr>
+<td>T+0:15</td>
+<td>即使在该客户部署结束后，系统也无法恢复：重放的 agent 缓冲区加上活跃重试超出了任何合理的 mu。 <strong>元稳定故障。</strong> 告警触发。值班工程师在防火墙层屏蔽了一半 agent 才得以恢复。</td>
+</tr>
+</tbody>
+</table>
+<p>问题所在：</p>
+<ol>
+<li>无上限 <code>asyncio.Queue</code> 将内存作为缓冲区。在背压生效之前内存已耗尽。</li>
+<li>API 在 Kafka 确认之前就返回了 200，因此生产者没有减速信号。</li>
+<li>客户端没有重试退避，导致故障被放大 <code>lambda</code>.</li>
+<li>CPU 自动扩展没有帮助，因为瓶颈在下游吞吐量，而非本地计算。</li>
+</ol>
+<h3 id="step-3-fixed-design">第三步：修复设计</h3>
+<pre><code>                                    ┌─── token bucket (per-tenant) ────┐
+                                    │  burst=10k, refill=tenant_quota  │
+Agents ── exp. backoff + jitter ─── HTTPS ── Ingest API ──┐
+                                                          ▼
+                                          Bounded queue (cap = 60k items)
+                                          policy: tail_drop
+                                          (returns 503 Retry-After)
+                                                          │
+                                                          ▼
+                                          Kafka producer
+                                          - batched (linger=20ms)
+                                          - circuit breaker on Kafka
+                                          - bulkhead: max 16 in-flight
+                                                          │
+                                                          ▼
+                                          Kafka (60k/sec sustained)
+                                                          │
+                                                          ▼
+                                          TSDB writer (independent consumer,
+                                          autoscale on Kafka consumer lag,
+                                          hysteresis: scale-up 1m, scale-down 5m)
+</code></pre>
+<p>具体决策：</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>决策</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Agent</td>
+<td>5xx 时指数退避加抖动；本地磁盘缓冲最多 30 分钟。</td>
+<td>防止重试风暴；允许在短暂采集中断时不丢失数据。</td>
+</tr>
+<tr>
+<td>Agent</td>
+<td>本地采样：当本地缓冲区 &gt; 50% 时，WARN/ERROR 发送 100%，INFO 发送 10%。</td>
+<td>在源头减少负载；保留高价值事件。</td>
+</tr>
+<tr>
+<td>API</td>
+<td>按租户的令牌桶，大小按合约配额设定。</td>
+<td>公平性：某客户的部署峰值不会淹没其他租户。</td>
+</tr>
+<tr>
+<td>API</td>
+<td>有界进程内队列，容量 = 60k 条（约 Kafka 持续速率下 1 秒量），尾丢弃返回 <code>503 Retry-After: jittered(5..30)</code>.</td>
+<td>强制让背压在 &lt;1 秒内传导到客户端；不会造成内存爆炸。</td>
+</tr>
+<tr>
+<td>API → Kafka</td>
+<td>批量生产者，启用 <code>linger.ms=20</code>, <code>batch.size=64KB</code>，compression=zstd。</td>
+<td>在边际延迟代价下将持续 Kafka 吞吐量提升 3-5 倍。</td>
+</tr>
+<tr>
+<td>API → Kafka</td>
+<td>熔断器：20 次调用中失败率超过 50% 时打开；冷却 30 秒。</td>
+<td>若 Kafka 性能下降，快速失败返回 503，而非继续堆积请求。</td>
+</tr>
+<tr>
+<td>Consumer（TSDB writer）</td>
+<td>在 Kafka <strong>消费者 lag</strong>上自动扩展，而非 CPU。阈值：lag &gt; 60 秒时扩容，lag &lt; 5 秒持续 5 分钟时缩容。</td>
+<td>Lag 是真实的背压信号；CPU 指标滞后数分钟。</td>
+</tr>
+<tr>
+<td>消费者</td>
+<td>解码失败或写入失败 5 次的消息发送到死信 topic（DLT）。</td>
+<td>单条格式错误的事件不会阻塞整个 topic。</td>
+</tr>
+</tbody>
+</table>
+<p><strong>用 Little's Law 验证。</strong> 有界队列容量 60k 条，排出速率 60k/秒 → 稳定状态下平均每条消息等待时间最多为 <code>L / mu = 60k / 60k = 1 second</code>。一旦到达率超过排出速率，队列将在 <code>60k / (lambda - mu)</code> 秒内填满——在部署峰值（<code>lambda = 200k</code>）时约为 <code>60k / 140k ≈ 0.4 sec</code> 在 API 开始返回 503 之前。这正是设计意图：正常抖动有一个亚秒级窗口，之后执行显式负载丢弃。内存上限 = 60k × 500 字节 = 30 MB，比容器限制低两个数量级。</p>
+<p><strong>修复方案对其代价是诚实的。</strong> 按租户令牌桶意味着，某客户的部署产生大量真实的 WARN 日志时， <em>确实</em> 会丢失数据——他们收到 503，agent 在本地缓冲，若峰值超过本地缓冲时长则会丢失尾部数据。Agent 端采样（缓冲填充时 INFO 只发 10%）也是同样的权衡：速率问题是通过 <em>丢弃数据</em>来解决的。这套修复方案不存在让所有事件都在持续 <code>5x</code> 过载中存活的版本；设计选择是 <em>谁</em> 承担损失（嘈杂租户，按其自身配额）以及 <em>哪种</em> 哪些事件被丢弃（INFO 优先于 WARN/ERROR）。Consumer lag 上的自动扩展有助于缩短恢复时间，但无法阻止即时的丢弃窗口——Kafka consumer 扩容仍需 1-3 分钟，且短期内 topic 分区数上限是固定的。</p>
+<p><strong>同一故障场景下的行为。</strong> 客户的 5 倍峰值现在会命中按租户令牌桶，被整形至合约速率。超出桶容量的部分收到 503 和 <code>Retry-After</code>，agent 将其缓冲在本地，而其他所有租户的采集保持健康。没有 OOM，没有重试风暴，没有元稳定崩溃。只有当峰值超过本地 agent 缓冲时长时，该客户才会丢失事件——而这本来就是应该由他们来承担的损失。</p>
+<hr/>
+<h2 id="6-variants-and-how-to-choose">6. 变体及如何选择</h2>
+<p>背压并非单一技术，而是一系列决策。第一个决策始终是： <strong>数据是否可丢弃？</strong></p>
+<table>
+<thead>
+<tr>
+<th>数据类型</th>
+<th>可丢弃？</th>
+<th>主要技术</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>指标/遥测/点击（统计型）</td>
+<td>是</td>
+<td>采样 + 丢弃最旧数据</td>
+</tr>
+<tr>
+<td>用户生成内容（上传、帖子）</td>
+<td>否</td>
+<td>持久队列 + 在边缘减少负载</td>
+</tr>
+<tr>
+<td>金融事件（支付、订单）</td>
+<td>否</td>
+<td>持久队列 + 至少一次投递 + 幂等性</td>
+</tr>
+<tr>
+<td>实时信号（直播聊天、体育比分）</td>
+<td>是（最新优先）</td>
+<td>丢弃最旧 + 小型有界队列</td>
+</tr>
+<tr>
+<td>通知</td>
+<td>部分（按优先级）</td>
+<td>优先队列 + 按通道限速</td>
+</tr>
+</tbody>
+</table>
+<p>第二层选择决策表：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>最佳工具</th>
+<th>次优选择</th>
+<th>应避免</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>生产者和消费者均由你控制</td>
+<td>Reactive streams（request-N）</td>
+<td>有界队列 + 丢弃最旧</td>
+<td>无界队列</td>
+</tr>
+<tr>
+<td>外部生产者（移动端/IoT），数据可丢弃</td>
+<td>令牌桶 + 尾丢弃 + 503</td>
+<td>在边缘 LB 按类别优先丢弃</td>
+<td>将背压推向设备端（不可行）</td>
+</tr>
+<tr>
+<td>外部生产者，数据不可丢弃</td>
+<td>持久 broker（Kafka/SQS）+ agent 侧缓冲 + 幂等 consumer</td>
+<td>同步减载返回 503（客户端必须重试）</td>
+<td>内存无界队列</td>
+</tr>
+<tr>
+<td>突发但有界，持续速率可接受</td>
+<td>令牌桶，大小按峰值突发设定</td>
+<td>有界队列容量 = 突发预算</td>
+<td>纯漏桶（会削减合理突发）</td>
+</tr>
+<tr>
+<td>持续过载，可水平扩展</td>
+<td>按 lag 自动扩展 consumer</td>
+<td>增加 Kafka 分区</td>
+<td>将资金砸在生产者侧桶上</td>
+</tr>
+<tr>
+<td>持续过载，无法扩展（如 GPU 绑定）</td>
+<td>优先队列 + 丢弃尽力而为流量</td>
+<td>采样</td>
+<td>假装问题只是暂时的</td>
+</tr>
+<tr>
+<td>下游不稳定/波动较大</td>
+<td>熔断器 + 舱壁</td>
+<td>带取消的对冲请求</td>
+<td>无界重试</td>
+</tr>
+<tr>
+<td>需要多租户公平性</td>
+<td>按租户令牌桶 + 按租户队列</td>
+<td>带租户类别权重的优先感知丢弃</td>
+<td>单一全局队列</td>
+</tr>
+</tbody>
+</table>
+<p><strong>最常见的面试错误</strong> 是直接说"加个 Kafka"。Kafka 是持久缓冲，本身并非背压解决方案。没有生产者速率限制、没有 consumer 自动扩展的 Kafka 仍然存在元稳定故障模式：topic 落后太多，即使峰值结束后，consumer 也无法在保留期到期前追上，数据因此丢失。</p>
+<hr/>
+<h2 id="7-failure-modes-and-operations">7. 故障模式与运维</h2>
+<p>应该告警的正确指标 <strong>永远是队列深度或 consumer lag</strong>，而非 consumer 自身的延迟。consumer 的延迟会在队列翻转的那一刻才暴露过载。</p>
+<table>
+<thead>
+<tr>
+<th>故障模式</th>
+<th>前置信号（指标）</th>
+<th>缓解措施</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>队列深度失控</td>
+<td><code>queue.size</code> &gt; 70% 容量持续 &gt; 30 秒</td>
+<td>扩容；若已到最大规模，开始减载。</td>
+</tr>
+<tr>
+<td>Consumer lag 持续增长</td>
+<td><code>kafka.consumer.lag</code> 导数 &gt; 0 且持续</td>
+<td>同上。Lag 导数是早期信号。</td>
+</tr>
+<tr>
+<td>生产者/API OOM</td>
+<td>容器内存 &gt; 80%；RSS 突然跳升</td>
+<td>降低队列容量，强制尾丢弃，水平扩展。</td>
+</tr>
+<tr>
+<td>Consumer OOM</td>
+<td>批处理中途容器内存 &gt; 80%</td>
+<td>减小批大小；启用预取背压（例如， <code>max.poll.records</code> 在 Kafka 中）。</td>
+</tr>
+<tr>
+<td>重试风暴</td>
+<td>客户端重试速率 &gt; 基线 × 3</td>
+<td>强制指数退避 + 抖动；返回 <code>Retry-After</code>；在边缘限速。</td>
+</tr>
+<tr>
+<td>元稳定过载（原因消除后无法恢复）</td>
+<td>系统在上游无流量峰值的情况下仍处于过载</td>
+<td>在边缘手动减载（防火墙丢弃或 LB 排空）。在下一次迭代中默认加入减载机制。</td>
+</tr>
+<tr>
+<td>自动扩展抖动</td>
+<td>每小时扩展事件 &gt; 4；每小时容器启动 &gt; 4</td>
+<td>扩大迟滞间隔；延长缩容等待时间。</td>
+</tr>
+<tr>
+<td>毒数据消息</td>
+<td>同一 offset 重试 &gt; N 次；consumer 崩溃循环</td>
+<td>死信队列；限制每条消息的重试次数。</td>
+</tr>
+<tr>
+<td>热分区/热键</td>
+<td>单个分区 lag 高而其他分区正常</td>
+<td>通过不同字段哈希重新分区；或拆分热键（参见 <a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew</a>).</td>
+</tr>
+<tr>
+<td>下游慢速级联</td>
+<td>依赖服务 p99 延迟上升</td>
+<td>熔断器打开；舱壁限制；优雅降级。</td>
+</tr>
+<tr>
+<td>客户端缓冲溢出</td>
+<td>设备上的 agent 缓冲区占用率</td>
+<td>向客户端暴露警告；确保服务端 <code>Retry-After</code> 是诚实的。</td>
+</tr>
+<tr>
+<td>长期容量不足</td>
+<td>即使凌晨 4 点队列深度也从未降到 50% 以下</td>
+<td>这不是背压问题——做容量规划，增加分区/分片/consumer。</td>
+</tr>
+</tbody>
+</table>
+<p><strong>运维例行操作。</strong></p>
+<ul>
+<li><strong>运行超出容量的负载测试。</strong> 如果你的系统从未被推过 <code>mu</code>，你就不了解其故障模式。大多数生产过载第一次被发现是在值班工程师的第一次故障中，而那时已经太晚了。</li>
+<li><strong>演练元稳定场景。</strong> 将流量设置为容量的 1.5 倍并保持，然后降至 0.5 倍。系统必须在数分钟内恢复。如果峰值结束后仍处于过载，则存在元稳定故障模式。</li>
+<li><strong>对导数告警，而非绝对值。</strong> "队列深度为 1M"可能是正常的；"队列深度在 5 分钟内增长了 1M"则必然是问题。</li>
+<li><strong>记录丢弃策略。</strong> 客户和值班人员必须清楚哪些事件会被丢弃，哪些有保证。</li>
+</ul>
+<hr/>
+<h2 id="8-combinations-with-other-patterns">8. 与其他模式的组合</h2>
+<p>背压很少单独存在。它是其他模式所依赖的 <em>基础</em> 。</p>
+<ul>
+<li><strong><a href="/zh/system-design-patterns/hot-key-skew/">热键倾斜</a>.</strong> 单个热键会在全局吞吐量正常时造成按分区的背压。修复方案（拆分键、在路由中加入随机性）位于任何背压策略的上游。</li>
+<li><strong><a href="/zh/system-design-patterns/fan-out-write-amplification/">扇出写放大</a>.</strong> 扇出会成倍放大生产者速率。1k 帖子/秒的 API 可能变成 1 亿次写入/秒的扇出。背压单位是扇出 worker，你几乎总是需要在全局限速之外加上按收件人限速。</li>
+<li><strong><a href="/zh/system-design-patterns/idempotency-exactly-once/">幂等性/精确一次语义</a>.</strong> 背压意味着重试；重试意味着重复；重复意味着你需要幂等键。单独设计其中一个而忽略另一个是不完整的。</li>
+<li><strong><a href="/zh/system-design-patterns/cache-stampede-read-amplification/">缓存击穿/读放大</a>.</strong> 缓存未命中风暴是背压的读取侧类比。工具箱（请求合并、概率性提前刷新、带抖动的 Time To Live（TTL））共享相同的精神：限制在途工作量。</li>
+<li><strong><a href="/zh/system-design-patterns/real-time-aggregation/">实时聚合</a>.</strong> 聚合器的窗口刷新开销占主导地位；对其施加背压意味着有界窗口与优雅重叠。</li>
+<li><strong><a href="/zh/system-design-patterns/durability-at-scale/">大规模持久性</a>.</strong> "不可丢弃"的数据迫使你使用持久化 broker；broker 成为背压边界。对 broker 进行容量规划（保留时长、分区数）是背压设计的一部分。</li>
+<li><strong><a href="/zh/system-design-patterns/coordination-exactly-one-execution/">协调 / 精确一次执行</a>.</strong> 对主节点协调型负载施加背压，也能限制单个协调者可以下发的工作量；结合租约（lease）使用。</li>
+<li><strong><a href="/zh/system-design-patterns/strong-consistency-under-contention/">强一致性下的竞争</a>.</strong> 一致性协议（Paxos、两阶段提交）有固定的 <code>mu</code>；背压可防止其被推入无法继续推进的降级模式。</li>
+</ul>
+<hr/>
+<h2 id="9-likely-interviewer-probes">9. 面试官可能追问的问题</h2>
+<p>预计面试官会就以下至少两个问题深挖：</p>
+<ol>
+<li><strong>"如果队列满了会怎样？"</strong> — 他们希望听到"对客户端执行 tail-drop 并返回 503， <code>Retry-After</code>, <em>。</em> 客户端以带抖动的指数退避方式重试，这样我们就不会引发重试风暴。"较弱的回答是"我们直接阻塞"。阻塞对进程内流量控制（Python <code>BoundedSemaphore</code>）可以接受，但对网络 API 来说是致命的。</li>
+<li><strong>"你如何为队列定容？"</strong> — 利特尔定律（Little's Law）。容量 = <code>lambda_peak * W_acceptable</code> （以条目数计）。然后内存 = 容量 × 条目大小。展示计算过程。</li>
+<li><strong>"如果消费者在故障期间进一步变慢怎么办？"</strong> — 背压必须传播。有界队列被填满，生产者收到 503，客户端退避——整条流水线自适应。务必明确提及亚稳定故障模式：不能干净传播背压的系统在故障原因消除后也无法恢复。</li>
+<li><strong>"这与限流有何不同？"</strong> — 限流在生产者侧限制 <code>lambda</code> 。背压是更宏观的工程规范，涵盖限流、 <em>。</em> 有界队列、丢弃策略、熔断器和自动扩缩容。单靠限流无法保护你免受下游变慢的影响；背压可以。</li>
+<li><strong>"你如何决定使用 drop-oldest 还是 tail-drop？"</strong> — 当最新数据最有价值时（实时数据、遥测）使用 drop-oldest。当每条数据价值相同且生产者可以作出反应时（客户端会重试的 API 请求），使用 tail-drop。</li>
+<li><strong>"你如何处理毒消息？"</strong> — 每条消息设置有界重试次数，超限后放入死信队列。否则，单个损坏事件会阻塞整个 topic。</li>
+<li><strong>"为什么不直接无限自动扩容？"</strong> — 成本上限（云账单）、下游约束（数据库连接数限制、第三方 API 限流）、启动时间（自动扩容需要 1-3 分钟，而故障可能只持续 30 秒）。自动扩容是背压的补充，而非替代。</li>
+<li><strong>"你监控什么指标并设置告警？"</strong> — 队列深度增长速率、消费者 lag 的导数、丢弃速率、熔断器开启次数。不能仅凭消费者 p99 延迟。</li>
+<li><strong>"你如何在预生产环境中测试？"</strong> — 在 1.5x 和 2x 容量下进行合成压测；混沌工程（杀死消费者、限流下游）；通过游戏日演练验证从持续过载中恢复的能力。</li>
+</ol>
+<hr/>
+<h2 id="10-common-traps-stronger-moves">10. 常见陷阱 → 更优方案</h2>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"在它们之间加一个队列就好了。"</td>
+<td>明确队列的容量、丢弃策略、归属方以及回退路径。无界队列本质上是内存泄漏。</td>
+</tr>
+<tr>
+<td>每次失败都重试。</td>
+<td>指数退避 + 抖动 + 有界重试次数，并由熔断器把关——当下游不健康时熔断器开启。</td>
+</tr>
+<tr>
+<td>基于 Central Processing Unit (CPU) 自动扩容。</td>
+<td>基于队列深度 / 消费者 lag 自动扩容。CPU 是滞后指标，lag 才是领先指标。</td>
+</tr>
+<tr>
+<td>当下游变慢时阻塞生产者线程。</td>
+<td>有界队列 + 非阻塞 offer + 向客户端返回 503。阻塞会导致队头阻塞并耗尽线程池。</td>
+</tr>
+<tr>
+<td>仅在全局维度应用限流。</td>
+<td>按租户或按 key 的限流可防止单个噪音客户拖垮所有人。</td>
+</tr>
+<tr>
+<td>"Kafka 会吸收这次峰值。"</td>
+<td>Kafka 是持久化的，但也是分区的——热分区的限速远低于集群总容量。此外，消费者 lag 必须在 retention 过期前追上。</td>
+</tr>
+<tr>
+<td>随机丢弃。</td>
+<td>有意识地丢弃：实时数据丢最旧的，混合优先级场景丢最低优先级的，遥测数据按采样 key 丢弃。</td>
+</tr>
+<tr>
+<td>相同的 <code>Retry-After</code> 对所有客户端。</td>
+<td>添加抖动；否则客户端集群会同时重试。</td>
+</tr>
+<tr>
+<td>将背压视为一次性设计。</td>
+<td>将其变为持续性实践：压测、游戏日、对导数设置告警、文档化丢弃策略。</td>
+</tr>
+<tr>
+<td>将过载隐藏在成功的 200 响应背后。</td>
+<td>在丢弃负载时诚实地返回错误。返回 200 但实际未执行任何工作是正确性 bug。</td>
+</tr>
+<tr>
+<td>将自动扩容上限设为无限。</td>
+<td>务必设置上限。成本也是一种故障模式。</td>
+</tr>
+<tr>
+<td>只保护 happy path。</td>
+<td>为每个外部依赖都配置熔断器 + bulkhead，而不仅仅是最近发生过故障的那个。</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h2 id="11-staff-level-answer-checklist">11. Staff 级别回答清单</h2>
+<p>当背压是深度探讨主题时，你的回答应涵盖以下所有内容：</p>
+<ul>
+<li>[ ] 说明不变量："无无界队列，重试不产生正反馈循环。"</li>
+<li>[ ] 陈述 <code>lambda</code>, <code>mu</code>，以及系统的目标 <code>W</code> （延迟）；用 Little's Law 为队列定容。</li>
+<li>[ ] 选择丢弃策略并 <strong>为其辩护</strong> （哪些数据、为何选此策略、用户会损失什么）。</li>
+<li>[ ] 在生产者边缘放置令牌桶或等效机制；如为多租户，说明按租户公平性。</li>
+<li>[ ] 根据数据是否可丢弃，在持久化 broker（Kafka/SQS）与进程内队列之间做出选择。</li>
+<li>[ ] 为每个外部依赖指定熔断器 + bulkhead。</li>
+<li>[ ] 基于正确信号（队列深度 / 消费者 lag）自动扩容，并设置滞后（hysteresis）以防止抖动。</li>
+<li>[ ] 在边缘丢弃负载，客户端退避时加入 <code>503 Retry-After</code> 。 <strong>抖动</strong> 。</li>
+<li>[ ] 使用有界重试和死信队列处理毒消息。</li>
+<li>[ ] 说明亚稳定故障模式，以及能证明你未陷入此模式的测试。</li>
+<li>[ ] 交叉关联幂等性：重试意味着重复，重复意味着幂等性 key。</li>
+<li>[ ] 定义告警：队列深度的导数，而非绝对值。</li>
+<li>[ ] 如果题目涉及多个客户类别，提及多租户公平性。</li>
+<li>[ ] 说明你不会 <em>非</em> 这样做（例如，"我不打算在这里推荐漏桶，因为合法突发流量必须通过"）。</li>
+</ul>
+<hr/>
+<h2 id="12-cross-references">12. 交叉引用</h2>
+<p><strong>相关模式。</strong></p>
+<ul>
+<li><a href="/zh/system-design-patterns/fan-out-write-amplification/">扇出写放大</a> — 写侧的流量倍增问题，通常是你需要吸收的背压来源。</li>
+<li><a href="/zh/system-design-patterns/hot-key-skew/">热键倾斜</a> — 当全局吞吐量正常但单个分区出现背压时。</li>
+<li><a href="/zh/system-design-patterns/strong-consistency-under-contention/">强一致性下的竞争</a> — 固定 <code>mu</code> 必须用背压保护的一致性协议。</li>
+<li><a href="/zh/system-design-patterns/idempotency-exactly-once/">幂等性/精确一次语义</a> — 必要补充：背压意味着重试，重试意味着去重。</li>
+<li><a href="/zh/system-design-patterns/cache-stampede-read-amplification/">缓存击穿/读放大</a> — 读侧的对应模式。</li>
+<li><a href="/zh/system-design-patterns/real-time-aggregation/">实时聚合</a> — 针对基于窗口的聚合器的背压。</li>
+<li><a href="/zh/system-design-patterns/ordering-causal-consistency/">排序 / 因果一致性</a> — 在丢弃事件的同时保持顺序是微妙的。</li>
+<li><a href="/zh/system-design-patterns/durability-at-scale/">大规模持久性</a> — 当"不可丢弃"迫使引入持久化 broker 边界时。</li>
+<li><a href="/zh/system-design-patterns/coordination-exactly-one-execution/">协调 / 精确一次执行</a> — 主节点协调的工作同样需要有界队列。</li>
+<li><a href="/zh/system-design-patterns/search-and-ranking/">搜索与排序</a> — 索引流水线是背压系统的教科书案例。</li>
+<li><a href="/zh/system-design-patterns/geo-spatial-queries/">地理空间查询</a> — 移动客户端产生的突发位置更新。</li>
+</ul>
+<p><strong>以背压为核心的问题文档。</strong></p>
+<ul>
+<li><a href="/zh/common-backend-systems/apache-kafka/">Apache Kafka</a> — 典范持久化 broker；生产者与消费者之间的契约即为背压接口。</li>
+<li><a href="/zh/common-backend-systems/design-an-api-rate-limiter/">API 限流器</a> — 深入讲解令牌桶、漏桶、滑动窗口。</li>
+<li><a href="/zh/common-backend-systems/design-a-metrics-and-monitoring-system-like-datadog/">指标与监控（Datadog）</a> — 日志/指标摄取；第 5 节中的实例可推广至此。</li>
+<li><a href="/zh/common-backend-systems/design-an-ad-click-aggregator/">广告点击聚合器</a> — 突发输入 + 窗口刷新下游。</li>
+<li><a href="/zh/common-backend-systems/design-a-web-crawler/">Web 爬虫</a> — 爬取速率 vs 解析器吞吐量；礼貌性作为限流手段。</li>
+<li><a href="/zh/common-backend-systems/design-a-notification-system/">通知系统</a> — fan-out 放大；每渠道的外部限流（APNs、FCM）。</li>
+<li><a href="/zh/common-backend-systems/design-youtube/">YouTube</a> — 上传 vs 编码流水线；持久化 broker 模式。</li>
+<li><a href="/zh/common-backend-systems/design-a-live-comment-streaming-service-like-twitch-chat/">Live Comment Streaming (Twitch Chat)</a> — 突发输入，实时数据的 drop-oldest 语义。</li>
+<li><a href="/zh/common-backend-systems/design-a-flash-sale-for-an-e-commerce-site/">Flash Sale</a> — 极端生产者峰值；在边缘丢弃负载是必须的。</li>
+</ul>
+<p><strong>术语表。</strong> Staff System Design Glossary 涵盖 quorum、副本、向量时钟等术语，这些术语在更广泛的设计中与背压并肩出现。</p>
+<p><strong>Playbook。</strong> Staff System Design Interview Playbook 介绍整体 45 分钟的结构，本模式作为深度探讨之一嵌入其中。</p>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

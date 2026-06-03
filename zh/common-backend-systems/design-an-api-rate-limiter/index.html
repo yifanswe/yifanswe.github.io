@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>设计 API 限流器 — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">设计 API 限流器</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p><strong>对这些术语不熟悉？</strong> 请参阅 <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> ，了解常见系统设计术语的中英文解释。</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. 基础知识与解题思路</h2>
+<h3 id="what-this-question-is-testing">本题考察点</h3>
+<p>限流器处于每个请求的热路径上，必须在个位数毫秒内做出允许或拒绝的决策。难点在于：在保持决策全局一致性以保护下游的同时，自身不能成为它本应防止的瓶颈。</p>
+<p>其不变量如下：</p>
+<blockquote>
+<p>对于任何限流键（用户、IP、API key、路由、租户或其组合），在任意滑动窗口内允许的请求数不得超过配置的配额，即便流量分散在众多边缘节点且客户端频繁重试。</p>
+</blockquote>
+<p>在 ICT5 / L6+ 级别，面试官考察的是：能否针对新鲜度与成本的权衡选择合适的计数算法、设计能应对热点键的分布式计数器，以及解释限流器自身不可用时的处理方案。</p>
+<h3 id="60-second-interview-framing">60 秒面试框架</h3>
+<p>口述版本：</p>
+<blockquote>
+<p>我会将限流器设计为每个 API 节点上的 sidecar 或内联中间件，由快速的分布式计数器存储作为后端。关键决策包括：选用哪种计数算法（固定窗口、滑动窗口、令牌桶、漏桶）、如何在不为每次请求支付完整往返开销的情况下跨边缘节点保持计数一致性，以及计数器存储降级时系统如何选择 fail-open 或 fail-closed。我将先明确需求，选定令牌桶作为默认算法，梳理数据路径，再深入讨论热点键与一致性问题。</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">首先明确需求</h3>
+<p>功能性需求：</p>
+<ul>
+<li>按身份（用户、API key、IP、租户）和路由对请求进行限流。</li>
+<li>同时支持多个限流窗口（例如：100/秒、1000/分钟、10000/小时）。</li>
+<li>不同身份可以拥有不同的配额；企业客户享有更高限额。</li>
+<li>返回清晰的反馈： <code>429 Too Many Requests</code> 与 <code>Retry-After</code> 以及配额相关的响应头。</li>
+<li>允许短暂突发流量超过持续速率（突发配额）。</li>
+<li>允许管理员在不重新部署的情况下，在运行时配置、提升或撤销配额。</li>
+</ul>
+<p>非功能性需求：</p>
+<ul>
+<li>允许/拒绝的决策延迟在 p99 个位数毫秒级。</li>
+<li>不能成为 API 的单点故障。</li>
+<li>必须能扩展至数百万个不同的键。</li>
+<li>必须能处理热点键（某个租户或 IP 接收不成比例的流量）。</li>
+<li>对被拒绝请求和配额变更具备可审计性。</li>
+</ul>
+<p>除非面试官要求，否则超出范围：</p>
+<ul>
+<li>网络层的 DDoS 攻击（在到达 API 限流器之前已处理）。</li>
+<li>WAF 规则及基于内容的封锁。</li>
+<li>业务层的计费与计量。</li>
+<li>并发限制（最大在途请求数）与速率限制（每单位时间）的区别——需确认是否两者都需要。</li>
+</ul>
+<h3 id="scale-assumptions">规模假设</h3>
+<table>
+<thead>
+<tr>
+<th>领域</th>
+<th>假设</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>API 流量</td>
+<td>全球峰值 1M 请求/秒。</td>
+</tr>
+<tr>
+<td>独立键数量</td>
+<td>超过 100M 个活跃的限流键（每用户 × 每路由的组合）。</td>
+</tr>
+<tr>
+<td>热点 key</td>
+<td>前 1% 的键占据超过 50% 的流量。</td>
+</tr>
+<tr>
+<td>配额更新</td>
+<td>每天数千次；大多为自动化的等级变更。</td>
+</tr>
+<tr>
+<td>限流器延迟预算</td>
+<td>在 API 路径上增加的延迟 p99 低于 5 ms。</td>
+</tr>
+<tr>
+<td>精度容忍度</td>
+<td>在边界处，根据算法不同，误差在配置限额的 1-5% 以内。</td>
+</tr>
+<tr>
+<td>故障模式</td>
+<td>按路由配置：非关键路由 fail-open（允许），敏感路由 fail-closed（拒绝）。</td>
+</tr>
+</tbody>
+</table>
+<p>瓶颈不在计数器存储，而在热点键。单个用户以每秒 10 万次请求的速度驱动，会锁定某一个分片。</p>
+<h3 id="core-product-model">核心产品模型</h3>
+<table>
+<thead>
+<tr>
+<th>界面</th>
+<th>用户体验</th>
+<th>系统需求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>API 调用方</td>
+<td>请求要么被处理，要么收到带有明确重试信号的 429 响应。</td>
+<td>决策必须足够快且准确，确保合法流量不被拦截。</td>
+</tr>
+<tr>
+<td>管理员</td>
+<td>配置配额、等级、覆盖规则；查看拒绝请求的仪表盘。</td>
+<td>配置需强一致性；并复制到所有限流节点。</td>
+</tr>
+<tr>
+<td>下游服务</td>
+<td>信任流量处于约定配额之内。</td>
+<td>限流器在正常运行时不得超额放行。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">高层架构</h3>
+<pre><code class="language-text">                +-------------------+
+Client    ---&gt;  | Edge / API Gateway|
+                +---------+---------+
+                          |
+                          v
+                +-------------------+
+                | Rate Limiter      |
+                | local cache +     |
+                | algorithm         |
+                +----+---------+----+
+                     |         |
+        sync/async   |         |
+        increment    v         v
+            +----------------+   +-------------------+
+            | Counter Store  |   | Quota Config      |
+            | sharded fast   |   | per identity/route|
+            | KV (Redis)     |   | replicated cache  |
+            +-------+--------+   +---------+---------+
+                    |                      ^
+                    v                      |
+            +----------------+    +-----------------+
+            | Persistence    |    | Admin API       |
+            | (optional WAL) |    | quota changes   |
+            +----------------+    +-----------------+
+
+         +-------------------+
+         | Denial Log Stream | -&gt; analytics, audit
+         +-------------------+
+</code></pre>
+<h3 id="core-components">核心组件</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>职责</th>
+<th>关键细节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>边缘层 / API 网关</td>
+<td>负责 TLS 终止，在到达应用层之前实施粗粒度的 IP 级限流。</td>
+<td>低成本的第一级过滤器；在内存中使用简单的固定窗口计数器。</td>
+</tr>
+<tr>
+<td>限流中间件</td>
+<td>对每个请求做出允许/拒绝决策；运行在 API 进程中或作为 sidecar。</td>
+<td>对热点键使用本地令牌桶副本；降级时回退到计数器存储。</td>
+</tr>
+<tr>
+<td>计数存储</td>
+<td>每个键的权威分布式计数器 <code>(key, window)</code>.</td>
+<td>通常是分片的内存 KV 存储，如 Redis 集群；读写延迟低于 1 ms。</td>
+</tr>
+<tr>
+<td>配额配置服务</td>
+<td>存储每个身份和每个路由的配额；支持更新。</td>
+<td>通过 pub/sub 推送或通过版本控制轮询。</td>
+</tr>
+<tr>
+<td>算法</td>
+<td>令牌桶、漏桶、固定窗口或滑动窗口日志/计数器。</td>
+<td>根据突发容忍度和精度需求，按路由选择。</td>
+</tr>
+<tr>
+<td>拒绝日志</td>
+<td>记录每一个 429 响应，包含键、原因、配额和当前计数。</td>
+<td>异步写入；用于分析和滥用检测。</td>
+</tr>
+<tr>
+<td>管理 API</td>
+<td>对配额进行增删改查；紧急覆盖操作。</td>
+<td>已审计、签名且限角色访问。</td>
+</tr>
+<tr>
+<td>兜底决策</td>
+<td>计数器存储不可达时的处理方案。</td>
+<td>按路由配置：fail-open 或 fail-closed。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="algorithms-pick-the-right-one">算法选择（选对适合的算法）</h3>
+<table>
+<thead>
+<tr>
+<th>算法</th>
+<th>工作方式</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>固定窗口</td>
+<td>按固定时间桶（如每分钟）统计请求数，在桶边界处重置。</td>
+<td>最简单；每个键只需一个计数器。</td>
+<td>窗口边界处的突发流量可能导致跨两个窗口的放行量达到配额的 2 倍。</td>
+</tr>
+<tr>
+<td>滑动窗口日志</td>
+<td>存储每个请求的时间戳；统计窗口内的请求数。</td>
+<td>最精确。</td>
+<td>内存开销随流量线性增长。</td>
+</tr>
+<tr>
+<td>滑动窗口计数器</td>
+<td>对当前和上一个固定窗口进行加权混合。</td>
+<td>开销低；对滑动窗口的近似效果好。</td>
+<td>在接近限额时存在轻微的不准确性。</td>
+</tr>
+<tr>
+<td>令牌桶</td>
+<td>大小为 N 个令牌的桶，以速率 R 补充；每个请求消耗一个令牌。</td>
+<td>支持受控突发，最多可达桶容量；对于"最大持续速率"的策略直观易懂。</td>
+<td>需要原子性的扣减加上补充计算。</td>
+</tr>
+<tr>
+<td>漏桶</td>
+<td>具有固定泄漏速率的队列；请求加入队列或被丢弃。</td>
+<td>平滑输出速率；适合流量整形。</td>
+<td>因排队引入额外延迟。</td>
+</tr>
+</tbody>
+</table>
+<p>默认推荐： <strong>令牌桶</strong> 适用于面向客户端的 API，因为其策略易于人类理解，且突发是一等概念。对同一个键组合使用多个窗口：例如，一个 100/秒的桶和一个 10000/小时的桶，两者同时允许才放行。</p>
+<p>面试用语：</p>
+<blockquote>
+<p>我会将令牌桶作为默认选择，因为其策略对人类可读，且突发是一等概念。当同一个键需要同时应对短期和长期保护时，我会在不同窗口上叠加多个桶。</p>
+</blockquote>
+<h3 id="data-model">数据模型</h3>
+<h4 id="quota-configuration">配额配置</h4>
+<pre><code class="language-text">Quota(
+  scope,                // global, route, tenant, user, ip, api_key
+  key_pattern,          // route_id, tenant_id, user_id, ...
+  algorithm,            // token_bucket, sliding_window, ...
+  capacity,             // bucket size or window count
+  refill_rate,          // tokens per second
+  window_size,          // for window-based algorithms
+  priority,             // tie-break when multiple rules match
+  fail_mode,            // open, closed
+  version
+)
+</code></pre>
+<h4 id="token-bucket-state">令牌桶状态</h4>
+<p>存储在计数器存储中，以键控索引 <code>bucket_key = hash(quota_id, identity)</code>:</p>
+<pre><code class="language-text">BucketState(
+  bucket_key,
+  tokens,               // float
+  last_refill_ts,       // milliseconds
+  version               // optional CAS token
+)
+</code></pre>
+<p>对于滑动窗口计数器：</p>
+<pre><code class="language-text">WindowState(
+  bucket_key,
+  current_window_id,
+  current_count,
+  previous_count
+)
+</code></pre>
+<h4 id="denial-record">拒绝记录</h4>
+<pre><code class="language-text">DenialEvent(
+  ts,
+  key,
+  identity,
+  route,
+  quota_id,
+  reason,                // exceeded_burst, exceeded_sustained, ...
+  retry_after_ms
+)
+</code></pre>
+<h3 id="apis">API</h3>
+<p>内部限流器检查（RPC 或进程内）：</p>
+<pre><code class="language-text">CheckRequest {
+  identities: [user_id?, api_key?, ip?, tenant_id?]
+  route_id
+  cost?            // default 1; expensive endpoints can charge more
+}
+
+CheckResponse {
+  decision: ALLOW | DENY
+  remaining: integer
+  reset_at: timestamp
+  retry_after_ms: integer  // when DENY
+  reason: string           // when DENY
+}
+</code></pre>
+<p>对拒绝请求的外部响应：</p>
+<pre><code class="language-text">HTTP 429 Too Many Requests
+Headers:
+  Retry-After: 12
+  X-RateLimit-Limit: 100
+  X-RateLimit-Remaining: 0
+  X-RateLimit-Reset: 1700000000
+</code></pre>
+<p>管理 API：</p>
+<pre><code class="language-text">PUT /quotas/{scope}/{key}
+GET /quotas/{scope}/{key}
+GET /denials?identity=&amp;route=&amp;since=
+</code></pre>
+<h3 id="token-bucket-implementation-detail">令牌桶实现细节</h3>
+<p>经典的原子操作：</p>
+<pre><code class="language-text">on each request:
+  state = read BucketState(bucket_key)
+  now = current_time_ms
+  elapsed = now - state.last_refill_ts
+  tokens_to_add = elapsed * refill_rate / 1000
+  state.tokens = min(capacity, state.tokens + tokens_to_add)
+  state.last_refill_ts = now
+  if state.tokens &gt;= cost:
+    state.tokens -= cost
+    write BucketState (CAS or atomic Lua)
+    return ALLOW
+  else:
+    return DENY with retry_after = (cost - state.tokens) / refill_rate
+</code></pre>
+<p>两种实现选择：</p>
+<ul>
+<li><strong>Redis 加 Lua 脚本</strong>：在单次往返中原子性地对桶执行读-改-写操作。每个 API 节点调用该脚本。</li>
+<li><strong>本地近似值 + 异步同步</strong>：每个节点为热点键维护一个本地令牌桶，并定期以 delta 的方式同步到中央计数器存储。以牺牲精度换取低延迟和更低的计数器存储压力。</li>
+</ul>
+<p>对于热点键：本地近似值至关重要。同步调用中央存储的方案无法处理单个键每秒 10 万 QPS 的场景。</p>
+<h3 id="hot-key-strategy">热点键策略</h3>
+<p>单个租户以每秒 10 万请求的速度消耗其配额，会锁定持有该键的 Redis 分片。</p>
+<p>缓解措施：</p>
+<ul>
+<li><strong>优先本地限流。</strong> 每个 API 节点为每个键维护一个本地令牌桶，容量为 <code>local_capacity = total_capacity / N</code> 其中 <code>N</code> 即节点数量。突发流量在本地处理，无需协调。</li>
+<li><strong>节点级子配额。</strong> 通过静态分配或 gossip 协议将配额预分发到各节点；节点仅在其份额接近耗尽时才联系中央存储。</li>
+<li><strong>分层限流器。</strong> 边缘节点在本地强制执行全局配额的 80%；中央节点对跨节点突发流量执行剩余的 20%。</li>
+<li><strong>对键进行分片。</strong> 对于单个极热的键，在限流器层将其拆分为 N 个子键；每个子键承载 <code>capacity/N</code>，请求根据哈希映射到子键。接受一种情况：即便某个大客户的全局配额未耗尽，仍可能因子键层面被略微限流。</li>
+<li><strong>副本读取。</strong> 对于能容忍轻微滞后的算法，从本地副本读取，并在后台进行调和。</li>
+</ul>
+<p>面试用语：</p>
+<blockquote>
+<p>中央计数器存储是精度的兜底手段，而非热点键的内联处理路径。我将执行逻辑下推到边缘，使用本地桶进行异步调和，以有界的超额放行换取高可用性。</p>
+</blockquote>
+<h3 id="write-and-read-path">写路径与读路径</h3>
+<p>请求路径（每次 API 调用）：</p>
+<ol>
+<li>API 节点接收请求。</li>
+<li>解析身份：从鉴权 token 中提取用户信息、路由、租户和 IP。</li>
+<li>从本地配额缓存（每隔几秒从配额服务刷新）中查找适用的配额。</li>
+<li>对每个配额，检查本地令牌桶；若任意一个返回 DENY，则返回 429。</li>
+<li>若所有本地检查均放行，可选择性地与中央计数器存储同步，用于高优先级配额。</li>
+<li>将请求转发给 API。</li>
+<li>若被拒绝，发出拒绝事件；否则在同步路径上不记录日志。</li>
+</ol>
+<p>配额配置更新路径：</p>
+<ol>
+<li>管理员通过管理 API 更新配额。</li>
+<li>配额服务写入强一致性存储。</li>
+<li>在 pub/sub 上发布配额版本变更事件。</li>
+<li>限流节点在下一次轮询或推送时获取新版本（附带版本号），然后原子性地替换本地规则。</li>
+</ol>
+<h3 id="scaling-and-partitioning">扩展与分区</h3>
+<table>
+<thead>
+<tr>
+<th>数据</th>
+<th>分区键</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>计数器存储的桶</td>
+<td>对 <code>bucket_key</code> 跨 Redis 集群分片进行哈希。</td>
+<td>分布均匀；支持每个键的原子操作。</td>
+</tr>
+<tr>
+<td>配额配置</td>
+<td>复制到所有限流节点。</td>
+<td>读多写少，数据量小，变更频率低。</td>
+</tr>
+<tr>
+<td>拒绝日志</td>
+<td>按时间分桶；按路由或租户分区。</td>
+<td>在攻击期间数据量可能极大；适用于事后分析。</td>
+</tr>
+<tr>
+<td>热点键拆分</td>
+<td>逻辑键 <code>bucket_key:shard_id</code> 针对已知热点键。</td>
+<td>将负载分散到多个分片。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">一致性模型</h3>
+<table>
+<thead>
+<tr>
+<th>决策</th>
+<th>一致性</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>正常键的允许/拒绝</td>
+<td>跨节点最终一致（漂移范围为毫秒到秒级）</td>
+<td>可接受少量百分比的超额放行。</td>
+</tr>
+<tr>
+<td>热点键的允许/拒绝</td>
+<td>本地优先；中央作为兜底</td>
+<td>无法承受每次请求的同步往返开销。</td>
+</tr>
+<tr>
+<td>配额配置</td>
+<td>通过版本化配置实现强一致性</td>
+<td>运营人员期望变更能够可预期地生效。</td>
+</tr>
+<tr>
+<td>拒绝日志</td>
+<td>最终一致</td>
+<td>用于分析，而非决策。</td>
+</tr>
+</tbody>
+</table>
+<p>接受分布式限流本质上是近似的这一现实。合同是"我们不会显著超过配置速率的放行"，而非"我们不会多放行哪怕一个请求"。</p>
+<h3 id="failure-modes-and-fail-mode-choice">故障模式及故障模式选择</h3>
+<table>
+<thead>
+<tr>
+<th>失败</th>
+<th>缓解措施</th>
+<th>故障模式默认行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>计数器存储不可达</td>
+<td>本地桶继续服务；恢复后中央计数同步跟上。</td>
+<td>低级别路由 fail-open；计费/鉴权/安全路由 fail-closed。</td>
+</tr>
+<tr>
+<td>计数器存储热点分片</td>
+<td>提前对热点键进行分片；使用本地近似值。</td>
+<td>以降级精度 fail-open。</td>
+</tr>
+<tr>
+<td>配额配置服务宕机</td>
+<td>限流器使用最后已知的配置。</td>
+<td>实际上是冻结状态，但功能正常。</td>
+</tr>
+<tr>
+<td>节点间时钟偏差</td>
+<td>使用服务器时间进行补充；限制漂移；本地使用单调时钟。</td>
+<td>在补充边界处存在轻微不准确。</td>
+</tr>
+<tr>
+<td>限流中间件崩溃</td>
+<td>Sidecar 重启；进程内中间件随 API 进程一同失败。</td>
+<td>与 API 进程同命运。</td>
+</tr>
+<tr>
+<td>在窗口边界处的协调突发问题（固定窗口缺陷）</td>
+<td>切换到滑动窗口或令牌桶。</td>
+<td>算法选择问题。</td>
+</tr>
+</tbody>
+</table>
+<p>选择 fail-open 还是 fail-closed 是产品策略决定：支付接口选 fail-closed；状态页面选 fail-open。</p>
+<h3 id="multi-region-strategy">多区域策略</h3>
+<p>对于全球 API，配额通常意味着单一全局速率。</p>
+<p>两种方案：</p>
+<ul>
+<li><strong>按区域配额</strong> （拆分为 N 份）：简单，无需跨区域协调，但空闲区域的"冗余容量"只有在重新分配时才能被繁忙区域使用。</li>
+<li><strong>全局配额加分层执行</strong>：每个区域在本地执行其基准份额；全局调和器追踪总使用量。若某区域的份额未使用，其他区域可申请临时租约。</li>
+</ul>
+<p>对大多数 API 而言，按区域拆分已足够好。突发情况下的跨区域精度极难保证，且鲜少被要求。</p>
+<h3 id="operational-metrics">运维指标</h3>
+<p>正确性指标：</p>
+<ul>
+<li>每个键的实际速率与配置限额的对比（应保持在限额以内或以下）。</li>
+<li>超额放行比率：在持续流量期间 <code>actual / configured</code> 的比值。</li>
+<li>各限流节点间的配额配置版本偏差。</li>
+</ul>
+<p>容量指标：</p>
+<ul>
+<li>计数器存储的 QPS、延迟和分片分布情况。</li>
+<li>限流中间件的决策延迟。</li>
+<li>按 QPS 和拒绝率排名的 Top-N 热点键。</li>
+</ul>
+<p>业务与安全指标：</p>
+<ul>
+<li>按路由、租户、身份划分的拒绝率。</li>
+<li>429 转 200 的重试成功率。</li>
+<li>峰值检测：某一身份的拒绝数突然激增（可能是机器人或账号被盗）。</li>
+<li>配额变更审计跟踪。</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">需要指出的权衡</h3>
+<ul>
+<li>滑动窗口日志最为精确，但开销较大；滑动窗口计数器以牺牲若干百分比的精度为代价，将内存占用降低数个数量级。</li>
+<li>Token bucket 允许突发流量；leaky bucket 则将其平滑处理。根据是否欢迎突发性来做选择。</li>
+<li>同步中心计数器精度高，但限制吞吐量；本地近似方案速度快，但允许量略有超出。</li>
+<li>过于严格的限制能保护下游，但会引发用户投诉；过于宽松的限制能保护用户体验，但会暴露下游。</li>
+<li>按 IP 限流会伤害 NAT 后或大型企业代理后的用户；按 API key 限流需要在限流路径上进行身份认证。</li>
+<li>失败开放对用户友好，但会放过滥用行为；失败关闭保护下游，但会导致故障范围扩大。</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">常见陷阱与更优做法</h3>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>仅使用固定窗口。</td>
+<td>指出边界突发缺陷；选择滑动窗口或 token bucket。</td>
+</tr>
+<tr>
+<td>用单个 Redis 实例存储所有计数器。</td>
+<td>使用分片集群；将集群本身作为一个分层并针对分片饱和进行设计。</td>
+</tr>
+<tr>
+<td>每次请求都同步往返 Redis。</td>
+<td>本地桶 + 异步协调；分层执行。</td>
+</tr>
+<tr>
+<td>忽视配额更新路径。</td>
+<td>带显式传播与审计的版本化配置。</td>
+</tr>
+<tr>
+<td>忘记故障模式。</td>
+<td>声明每条路由的失败开放或关闭策略并说明理由。</td>
+</tr>
+<tr>
+<td>平等对待所有 key。</td>
+<td>识别热点 key，提前分片或使用近似本地桶。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">面试官可能深入探讨的方向</h3>
+<table>
+<thead>
+<tr>
+<th>深入方向</th>
+<th>优秀回答要点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>算法选择</td>
+<td>对比 token bucket、滑动窗口计数器、固定窗口，说明为何以 token bucket 作为默认选择。</td>
+</tr>
+<tr>
+<td>热点 key 处理</td>
+<td>本地优先执行；预分片；基于 gossip 的容量重新分配。</td>
+</tr>
+<tr>
+<td>分布式一致性</td>
+<td>接受有界误差；解释本地 + 中心协调如何工作。</td>
+</tr>
+<tr>
+<td>故障模式</td>
+<td>按路由的失败开放与关闭；如何检测与恢复。</td>
+</tr>
+<tr>
+<td>多区域</td>
+<td>按区域拆分与分层全局方案的对比；权衡分析。</td>
+</tr>
+<tr>
+<td>实现</td>
+<td>展示用于原子 token bucket 的 Redis Lua 脚本。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff 级别回答检查清单</h3>
+<ul>
+<li>声明不变量：即使在重试情况下，也不得超过每个 key 的配置速率。</li>
+<li>选择一种算法并说明理由。</li>
+<li>区分热路径执行与精确中心计数。</li>
+<li>用本地桶和预分片解释热点 key 处理。</li>
+<li>将配额配置平面与数据平面分开介绍。</li>
+<li>声明每条路由的失败开放或关闭策略。</li>
+<li>讨论多区域配额拆分。</li>
+<li>将拒绝日志作为安全审计的异步旁路通道。</li>
+</ul>
+<h3 id="interview-phrase">面试用语</h3>
+<blockquote>
+<p>分布式限流是一个近似问题，而非精确计数问题。我愿意接受几个百分点的超限，以换取亚毫秒级决策和对计数器存储故障的韧性，并只在真正重要的地方为精度付出代价：计费、安全和滥用拦截。</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. 模拟面试</h2>
+<p><strong>面试官：</strong> 设计一个 API 限流器。</p>
+<p><strong>候选人：</strong> 我将以每请求允许/拒绝中间件为核心进行设计，后端由分布式计数器支撑。不变量是：对于任意限流 key——用户、API key、IP、租户、路由或其组合——我们在整个集群中不会显著超过配置的配额。我将从澄清需求开始，选择算法，梳理数据路径，并深入讨论热点 key 与一致性问题。</p>
+<p><strong>面试官：</strong> 你会选择哪种算法？</p>
+<p><strong>候选人：</strong> 默认选用 token bucket。其语义直观易懂：固定的补充速率和突发容量。对于长窗口下接近限制时的精度要求，我有时会叠加一个滑动窗口计数器作为第二个桶。固定窗口最简单，但存在边界突发问题——在窗口边界附近可能获得 2 倍的限额，因此对面向客户端的 API 我会避免使用。</p>
+<p><strong>面试官：</strong> 计数器存放在哪里？</p>
+<p><strong>候选人：</strong> 逻辑上存放在分片的高速 KV 存储（如 Redis 集群）中，通过 Lua 脚本原子执行读-改-写。实践中，每个 API 节点针对活跃 key 维护本地 token bucket，中心计数器作为精度的兜底。对于热点 key，每个节点从本地份额执行，无需往返；否则中心存储将成为瓶颈。</p>
+<p><strong>面试官：</strong> 如果单个租户每秒产生 100,000 个请求怎么办？</p>
+<p><strong>候选人：</strong> 这就是热点 key 问题。有几种缓解方案：第一，将配额分配给各 API 节点，让每个节点在本地执行其份额。第二，将 key 拆分为子分片：将请求哈希到 N 个逻辑桶中的某一个，每个桶容量为 capacity/N。用户在未达到全局上限时可能会被轻微限流，这是可接受的权衡。第三，如果中心存储开始饱和，限流器退回到纯本地执行，并接受超限。</p>
+<p><strong>面试官：</strong> 精度如何？</p>
+<p><strong>候选人：</strong> 在本地优先执行和异步协调下，突发期间可能超限几个百分点，尤其是在流量突然激增之后。这对几乎所有限流场景来说都是可接受的。如果某路由需要严格计数——计费计量、安全拦截——我会通过同步 Redis Lua 脚本处理，并接受更高延迟。</p>
+<p><strong>面试官：</strong> 如果 Redis 宕机怎么办？</p>
+<p><strong>候选人：</strong> 中间件回退到本地桶。这里的配置很关键：对非关键路由，失败开放并接受部分超限；对计费和认证，失败关闭。每条路由都有一个失败模式策略。拒绝日志会记录回退情况，以便事后审计。</p>
+<p><strong>面试官：</strong> 如何处理配额更新？</p>
+<p><strong>候选人：</strong> 配额配置是独立于数据平面的控制平面。管理 API 写入强一致性存储，递增版本号，并在 pub/sub 上发布变更事件。限流节点通过订阅或轮询获取更新，并原子地切换到带有新版本号的新配额。运维人员可通过查询每个节点上的活跃版本来验证传播情况。</p>
+<p><strong>面试官：</strong> 你会返回什么状态码和响应头？</p>
+<p><strong>候选人：</strong> <code>429 Too Many Requests</code> 与 <code>Retry-After</code>, <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>，以及 <code>X-RateLimit-Reset</code> 响应头。retry-after 根据 token bucket 计算得出 <code>(cost - tokens) / refill_rate</code>。客户端可以据此精确退避。</p>
+<p><strong>面试官：</strong> NAT 后或企业代理后的 IP 如何处理？</p>
+<p><strong>候选人：</strong> 按 IP 限流会不公平地伤害 NAT 后的用户——整个办公室共享一个配额。因此我会组合限制：一个粗粒度的按 IP 防护用于匿名滥用保护，一个按已认证身份的限制用于实际产品配额。在 API 内部，我尽可能优先使用基于身份的限制。</p>
+<p><strong>面试官：</strong> 多区域？</p>
+<p><strong>候选人：</strong> 最简单的方式是按区域拆分配额：每个区域获得全局配额的一份，在本地执行。无需跨区域协调，但安静区域未使用的容量会被浪费。如果产品需要单一全局配额，我会添加一个全局协调器，定期跟踪用量并在区域间重新分配租约——以边际精度提升换取运维复杂度。大多数 API 使用按区域拆分就足够了。</p>
+<p><strong>面试官：</strong> 如何支持不同的服务层级——免费、专业、企业？</p>
+<p><strong>候选人：</strong> 配额配置将身份属性映射到算法和容量。请求到来时，限流器从认证上下文中解析服务层级并查询适用的配额。层级变更即配置变更，下次配置刷新时生效。对于极高并发的企业客户，我可能会预先对其 key 进行分片，以避免单个 Redis 分片成为瓶颈。</p>
+<p><strong>面试官：</strong> 如何检测客户滥用配额？</p>
+<p><strong>候选人：</strong> 拒绝事件流向分析管道。模式包括：持续 100% 拒绝率（始终处于上限）、以前安静的身份突然爆发（账号被盗），或拒绝集中在可疑路由上。告警会触发安全审查，并可能自动吊销 API key。</p>
+<p><strong>面试官：</strong> 总结设计。</p>
+<p><strong>候选人：</strong> 算法选用 token bucket，每个 API 节点本地优先执行，分片 Redis 集群作为精度兜底。热点 key 拆分为子桶。配额配置是独立的版本化控制平面。每路由配置失败模式策略。多区域默认使用按区域配额拆分。整体设计接受分布式限流本质上是近似的，以快速决策和高可用性为优先目标，而非精确计数。</p>
+<h2 id="3-practice-notes">3. 练习备注</h2>
+<h3 id="five-minute-version">五分钟版本</h3>
+<ol>
+<li>澄清：按身份、按路由、多窗口、失败模式的限制。</li>
+<li>声明不变量：不得显著超过配置速率。</li>
+<li>选择 token bucket；与固定/滑动窗口对比说明理由。</li>
+<li>展示数据路径：本地桶 → 可选的中心 Redis 检查。</li>
+<li>用本地优先和 key 分片解决热点 key 问题。</li>
+<li>展示独立于数据平面的配额配置平面。</li>
+<li>讨论每路由的失败开放与失败关闭。</li>
+<li>以多区域按区域拆分和拒绝日志作为收尾。</li>
+</ol>
+<h3 id="one-minute-closeout">一分钟结尾陈述</h3>
+<blockquote>
+<p>限流器是一个近似系统。我会使用 token bucket 提供人类可读的配额，将执行下沉至进程内本地桶以保持热路径快速，并以分片 Redis 集群作为兜底。热点 key 预先分片；配额配置有独立的版本化平面。失败模式按路由配置。核心权衡是精确计数与可用性，我优化可用性，接受几个百分点的超限。</p>
+</blockquote>
+<h3 id="best-interview-phrases">最佳面试用语</h3>
+<ul>
+<li>"分布式限流是一个近似问题，而非精确计数问题。"</li>
+<li>"Token bucket 是默认选择，因为突发性是一等概念。"</li>
+<li>"本地优先执行；中心存储是兜底，而非内联路径。"</li>
+<li>"热点 key 会破坏朴素设计；预先对 key 分片或从逻辑上拆分它。"</li>
+<li>"失败模式是按路由的策略决策，而非全系统设置。"</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

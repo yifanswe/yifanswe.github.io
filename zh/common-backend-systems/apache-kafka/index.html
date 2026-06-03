@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Apache Kafka — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">Apache Kafka</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p><strong>对这些术语不熟悉？</strong> 请参阅 <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> ，了解常见系统设计术语的中英文解释。</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. 基础知识与解题思路</h2>
+<h3 id="what-this-question-is-testing">本题考察点</h3>
+<p>Kafka 是一个分布式日志系统：一个仅追加、分区、副本复制的数据流。难点在于：在分区内保证消息有序、在 broker 故障时做到零数据丢失、扩展至每秒数百万次写入，以及支持消费者组在不重复处理的情况下共享工作负载。</p>
+<p>其不变量如下：</p>
+<blockquote>
+<p>每条生产成功的消息都会在 quorum 副本上持久化提交，在其所在分区内有序排列，可由任何消费者按分配的 offset 读取，并按配置时间保留；消费者组将分区分配给各成员，使每个分区最多由组内一个消费者处理；rebalance 有界，不会丢失进度。</p>
+</blockquote>
+<p>在 ICT5 / L6+ 级别，面试官考查的是：能否设计一个分区副本日志、解释主节点选举和 ISR（同步副本集），推导 producer acks 级别的含义，理解消费者组 rebalance 机制，以及通过事务或幂等 producer 实现 exactly-once 语义。</p>
+<h3 id="60-second-interview-framing">60 秒面试框架</h3>
+<p>口述版本：</p>
+<blockquote>
+<p>我会将 Kafka 设计为一个 broker 集群，每个 broker 持有一部分 topic 分区。每个分区是一个带副本的仅追加日志，由一个主节点（leader）处理读写，从节点（follower）负责复制。Producer 向分区 leader 发送批量消息；Consumer 按分区追踪 offset。消费者组将分区拆分以实现并行消费。核心设计决策包括：分区副本、ISR 管理、producer ack 级别、消费者组 rebalance，以及 exactly-once 语义。</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">首先明确需求</h3>
+<p>功能性需求：</p>
+<ul>
+<li>带分区的有序消息日志 topic。</li>
+<li>Producer 追加消息；持久化。</li>
+<li>Consumer 从 offset 开始读取；可恢复。</li>
+<li>消费者组：成员共享分区。</li>
+<li>数据保留：按时间或大小。</li>
+<li>Topic 压缩（按 key 保留最新值）。</li>
+<li>跨 topic 的事务，以实现 exactly-once 语义。</li>
+</ul>
+<p>非功能性需求：</p>
+<ul>
+<li>每集群每秒百万级写入。</li>
+<li>PB 级存储；数周的保留期。</li>
+<li>高可用性：能容忍 broker 故障。</li>
+<li>分区内强顺序保证。</li>
+<li>Producer 持久性可调（acks=0、1、all）。</li>
+<li>Consumer 支持 at-least-once 或 exactly-once。</li>
+</ul>
+<p>以下内容超出范围，除非被特别询问：</p>
+<ul>
+<li>Connector 和 Kafka Connect。</li>
+<li>Streams 处理 API。</li>
+<li>KSQL。</li>
+</ul>
+<h3 id="scale-assumptions">规模假设</h3>
+<table>
+<thead>
+<tr>
+<th>领域</th>
+<th>假设</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Broker</td>
+<td>每集群 10 至 1000 个。</td>
+</tr>
+<tr>
+<td>Topic</td>
+<td>数千个。</td>
+</tr>
+<tr>
+<td>分区</td>
+<td>每集群 1 万至 10 万个。</td>
+</tr>
+<tr>
+<td>吞吐量</td>
+<td>每集群每秒数百万条消息。</td>
+</tr>
+<tr>
+<td>留存期</td>
+<td>数小时至数周。</td>
+</tr>
+<tr>
+<td>副本因子</td>
+<td>通常为 3。</td>
+</tr>
+<tr>
+<td>消息大小</td>
+<td>通常 1 KB；最大 1 MB。</td>
+</tr>
+<tr>
+<td>消费者组</td>
+<td>数百至数千个。</td>
+</tr>
+</tbody>
+</table>
+<p>瓶颈：分区级吞吐量（单一 leader）、broker 的磁盘 I/O，以及元数据变更时的 controller 工作负载。</p>
+<h3 id="core-product-model">核心产品模型</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>职责</th>
+<th>需求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>broker</td>
+<td>存储分区日志；服务 producer 和 consumer。</td>
+<td>磁盘密集；高 I/O。</td>
+</tr>
+<tr>
+<td>Controller</td>
+<td>管理集群元数据；负责主节点选举。</td>
+<td>每集群一个 controller；高可用副本。</td>
+</tr>
+<tr>
+<td>Producer</td>
+<td>向分区追加消息。</td>
+<td>批量处理；可调节持久性。</td>
+</tr>
+<tr>
+<td>消费者</td>
+<td>从分配的分区读取消息；提交 offset。</td>
+<td>默认 at-least-once。</td>
+</tr>
+<tr>
+<td>消费者组</td>
+<td>用于分区分配的成员协议。</td>
+<td>成员变更时触发 rebalance。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">高层架构</h3>
+<pre><code class="language-text">Producers --batch--&gt; Broker (partition leader)
+                          |
+                          v
+                 +------------------+
+                 | Append-only Log  |
+                 | per partition    |
+                 +--------+---------+
+                          |
+                replicate to followers
+                          |
+                          v
+                 +------------------+
+                 | Follower brokers |
+                 | mirror log       |
+                 +------------------+
+
+
+Consumers --poll--&gt; Broker (partition leader/follower) -&gt; consume offsets
+
+Controller (metadata, leader election, ISR management)
+</code></pre>
+<h3 id="core-components">核心组件</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>职责</th>
+<th>关键细节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>broker</td>
+<td>在本地磁盘上存储日志；处理生产/消费请求。</td>
+<td>无状态配置；数据存储在磁盘上。</td>
+</tr>
+<tr>
+<td>分区 leader</td>
+<td>负责该分区的读写。</td>
+<td>向 follower 复制数据。</td>
+</tr>
+<tr>
+<td>分区 follower</td>
+<td>镜像 leader 的日志。</td>
+<td>在 leader 故障时晋升为 leader。</td>
+</tr>
+<tr>
+<td>Controller</td>
+<td>追踪 broker 存活状态；分配分区 leader；管理元数据。</td>
+<td>关键组件；高可用。</td>
+</tr>
+<tr>
+<td>ZooKeeper / KRaft</td>
+<td>存储集群元数据。</td>
+<td>在现代 Kafka 中已被 KRaft（基于 Raft）取代。</td>
+</tr>
+<tr>
+<td>日志段（Log segment）</td>
+<td>磁盘上的文件；分区日志的分块。</td>
+<td>建有索引以快速查找 offset。</td>
+</tr>
+<tr>
+<td>Producer 客户端</td>
+<td>批量处理消息；按分区键路由。</td>
+<td>可插拔的 partitioner。</td>
+</tr>
+<tr>
+<td>Consumer 客户端</td>
+<td>轮询分区；管理 offset。</td>
+<td>心跳检测；rebalance 处理器。</td>
+</tr>
+<tr>
+<td>组协调器（Group coordinator）</td>
+<td>管理消费者组成员关系的 broker（每组一个）。</td>
+<td>负责分区分配。</td>
+</tr>
+<tr>
+<td>压缩</td>
+<td>按 key 保留最新值。</td>
+<td>每个 topic 可选配置。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">数据模型</h3>
+<h4 id="partition-log">分区日志</h4>
+<p>仅追加的记录日志：</p>
+<pre><code class="language-text">Record(
+  offset,               // monotonic per partition
+  key?,
+  value,
+  headers,
+  timestamp,
+  producer_id?,
+  producer_epoch?,
+  sequence?             // for idempotent producer
+)
+</code></pre>
+<p>存储在 broker 磁盘上的 segment 文件中；索引将 offset 映射到文件位置。</p>
+<h4 id="topic-metadata">Topic 元数据</h4>
+<pre><code class="language-text">Topic(
+  topic_name,
+  partition_count,
+  replication_factor,
+  retention_ms,
+  retention_bytes,
+  cleanup_policy,         // delete, compact
+  min_isr,
+  compression
+)
+</code></pre>
+<h4 id="partition-state">分区状态</h4>
+<pre><code class="language-text">Partition(
+  topic_partition,        // topic + partition_id
+  leader_broker,
+  replica_set,            // assigned brokers
+  isr,                    // in-sync replicas
+  leader_epoch,
+  high_water_mark,
+  log_start_offset
+)
+</code></pre>
+<h4 id="consumer-offset">Consumer Offset</h4>
+<pre><code class="language-text">Offset(
+  group_id,
+  topic_partition,
+  committed_offset,
+  metadata,
+  committed_at
+)
+</code></pre>
+<p>存储在 Kafka 内部 topic 中（<code>__consumer_offsets</code>).</p>
+<h3 id="apis">API</h3>
+<pre><code class="language-text">Produce(topic, partition?, key?, value, acks)
+Fetch(topic, partition, offset, max_bytes)
+JoinGroup(group_id, member_id, subscriptions)
+Heartbeat(group_id, member_id, generation)
+CommitOffsets(group_id, offsets)
+</code></pre>
+<h3 id="replication-and-isr">副本复制与 ISR</h3>
+<p>每个分区有一个副本因子（例如 3）。一个副本为 leader，其余为 follower。</p>
+<ul>
+<li>Leader 接收生产请求，追加到本地日志。</li>
+<li>Follower 从 leader 拉取数据并复制。</li>
+<li>Follower 满足以下条件时被认为是 <strong>同步副本（ISR）</strong> ：其 offset 在阈值范围内追上了 leader。</li>
+<li>高水位线（HW）是所有 ISR 成员都已复制的最高 offset。</li>
+<li>Consumer 只能读取到 HW 之前的数据。</li>
+</ul>
+<p>Producer acks 级别：</p>
+<ul>
+<li><code>acks=0</code>：producer 不等待确认。速度最快，无持久性保证。</li>
+<li><code>acks=1</code>：leader 写入本地后立即返回，不等待 follower。若 leader 在复制前故障，存在数据丢失风险。</li>
+<li><code>acks=all</code>：leader 等待所有 ISR 成员确认。持久性最强。</li>
+</ul>
+<p>若某个 follower 滞后过多，将被移出 ISR；分区继续以剩余 ISR 成员运行。若 ISR 缩减至低于 <code>min.insync.replicas</code>，分区将拒绝写入（附带 <code>acks=all</code>).</p>
+<p>面试用语：</p>
+<blockquote>
+<p>ISR 是被认为处于最新状态的动态副本集。当所有 ISR 成员确认后，写入才算提交；Consumer 只能看到已提交的 offset。这使得持久性可以以成本为代价进行调节。</p>
+</blockquote>
+<h3 id="leader-election">主节点选举</h3>
+<p>Controller 监控 broker 健康状态。当某个 broker 故障时：</p>
+<ol>
+<li>Controller 通过心跳超时检测到故障。</li>
+<li>对于该 broker 所负责的每个分区，controller 从 ISR 中选出新的 leader。</li>
+<li>新 leader 接管；发出新的 leader_epoch。</li>
+<li>Producer 向新 leader 重试。</li>
+</ol>
+<p>若没有可用的 ISR 成员，行为取决于 <code>unclean.leader.election.enable</code>:</p>
+<ul>
+<li>默认 false：分区将不可用，直到某个 ISR 成员恢复。</li>
+<li>True：允许选举一个不同步的副本（提高可用性，但存在数据丢失风险）。</li>
+</ul>
+<p>现代 Kafka 使用 <strong>KRaft</strong> （基于 Raft 的 controller），取代 ZooKeeper，简化了部署。</p>
+<h3 id="producer-path">Producer 路径</h3>
+<ol>
+<li>Producer 创建带可选 key 的消息记录。</li>
+<li>Partitioner 选择分区：hash(key) % num_partitions，或在无 key 时使用轮询。</li>
+<li>Producer 按分区批量聚合消息。</li>
+<li>将批量消息发送给分区 leader。</li>
+<li>Leader 追加到本地日志并复制。</li>
+<li>一旦满足 acks 级别要求，leader 返回成功。</li>
+</ol>
+<p>幂等 producer：</p>
+<ul>
+<li>每个 producer 有一个 producer_id 及每个分区的序列号。</li>
+<li>Broker 通过以下方式去重： <code>(producer_id, sequence_number)</code>.</li>
+<li>消除重试导致的重复消息。</li>
+</ul>
+<p>事务性 producer：</p>
+<ul>
+<li>Producer 开启一个事务。</li>
+<li>向多个分区/topic 写入数据。</li>
+<li>原子性地提交或中止。</li>
+<li>配置了 <code>read_committed</code> 的 Consumer 只能看到已提交的消息。</li>
+<li>用于实现 read-process-write 流水线的 exactly-once 语义。</li>
+</ul>
+<h3 id="consumer-path">Consumer 路径</h3>
+<ol>
+<li>Consumer 从已分配的分区轮询 broker 获取消息。</li>
+<li>Broker 返回不超过高水位线的批量消息。</li>
+<li>Consumer 处理消息。</li>
+<li>Consumer 提交 offset（同步或异步）。</li>
+<li>重启或 rebalance 后，Consumer 从上次提交的 offset 恢复消费。</li>
+</ol>
+<p>默认投递语义： <strong>至少一次（at-least-once）</strong>。若 Consumer 在处理后、提交前崩溃，重启后会重新处理。</p>
+<p>如需 exactly-once：使用事务性 producer 将 offset 提交与输出写入原子性地捆绑。</p>
+<h3 id="consumer-group-rebalancing">消费者组 Rebalance</h3>
+<p>组内成员共享分区：每个分区分配给一个成员。</p>
+<p>成员协议：</p>
+<ol>
+<li>新成员加入；向组协调器 broker 发送 <code>JoinGroup</code> 向组协调器 broker。</li>
+<li>协调器收集所有成员；选出一个 leader（成员之一）。</li>
+<li>Leader 计算分配方案（例如范围分配或轮询）。</li>
+<li>协调器将分配结果广播给所有成员。</li>
+<li>成员开始消费各自的分区。</li>
+</ol>
+<p>成员离开或崩溃时触发 rebalance。Rebalance 期间：</p>
+<ul>
+<li>所有成员暂停消费。</li>
+<li>计算新的分配方案。</li>
+<li>成员恢复消费。</li>
+</ul>
+<p>现代 Kafka 提供 <strong>增量协作式 rebalance（incremental cooperative rebalancing）</strong> 以减少全停顿影响：只有受影响的分区发生迁移，其余分区继续正常消费。</p>
+<p>面试用语：</p>
+<blockquote>
+<p>消费者组 rebalance 是运维上最棘手的部分。成员在 rebalance 期间暂停消费；长时间的 rebalance 会阻塞消息处理。协作式 rebalance 可降低中断程度。</p>
+</blockquote>
+<h3 id="storage-and-retention">存储与数据保留</h3>
+<p>每个分区在磁盘上由一系列日志段（log segment）组成。</p>
+<ul>
+<li>新写入追加到活跃段。</li>
+<li>当 segment 达到大小限制时进行滚动，并开始新的活跃段。</li>
+<li>旧 segment 按 topic 配置（时间或大小）保留。</li>
+<li>清理操作删除过期 segment。</li>
+</ul>
+<p>压缩（按键保留）：</p>
+<ul>
+<li>对于配置了 <code>cleanup.policy=compact</code>.</li>
+<li>具有与较新记录相同键的旧记录可被删除。</li>
+<li>适用于只关心最新值的变更日志主题。</li>
+</ul>
+<h3 id="consistency-model">一致性模型</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>保证</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>分区内顺序</td>
+<td>强一致性。</td>
+</tr>
+<tr>
+<td>跨分区顺序</td>
+<td>无。</td>
+</tr>
+<tr>
+<td>生产者 ack</td>
+<td>可调（0、1、all）。</td>
+</tr>
+<tr>
+<td>消费者读取</td>
+<td>不超过高水位线（已提交）。</td>
+</tr>
+<tr>
+<td>幂等生产者</td>
+<td>分区内精确一次。</td>
+</tr>
+<tr>
+<td>事务性生产者</td>
+<td>跨分区/主题原子写入。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="scaling-and-partitioning">扩展与分区</h3>
+<table>
+<thead>
+<tr>
+<th>关注点</th>
+<th>策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>每主题吞吐量</td>
+<td>增加分区数量。</td>
+</tr>
+<tr>
+<td>每分区吞吐量</td>
+<td>单主节点瓶颈；调整批处理大小。</td>
+</tr>
+<tr>
+<td>Broker 磁盘</td>
+<td>将分区分布到各 Broker 上。</td>
+</tr>
+<tr>
+<td>热键</td>
+<td>添加随机后缀进行子分区；消费者重新聚合。</td>
+</tr>
+<tr>
+<td>消费者扩展</td>
+<td>成员数最多增加至分区数；每个成员最多对应一个分区。</td>
+</tr>
+</tbody>
+</table>
+<p>分区数量是关键决策：</p>
+<ul>
+<li>更多分区 = 更高并行度，但 Controller 负载更大、Rebalance 时间更长。</li>
+<li>更少分区 = 更低开销，但消费者扩展受限。</li>
+</ul>
+<h3 id="multi-region-mirrormaker-cluster-linking">多区域（MirrorMaker / Cluster Linking）</h3>
+<ul>
+<li>主集群位于一个区域。</li>
+<li>MirrorMaker 将主题复制到从集群，用于灾难恢复或地理就近访问。</li>
+<li>Cluster Linking（Confluent）：保留偏移量的原生跨集群复制。</li>
+<li>双向主主模式可行，但同一主题的冲突处理需格外谨慎。</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">故障模式与缓解措施</h3>
+<table>
+<thead>
+<tr>
+<th>故障模式</th>
+<th>缓解措施</th>
+<th>监控指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Broker 故障。</td>
+<td>Controller 从 ISR 中选举新的主节点。</td>
+<td>Broker 数量；副本不足的分区数。</td>
+</tr>
+<tr>
+<td>所有 ISR 成员故障。</td>
+<td>分区不可用；触发告警。</td>
+<td>ISR 大小。</td>
+</tr>
+<tr>
+<td>慢速从节点。</td>
+<td>从 ISR 中移除；追上进度后重新加入。</td>
+<td>ISR 收缩频率。</td>
+</tr>
+<tr>
+<td>生产者重试产生重复消息。</td>
+<td>幂等生产者去重。</td>
+<td>生产者重试率。</td>
+</tr>
+<tr>
+<td>消费者积压持续增长。</td>
+<td>增加消费者；对积压触发告警。</td>
+<td>每分区消费者积压。</td>
+</tr>
+<tr>
+<td>长时间 Rebalance 阻塞工作。</td>
+<td>协作式 Rebalance；静态成员资格。</td>
+<td>Rebalance 频率与持续时间。</td>
+</tr>
+<tr>
+<td>磁盘满。</td>
+<td>执行保留策略；对使用率触发告警。</td>
+<td>每 Broker 磁盘使用率 %。</td>
+</tr>
+<tr>
+<td>热分区（单一生产者键）。</td>
+<td>子分区；添加随机后缀分散写入。</td>
+<td>每分区写入速率。</td>
+</tr>
+<tr>
+<td>Controller 故障。</td>
+<td>KRaft 共识故障转移。</td>
+<td>Controller 健康状态。</td>
+</tr>
+<tr>
+<td>跨区域复制延迟。</td>
+<td>监控；定位背压来源。</td>
+<td>镜像延迟。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">运维指标</h3>
+<p>正确性：</p>
+<ul>
+<li>副本不足的分区数（应接近零）。</li>
+<li>ISR 收缩失败次数。</li>
+<li>每主题生产者错误数。</li>
+<li>消费者提交失败次数。</li>
+</ul>
+<p>容量：</p>
+<ul>
+<li>每分区吞吐量。</li>
+<li>每 Broker 磁盘 I/O。</li>
+<li>消费者积压。</li>
+<li>Rebalance 持续时间。</li>
+</ul>
+<p>业务层面：</p>
+<ul>
+<li>按团队划分的主题吞吐量。</li>
+<li>保留策略合规性。</li>
+<li>端到端延迟。</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">需要指出的权衡</h3>
+<ul>
+<li>更多分区 = 更高并行度，但元数据开销更大。</li>
+<li><code>acks=all</code> 是最安全但最慢的选项。</li>
+<li>不干净主节点选举以可能丢失数据为代价换取可用性。</li>
+<li>幂等 + 事务性生产者增加延迟，但实现精确一次语义。</li>
+<li>压缩为键控主题节省空间，但增加了复杂性。</li>
+<li>ISR 收缩风险 vs 要求高 <code>min.insync.replicas</code>.</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">常见陷阱与更优做法</h3>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>将分区视为主题内的全局顺序。</td>
+<td>顺序是分区内的；跨分区互相独立。</td>
+</tr>
+<tr>
+<td>使用单分区实现全局顺序。</td>
+<td>牺牲并行度；建议改用按键排序。</td>
+</tr>
+<tr>
+<td><code>acks=1</code> 到处都是。</td>
+<td><code>acks=all</code> 适用于正确性关键型主题。</td>
+</tr>
+<tr>
+<td>忽视消费者积压。</td>
+<td>对积压触发告警；自动扩展消费者。</td>
+</tr>
+<tr>
+<td>无幂等性保障。</td>
+<td>启用幂等生产者以确保安全重试。</td>
+</tr>
+<tr>
+<td>Stop-the-world 式 Rebalance。</td>
+<td>协作式 Rebalance；静态成员资格。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">面试官可能深入探讨的方向</h3>
+<table>
+<thead>
+<tr>
+<th>深入方向</th>
+<th>优秀回答要点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ISR 与复制</td>
+<td>主节点、从节点、同步集合、HW、acks。</td>
+</tr>
+<tr>
+<td>主节点选举</td>
+<td>Controller；ISR；KRaft；不干净选举。</td>
+</tr>
+<tr>
+<td>精确一次</td>
+<td>幂等生产者 + 事务；消费者 read_committed。</td>
+</tr>
+<tr>
+<td>消费者组</td>
+<td>成员资格协议；Rebalance；协作式。</td>
+</tr>
+<tr>
+<td>压缩</td>
+<td>日志压缩；墓碑记录；基于键的保留。</td>
+</tr>
+<tr>
+<td>多区域</td>
+<td>MirrorMaker；Cluster Linking；主主风险。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff 级别回答检查清单</h3>
+<ul>
+<li>分区复制日志模型。</li>
+<li>每分区主从结构；ISR。</li>
+<li>生产者 ack 级别可调，用于控制持久性。</li>
+<li>每消费者组每分区的消费者偏移量。</li>
+<li>消费者组 Rebalance 协议。</li>
+<li>幂等和事务性生产者。</li>
+<li>KRaft / ZooKeeper 用于元数据管理。</li>
+<li>通过 MirrorMaker 实现多区域复制。</li>
+</ul>
+<h3 id="interview-phrase">面试用语</h3>
+<blockquote>
+<p>Kafka 是一个分区复制的仅追加日志。分区内强顺序保证、主从复制以及通过生产者 acks 可调的持久性，使其成为流处理的核心引擎。最难的正确性问题是精确一次（通过事务解决）和消费者组 Rebalance（通过协作式 Rebalance 缓解）。</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. 模拟面试</h2>
+<p><strong>面试官：</strong> 设计 Kafka。</p>
+<p><strong>候选人：</strong> 由多个 Broker 组成的集群；每个主题跨 Broker 分区；每个分区通常以 3 副本复制，含一个主节点和若干从节点。生产者追加数据；消费者从偏移量轮询。消费者组分摊分区。Controller（现在是 KRaft）管理元数据。不变量是分区内强顺序，持久性取决于配置的 ack 级别，消费者组通过分配分区实现并行处理。</p>
+<p><strong>面试官：</strong> 带我走一遍生产流程。</p>
+<p><strong>候选人：</strong> 生产者按分区批量发送记录。若设置了键，则通过 hash(key) % num_partitions 选择分区，否则轮询。将批次发送到分区主节点。主节点追加到本地日志，复制到从节点。使用 <code>acks=all</code>时，主节点等待所有 ISR 成员确认后再向生产者返回成功。使用 <code>acks=1</code>时，主节点本地写入后即返回。使用 <code>acks=0</code>时，直接发送不等待确认。</p>
+<p><strong>面试官：</strong> 某个 Broker 宕机，会发生什么？</p>
+<p><strong>候选人：</strong> Controller 通过心跳超时检测到故障。对于该 Broker 担任主节点的每个分区，Controller 从 ISR（同步副本集）中选举新的主节点。发布新的 leader_epoch；生产者向新主节点重试。从节点继续从新主节点复制数据。如果故障 Broker 也是其他分区的从节点，那些分区的 ISR 会收缩；若低于 min.insync.replicas，这些分区将拒绝写入。</p>
+<p><strong>面试官：</strong> 什么是 ISR？</p>
+<p><strong>候选人：</strong> In-Sync Replicas——在配置的延迟阈值内与主节点保持同步的副本集合。ISR 是动态的：慢速从节点会被移除；恢复后重新加入。高水位线是所有 ISR 成员均已复制的最高偏移量；消费者只能看到高水位线以下的数据。 <code>acks=all</code> 等待 ISR 确认，提供最强持久性保障。</p>
+<p><strong>面试官：</strong> 消费者组如何知道读取哪个分区？</p>
+<p><strong>候选人：</strong> 成员资格协议。每个消费者通过 JoinGroup 向消费者组协调者 Broker 加入群组。协调者收集所有成员，选出一个作为 Leader，让它制定分配方案（range、round-robin 或 sticky）。协调者广播分配结果。每个消费者开始读取被分配的分区。成员变化时，触发 Rebalance 并重新计算分配。</p>
+<p><strong>面试官：</strong> Rebalance 会暂停工作吗？</p>
+<p><strong>候选人：</strong> 传统上是的——stop-the-world。所有成员暂停，计算新分配，成员恢复。对于高吞吐量消费者来说代价很大。现代 Kafka 支持协作式 Rebalance：只有发生迁移的分区才会暂停，其他分区继续处理。静态成员资格允许消费者在短暂崩溃后重新加入而不触发 Rebalance。</p>
+<p><strong>面试官：</strong> 精确一次？</p>
+<p><strong>候选人：</strong> 两个部分。第一，幂等生产者：每个生产者有一个 producer_id；每分区的序列号使 Broker 能够去重重试。消除单个生产者重试产生的重复消息。第二，事务性生产者：生产者开启事务，向多个分区/主题写入，原子提交。消费者配置为 <code>read_committed</code> 时只能看到已提交的记录。结合在同一事务中提交消费者偏移量，可实现读-处理-写流水线的精确一次语义。</p>
+<p><strong>面试官：</strong> 压缩？</p>
+<p><strong>候选人：</strong> 按主题策略。对于 <code>cleanup.policy=compact</code>，Broker 定期重写日志段，每个键只保留最新记录。相同键的旧记录被删除。适用于只关心当前状态的变更日志主题。墓碑记录（null 值）表示删除。压缩在后台运行，不阻塞写入。</p>
+<p><strong>面试官：</strong> 某个生产者键每秒产生 100,000 条消息，远超单个分区的处理能力。</p>
+<p><strong>候选人：</strong> 单个分区是该键的吞吐量上限。缓解方案：在键上追加随机后缀进行子分区，使同一逻辑键分散到多个分区。若需要按键处理，消费者必须重新聚合。权衡：以牺牲严格的按键顺序换取更高的吞吐量。</p>
+<p><strong>面试官：</strong> 存储？</p>
+<p><strong>候选人：</strong> 每个分区是磁盘上的一系列日志段。活跃段接收写入；当达到大小或时间限制时进行滚动。旧段按保留策略（时间或字节）保留。清理操作删除过期段。压缩（若启用）每个键只保留最新记录。Broker 大量使用页缓存；顺序磁盘写入速度非常快。</p>
+<p><strong>面试官：</strong> 多区域？</p>
+<p><strong>候选人：</strong> MirrorMaker（或 Cluster Linking）将主题复制到从集群。一个区域为主集群，另一个为灾难恢复或读就近访问的从集群。双向主主模式可行，但每一侧写入自己的主题；跨区域写入同一主题需要仔细处理冲突。大多数部署采用主备模式，并在需要时进行故障转移。</p>
+<p><strong>面试官：</strong> 总结。</p>
+<p><strong>候选人：</strong> Kafka 是一个分区复制的仅追加日志。Broker 将分区存储在磁盘上；每分区主从结构，带 ISR。生产者通过 acks 调节持久性；幂等生产者去重重试。消费者跟踪每分区偏移量；消费者组分摊分区实现并行。Controller（KRaft）管理元数据和主节点选举。压缩支持键控状态主题。通过 MirrorMaker 实现多区域复制。最难的正确性问题是精确一次；最难的运维问题是 Rebalance 影响。</p>
+<h2 id="3-practice-notes">3. 练习备注</h2>
+<h3 id="five-minute-version">五分钟版本</h3>
+<ol>
+<li>澄清：分区日志、复制、消费者组、保留策略。</li>
+<li>不变量：分区内顺序；持久性取决于 ack 级别。</li>
+<li>主题 + 分区；每个分区主从复制。</li>
+<li>ISR + acks 级别用于持久性调优。</li>
+<li>消费者组 Rebalance 分配分区。</li>
+<li>幂等 + 事务性生产者实现精确一次。</li>
+<li>压缩用于键控状态主题。</li>
+<li>KRaft 用于元数据；MirrorMaker 用于多区域。</li>
+</ol>
+<h3 id="one-minute-closeout">一分钟结尾陈述</h3>
+<blockquote>
+<p>Kafka 是一个分区复制的仅追加日志。分区内强顺序；每分区主从结构；通过生产者 acks 可调的持久性。消费者组分摊分区实现并行处理。幂等和事务性生产者实现精确一次。压缩支持基于键的保留。Controller（KRaft）管理元数据。MirrorMaker 处理多区域复制。最难的正确性问题是精确一次；最难的运维问题是 Rebalance。</p>
+</blockquote>
+<h3 id="best-interview-phrases">最佳面试用语</h3>
+<ul>
+<li>"分区内强顺序；跨分区互相独立。"</li>
+<li>"ISR 是同步副本的动态集合；HW 是已提交的偏移量。"</li>
+<li>"<code>acks=all</code> 等待 ISR；每主题可调的持久性。"</li>
+<li>"幂等 + 事务性生产者为读-处理-写流水线提供精确一次语义。"</li>
+<li>"协作式 Rebalance 减少 stop-the-world 的影响。"</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>GitHub Actions — CI Runner 平台（详解） — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">GitHub Actions — CI Runner 平台（详解）</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<p><strong>难度：</strong> Hard · <strong>总耗时：</strong> ~45 min · <strong>框架：</strong> Hello Interview Delivery</p>
+<p><strong>一句话场景：</strong> 构建 GitHub Actions。开发者提交代码；工作流 YAML 定义在临时 VM/容器上运行的 job；结果回报。1 亿个仓库，约每日 1000 万个 job，峰值约每分钟 10 万个 job，job 时长从 30 秒到 6 小时不等，运行在托管的 Linux/macOS/Windows VM 上。</p>
+<hr/>
+<h2 id="1-requirements-5-min">1. 需求（约 5 分钟）</h2>
+<p><strong>功能需求</strong>
+- 开发者推送提交 → 匹配的工作流触发 job。\n- 每个 job 在隔离的、临时的环境中运行。\n- 近实时流式传输日志；最终状态报告回 GitHub UI/API。\n- 支持矩阵 job（多操作系统 + 版本组合）。</p>
+<p>我会推迟讨论自托管 Runner、复杂制品存储以及超出简单提及的高级依赖缓存。</p>
+<p><strong>非功能需求</strong>
+- <strong>隔离性</strong> — 运行任意用户代码；不得在 job 之间或向我们的基础设施泄露。\n- job 启动延迟 p95 &lt; 30 秒（排队 + 配置）。\n- 峰值维持每分钟 10 万个 job，约 1500 个 VM 并发启动。\n- 持久化日志和状态；永不丢失构建结果。\n- 支持多操作系统。</p>
+<p><strong>容量估算</strong>
+- 每日 1000 万个 job × 平均 15 分钟 = 约每日 1.5 亿 VM 分钟。以每天 24×60 = 1440 分钟计，任意时刻约有 10 万个并发 VM。\n- 日志：1000 万个 job × 约 5 MB ≈ 每日 50 TB。\n- 元数据相比日志很小：run/job 行约 2 KB/job × 每日 1000 万 × RF=3 约 60 GB/天，而压缩后日志约每日 5 TB，保留 90 天共约 450 TB。制品可能远超两者，因此应尽早强制执行 TTL 和配额。</p>
+<hr/>
+<h2 id="2-core-entities-2-min">2. 核心实体（约 2 分钟）</h2>
+<ul>
+<li><strong>工作流</strong> — 仓库中的 YAML 文件。</li>
+<li><strong>WorkflowRun</strong> — <code>run_id, repo, commit, status, triggered_by</code>.</li>
+<li><strong>Job</strong> — <code>job_id, run_id, name, runs_on, status, started_at, ended_at</code>.</li>
+<li><strong>Step</strong> — job 内的子单元，日志行流式传输。</li>
+<li><strong>Runner</strong> — 可用于执行 job 的 VM/容器。</li>
+</ul>
+<hr/>
+<h2 id="3-api-5-min">3. API（约 5 分钟）</h2>
+<pre><code>// Internal triggers:
+POST  /v1/runs                       { repo, commit, workflow }  → { run_id }
+
+// Runner protocol (long-poll / WS):
+GET   /v1/runner/jobs                 → { job_id, image, steps[] }  // pulls a job
+POST  /v1/runner/jobs/{id}/logs       (streaming)
+POST  /v1/runner/jobs/{id}/status     { state, exit_code }
+
+// User-facing:
+GET   /v1/runs/{id}                   → run + jobs + statuses
+WS    /v1/jobs/{id}/logs              → stream logs to UI
+</code></pre>
+<p>Runner 状态更新在 <code>{job_id, attempt, state_seq}</code>上是幂等的。日志上传分块携带 <code>{job_id, attempt, offset}</code> ，因此重试不会重复日志字节。</p>
+<hr/>
+<h2 id="4-data-flow-5-min">4. 数据流（约 5 分钟）</h2>
+<p>提交事件 → 工作流触发 → 解析 YAML → 将 job 入队 → Runner 拉取 → 配置 VM → 执行步骤 → 流式传输日志 → 写入状态 → 标记完成 → 向 GitHub 发出检查。</p>
+<hr/>
+<h2 id="5-high-level-design-1015-min">5. 高层设计（约 10–15 分钟）</h2>
+<ol>
+<li><strong>Webhook 接收。</strong> GitHub 事件（push、PR）到达我们的服务。解析仓库受影响的工作流 YAML。物化一个 <code>WorkflowRun</code> 和 N 个 <code>Job</code>。</li>
+<li><strong>job 队列。</strong> 按 Runner 类型分队列： <code>linux-ubuntu</code>, <code>linux-self-hosted</code>, <code>macos</code>, <code>windows</code>。优先级基于计划层级（付费 &gt; 免费）。以 Kafka 主题实现，按操作系统设置分片键。</li>
+<li><strong>Runner 配置器。</strong> 管理临时 Runner 池。对于 Linux：从预烘培镜像启动的 Firecracker/Kata microVM。对于 macOS：专用 Mac 硬件（真实机器），池化管理。对于 Windows：预热 VM。预热以吸收启动延迟。</li>
+<li><strong>Runner 代理。</strong> 在每个 Runner 内部，一个小型代理轮询 job 队列，下载 job 规范，执行步骤，流式传输日志。</li>
+<li><strong>日志流式传输。</strong> 代理批量处理日志行（约 1 秒窗口），通过 POST 发送到日志服务。日志服务写入流式日志存储（支持追加写入的对象存储；或类似 ClickHouse 的日志集群）。</li>
+<li><strong>状态服务。</strong> 拥有 job 状态机： <code>queued → in_progress → success | failure | canceled</code>。在转换时发出事件（供 UI 使用并回传至 GitHub Checks API）。</li>
+<li><strong>制品存储。</strong> job 产生的可选制品上传至带有 TTL 的对象存储。</li>
+<li><strong>密钥注入。</strong> 每个仓库的加密密钥存储在 KMS 支持的保险库中。Runner 代理仅接收 job 所需的密钥，在 VM 内解密，并从日志中删除。</li>
+<li><strong>每个组织的并发限制。</strong> 每个计划层级的最大并发 job 数；超出部分排队。</li>
+</ol>
+<h3 id="system-components-diagram">系统组件图</h3>
+<pre><code>+------------------------------+
+| GITHUB WEBHOOKS / UI / API   |
++------------+-----------------+
+         |
+         +-- POST /webhooks push,PR --&gt; +----------------+
+         |                              | Workflow       |
+         |                              | Trigger        |
+         |                              | parse YAML     |
+         |                              +-------+--------+
+         |                                      |
+         |                                      v
+         |                              +----------------+
+         |                              | Scheduler      |
+         |                              | org limits     |
+         |                              +-------+--------+
+         |                                      | enqueue jobs.{os}.{priority}
+         |                                      v
+         |              +-----------------------------------------------+
+         |              | Async / Scheduling                            |
+         |              | Queue: jobs.{os}.{priority}, key=(os,prio,repo)|
+         |              | Lease: runner:{runner_id}-&gt;job, TTL 30s       |
+         |              | Tokens: org_concurrency:{org_id}-&gt;active      |
+         |              +--------+------------------------------+-------+
+         |                       | depth / scale signal        | GET /runner/jobs
+         |                       v                             v
+         |              +----------------+             +---------------+
+         |              | Provisioner    | assign VM    | Runner Agent  |
+         |              | Runner Pool    |------------&gt;| ephemeral VM  |
+         |              +-------+--------+             +---+-------+---+
+         |                      |                          |       |
+         |              secrets |                          |       | POST /logs, artifacts
+         |                      v                          v       v
+         |              +----------------+         +-----------------------------+
+         |              | KMS / Vault    |         | Stores / Caches             |
+         |              | repo secrets   |         | RunDB: run:{repo}:{run_id}  |
+         |              +----------------+         | JobDB: job:{run}:{job_id}   |
+         |                                       | LogHot: log:{job}:{try}:{n} |
+         +-- GET /runs/{id}/logs --------------&gt; | Archive: logs/{repo}/{run}/ |
+                             | Artifact: artifacts/{run}/  |
+                             | Cache: cache:{repo}:{key}   |
+                             +------+----------------------+
+                                | log hot miss
+                                v
+                             +---------------+
+                             | Object Archive|
+                             | source of logs|
+                             +---------------+
+</code></pre>
+<p>端到端描述：Alice 推送到 main → webhook → 工作流被解析，创建 4 个 job（lint、test-linux、test-mac、build）→ job 入队至各自的操作系统队列 → Runner 配置器用 Linux 镜像启动一个 Firecracker microVM，将 lint job 交给它 → Runner 代理在 8 秒内启动，克隆仓库，运行步骤，流式传输日志 → 完成时，状态设置为成功，VM 销毁。同时，测试在其他 VM 上并行运行。</p>
+<p>具体存储方案：</p>
+<table>
+<thead>
+<tr>
+<th>存储</th>
+<th>我会明确说出的具体存储方案：</th>
+<th style="text-align: right;">条目大小</th>
+<th>TTL / 保留期</th>
+<th>分片键</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>运行数据库</td>
+<td><code>run:{repo_id}:{run_id}</code> 。 <code>job:{run_id}:{job_id}</code> 行</td>
+<td style="text-align: right;">约 2 KB/job</td>
+<td>热数据保留 90 天，之后归档</td>
+<td><code>repo_id</code></td>
+</tr>
+<tr>
+<td>job 队列</td>
+<td>主题 <code>jobs.{os}.{priority}</code> 消息 =<code>job_id + image + attempt</code></td>
+<td style="text-align: right;">~1 KB</td>
+<td>24 小时重放</td>
+<td>操作系统 + 优先级</td>
+</tr>
+<tr>
+<td>日志热存储</td>
+<td><code>log:{job_id}:{attempt}:{chunk_no}</code> 追加分块</td>
+<td style="text-align: right;">约 64 KB/块</td>
+<td>热数据保留 24 小时</td>
+<td><code>job_id</code></td>
+</tr>
+<tr>
+<td>日志归档</td>
+<td><code>logs/{repo}/{run}/{job}.gz</code> 对象</td>
+<td style="text-align: right;">约 0.5 MB 压缩/job</td>
+<td>默认保留 90 天</td>
+<td><code>repo_id/run_id</code></td>
+</tr>
+<tr>
+<td>Runner 租约</td>
+<td><code>runner:{runner_id}</code> 心跳 + 当前 job</td>
+<td style="text-align: right;">约 200 B</td>
+<td>30 秒 TTL</td>
+<td><code>runner_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>运行创建路径：</p>
+<ol>
+<li>触发服务接收推送事件，读取提交 SHA 处的工作流 YAML，并展开矩阵 job。</li>
+<li>在一次数据库事务中，写入 <code>run:{repo_id}:{run_id}</code> 。 <code>job:{run_id}:{job_id}</code> 行，状态为 <code>queued</code> 状态。</li>
+<li>为每个 job 向 <code>jobs.{os}.{priority}</code> 与 <code>{job_id, repo_id, image, attempt=1}</code>发布一条队列消息；队列分区键为 <code>(os, priority, repo_id)</code> ，以分散大型组织的负载。</li>
+<li>状态服务发出初始 Checks API 状态，UI 现在即使在 Runner 存在之前就可以读取运行记录。</li>
+</ol>
+<p>Runner 认领路径：</p>
+<ol>
+<li>配置器监视每个操作系统的队列深度和空闲池大小；如果 <code>jobs.linux.paid</code> 增长，则启动或预留 Linux microVM。</li>
+<li>Runner 代理长轮询 <code>/runner/jobs</code>；调度器检查组织并发令牌并分配 job 尝试。</li>
+<li>调度器写入带 30 秒 TTL 的 <code>runner:{runner_id}</code> 租约，并使用 <code>in_progress</code> 上的 compare-and-set 将 job 移至 <code>{job_id, attempt}</code>.</li>
+<li>Runner 并行获取密钥、仓库检出元数据和缓存清单；然后步骤执行并按分块偏移量流式传输日志。</li>
+<li>终态状态更新 job 数据库，释放组织令牌，发出 UI/Checks 事件，并销毁 VM。</li>
+</ol>
+<p>按存储容量：运行数据库约每日 1000 万 job × 2 KB × RF=3 = 约 60 GB/天，90 天热窗口约 5.4 TB。队列流量在每分钟 10 万 job 时约为每秒 1700 条消息；以 1 KB/消息和 RF=3 计算，仅约 5 MB/秒，因此队列吞吐量不是主要成本。日志：每日 50 TB 原始数据，约 5-10 TB/天压缩，90 天共 450-900 TB 对象存储。Runner 租约很小，约 10 万活跃 Runner × 200 B = 20 MB，但心跳正确性很重要。制品可能远超日志；即使 20% 的 job 上传 50 MB 制品也是每日 100 TB，因此 TTL 和每组织配额是产品需求，而非清理细节。</p>
+<hr/>
+<h2 id="6-deep-dives-10-min">6. 深度探讨（约 10 分钟）</h2>
+<p><strong>隔离——核心要点。</strong> 每个 job 在全新的临时 VM 中运行，从不复用。Firecracker（或 Kata Containers）以容器级启动时间（约 1-2 秒）提供 VM 级隔离。job 完成后，VM 被销毁。job 之间没有文件系统持久化。</p>
+<p>为何不用普通容器：启动最快，但任意客户代码使得共享内核成为一个危险的默认选项。为何不仅用完整云 VM：隔离性更强，但在 10 万并发 job 下冷启动时间和成本更差。MicroVM 是中间方案：硬件隔离边界、镜像预热和快速销毁。对于 macOS，替代方案不是 Firecracker；而是有限的真实 Mac 硬件池，因此调度策略比虚拟化技巧更重要。</p>
+<p><strong>预热池。</strong> Runner 冷启动约需 10-15 秒。为达到 job 启动 p95 &lt; 30 秒，为每个操作系统类型保持一个 N 个预热 Runner 的空闲池。大小根据吸收突发流量的需求而定；根据队列深度自动扩缩。</p>
+<p>配置路径追踪：调度器写入 <code>job_id</code> 与 <code>jobs.linux.paid</code>；配置器监视队列深度并在 <code>runner_pool:linux</code>中保持空闲 microVM；Runner 长轮询，接收 job 规范，每 10 秒写一次租约心跳，按分块偏移量流式传输日志，然后发布终态状态。队列拉取、密钥获取和仓库检出的元数据启动可以在 Runner 分配后并行运行。</p>
+<p>job 状态机：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>持久化状态</th>
+<th>数据真实来源</th>
+<th>超时/回退</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>queued</td>
+<td><code>job.status=queued</code>，队列消息</td>
+<td>job 数据库 + 持久队列</td>
+<td>调度器可以重放消息</td>
+</tr>
+<tr>
+<td>assigned</td>
+<td><code>attempt=N</code>, <code>runner_id</code> 租约</td>
+<td>job 数据库 CAS + Runner 租约</td>
+<td>租约未确认 → 重新入队</td>
+</tr>
+<tr>
+<td>in_progress</td>
+<td>每 10 秒心跳</td>
+<td>Runner 租约 + 状态行</td>
+<td>30-60 秒未收到 → <code>lost_runner</code></td>
+</tr>
+<tr>
+<td>canceling</td>
+<td>取消令牌已设置</td>
+<td>job 数据库</td>
+<td>Runner 停止步骤；超时则终止 VM</td>
+</tr>
+<tr>
+<td>terminal</td>
+<td>成功/失败/已取消</td>
+<td>job 数据库</td>
+<td>该次尝试的不可变记录</td>
+</tr>
+<tr>
+<td>retry</td>
+<td>新的尝试行/消息</td>
+<td>job 数据库</td>
+<td>通过...实现幂等 <code>{job_id, attempt}</code></td>
+</tr>
+</tbody>
+</table>
+<pre><code>
+ queued ──assign──▶ assigned ──heartbeat──▶ in_progress ──exit──▶ terminal
+    ▲                    │                         │
+    │                    └──lease timeout──────────┘
+    └──────────── requeue / retry with attempt+1
+</code></pre>
+<p><strong>job 调度。</strong> 按操作系统分队列；在出队时强制执行每组织并发限制。拉取 job 的 Runner 检查"该组织是否还有容量？"——如果没有，则返回 job 并拉取另一个。更好的方式：在调度器侧于出队前强制执行，使用组织级令牌桶。</p>
+<p>为何使用类 Kafka 的持久队列而非 Redis 列表：对于小型 Worker 池，Redis 更简单，但此工作负载需要回放、按操作系统分区、计划层级优先级，以及当结果有争议时的可审计性。SQS/PubSub 也可行；当顺序和回放重要时，Kafka 最易解释。</p>
+<p><strong>macOS 稀缺性。</strong> Mac 硬件是有限的（法律要求在 Apple silicon 上运行）。池较小，队列等待时间较长，通常需要额外付费。承认这是一个真实的产品约束。</p>
+<p><strong>日志流式传输与存储。</strong> 每个步骤的 stdout 通过批量 POST（每 1 秒）从 Runner 流式传输。日志落入热存储用于实时 UI；job 完成后，刷新到具有保留期（例如 90 天）的对象存储。每日 50 TB 原始数据 → 压缩约 10 倍。</p>
+<p>实时日志读取路径：浏览器 WS -&gt; 日志服务订阅 <code>log_tail:{job_id}</code>；同时从热存储中以请求的偏移量开始获取现有分块；新分块从 Runner 到达并推送给所有订阅者；完成后，同一 API 通过字节范围从对象存储读取。</p>
+<p><strong>日志和 job 的两种视图。</strong> job 数据库是持久化状态视图；队列只是待处理工作的视图，可能包含重复项。日志热存储是实时追踪视图；对象存储是持久化归档。UI 应通过使用 <code>{job_id, attempt, offset}</code> 作为游标来容忍在完成时切换数据源，使得浏览器刷新可以从热数据分块或归档的字节范围继续，而不会出现重复行。</p>
+<p><strong>实时日志扇出。</strong> 当用户观察一个正在运行的 job 时，UI WS 订阅该 job 的日志事件。日志服务保持开放连接并在新分块到达时推送。浏览器在日志发生约 1 秒后即可看到。</p>
+<p><strong>密钥处理。</strong> 仓库密钥静态加密（KMS）。为 job 配置 Runner 时，仅获取该 job 引用的密钥，通过 TLS 发送，在 VM 内存中解密，从不写入磁盘。日志清洗器会屏蔽 stdout 中的密钥值。</p>
+<p><strong>取消/重新运行。</strong> 取消向 Runner 的 job 发送信号；代理停止步骤，标记状态。重新运行：相同的 job 规范重新入队；全新 VM；通过重新运行 id 实现幂等。</p>
+<p><strong>缓存（简要提及）。</strong> 依赖缓存（node_modules、.gradle）很大。每仓库缓存服务将 key → blob 存储在对象存储中。job 声明缓存键；命中时，Runner 在步骤运行前下载 blob。缓存驱逐基于年龄 + 大小。</p>
+<p><strong>矩阵 job。</strong> YAML <code>strategy.matrix</code> 展开为 N 个 job，独立调度。除非设置了 <code>fail-fast: true</code> ，否则失败的 job 不会阻塞兄弟 job。</p>
+<p><strong>故障模式。</strong> Runner 在 job 中途崩溃：状态计时器在缺少心跳后触发 → job 被标记为 <code>failed: lost runner</code> → 用户看到带有明确原因的失败。可选择自动重试一次。</p>
+<p>队列重复投递是预期的：Runner 必须通过 compare-and-set 获取 <code>{job_id, attempt}</code> 才能执行。如果两个 Runner 竞争，一个获胜，失败者丢弃 job。如果某个区域故障，调度器在另一个区域重放已排队的 job，但进行中的 job 被标记为 <code>lost_runner</code> ，因为它们的 VM 状态不可移植。冷镜像启动由预热池和镜像层缓存处理；如果这些都为空，job 保持排队状态并显示 ETA，而不是在复用的 VM 上启动。密钥服务降级时失败关闭：需要密钥的 job 保持排队或明确失败，而公共 job 可以继续。</p>
+<p><strong>优雅降级。</strong></p>
+<table>
+<thead>
+<tr>
+<th>情形</th>
+<th>模式</th>
+<th>数据源</th>
+<th>延迟/行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Linux 突发</td>
+<td>耗尽预热池，然后冷启动</td>
+<td>runner pool + queue</td>
+<td>p95 可能上升至 30 秒</td>
+</tr>
+<tr>
+<td>macOS 资源耗尽</td>
+<td>按计划套餐分级排队，显示预计等待时间（ETA）</td>
+<td>mac runner 队列</td>
+<td>分钟，但需明确指定</td>
+</tr>
+<tr>
+<td>记录热存储下线</td>
+<td>在 runner 本地磁盘和 Kafka 上缓冲数据块</td>
+<td>runner 本地缓冲池</td>
+<td>实时日志有延迟，最终日志具有持久性</td>
+</tr>
+<tr>
+<td>Runner 心跳丢失</td>
+<td>标记 <code>lost_runner</code>，如果策略允许则重试</td>
+<td>runner 租约 + 作业数据库</td>
+<td>不存在静默成功</td>
+</tr>
+<tr>
+<td>Secrets 服务降级</td>
+<td>不启动需要密钥的作业</td>
+<td>vault/KMS</td>
+<td>故障关闭</td>
+</tr>
+</tbody>
+</table>
+<p>面试要点："对于 CI 而言，隔离性和持久的状态记录胜过原始的调度技巧；每一项优化都必须保证：在一次性容器中运行的敌意代码仍然产生了可审计的结果。"</p>
+<p><strong>自托管 runner（简述）。</strong> 客户在其自有硬件上运行我们的 runner 代理。它通过自身 token 长轮询我们的作业队列，并在其环境中运行作业。协议相同，但隔离责任由客户自行承担。</p>
+<p><strong>我会推迟的内容。</strong> 可复用 action 生态系统与注册表、完整市场、组织计费、合规认证（SOC 2）、高级工作流组合（可复用工作流）。</p>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

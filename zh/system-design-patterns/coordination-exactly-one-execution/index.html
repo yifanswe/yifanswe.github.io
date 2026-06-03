@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>协调 / 单活跃节点 — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/system-design-patterns/">← 返回系统设计模式</a>
+<h1 class="article-title">协调 / 单活跃节点</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/05/31  ·  系统设计模式
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p><strong>一句话定义。</strong> 当系统需要恰好一个执行者来完成某项操作（执行凌晨 3 点的支付任务、持有分片所有权、持有锁）时，协调（coordination）这门学科要确保 <strong>即使在网络分区、GC 暂停或时钟偏移期间，也不会有两个节点同时认为自己是被选中的那个</strong> ——通常通过将身份共识与资源侧的 fencing token 相结合来实现。</p>
+</blockquote>
+<p>阅读 Staff System Design Glossary，获取 quorum、lease、replica 和 consensus 等术语的共享词汇。</p>
+<p>回答时应积极交叉引用的相关问题文档：</p>
+<ul>
+<li><a href="/zh/common-backend-systems/design-a-distributed-lock-manager-like-chubby/">Distributed Lock Manager like Chubby</a> — 权威协调服务。</li>
+<li><a href="/zh/common-backend-systems/design-a-distributed-job-scheduler-like-cron/">Distributed Job Scheduler like Cron</a> — 每次调度执行的恰好一次执行。</li>
+<li><a href="/zh/common-backend-systems/design-a-payment-system/">Payment System</a> — 重复执行的代价以美元衡量。</li>
+<li><a href="/zh/common-backend-systems/design-the-stripe-payment-gateway/">Stripe Payment Gateway</a> — 幂等键作为补充工具。</li>
+<li><a href="/zh/common-backend-systems/design-a-stock-exchange/">Stock Exchange</a> — 分区订单簿的主节点故障转移。</li>
+<li><a href="/zh/common-backend-systems/design-a-reminder-alert-system/">Reminder / Alert System</a> — 基于时间触发器的单次触发。</li>
+<li><a href="/zh/common-backend-systems/apache-kafka/">Apache Kafka</a> — 每分区单主节点作为协调原语。</li>
+</ul>
+<hr/>
+<h2 id="1-the-fundamental-hardness">1. 核心难点</h2>
+<p>协调的朴素图景是："选举一个主节点，其他所有人等待。"一旦提出更难的问题，这种方案就会崩溃： <strong>主节点如何知道自己仍然是主节点？</strong> 一个节点在时间 T 是主节点，随后经历 30 秒的 JVM 垃圾回收暂停，而集群其余节点宣布它已死亡并选举出继任者。当原节点醒来时，它本地仍然认为自己持有锁。两个节点将同时尝试行动。这就是 <strong>脑裂问题</strong>：两个节点同时认为自己拥有权威。</p>
+<p>更糟糕的是，"行动前先检查自己是否仍是主节点"是不够的。假设主节点在发出写入之前立即向共识服务查询。查询返回"是的，你是主节点。"然后网络分区了 200 ms。租约过期。新主节点被选举出来。旧主节点的写入——仍在飞行中——到达资源（数据库、支付处理器、库存存储） <strong>after</strong> 新主节点的写入之后。从资源的角度来看，两个不同的主节点都告诉它行动。检查时刻与使用时刻（TOCTOU）在网络层面上根本无法保证安全。</p>
+<p>解决方案有两个关键。 <strong>首先</strong>，通过共识算法（Raft、Paxos、ZAB——ZAB 是 ZooKeeper Atomic Broadcast 协议）就身份达成一致，使"谁是主节点"成为单一复制的决定，而非本地意见。 <strong>其次</strong>，为每次授权附加一个 <strong>单调递增的 fencing token</strong> 。每个新主节点获得的 token 严格高于任何前任。被保护的下游资源——拒绝任何 token 低于它所见过的最高 token 的操作。注意这里的不对称性：新主节点的正确写入成功并将 <code>max_token_seen</code>递增；旧主节点的过期写入随后到达并被拒绝——不是因为旧主节点被检测为过期，而是因为资源已经承诺了更高的 token。协调正确性从"主节点是诚实的"转移到"资源是多疑的"。</p>
+<p>推论，也是大多数"我们有锁服务"的设计失败之处： <strong>不能只在协调层保证协调安全性</strong>。资源侧必须参与。一个不向资源暴露可验证 token 的锁服务，在对抗性条件下只是一种优化——而非正确性机制。这就是为什么 Chubby 返回序列号，以及为什么一个"Redis 锁"如果只给你一个字符串 token（在资源处没有原子性的 compare-and-swap）就无法在任意暂停下独立保证互斥。诚实的告诫：整套机制只有在 <em>恰好一次执行</em> 是需求时才值得其代价。如果操作是幂等的，且重复执行可以接受（大多数只读刷新、大多数缓存重建、大多数对账任务），那么 at-least-once 交付加幂等性才是 Staff 级答案——而非共识算法。</p>
+<hr/>
+<h2 id="2-how-to-recognize-it-in-the-interview">2. 如何在面试中识别背压问题</h2>
+<p><strong>提示性短语</strong> 触发此模式的信号词：</p>
+<ul>
+<li>"恰好一个节点应该……"</li>
+<li>"……必须恰好执行一次。"</li>
+<li>"避免重复执行……"</li>
+<li>"选举一个主节点……"</li>
+<li>"在分区下不出现两个主节点……"</li>
+<li>"如果调度器/主节点崩溃会发生什么？"</li>
+<li>"在几秒内完成故障转移。"</li>
+<li>"每个分片/分区/租户只有一个写入者。"</li>
+</ul>
+<p><strong>架构异味</strong> 候选人自己的设计中需要引入此模式的信号：</p>
+<ul>
+<li>设计图中有"scheduler"或"coordinator"，旁边没有副本框（单点故障）。</li>
+<li>有"leader"但没有租约或 term 编号（无法检测它是否已失去权威）。</li>
+<li>重试时调用远程系统但没有幂等性或 fencing token（重试时会执行两次）。</li>
+<li>"我们用心跳检测故障"——但对"如果心跳因暂停而撒谎怎么办？"没有回答。</li>
+<li>"我们用 Redis SETNX 加锁"——没有描述 fencing 或资源处的原子 compare-and-set。</li>
+<li>类 Cron 的扇出但没有持久化的 occurrence 行供且仅供一个 worker 声明。</li>
+</ul>
+<p><strong>此模式为核心的示例面试题：</strong></p>
+<ol>
+<li>设计分布式 cron / 任务调度器（<a href="/zh/common-backend-systems/design-a-distributed-job-scheduler-like-cron/">cron doc</a>).</li>
+<li>设计 Chubby / ZooKeeper / etcd（<a href="/zh/common-backend-systems/design-a-distributed-lock-manager-like-chubby/">Chubby 文档</a>).</li>
+<li>设计不能重复扣款的支付调度器（<a href="/zh/common-backend-systems/design-a-payment-system/">支付系统</a>).</li>
+<li>设计 Kafka 控制器 / 分区主节点（<a href="/zh/common-backend-systems/apache-kafka/">Kafka doc</a>).</li>
+<li>设计主从 MySQL/Postgres 故障转移编排器。</li>
+<li>设计带主节点故障转移的股票交易所撮合引擎（<a href="/zh/common-backend-systems/design-a-stock-exchange/">stock exchange</a>).</li>
+<li>设计主节点驱动的缓存失效服务。</li>
+</ol>
+<p>如果存在两个或更多上述信号，则应明确指出该模式。Staff 候选人通过大声说出以下内容获得加分： <em>"这从根本上是一个恰好一次执行的问题。我想在绘制其他内容之前先设计协调层，因为架构其余部分的安全性都继承自这一层。"</em></p>
+<hr/>
+<h2 id="3-60-second-spoken-framing">3. 60秒口头框架</h2>
+<blockquote>
+<p>在引入共识算法之前，我想知道重复执行是否真的不安全。如果操作是幂等的——重复执行产生相同效果——那么带去重键的 at-least-once 就足够了，协调层是不需要承担的开销。困难的情况是当副作用 <em>非</em> 天然不是幂等的且资源本身无法去重时。此时我会在基于 Raft 的共识服务（如 etcd 或 ZooKeeper）上构建协调层。主节点持有带严格单调 fencing token 的租约；租约通过心跳续期。每次针对下游资源的操作都携带该 token，资源本身拒绝任何低于其所见最高 token 的操作——因此如果旧主节点暂停 30 秒后醒来仍认为自己是主节点，其过期写入在资源处被拒绝，而不是在主节点处。作为双重保险，我仍会尽量使副作用幂等。安全性来自三个方面，按必要性排序：副作用幂等性、资源处强制执行的 fencing token、协调层的身份共识。</p>
+</blockquote>
+<hr/>
+<h2 id="4-canonical-toolkit">4. 标准工具集</h2>
+<p>每位 Staff 候选人都应能命名并对比的七种技术。</p>
+<h3 id="41-replicated-consensus-raft-paxos-zab">4.1 复制共识：Raft、Paxos、ZAB</h3>
+<p>三者解决相同的问题——让奇数个副本组成的集群就日志中的下一条条目达成一致——但工程体验不同。</p>
+<table>
+<thead>
+<tr>
+<th>属性</th>
+<th>Raft（etcd、Consul）</th>
+<th>Multi-Paxos（Chubby、Spanner）</th>
+<th>ZAB（ZooKeeper）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>心智模型</td>
+<td>强主节点 + 复制日志；可在白板上清晰讲解。</td>
+<td>解耦提议者/接受者；变体众多，约束较少。</td>
+<td>基于主节点的有序广播；专为主备架构设计。</td>
+</tr>
+<tr>
+<td>主节点角色</td>
+<td>单一主节点处理所有写入；从节点进行复制。</td>
+<td>稳定状态下由单一显著提议者担任；可切换。</td>
+<td>单一主节点（Primary）按顺序广播。</td>
+</tr>
+<tr>
+<td>故障转移触发条件</td>
+<td>选举超时（通常为 150-300 ms）。</td>
+<td>更高的提案编号强制发起新一轮投票。</td>
+<td>Epoch 变更；从节点拒绝较低 Epoch 的请求。</td>
+</tr>
+<tr>
+<td>任期 / Epoch 编号</td>
+<td>任期为单调递增的整数。</td>
+<td>投票 / 提案编号，单调递增。</td>
+<td>Epoch / zxid，单调递增且全局有序。</td>
+</tr>
+<tr>
+<td>常见生产用途</td>
+<td>etcd、Consul、CockroachDB、TiKV。</td>
+<td>Chubby（Google）、Spanner、Megastore。</td>
+<td>ZooKeeper，被 Kafka（旧版）、HBase、Solr 使用。</td>
+</tr>
+<tr>
+<td>适用场景</td>
+<td>新系统；有完善文档的 Go/Rust 库。</td>
+<td>由经验丰富的团队嵌入大型系统中使用。</td>
+<td>分层配置 / Watch 原语。</td>
+</tr>
+</tbody>
+</table>
+<p>在面试中， <strong>除非有特殊原因，否则说"Raft"</strong> ——它是新系统的默认选择，因为协议易于理解，且参考实现（etcd、hashicorp/raft）经过了大量生产验证。仅在讨论 Google 内部系统或面试官深究历史/理论角度时才考虑 Paxos。在讨论 ZooKeeper 时才考虑 ZAB。</p>
+<p>它们共同提供的能力：在每次主节点变更时，产生一个 <strong>单调递增的任期/Epoch 编号</strong> ，该编号是 Fencing 机制的基础。</p>
+<p><strong>你应能随口说出的基准成本。</strong> 一次 Raft 写入需要从主节点到多数从节点的一个来回，加上磁盘 fsync——在单个可用区内，p50 通常为 5-10 ms，p99 为 20-50 ms；跨可用区或跨地区需直接加上区间/地区间的往返时间。吞吐量受单一主节点的磁盘和网络限制——etcd 基准测试轻松达到每秒数千次写入，ZooKeeper 类似；两者均比单节点 KV 慢一个数量级。这意味着：不要将应用数据通过 Raft 传输，而应将其用于元数据、身份信息和小型复制状态。如果你想把每笔业务写入都放入 etcd，说明你选错了架构层。</p>
+<h3 id="42-fencing-tokens">4.2 Fencing 令牌</h3>
+<p>Fencing 令牌是由共识层在每次授予锁或租约时发放的严格单调递增整数。其契约如下：</p>
+<ol>
+<li>共识层保证任何两次授予绝不会收到相同的令牌，且令牌值永不减小。</li>
+<li>对受保护资源的每个操作都携带该令牌。</li>
+<li>资源记录它曾接受过的最高令牌值。</li>
+<li>资源拒绝任何携带较低令牌的操作。</li>
+</ol>
+<pre><code>Leader A acquires lock, token = 17.
+Leader A pauses (GC, network).
+Lease expires.
+Leader B acquires lock, token = 18.
+Leader B writes to DB with token 18 → DB records max_token = 18.
+Leader A wakes up, attempts write with token 17 → DB rejects: 17 &lt; 18.
+</code></pre>
+<p>Fencing 令牌使协调在无限期暂停下保持安全。没有它，你只能依靠主节点诚实地自报是否仍是主节点，这在任何允许 GC 暂停、OS 调度延迟或网络缓冲的模型下都是不安全的。</p>
+<p>资源端检查的最简 Python 示例：</p>
+<pre><code class="language-python">class FencedResource:
+    def __init__(self):
+        self._max_token_seen = 0
+        self._state = None
+        self._lock = threading.Lock()
+
+    def write(self, token: int, value):
+        """Apply a write only if token &gt;= max_token_seen.
+        Returns True on accept, False on reject."""
+        with self._lock:
+            if token &lt; self._max_token_seen:
+                # Stale leader. Reject.
+                return False
+            self._max_token_seen = token
+            self._state = value
+            return True
+</code></pre>
+<p>以及主节点端的操作：</p>
+<pre><code class="language-python">def perform_action(lock_client, resource, payload):
+    # 1. Confirm we still hold the lock; receive the current token.
+    grant = lock_client.who_holds(lock_id="payments-cron")
+    if grant.owner != my_node_id:
+        raise NotLeader()
+    token = grant.token  # monotonically increasing integer
+
+    # 2. Carry the token to the resource. The RESOURCE enforces fencing.
+    accepted = resource.write(token=token, value=payload)
+    if not accepted:
+        raise StaleLeader(f"resource rejected token {token}")
+</code></pre>
+<p>关键在于， <code>resource.write</code> 调用才是保证安全的关键—— <strong>非</strong> HTTP 请求中的 <code>lock_client.who_holds</code> 调用。调用前的检查是尽力而为；资源端的强制执行才是权威的。这是 <a href="/zh/common-backend-systems/design-a-distributed-lock-manager-like-chubby/">Chubby 问题</a> 所反复强调的原则。</p>
+<h3 id="43-leases-with-heartbeat-renewal">4.3 租约（含心跳续约）</h3>
+<p>租约是带有 TTL 的锁——在此时间段内若未续约，锁将自动释放。主节点通过心跳续约。若心跳失败（主节点崩溃、分区或暂停），租约到期，新一轮选举即可进行。</p>
+<p>使用租约而非永久持有的纯锁的原因：</p>
+<ul>
+<li><strong>故障下的活性保证。</strong> 持有永久锁的崩溃主节点会导致系统冻结。</li>
+<li><strong>无需在共识层进行故障检测。</strong> 由时钟来完成。如果在租约期内未收到主节点的心跳，则认为主节点已失效。</li>
+</ul>
+<p>租约设计参数：</p>
+<ul>
+<li><strong>TTL 时长。</strong> 过短：GC 引发误报故障转移。过长：故障转移缓慢。典型值：5-15 秒。</li>
+<li><strong>续约间隔。</strong> 通常为 TTL 的 1/3，这样两次续约失败也不会丢失租约。</li>
+<li><strong>时钟假设。</strong> 服务器必须使用相同的时钟，或采用"与本地已流逝时间比较"模型。参见 <a href="#7-failure-modes-and-operations">第 7 节</a> 关于时钟偏差的内容。</li>
+</ul>
+<h3 id="44-single-leader-per-partition">4.4 单分区单主节点</h3>
+<p>与其使用一个全局主节点，不如对键空间分区，并为每个分区选举一个主节点。这正是 <strong>Kafka 分区主节点</strong>, <strong>Spanner Paxos 组</strong>, <strong>Cassandra LWT（轻量级事务）按 Token 范围</strong>，以及 <strong>HBase 区域服务器</strong> 的工作方式。</p>
+<p>特性：</p>
+<ul>
+<li>每分区主节点可水平扩展；共识组规模保持较小（通常为 3 或 5）。</li>
+<li>跨分区操作需要两阶段提交或 Saga——只有跨分区时才需支付协调成本。</li>
+<li>一个节点可以是分区 1 的主节点，同时是分区 17 的从节点，从而实现负载均衡。</li>
+</ul>
+<p>这也被称为 <strong>分片共识</strong> 或 <strong>multi-Raft / multi-Paxos</strong>。大多数现代强一致性数据库（CockroachDB、TiKV、YugabyteDB、Spanner）均遵循此模式。</p>
+<p>参见 <a href="/zh/common-backend-systems/apache-kafka/">Kafka doc</a> 的时间戳与 <a href="/zh/common-backend-systems/apache-cassandra/">Cassandra 文档</a>.</p>
+<h3 id="45-heartbeat-lease-for-failover">中关于分区主节点的讨论。</h3>
+<p>4.5 心跳 + 租约实现故障转移</p>
+<pre><code>Primary holds lease, TTL = 10s, renews every 3s.
++----+----+----+----+----+----+----+----+----+----+----+----+----+
+0    1    2    3    4    5    6    7    8    9   10   11   12   13  time (s)
+
+t=0:  primary acquires lease (token=42), TTL until t=10.
+t=3:  primary renews (TTL extended to t=13).
+t=5:  primary crashes (its last successful renewal was at t=3 → TTL until t=13).
+t=6:  standby misses heartbeat, starts watching.
+t=13: lease expires (the renewal at t=3 had extended TTL to t=13).
+t=13-15: standby tries acquire, wins (token=43).
+t=15: standby becomes new primary, starts issuing writes with token=43.
+</code></pre>
+<p>使系统呈现出"主节点在 8 秒内完成故障转移"这一可观测行为的复合机制： <strong>观测到的故障转移时间大约为</strong>(time-since-last-renew) + lease_TTL + election_RTT <em>不同的</em> ，最坏情况是租约在崩溃前刚刚续约。注意一个容易被忽视的非对称性：续约间隔（3 秒）和 TTL（10 秒）描述的是两件不同的 <strong>非</strong> 事情。续约间隔控制主节点多久证明一次活性；TTL 控制崩溃的主节点在其他人可以接管之前，能"持有"租约多久。缩短续约间隔并</p>
+<h3 id="46-quorum-based-decisions">加速故障转移；只有缩短 TTL 才能做到，但代价是当主节点停顿时间短于 TTL 时（例如 6 秒 GC 暂停而 TTL=5 秒时是致命的）会产生误报故障转移。</h3>
+<p>4.6 基于 Quorum 的决策 <strong>对于不需要建立完整共识组的决策，对一组副本执行</strong> Quorum 写入</p>
+<ul>
+<li>可提供线性一致性： <code>W</code> 写入必须获得 <code>R</code> 个副本的确认；读取必须触达 <code>R + W &gt; N</code>个副本；当满足条件时，</li>
+<li>，每次读取都与最新写入有交集。</li>
+</ul>
+<p>请参阅 <a href="/zh/common-backend-systems/amazon-dynamo/">被采用了 LWT/Paxos 覆盖层的 Dynamo 风格系统（如 Cassandra）以及单次决策协调（例如"这是主节点吗？"）所使用。</a> Dynamo 文档</p>
+<h3 id="47-idempotency-as-a-fallback-belt-and-suspenders-sometimes-the-whole-answer">了解 (N, R, W) 的完整论述。</h3>
+<p>4.7 幂等性作为兜底（双重保险，有时是全部答案） <strong>即便有了共识 + Fencing，也要</strong>让副作用本身幂等 <a href="/zh/system-design-patterns/idempotency-exactly-once/">idempotency-exactly-once.md</a>.</p>
+<p>。如果 Fencing 令牌检查为时已晚（例如调用已经发出），幂等性就是最后一道防线。参见同级模式 <em>是</em> 对于一大类任务——缓存预热、物化视图重建、协调扫描，以及任何通过重复执行收敛的任务——幂等性</p>
+<p>才是答案，协调层是你不必支付的开销。两个 cron 节点都在 03:00 执行物化视图重建；第二个节点的写入以相同的值覆盖第一个节点的写入；不会有任何问题。Staff 级别的判断：在使用 Raft 之前，先问该操作是否幂等。</p>
+<blockquote>
+<p>在幂等性单独不足的生产系统（资金划转、无去重的外部副作用、单写入账本）中，综合不变量为： <em>恰好一次</em> 执行 <em>可能无法实现；恰好一次</em> 效果</p>
+</blockquote>
+<p>可通过以下方式实现：共识保证身份唯一性 + 资源端 Fencing 令牌 + 副作用幂等性。</p>
+<ul>
+<li>强健的系统依赖全部三层，因为每层的故障方式不同：</li>
+<li>共识在 Quorum 丢失时失败。</li>
+<li>Fencing 在资源无法存储/检查令牌时失败。</li>
+</ul>
+<p>幂等性在去重键缺失或其窗口过期时失败。</p>
+<hr/>
+<h2 id="5-worked-example-naive-broken-fixed">5. 实际案例：朴素设计 → 崩溃 → 修复</h2>
+<h3 id="setup">场景设定</h3>
+<p>三者合力，使重复执行的可能性趋近于零。 <strong>一家支付公司每天在 UTC 03:00 运行日结算任务。该任务读取待处理费用，并向银行提交批量调用以完成资金划转。</strong> 运行两次意味着提交两次批量请求，即银行对商户账户进行两次扣款。</p>
+<h3 id="naive-design">没有冲正接口；每次事故的对账成本高达五位数美元。</h3>
+<pre><code>+----------+      +----------+      +----------+
+| cron-1   |      | cron-2   |      | cron-3   |
+| (asg=3)  |      |          |      |          |
++----+-----+      +----+-----+      +----+-----+
+     |                 |                  |
+     | "is it 3am?     | "is it 3am?     | "is it 3am?
+     |  yes — run."    |  yes — run."    |  yes — run."
+     v                 v                  v
+        +-----------------------------+
+        |     Bank batch endpoint     |
+        +-----------------------------+
+</code></pre>
+<p>朴素设计</p>
+<p><strong>三个相同的调度节点实现高可用，每个节点运行相同的 crontab。结果：银行在 03:00:00 收到三份相同的批量提交。</strong> 失败原因：</p>
+<h3 id="first-fix-attempt-redis-setnx-lock">没有"只有一个节点运行"的概念。每个节点各自基于本地时间独立行动。</h3>
+<pre><code class="language-python"># pseudo
+def run_settlement():
+    got_lock = redis.set("settlement:2024-01-15", node_id, nx=True, ex=300)
+    if not got_lock:
+        return
+    submit_batch_to_bank()
+    redis.delete("settlement:2024-01-15")
+</code></pre>
+<p>第一次修复尝试：Redis SETNX 锁</p>
+<ol>
+<li><strong>看似安全，实则在多种情况下并不安全：</strong> Redis 主节点故障。</li>
+<li><strong>副本是异步的——锁的键可能尚未复制。新的 Redis 主节点没有该锁；另一个节点获取锁；双重执行。</strong> 持锁方 GC 暂停。 <code>submit_batch_to_bank()</code>节点 A 获取锁，遭遇 6 分钟 GC 暂停。TTL 过期。节点 B 获取锁。节点 A 恢复后运行</li>
+<li><strong>网络分区。</strong> ，却不知自己已失去锁。银行收到两批请求。</li>
+</ol>
+<p>这就是 <strong>同样的场景；锁 TTL 过期；新的持有者被选出；旧的持有者仍在运行。</strong>"Redis 分布式锁"争议 <strong>：Martin Kleppmann 对 Redlock（多节点 Redis 锁算法）的批评。该协议无法在没有</strong>资源端强制执行 Fencing 令牌 <a href="#9-likely-interviewer-probes">的情况下保证互斥，因为无论在锁所有权上达成多少共识，都无法防止旧主节点在失去锁后继续写入。参见</a> 第 9 节关于 Redlock 争议</p>
+<h3 id="stronger-fix-consensus-fencing-tokens">的完整讨论。</h3>
+<p>架构：</p>
+<pre><code>                            +-----------------+
+                            |   etcd cluster  |
+                            |  (Raft, n=5)    |
+                            +--------+--------+
+                                     | grants lease + token
+                +--------------------+--------------------+
+                |                    |                    |
+            +---v-----+         +----v----+         +-----v---+
+            | sched-1 |         | sched-2 |         | sched-3 |
+            +---+-----+         +---------+         +---------+
+                | I hold lease "settlement-cron"
+                | with token=42
+                v
+            +-------+
+            | Bank  |  &lt;-- stores max_token_seen per job_id
+            | API   |      rejects requests with token &lt; max
+            +-------+
+</code></pre>
+<p>更强的修复方案：共识 + Fencing 令牌</p>
+<pre><code class="language-python">def run_settlement(now_utc):
+    # 1. Acquire (or confirm) the lease + token via etcd.
+    grant = etcd.acquire_or_refresh(
+        lock_key="settlement-cron",
+        lease_ttl=15,  # seconds
+        holder_id=NODE_ID,
+    )
+    if grant.holder_id != NODE_ID:
+        return  # someone else holds it
+
+    # 2. Materialize the "expected run" row with a unique key.
+    occurrence_id = f"settlement:{now_utc.date().isoformat()}"
+    inserted = catalog.try_insert_occurrence(
+        occurrence_id=occurrence_id,
+        scheduled_at=now_utc,
+    )
+    if not inserted:
+        return  # already created; another scheduler did it
+
+    # 3. Dispatch the work with the fencing token.
+    bank_api.submit_batch(
+        idempotency_key=occurrence_id,
+        fencing_token=grant.token,  # the token MUST be checked downstream
+        payload=load_pending_charges(now_utc),
+    )
+</code></pre>
+<p>结算代码：</p>
+<pre><code class="language-python">def submit_batch(idempotency_key, fencing_token, payload):
+    with db.transaction():
+        row = db.select_for_update(
+            "bank_jobs", where={"job_id": "settlement-cron"}
+        )
+        if fencing_token &lt; row.max_token_seen:
+            # Stale leader. Refuse.
+            raise StaleLeaderError(
+                f"got {fencing_token}, have {row.max_token_seen}"
+            )
+        if db.exists("bank_batches", idempotency_key=idempotency_key):
+            # Belt-and-suspenders: idempotency dedup.
+            return db.lookup("bank_batches", idempotency_key=idempotency_key)
+        db.update("bank_jobs", job_id="settlement-cron",
+                  max_token_seen=fencing_token)
+        result = execute_batch(payload)
+        db.insert("bank_batches",
+                  idempotency_key=idempotency_key, result=result)
+        return result
+</code></pre>
+<p>银行 API 资源（负责强制执行 Fencing 的一侧）：</p>
+<ol>
+<li><strong>现在重新审视上述故障场景：</strong> sched-1 持有 token=42，GC 暂停 6 分钟。 <strong>etcd 租约过期；sched-2 获胜，token=43。sched-2 携带 token=43 调用银行；银行记录 max=43。sched-1 恢复，携带 token=42 调用银行。银行拒绝：42 &lt; 43。Fencing 机制保护了我们。</strong></li>
+<li><strong>安全。</strong> etcd 主节点故障。 <strong>etcd 租约过期；sched-2 获胜，token=43。sched-2 携带 token=43 调用银行；银行记录 max=43。sched-1 恢复，携带 token=42 调用银行。银行拒绝：42 &lt; 43。Fencing 机制保护了我们。</strong></li>
+<li><strong>Raft 从剩余 4 个副本中选举出新的 etcd 主节点。租约状态已被复制；无数据丢失。共识机制保护了我们。 <em>之前</em> sched-1 的请求在 sched-2 之后到达银行，尽管 sched-1 早已失去租约。</strong> 银行看到 token=42，从未见过更高的值，接受请求；设置 max=42，处理批量请求。sched-2 携带 token=43 到达；银行设置 max=43（43 ≥ 42，Fencing 通过）——但由于 <strong>幂等键</strong> 是 <code>settlement:2024-01-15</code>，与之前相同。银行进行去重：返回缓存结果而不再次执行。 <strong>注意：单靠 Fencing 在此处并未保护我们</strong> ——两个令牌按到达顺序都是单调可接受的。是幂等性保护了我们。 <strong>etcd 租约过期；sched-2 获胜，token=43。sched-2 携带 token=43 调用银行；银行记录 max=43。sched-1 恢复，携带 token=42 调用银行。银行拒绝：42 &lt; 43。Fencing 机制保护了我们。</strong></li>
+</ol>
+<p>场景 3 证明了三层并非冗余。Fencing 保护的是旧主节点在 <em>after</em> 新主节点更高令牌已落地；它 <strong>非</strong> 防止旧主节点的写入落地 <em>第一个</em>，这可能发生在旧主节点不知道自己已失去租约而网络重排了数据包的情况下。幂等性捕获了这种情况。三层缺一不可；合力才能产生恰好一次的效果。</p>
+<hr/>
+<h2 id="6-variants-and-how-to-choose">6. 变体及如何选择</h2>
+<table>
+<thead>
+<tr>
+<th>变体</th>
+<th>解决的问题</th>
+<th>工具集</th>
+<th>适用场景</th>
+<th>何时不应使用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>主节点选举</strong></td>
+<td>由一个节点拥有全局角色（运行 cron、驱动故障转移）。</td>
+<td>etcd/ZK/Chubby + 租约 + Fencing 令牌。</td>
+<td>单一全局决策者（编排器、Primary）。</td>
+<td>需要扩展至超出单节点吞吐量的热路径。</td>
+</tr>
+<tr>
+<td><strong>分布式锁</strong></td>
+<td>在有限时间窗口内对命名资源实现互斥。</td>
+<td>Chubby / ZooKeeper 临时节点 / etcd 租约。</td>
+<td>粗粒度所有权声明、主节点选举（退化情形）、低频关键区间。</td>
+<td>细粒度逐行互斥（请使用数据库事务）。</td>
+</tr>
+<tr>
+<td><strong>单分区单主节点</strong></td>
+<td>可扩展性：每个分片一个主节点。</td>
+<td>每分片 Raft 组；由元协调器管理（例如 Kafka 控制器）。</td>
+<td>分片数据存储、分区共识（CockroachDB、Spanner、Kafka）。</td>
+<td>一个 Raft 组即可满足的小型数据集。</td>
+</tr>
+<tr>
+<td><strong>共识状态机（复制型）</strong></td>
+<td>状态本身即是共识，而非仅仅是主节点身份。</td>
+<td>直接使用 Raft / Paxos 存储应用状态。</td>
+<td>强一致性 KV / 元数据（etcd、Consul、ZooKeeper 作为小型数据库）。</td>
+<td>大型状态；共识受吞吐量限制，不适合作为主存储。</td>
+</tr>
+<tr>
+<td><strong>乐观主节点 + 幂等性</strong></td>
+<td>"在任意节点运行"并通过资源保证安全性。</td>
+<td>幂等键 + 数据库约束 + 协调扫描。</td>
+<td>无法承担协调层时，或作为兜底方案。</td>
+<td>资源无法原子性地强制执行幂等性时。</td>
+</tr>
+</tbody>
+</table>
+<p>决策流程：</p>
+<pre><code>"Need exactly one actor?"
+        |
+        v
+Is the state being protected a fixed, small role
+(primary, scheduler, controller)?
+        |
+   yes --&gt; Leader election with fencing tokens.
+        |
+        no
+        v
+Is it many resources, each needing one writer?
+        |
+   yes --&gt; Single-leader-per-partition (sharded consensus).
+        |
+        no
+        v
+Is it occasional access to a named resource?
+        |
+   yes --&gt; Distributed lock (with fencing).
+        |
+        no
+        v
+Is the state itself what needs replication?
+        |
+   yes --&gt; Replicated state machine on top of consensus (Raft/Paxos).
+        |
+        no
+        v
+Reconsider: maybe coordination isn't needed; pure idempotency suffices.
+</code></pre>
+<p>在面试中， <strong>说明你选择了哪种变体以及原因</strong> ——例如， <em>"对于每日支付 cron，单一主节点选举的调度器是正确的，因为该操作是全局的且不频繁。我不会使用分区；与安全性收益相比，协调成本可忽略不计。"</em></p>
+<hr/>
+<h2 id="7-failure-modes-and-operations">7. 故障模式与运维</h2>
+<table>
+<thead>
+<tr>
+<th>失败</th>
+<th>症状</th>
+<th>需监控的指标</th>
+<th>缓解措施</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>共识副本间的时钟偏差</strong></td>
+<td>租约到期决策不一致；误报故障转移；重复授权。</td>
+<td>每节点的 NTP 漂移；clock_offset_seconds。</td>
+<td>使用 NTP + 闰秒平滑；将租约到期视为自上次心跳以来的本地已流逝时间，在 <strong>服务器</strong> 侧（而非客户端侧）判断。Spanner 使用 TrueTime 来明确约束这一问题。</td>
+</tr>
+<tr>
+<td><strong>租约到期竞态（长时间 GC 暂停）</strong></td>
+<td>旧主节点认为自己仍持有租约；新主节点被选出；两者同时尝试写入。</td>
+<td>gc_pause_p99；lease_lost_count。</td>
+<td>在资源端使用 Fencing 令牌。租约 TTL 必须超过最坏情况下的 GC 时间；不要为了追求更快的故障转移而在未解决 GC 问题的情况下缩短 TTL。</td>
+</tr>
+<tr>
+<td><strong>网络分区（脑裂）</strong></td>
+<td>在两个分区中各自选出主节点；两者均进行写入。</td>
+<td>partition_detected 事件；quorum_unhealthy。</td>
+<td>共识要求多数方才能授权——少数方无法选出新主节点。资源端 Fencing 仍然必要，因为多数方的旧主节点可能在意识到之前就已失去租约。</td>
+</tr>
+<tr>
+<td><strong>Quorum 丢失（故障数超过容忍上限）</strong></td>
+<td>集群无法选举或提交；系统停止写入。</td>
+<td>unhealthy_replicas；commit_latency p99。</td>
+<td>对关键系统使用 n=5 而非 n=3；将副本分散至不同可用区；制定文档化的灾难恢复计划（手动多数覆盖非常危险——接受强一致性意味着故障时停止服务）。</td>
+</tr>
+<tr>
+<td><strong>心跳放大</strong></td>
+<td>大量从节点向主节点发送心跳；主节点 CPU 饱和。</td>
+<td>leader_cpu_pct；heartbeat_qps。</td>
+<td>限制每个协调单元的客户端数量（Chubby 每个单元约 1 万个客户端）；超出时进行分片。</td>
+</tr>
+<tr>
+<td><strong>主节点 WAL 磁盘缓慢</strong></td>
+<td>提交延迟上升；客户端出现超时；发生虚假故障转移。</td>
+<td>wal_fsync_p99；commit_latency p99。</td>
+<td>为共识日志配置专用 SSD；不要与高负载工作负载共置。</td>
+</tr>
+<tr>
+<td><strong>主节点变更时的 Watch 风暴</strong></td>
+<td>故障转移后大量客户端同时重新获取租约；雷群效应。</td>
+<td>reacquire_qps 峰值。</td>
+<td>重新获取时加入抖动退避；限制入站扇入。</td>
+</tr>
+<tr>
+<td><strong>长时间分区后旧主节点重新上线</strong></td>
+<td>过时的主节点重新加入已经向前推进的网络；尝试使用旧令牌写入。</td>
+<td>被令牌拒绝的写入数量（rejected_writes by token）。</td>
+<td>在资源侧通过 fencing token 拒绝此类请求。同时：主节点自检是否仍能从大多数对等节点收到响应，若不能则自动降级。</td>
+</tr>
+<tr>
+<td><strong>资源无法存储 fencing token</strong></td>
+<td>下游系统（如邮件 API）没有 token 字段；协调正确性退化为依赖租约诚信。</td>
+<td>side_effects_without_fencing。</td>
+<td>使副作用幂等（幂等键 + 去重窗口）。将锁视为尽力而为。记录残余风险。</td>
+</tr>
+<tr>
+<td><strong>租约 TTL 设置过短</strong></td>
+<td>正常 GC 期间频繁故障转移；发生抖动。</td>
+<td>failover_count/hour；leader_age p50。</td>
+<td>增大 TTL；分析最坏情况的 stop-the-world 暂停时间；将续约间隔调整为 TTL/3。</td>
+</tr>
+<tr>
+<td><strong>租约 TTL 设置过长</strong></td>
+<td>故障转移缓慢；用户遭遇数分钟的服务中断。</td>
+<td>mean_failover_seconds。</td>
+<td>在解决 GC 根因之后再缩短 TTL。</td>
+</tr>
+</tbody>
+</table>
+<p>每个协调层都应输出的运营指标：</p>
+<ul>
+<li><strong>单锁指标</strong>：持有者标识、token、剩余租约时间、获取/续约/丢失计数器。</li>
+<li><strong>单副本指标</strong>：term、角色（leader/follower/candidate）、commit index、wal_fsync p99。</li>
+<li><strong>单客户端指标</strong>：token 被拒绝次数（验证 fencing 是否真正被执行的冒烟测试）、重新获取次数。</li>
+<li><strong>审计日志</strong>：每次授予、每次释放、每次过期。这是当"谁运行了这个任务？"成为问题时的取证记录。</li>
+</ul>
+<hr/>
+<h2 id="8-combinations-with-other-patterns">8. 与其他模式的组合</h2>
+<p>协调很少单独存在。完整的安全故事通常涉及三到四个关联模式。</p>
+<table>
+<thead>
+<tr>
+<th>关联模式</th>
+<th>组合方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="/zh/system-design-patterns/idempotency-exactly-once/">idempotency-exactly-once.md</a></td>
+<td>协调提供 <strong>恰好一次的执行尝试</strong>；幂等性提供 <strong>在重试情况下也恰好一次的效果</strong>。对于涉及资金转移或外部副作用的操作，始终将两者配合使用。</td>
+</tr>
+<tr>
+<td><a href="/zh/system-design-patterns/strong-consistency-under-contention/">strong-consistency-under-contention.md</a></td>
+<td>协调是 <em>如何</em> 你在标识上实现强一致性的手段。竞争模式覆盖下游（行、余额）——协调覆盖执行者。</td>
+</tr>
+<tr>
+<td><a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a></td>
+<td>单一主节点从定义上来说就是一个热点键。应通过对工作进行分区来缓解（每分区单主节点），而不是在协调上撒谎。</td>
+</tr>
+<tr>
+<td><a href="/zh/system-design-patterns/ordering-causal-consistency/">ordering-causal-consistency.md</a></td>
+<td>共识日志本身提供全序排序。如果使用 Raft 日志作为真实来源，则在主节点切换时可免费获得排序保证。</td>
+</tr>
+<tr>
+<td><a href="/zh/system-design-patterns/fan-out-write-amplification/">fan-out-write-amplification.md</a></td>
+<td>如果主节点对工作进行扇出，扇出上的重试必须在主节点切换下保持安全——使用幂等键加 fencing token。</td>
+</tr>
+<tr>
+<td><a href="/zh/system-design-patterns/backpressure-flow-control/">backpressure-flow-control.md</a></td>
+<td>共识层本身有速率限制；保护它免受故障转移后大量客户端心跳的冲击。</td>
+</tr>
+<tr>
+<td><a href="/zh/system-design-patterns/durability-at-scale/">durability-at-scale.md</a></td>
+<td>共识日志必须在仲裁组中持久化；失去持久性则失去协调正确性。</td>
+</tr>
+</tbody>
+</table>
+<p>高级工程师的回答应明确连接这些要点： <em>"协调层确保只有一个调度器触发任务。银行 API 的幂等性确保效果恰好一次。复式账本提供审计记录。每一层覆盖其他层无法覆盖的故障模式。"</em></p>
+<hr/>
+<h2 id="9-likely-interviewer-probes">9. 面试官可能追问的问题</h2>
+<p>至少要准备好其中三道题的答案，并提前演练。</p>
+<h3 id="91-explain-the-redlock-controversy">9.1 "请解释 Redlock 争议。"</h3>
+<p><strong>Redlock</strong> 是 Salvatore Sanfilippo（Redis 作者）提出的跨 N 个独立 Redis 节点的分布式锁算法：在时间限制内在 N=5 个节点的多数上获取锁；锁持有者在剩余时间减去时钟漂移余量的时间内使用锁。</p>
+<p><strong>Martin Kleppmann 2016 年的批评</strong> 比"Redis 不安全"更为深刻。他的核心主张是 <em>任何</em> 锁服务——Redlock、Chubby、ZooKeeper，乃至自研的——如果只向客户端提供不透明的锁标识，在被保护资源存在于其他地方时就是不够的。获取锁后，客户端可能因 GC、swap、OS 调度、虚拟化停顿而被暂停超过租约 TTL；与此同时第二个客户端获取了锁并写入资源；然后第一个客户端恢复并也进行了写入。Kleppmann 坚持的补救措施是 <strong>：Martin Kleppmann 对 Redlock（多节点 Redis 锁算法）的批评。该协议无法在没有</strong> ——资源记录它曾见过的最高 token 并拒绝较低的 token。Redlock 的具体缺口在于它不颁发此类 token；从技术上讲，"不使用 sequencer 的 Chubby"或"不使用 zxid 的 ZooKeeper"也存在同样的缺口。</p>
+<p>Antirez 的回应：在实践中，足以破坏 Redlock 的 GC 暂停是可观测且罕见的；对于负担不起 Raft/Paxos 集群的系统，Redlock 是合理的权衡。Kleppmann 的反驳："罕见"对于涉及资金转移的操作不是正确性论据。</p>
+<p>高级工程师的综合观点：</p>
+<blockquote>
+<p>这场争议并非 Redis 对 Raft，而是关于 <strong>互斥在哪里被执行</strong>：在锁服务处（必要但永远不够）还是在资源处（唯一真正能将两个写入者隔开的地方）。没有 fencing token 的锁服务是尽力而为的。有 fencing token 的锁服务是正确的 <em>当且仅当资源校验该 token</em>。Chubby、ZooKeeper 和 etcd 都支持 fencing token；Redlock 原生不支持。但故障模式是普遍的：任何以锁服务作为唯一防线的设计，在对抗性暂停下都是有缺陷的，无论锁服务叫什么名字。</p>
+</blockquote>
+<h3 id="92-what-if-the-consensus-cluster-loses-quorum">9.2 "如果共识集群失去仲裁会怎样？"</h3>
+<p>答：集群停止写入。共识是 CAP 中的 <strong>CP</strong> ——在仲裁丢失时以可用性为代价换取分区容忍和一致性。记录这一点。不要试图通过允许少数写入来"修复"它（那会重新引入脑裂）。</p>
+<p>缓解措施：使用 n=5 而非 n=3（容忍 2 个故障而非 1 个）；跨可用区分散副本；制定文档化的手动恢复路径，包括对少数派进行快照并引导新多数派——明确接受数据丢失。</p>
+<h3 id="93-why-not-just-use-a-database-row-lock">9.3 "为什么不直接使用数据库行锁？"</h3>
+<p>对某些情况有效——例如，单主节点 Postgres 上的 <code>SELECT ... FOR UPDATE</code> 完全可以作为协调原语。其局限性：</p>
+<ul>
+<li>数据库成为协调的单点故障；如果它宕机，没有人可以协调。</li>
+<li>数据库本身的故障转移将协调问题向下引入了一层（哪个 Postgres 副本现在是主节点？）。</li>
+<li>吞吐量受行锁竞争的限制。</li>
+</ul>
+<p>专用共识服务的优势：它专为小型、热点、竞争状态的高可用性而构建。</p>
+<h3 id="94-how-fast-can-you-fail-over">9.4 "故障转移能有多快？"</h3>
+<p>最坏情况 = lease_TTL + election_RTT（共识选举超时，Raft 在健康的局域网上通常为 150-300 ms）。TTL = 10 s 时，观测到的故障转移时间约为 10-15 s。要更快就必须缩短 TTL——而这正是不对称性所在：将 TTL 缩短到低于最坏情况的 stop-the-world 暂停（JVM GC、Go STW、hypervisor 抢占），会以真实的假故障转移风险换取真实的故障转移速度。"5 秒故障转移"只有在你已经通过实证表征了最坏情况暂停 <em>或</em> 或者将运行时迁离 JVM 的情况下才可实现。"预热备用"的观点是真实的，但与此正交：它缩短的是选举后的预热时间，而非选举本身。</p>
+<h3 id="95-what-if-the-leader-is-a-byzantine-actor-malicious-or-buggy">9.5 "如果主节点是拜占庭行为者（恶意或有缺陷）怎么办？"</h3>
+<p>标准共识（Raft、Paxos、ZAB）容忍 <strong>崩溃故障</strong>，而非拜占庭故障。如果需要拜占庭容错，你需要 PBFT、Tendermint 或 HotStuff——代价是显著的开销。在典型的云系统中，我们假设非拜占庭。</p>
+<p>针对有缺陷主节点的实际缓解措施：主节点自检（我仍在多数中吗？我能提交吗？）；主节点出站调用中的熔断器；金丝雀部署；资源侧 fencing token 是最终裁决。</p>
+<h3 id="96-why-does-kafka-use-zookeeper-kraft-instead-of-just-electing-controllers-via-gossip">9.6 "为什么 Kafka 使用 ZooKeeper / KRaft 而不是通过 gossip 选举控制器？"</h3>
+<p>Gossip 提供成员关系的最终一致性，而非标识上的强一致性。Kafka 控制器需要严格的单写入者语义来进行分区领导权分配。ZooKeeper（以及现在的 KRaft，即内部 Raft）提供了这一点。基于 gossip 的控制器会在元数据上产生脑裂风险。</p>
+<h3 id="97-how-does-this-interact-with-multi-region">9.7 "这与多区域如何交互？"</h3>
+<p>跨区域共识在每次写入时都要付出跨区域 RTT 的代价——通常为 50-100 ms。对于延迟敏感的协调，可以：</p>
+<ul>
+<li>保持共识在区域内，并为跨区域设置单独的协调层（例如，Spanner 的 Paxos 组在热路径上位于同一区域；跨区域使用外部协调器）。</li>
+<li>仅对罕见的高风险决策（灾难恢复故障转移）使用全局共识。</li>
+<li>对跨区域协调接受最终一致性，并使用幂等性来吸收松散带来的影响。</li>
+</ul>
+<hr/>
+<h2 id="10-common-traps-stronger-moves">10. 常见陷阱 → 更优方案</h2>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"我们使用 Redis SETNX 作为锁。"</td>
+<td>"我们将 Redis 作为提示；正确性来自在数据库通过 <code>WHERE max_token_seen &lt;= :token</code> update 强制执行的 fencing token。"</td>
+</tr>
+<tr>
+<td>"主节点在行动前检查自己是否仍是主节点。"</td>
+<td>"每个操作都携带租约的 fencing token；资源——而非主节点——执行新鲜度检查。"</td>
+</tr>
+<tr>
+<td>"我们使用心跳来检测故障。"</td>
+<td>"我们使用带 TTL 的租约；心跳续约租约。故障检测是经过时间的时钟，而非单独的信号。"</td>
+</tr>
+<tr>
+<td>"如果主节点崩溃，备用节点立即接管。"</td>
+<td>"故障转移时间是 lease_TTL + election_RTT，通常为 5-15 秒。更快需要接受更高的误报率。"</td>
+</tr>
+<tr>
+<td>"我们相信集群不会发生分区。"</td>
+<td>"我们针对分区进行设计：少数侧停止写入；多数侧继续服务；资源执行 fencing，使恢复的少数主节点无法导致数据损坏。"</td>
+</tr>
+<tr>
+<td>"整个系统使用一个主节点。"</td>
+<td>"每个分区一个主节点；元协调器分配分区主节点。水平扩展，无全局瓶颈。"</td>
+</tr>
+<tr>
+<td>"为节省成本，共识运行 n=3。"</td>
+<td>"关键路径运行 n=5，以便容忍 2 个同时故障（例如一个计划升级加一个计划外故障）。"</td>
+</tr>
+<tr>
+<td>"Raft 太难了，我们自己写协议。"</td>
+<td>"我们使用 etcd / ZooKeeper / 托管服务。自定义共识是一个多年期项目，充满陷阱。"</td>
+</tr>
+<tr>
+<td>"幂等性使协调变得不必要。"</td>
+<td>"有时确实如此：对于缓存重建、物化视图刷新，或任何天然幂等的任务，幂等性 <em>是</em> 才是答案，共识是额外开销。对于非幂等副作用（银行 API 没有去重，邮件服务商每次调用都发送一封），协调 + fencing + 幂等性的组合才是高级工程师的答案。在采用 Raft 之前，先确认你面对的是哪种情况。"</td>
+</tr>
+<tr>
+<td>"我们不需要 fencing，因为我们的锁服务是可靠的。"</td>
+<td>"我们添加 fencing，因为没有任何锁服务能可靠抵御 30 秒的 JVM GC 暂停。Fencing 代价低廉；缺少 fencing 是无界风险。"</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h2 id="11-staff-level-answer-checklist">11. Staff 级别回答清单</h2>
+<p>当面试官触及这一模式时，按顺序展现以下要点：</p>
+<ul>
+<li>[ ] <strong>首先，判断你是否真的需要共识。</strong> 如果副作用是幂等的，请说出来并提议至少一次 + 幂等性。在任务 <code>INSERT ... ON CONFLICT DO NOTHING</code> 时去用 Raft 是过度设计，精明的面试官会给你扣分。</li>
+<li>[ ] <strong>大声说出不变量。</strong> "即使在分区情况下，最多一个执行者执行此操作。"这句话正是面试官打分的依据。</li>
+<li>[ ] <strong>识别共识层。</strong> Raft（etcd / Consul / 托管服务）、Paxos（Chubby / Spanner）或 ZAB（ZooKeeper）。不要自己实现。</li>
+<li>[ ] <strong>指定 fencing token。</strong> 它来自哪里、如何保证单调性，以及——关键是—— <strong>它在哪里被执行</strong>。只说"fencing token"而不指明资源侧校验是不完整的。</li>
+<li>[ ] <strong>讨论租约，而不仅仅是锁。</strong> TTL、续约间隔，以及它所暗示的故障转移时间。</li>
+<li>[ ] <strong>明确讨论 GC 暂停 / 分区场景。</strong> 逐步说明旧主节点在租约过期后重新唤醒时会发生什么。</li>
+<li>[ ] <strong>承认 Redlock 式争议。</strong> 表明你理解锁语义与 fencing 语义之间的区别。</li>
+<li>[ ] <strong>与幂等性结合。</strong> 协调是第一道防线；幂等性是第二道。对于涉及资金转移的操作，两者都是必需的。</li>
+<li>[ ] <strong>讨论可观测性。</strong> 哪个指标能告诉你 fencing 拒绝了一次过期写入？（如果主节点对自己的写入进行自我 fencing，你应该感到警觉。）</li>
+<li>[ ] <strong>明确选择一种变体。</strong> 主节点选举 vs 分布式锁 vs 每分区单主节点 vs 共识状态机——并说明选择理由。</li>
+<li>[ ] <strong>说明故障转移时间预算。</strong> "TTL=10s 时，设计上为 5-15 秒。"不是"即时"。</li>
+<li>[ ] <strong>承认仲裁丢失时停止服务。</strong> 共识是 CP 的。记录恢复流程。</li>
+<li>[ ] <strong>避免拜占庭声明。</strong> 标准共识不具备拜占庭容错；请明确说明。</li>
+</ul>
+<p>如果你能做到这 13 条中的 9 条，听起来就像一位在生产中运行过协调层的高级工程师。如果少于 5 条，听起来就像只读过 Raft 论文但从未负责过 on-call。</p>
+<hr/>
+<h2 id="12-cross-references">12. 交叉引用</h2>
+<p>关联模式：</p>
+<ul>
+<li><a href="/zh/system-design-patterns/idempotency-exactly-once/">idempotency-exactly-once.md</a> ——天然的配对；协调 + 幂等性 = 恰好一次效果。</li>
+<li><a href="/zh/system-design-patterns/strong-consistency-under-contention/">strong-consistency-under-contention.md</a> ——在数据上使用共识，而不仅仅是标识。</li>
+<li><a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a> ——单一主节点从定义上是一个热点键。</li>
+<li><a href="/zh/system-design-patterns/ordering-causal-consistency/">ordering-causal-consistency.md</a> ——共识日志在主节点切换时提供全序排序。</li>
+<li><a href="/zh/system-design-patterns/fan-out-write-amplification/">fan-out-write-amplification.md</a> ——进行扇出的主节点必须使用幂等键以安全重试。</li>
+<li><a href="/zh/system-design-patterns/backpressure-flow-control/">backpressure-flow-control.md</a> ——保护协调层免受雷群效应冲击。</li>
+<li><a href="/zh/system-design-patterns/durability-at-scale/">durability-at-scale.md</a> ——共识日志的持久性是上述一切的基础。</li>
+<li><a href="/zh/system-design-patterns/search-and-ranking/">search-and-ranking.md</a>, <a href="/zh/system-design-patterns/geo-spatial-queries/">geo-spatial-queries.md</a>, <a href="/zh/system-design-patterns/real-time-aggregation/">real-time-aggregation.md</a>, <a href="/zh/system-design-patterns/cache-stampede-read-amplification/">cache-stampede-read-amplification.md</a> ——直接关联较少，但分区主节点的思想会反复出现。</li>
+</ul>
+<p>最相关的问题文档：</p>
+<ul>
+<li><a href="/zh/common-backend-systems/design-a-distributed-lock-manager-like-chubby/">Chubby</a> ——权威协调服务。</li>
+<li><a href="/zh/common-backend-systems/design-a-distributed-job-scheduler-like-cron/">分布式任务调度器 / Cron</a> ——每次触发恰好执行一次。</li>
+<li><a href="/zh/common-backend-systems/design-a-payment-system/">Payment System</a> ——双重执行的代价。</li>
+<li><a href="/zh/common-backend-systems/design-the-stripe-payment-gateway/">Stripe Payment Gateway</a> ——幂等键是协调的补充。</li>
+<li><a href="/zh/common-backend-systems/design-a-stock-exchange/">Stock Exchange</a> ——订单簿的主节点故障转移。</li>
+<li><a href="/zh/common-backend-systems/design-a-reminder-alert-system/">Reminder / Alert System</a> ——触发器的单次触发。</li>
+<li><a href="/zh/common-backend-systems/apache-kafka/">Apache Kafka</a> ——每分区单主节点模式。</li>
+<li><a href="/zh/common-backend-systems/apache-cassandra/">Apache Cassandra</a> ——LWT（轻量级事务）作为 Paxos 覆盖层。</li>
+<li><a href="/zh/common-backend-systems/amazon-dynamo/">Amazon Dynamo</a> ——反例：通过仲裁 + 向量时钟避免协调。</li>
+<li><a href="/zh/common-backend-systems/google-bigtable/">Google Bigtable</a> ——使用 Chubby 进行 tablet 主节点选举。</li>
+</ul>
+<p>基础阅读：</p>
+<ul>
+<li>Staff System Design Glossary——术语如 quorum、lease、replica、consensus。</li>
+<li>Staff System Design Interview Playbook——面试流程、时间预算、开场脚本。</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

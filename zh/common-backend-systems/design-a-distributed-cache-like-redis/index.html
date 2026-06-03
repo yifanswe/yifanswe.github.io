@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>设计类 Redis 的分布式缓存 — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">设计类 Redis 的分布式缓存</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p><strong>对这些术语不熟悉？</strong> 请参阅 <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> ，了解常见系统设计术语的中英文解释。</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. 基础知识与解题思路</h2>
+<h3 id="what-this-question-is-testing">本题考察点</h3>
+<p>分布式缓存位于应用与其真相来源（通常是较慢的数据存储，如数据库、对象存储或下游服务）之间，用于吸收读取负载。难点不在于内存中的哈希表本身，而在于：协调跨多台机器的大内存池、淘汰合适的数据、在故障中保持存活，以及在关联流量峰值时保护真相来源。</p>
+<p>其不变量如下：</p>
+<blockquote>
+<p>对任意缓存键，读取返回某个近期有效时间点的值（新鲜度契约），或在每个防雷击窗口内触发且仅触发一次源站拉取的干净 miss——即使节点故障、键是热键且客户端激进重试。</p>
+</blockquote>
+<p>在工业职级 L5（ICT5）或高级 Staff 及以上（L6+），面试官考察的是：你能否选择分区方案、淘汰策略、副本与故障转移方案，以及——最重要的——能否解释当缓存 miss、故障或重启时，源站会发生什么。</p>
+<h3 id="60-second-interview-framing">60 秒面试框架</h3>
+<p>口述版本：</p>
+<blockquote>
+<p>我将把缓存设计为一个分片的内存键值（KV）集群，位于应用服务器与真相来源之间的读取路径上。关键决策包括：如何对键分区、如何通过副本保障可用性、内存满时如何淘汰，以及如何在热 miss 和冷重启时保护源站免受缓存雪崩冲击。我将澄清需求，选择一致性哈希加哈希槽方案，梳理读写路径，然后深入探讨淘汰、热键和故障模式。</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">首先明确需求</h3>
+<p>功能性需求：</p>
+<ul>
+<li>支持的操作：GET、SET、DEL，以及 SET 时指定 Time To Live（TTL）。</li>
+<li>数据类型：仅字节字符串值，还是更丰富的类型，如列表、集合、有序集合、哈希？Redis 本身暴露了这些数据结构；Memcached 则没有。</li>
+<li>Pub/Sub、原子计数器、分布式锁——这些是否在范围内？</li>
+<li>多键操作：pipeline、事务、涉及多个键的脚本。</li>
+<li>一致性契约：读写一致？最终一致？尽力而为？</li>
+</ul>
+<p>非功能性需求：</p>
+<ul>
+<li>读取延迟预算——通常在数据中心内 p99 低于毫秒级。</li>
+<li>命中率目标——通常高于 90%，设计才值得。</li>
+<li>内存大小——整个集群达到 TB 级别。</li>
+<li>吞吐量——每集群每秒数百万次操作。</li>
+<li>持久性——缓存是否允许重启后丢失数据，还是必须保存？如果必须保存，那就是 KV 存储领域，而非缓存。</li>
+<li>多区域——每区域一个复制集群，还是一个全球集群？</li>
+</ul>
+<p>除非面试官要求，否则超出范围：</p>
+<ul>
+<li>完整磁盘持久化和时间点恢复（那是数据库的问题）。</li>
+<li>查询语言、索引、二级索引。</li>
+<li>强跨分片事务（缓存不擅长此类操作，应当明确说明）。</li>
+<li>搜索和分析负载（使用 Elasticsearch 或列式存储）。</li>
+</ul>
+<h3 id="scale-assumptions">规模假设</h3>
+<table>
+<thead>
+<tr>
+<th>领域</th>
+<th>假设</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>读取流量</td>
+<td>集群峰值 1000 万次操作/秒。</td>
+</tr>
+<tr>
+<td>写入流量</td>
+<td>100 万次操作/秒——通常读写比为 10:1。</td>
+</tr>
+<tr>
+<td>工作集</td>
+<td>1 TB 热数据，分布在 100+ 个分片上。</td>
+</tr>
+<tr>
+<td>值大小</td>
+<td>中位数 1 KB，p99 为 50 KB，硬上限 1 MB（大值会拖垮事件循环）。</td>
+</tr>
+<tr>
+<td>TTL 分布</td>
+<td>大多数键为 5 分钟到 1 小时；部分粘性 session 键为 24 小时。</td>
+</tr>
+<tr>
+<td>命中率</td>
+<td>目标 95%+；低于 80% 表明缓存不值得。</td>
+</tr>
+<tr>
+<td>延迟预算</td>
+<td>p99 GET 延迟在区域内低于 1 毫秒；p99 SET 低于 2 毫秒。</td>
+</tr>
+<tr>
+<td>重启爆炸半径</td>
+<td>全集群重启不得压垮源站数据库。</td>
+</tr>
+</tbody>
+</table>
+<p>瓶颈通常不是单节点的每秒查询数——单个 Redis 实例在普通硬件上可以处理 10 万+次操作/秒。瓶颈在于热键、热分片，以及缓存 miss 时的源站保护。</p>
+<p>需要当面说出的容量估算：</p>
+<ul>
+<li>如果热值集为 1 TB，中位值大小为 1 KB，则集群约存储 10 亿个键。</li>
+<li>每键元数据并非免费：键字节、过期时间戳、LRU/LFU 元数据、分配器开销、哈希表指针。对于简单字符串值，预算每键 100-150 字节。</li>
+<li>10 亿个键 × 1 KB 值 ≈ 1 TB 值字节；10 亿 × 120 字节元数据 ≈ 120 GB 开销。</li>
+<li>加上 30% 分配器碎片和空闲余量： <code>(1.12 TB × 1.3) ≈ 1.46 TB</code> 每完整副本。</li>
+<li>主节点加一个副本，整个集群需要约 3 TB RAM（不含增长余量）。100 个主分片，每个主分片持有约 15 GB 逻辑数据；实际使用 40-80 GB 节点，以便故障转移和重新分片有足够空间。</li>
+</ul>
+<p>主要成本是 RAM，而非 CPU。降低成本的手段包括：调整 TTL、缩小值上限、紧凑编码、丢弃冷命名空间，以及将大 blob 移出缓存放入对象存储，仅缓存元数据。</p>
+<h3 id="core-product-model">核心产品模型</h3>
+<table>
+<thead>
+<tr>
+<th>界面</th>
+<th>用户体验</th>
+<th>系统需求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>应用读取</td>
+<td>高命中率下的亚毫秒 GET。</td>
+<td>缓存必须靠近应用，通过分区分散负载，并保持预热状态。</td>
+</tr>
+<tr>
+<td>应用写入</td>
+<td>具有 TTL 的可预期 SET 语义。</td>
+<td>写入必须足够快地传播到副本，以使大多数情况下写后读一致。</td>
+</tr>
+<tr>
+<td>源站数据库</td>
+<td>即使缓存降级，读取负载也有上限。</td>
+<td>缓存必须合并雪崩请求、对 TTL 添加抖动，并优雅失败。</td>
+</tr>
+<tr>
+<td>运维人员</td>
+<td>可以在不中断服务的情况下调整集群大小、排空节点并重新平衡。</td>
+<td>重新分片必须是在线增量式的。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">高层架构</h3>
+<pre><code class="language-text">                                 +-----------------------+
+                                 |    Configuration /    |
+                                 |    Topology Service   |
+                                 |  (etcd / Sentinel /   |
+                                 |   Cluster Manager)    |
+                                 +-----------+-----------+
+                                             |
+                                             v
++----------+   +-------------+    +----------------------+
+|  Client  +--&gt;+ Smart Client|---&gt;+   Cache Cluster      |
+|   App    |   | (or proxy)  |    |  +----+ +----+ +----+|
++----------+   +------+------+    |  |Sh1 | |Sh2 | |Sh3 ||
+                      |           |  | M  | | M  | | M  ||
+              (cache miss)        |  | +R | | +R | | +R ||
+                      v           |  +----+ +----+ +----+|
+              +---------------+   +----------------------+
+              |   Origin DB   |
+              | (Postgres,    |
+              |  MySQL, S3,   |
+              |  service API) |
+              +---------------+
+</code></pre>
+<p>客户端（或客户端前的代理）负责将键哈希到分片。每个分片是一个主节点加一个或多个副本。拓扑服务跟踪谁拥有哪个键范围并协调故障转移。</p>
+<h3 id="core-components">核心组件</h3>
+<ul>
+<li><strong>智能客户端或代理</strong>：将键哈希到分片，在槽位迁移时处理重定向，故障时重试。智能客户端示例：Jedis、Lettuce、redis-py-cluster。代理示例：Twemproxy、Envoy、Redis Cluster Proxy。智能客户端更快（少一跳网络），但将客户端与拓扑耦合；代理更易运维。</li>
+<li><strong>分片主节点</strong>：拥有键空间的一个切片，处理读写，并向从节点复制。</li>
+<li><strong>分片副本</strong>：从主节点接收异步复制，某些配置下可处理读请求，故障转移时成为新主节点。</li>
+<li><strong>拓扑服务</strong>：维护槽位到分片的映射并协调故障转移。可以是 Redis Sentinel、Redis Cluster gossip、ZooKeeper、etcd 或自定义控制器。</li>
+<li><strong>源站数据库</strong>：真相来源。缓存 miss 落到这里。</li>
+</ul>
+<h3 id="concrete-data-model-and-client-api">具体数据模型与客户端 API</h3>
+<p>即使缓存"只是键值对"，面试官也希望你能说出使淘汰、过期和故障转移正常工作所需的元数据。</p>
+<table>
+<thead>
+<tr>
+<th>数据</th>
+<th>键模式 / 分片</th>
+<th>值</th>
+<th>TTL</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>缓存值</td>
+<td><code>{namespace}:{logical_id}</code>；slot = <code>crc16(key) % 16384</code></td>
+<td>最大 1 MB 的字节字符串，加上元数据 <code>{expire_at_ms, last_access_sample, lfu_counter, version?}</code></td>
+<td>调用方指定，通常为 5 分钟至 1 小时。仅对明确配置的命名空间才不设 TTL。</td>
+</tr>
+<tr>
+<td>负向缓存</td>
+<td><code>neg:{namespace}:{logical_id}</code></td>
+<td>微型标记： <code>NOT_FOUND</code>，source 版本，created_at</td>
+<td>30-120 秒，以避免将新创建的对象隐藏过长时间。</td>
+</tr>
+<tr>
+<td>单飞租约</td>
+<td><code>sf:{hash(key)}</code></td>
+<td>获取所有者请求 ID + 截止时间</td>
+<td>5-30 秒；若所有者宕机必须自动过期。</td>
+</tr>
+<tr>
+<td>槽位映射</td>
+<td><code>slot:{0..16383}</code> 在拓扑服务中</td>
+<td>主节点 ID、副本 ID、配置纪元、迁移/导入状态</td>
+<td>无 TTL；通过仲裁管理的配置更新来变更。</td>
+</tr>
+<tr>
+<td>热键草图</td>
+<td>每个分片的 Count-Min Sketch + Top-N 堆</td>
+<td>键指纹及近似计数</td>
+<td>1 分钟滚动窗口，导出至监控指标。</td>
+</tr>
+<tr>
+<td>持久化快照</td>
+<td>每个分片的 RDB/AOF 段（若已启用）</td>
+<td>序列化键/值数据或追加日志</td>
+<td>运维层面的 TTL，而非应用层面的 TTL。</td>
+</tr>
+</tbody>
+</table>
+<p>最简客户端 API：</p>
+<pre><code class="language-text">GET key                         -&gt; value | MISS | ERROR
+MGET [key...]                   -&gt; [{key, value|MISS}]
+SET key value ttl_ms [NX|XX]     -&gt; OK | NOT_STORED | ERROR
+DEL key                         -&gt; deleted_count
+INCR key delta ttl_ms?           -&gt; integer
+TOPOLOGY                         -&gt; slot map + epoch
+</code></pre>
+<p><code>MGET</code> 仅在键映射到少量分片时才高效；否则智能客户端会并行扇出并合并响应。多键原子操作应要求使用哈希标签，例如 <code>user:{42}:profile</code> 。 <code>user:{42}:cart</code>，以确保所有涉及的键都位于同一槽位。</p>
+<p>技术选型框架：如果产品需要丰富的数据结构、Lua/函数、流及成熟的运维支持，Redis Cluster 是默认选择。Memcached 在超大规模 CPU 场景下纯字符串 GET/SET 更优，因为它更简单且多线程。若"缓存"需要持久化 KV 行为，则 Aerospike 或 DynamoDB DAX 更合适。要准备好回答"为什么不用 Memcached？"——答案是：工作负载简单时使用它；当数据结构和复制功能值得承担运维成本时，选择 Redis。</p>
+<h3 id="partitioning-strategy">分区策略</h3>
+<p>两种实际可选方案：</p>
+<table>
+<thead>
+<tr>
+<th>Scheme</th>
+<th>工作方式</th>
+<th>权衡</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>带虚拟节点的一致性哈希</td>
+<td>每个物理节点在哈希环上拥有多个点。添加或移除节点时，只影响其相邻节点。</td>
+<td>平滑扩缩容，无需中心节点。热键仍会固定在单个节点上。</td>
+</tr>
+<tr>
+<td>哈希槽（Redis Cluster 风格）</td>
+<td>固定 16,384 个槽位，每个槽位映射到一个分片。迁移槽位会移动其所有键。</td>
+<td>运维模型更简单；重新分片操作显式可观测。这是 Redis Cluster 实际采用的方案。</td>
+</tr>
+</tbody>
+</table>
+<p>推荐选择 <strong>hash slots</strong> 作为默认方案——它们使重新分片操作显式化，通过哈希标签支持多键操作（<code>user:{42}:profile</code> 。 <code>user:{42}:cart</code> 映射到同一槽位），并与在线迁移无缝集成。要准备好阐述为何优于一致性哈希：可预测的槽位移动、MOVED 和 ASK 重定向为客户端提供了清晰的协议，哈希标签则简洁地解决了多键问题。</p>
+<p>模 N 哈希（<code>hash(key) % N</code>）是陷阱答案——每次扩缩容都会重新映射所有键。</p>
+<h3 id="eviction-policy">淘汰策略</h3>
+<p>当内存满时必须淘汰数据。各策略及其适用场景：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>适用场景</th>
+<th>成本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>最近最少使用（LRU）</td>
+<td>通用默认方案；近期访问能预测未来访问。</td>
+<td>近似 LRU 开销低；精确 LRU 每键需维护一个双向链表。</td>
+</tr>
+<tr>
+<td>最不经常使用（LFU）</td>
+<td>抗扫描型工作负载，单次大规模扫描在 LRU 下会淘汰热数据集。</td>
+<td>每键需维护计数器；访问模式变化缓慢。</td>
+</tr>
+<tr>
+<td>仅 TTL</td>
+<td>当每个键都有有意义的过期时间且不希望提前淘汰时。</td>
+<td>若 TTL 较长，内存可能填满；届时 SET 操作开始失败。</td>
+</tr>
+<tr>
+<td>先进先出（FIFO）</td>
+<td>几乎不用；LRU 在相近成本下严格优于 FIFO。</td>
+<td>—</td>
+</tr>
+<tr>
+<td>自适应替换缓存（ARC）/ Window TinyLFU（W-TinyLFU）</td>
+<td>当命中率比实现复杂度更重要时。</td>
+<td>更复杂；在基准测试中表现优异，但运维难度更高。</td>
+</tr>
+</tbody>
+</table>
+<p>Redis 默认使用 <code>allkeys-lru</code> 或 <code>volatile-lru</code>。更深层的要点： <strong>近似 LRU 已足够</strong>。Redis 随机采样少量键，淘汰其中最旧的。采样大小为 10 时，以极低成本达到接近真实 LRU 的效果，误差在 1% 以内。</p>
+<p>更难的设计问题是 <strong>当内存压力导致 SET 操作失败时该如何处理</strong>：向应用返回错误、主动淘汰，还是允许下次读取时缓存未命中？大多数缓存返回错误并让应用决策。部分缓存在内存超过高水位线时由后台线程提前淘汰数据。</p>
+<h3 id="replication-and-consistency">复制与一致性</h3>
+<p>默认模型：从主节点到一个或多个副本的异步复制。</p>
+<ul>
+<li><strong>写操作</strong> 发送至主节点，主节点在副本持有数据之前即完成确认。复制流是逻辑操作日志（在 Redis 中，这与主节点与客户端通信所用的协议相同）。</li>
+<li><strong>副本延迟</strong> 在数据中心内通常低于 1 毫秒，跨区域则为数十毫秒。</li>
+<li><strong>读操作</strong> 可发送至主节点（读己所写）或副本（成本更低，但可能读到旧数据）。</li>
+<li><strong>故障转移</strong> 在主节点不可达时将副本提升为主节点。由拓扑服务决策；在 Redis Sentinel 中由仲裁数量的 Sentinel 协商决定；在 Redis Cluster 中由其他主节点投票决定。</li>
+</ul>
+<p>缓存的一致性契约是 <strong>最终一致，读主节点以保证读己所写</strong>。缓存失效只是一种提示，而非保证——应用必须将缓存未命中视为驱动正确性的失败模式，以原始数据库作为权威存储。</p>
+<p>若面试官询问更强的一致性：具备强一致性的缓存确实存在（Aerospike、FoundationDB），但需要付出额外往返延迟的代价。大多数缓存使用场景不需要强一致性；使用缓存的应用本就能接受 TTL 范围内的旧数据读取。</p>
+<h3 id="read-and-write-path">读写路径</h3>
+<p><strong>读（Cache-aside，最常见的模式）：</strong></p>
+<pre><code class="language-text">1. App constructs `{namespace}:{logical_id}` and asks the smart client for `GET`.
+2. Smart client hashes the key to a slot and reads the current slot owner from its local topology cache.
+3. It dispatches to the shard primary for read-your-writes namespaces, or to a replica for stale-tolerant namespaces.
+4. Cache hit: shard checks `expire_at_ms`, updates approximate LRU/LFU metadata, returns the byte string.
+5. Clean miss: app tries to acquire `sf:{hash(key)}` single-flight lease for 5-30s.
+6. Lease winner reads the origin, writes `SET key value ttl+jitter`, and releases by expiry. Concurrent missers wait briefly or return stale-if-available.
+7. If origin returns not found, app writes `neg:{namespace}:{logical_id}` for 30-120s, not a long-lived empty value.
+</code></pre>
+<p><strong>写（Cache-aside，Write-around）：</strong></p>
+<pre><code class="language-text">1. App writes to origin database and commits the durable version.
+2. App invalidates cache with `DEL key` or writes `SET key new_value ttl` if the new value is already available.
+3. Invalidation is best effort; correctness still comes from TTL and origin truth.
+4. For high-value namespaces, origin write publishes an invalidation event so every region deletes the key.
+</code></pre>
+<p><strong>拓扑迁移路径：</strong></p>
+<pre><code class="language-text">1. Cluster manager marks slot S as MIGRATING from shard A to shard B with config epoch E+1.
+2. Smart clients seeing MOVED update the slot map; clients seeing ASK send the next request to B for that one key.
+3. A streams keys in slot S to B while both shards continue serving under migration rules.
+4. Cluster manager flips ownership when copied keys and replication catch up.
+</code></pre>
+<p>面试用语：</p>
+<blockquote>
+<p>缓存未命中不仅仅是未命中；它是一次带租约的受控回源请求，附带抖动补填和负向缓存选项。这就是缓存与数据库放大器之间的区别。</p>
+</blockquote>
+<p><strong>其他值得提及的模式：</strong></p>
+<ul>
+<li><strong>Write-through</strong>：缓存与数据库同步写入；缓存始终与数据库保持一致，但写操作需承担两者的代价。适用于读己所写至关重要且回源写入成本低廉的场景。</li>
+<li><strong>Write-back（Write-behind）</strong>：写入缓存，异步刷新至数据库。非常适合写密集型工作负载，但缓存成为持久性单点故障。除非已在缓存持久性上投入充分，否则几乎不是正确的选择。</li>
+<li><strong>Refresh-ahead</strong>：在 TTL 过期前主动刷新热键。适合可预测的热键；对冷键则造成浪费。</li>
+</ul>
+<p>默认使用 Cache-aside 加 Write-around。应向面试官明确说明，仅在需求迫使时才偏离此方案。</p>
+<h3 id="cache-stampede-protection">缓存击穿防护</h3>
+<p>最重要的话题。当热键过期（或缓存重启）时，大量客户端同时未命中，全部回源，导致源端崩溃，即发生缓存击穿。</p>
+<p>缓解措施，从低成本到高成本：</p>
+<table>
+<thead>
+<tr>
+<th>技术</th>
+<th>工作方式</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TTL 抖动</td>
+<td>为 TTL 添加 ±10% 的随机抖动，防止集中过期。</td>
+<td>始终适用。零成本。</td>
+</tr>
+<tr>
+<td>请求合并（单飞）</td>
+<td>首个未命中者持有单键锁并回源填充缓存；并发未命中者等待。</td>
+<td>当回源调用成本高昂时。在应用层或 Sidecar 中实现。</td>
+</tr>
+<tr>
+<td>概率提前过期（XFetch）</td>
+<td>每个读取者掷骰；随着 TTL 临近，"立即刷新"的概率上升。某个读取者提前数秒回源，在悬崖边缘前完成填充。</td>
+<td>热键场景下，过期时的停机不可接受。</td>
+</tr>
+<tr>
+<td>后台刷新</td>
+<td>后台 Worker 在热键过期前刷新；读取者始终读到新鲜数据。</td>
+<td>Top-N 热键，且可识别这些键时。</td>
+</tr>
+<tr>
+<td>负向缓存</td>
+<td>将未命中本身以短 TTL 缓存（"该键无值"）。</td>
+<td>当客户端反复请求不存在的键时（例如 404 泛洪攻击）。</td>
+</tr>
+<tr>
+<td>在缓存前置 Bloom filter</td>
+<td>在请求到达缓存或源端之前拒绝不可能的查询。</td>
+<td>攻击者查询随机不存在键的缓存穿透攻击。</td>
+</tr>
+</tbody>
+</table>
+<p>最深层的回答： <strong>区分热键过期引发的击穿与缓存冷启动引发的击穿</strong>。前者是单键级别；请求合并可处理。后者是集群级别；只有源端防护（源端限速、集群逐步预热、从快照进行粘性预热）才能处理。</p>
+<h3 id="hot-key-and-hot-shard-strategy">热键与热分片策略</h3>
+<p>热键是单个分片无法承载的键。应对策略：</p>
+<ul>
+<li><strong>读副本</strong>：将读请求分散到各副本。适用于读热键，不适用于写热键。</li>
+<li><strong>客户端侧缓存</strong>：客户端为最热的键维护短 TTL 的进程内缓存。Redis 6 支持通过失效通知实现服务端辅助的客户端侧缓存。</li>
+<li><strong>键拆分</strong>：拆分 <code>leaderboard:global</code> topic。 <code>leaderboard:global:{0..15}</code> 并让客户端合并结果。以额外读取换取分布式负载。</li>
+<li><strong>专属热键层</strong>：将已知热键路由到专门为该流量规模设计的独立副本集群。</li>
+<li><strong>应用层去重</strong>：若大量请求需要相同数据，在到达缓存前在应用层批处理。</li>
+</ul>
+<p>热分片是由于键范围集中流量导致的，与任何单个键无关。症状：分片 CPU 满载，相邻分片空闲。策略：预分片（从一开始为热点范围分配更多槽位）、在线槽位迁移，或重构键以更均匀地分散（若某个租户占主导地位，避免使用 <code>tenant_id:{...}</code> ）。</p>
+<h3 id="failure-modes">故障模式</h3>
+<table>
+<thead>
+<tr>
+<th>失败</th>
+<th>故障情况</th>
+<th>缓解措施</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单个副本宕机</td>
+<td>到该副本的读请求失败；客户端重试或回退到主节点。</td>
+<td>健康检查，快速刷新拓扑。</td>
+</tr>
+<tr>
+<td>主节点宕机</td>
+<td>故障转移将副本提升为主节点。部分未提交写入丢失（异步复制）。</td>
+<td>基于仲裁的提升，隔离旧主节点。</td>
+</tr>
+<tr>
+<td>网络分区</td>
+<td>脑裂风险：两个主节点服务同一槽位。</td>
+<td>多数节点不可达时仲裁阻止提升；写操作使用隔离令牌。</td>
+</tr>
+<tr>
+<td>集群冷启动</td>
+<td>缓存为空；所有读请求未命中；源端过载。</td>
+<td>从快照恢复，逐步提升流量，源端限速。</td>
+</tr>
+<tr>
+<td>慢操作阻塞事件循环</td>
+<td>一个 <code>KEYS *</code> 或大型 <code>SUNION</code> 占满单线程；其他所有操作超时。</td>
+<td>在代码审查中禁止慢操作；使用 <code>SCAN</code>；限制值大小。</td>
+</tr>
+<tr>
+<td>内存溢出（OOM）</td>
+<td>缓存加速淘汰，命中率下降，源端负载上升。</td>
+<td>在达到硬限制之前对内存压力发出告警；淘汰策略优先淘汰冷数据。</td>
+</tr>
+<tr>
+<td>副本延迟骤增</td>
+<td>副本读取返回严重过时的数据。</td>
+<td>限制延迟上限；若延迟超过阈值则将副本从轮转池中摘除。</td>
+</tr>
+<tr>
+<td>热键拖垮单个分片</td>
+<td>一个分片 CPU 100%，其他分片空闲。</td>
+<td>通过单键采样检测；对该键应用键拆分或客户端侧缓存。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="graceful-degradation-state-table">优雅降级状态表</h3>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>模式</th>
+<th>数据源</th>
+<th>延迟预算</th>
+<th>回退</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>热命中</td>
+<td>正常缓存读取</td>
+<td>分片主节点/副本</td>
+<td>区域内 p99 &lt; 1 毫秒</td>
+<td>无。</td>
+</tr>
+<tr>
+<td>本地拓扑过时</td>
+<td>客户端路由到旧所有者</td>
+<td>MOVED / ASK 重定向</td>
+<td>额外一次网络往返</td>
+<td>刷新槽位映射（按纪元）。</td>
+</tr>
+<tr>
+<td>干净未命中</td>
+<td>由租约控制的回源请求</td>
+<td>源 DB + 单飞</td>
+<td>源端 p99 加等待者，上限为数百毫秒</td>
+<td>若命名空间允许则提供旧值；否则有界未命中。</td>
+</tr>
+<tr>
+<td>租约所有者宕机</td>
+<td>单飞租约过期</td>
+<td><code>sf:{hash(key)}</code> TTL</td>
+<td>若客户端选择等待，最差情况等待 5-30 秒</td>
+<td>下一个等待者成为所有者；源端限速仍适用。</td>
+</tr>
+<tr>
+<td>分片主节点宕机</td>
+<td>故障转移</td>
+<td>副本 + 拓扑仲裁</td>
+<td>秒级；客户端带退避重试</td>
+<td>提升副本，隔离旧主节点，若允许则从本地应用缓存提供旧值。</td>
+</tr>
+<tr>
+<td>集群冷启动</td>
+<td>重启后命中率低</td>
+<td>快照 + 源端</td>
+<td>分钟级预热</td>
+<td>流量分级提升，源端熔断器，预热 Top-N 热键。</td>
+</tr>
+<tr>
+<td>源端过载</td>
+<td>缓存未命中路径不安全</td>
+<td>源端限速器</td>
+<td>快速返回降级响应</td>
+<td>Stale-if-error、负向准入、丢弃低优先级请求。</td>
+</tr>
+</tbody>
+</table>
+<p>跨请求持久的游标状态是客户端中的拓扑纪元，以及对于 <code>SCAN</code>等分页批量操作，还有服务端下发的扫描游标。 <code>SCAN</code> 游标编码了分片、桶位置和拓扑纪元；若纪元在重新分片期间发生变化，客户端应容忍重复数据并按键去重。</p>
+<p>面试用语：</p>
+<blockquote>
+<p>正常的状态机是：命中 → 受控未命中 → 允许时返回旧值 → 降级。绝不让缓存故障演变为无限回源击穿。</p>
+</blockquote>
+<p>大声说出故障模式策略： <strong>缓存故障不得演变为源端故障</strong>。应用必须将缓存错误视为缓存未命中，并在源端做好防护（限速、熔断器）以吸收由此产生的流量峰值。</p>
+<h3 id="persistence-cache-vs-kv-store">持久性（缓存 vs. KV 存储）</h3>
+<p>纯缓存不做持久化。若面试官说"我们无法承受冷启动"，有两种选择：</p>
+<ul>
+<li><strong>快照到磁盘</strong>：定期时间点转储（Redis <code>RDB</code>）。成本低，但最后一次转储后的数据会丢失。</li>
+<li><strong>仅追加日志</strong>：每次写入同时向磁盘上的日志追加记录（Redis <code>AOF</code>）。持久性更强，写入较慢，需要日志压缩。</li>
+</ul>
+<p>对面试官坦诚：为缓存启用持久化会使其变成一个更慢的 KV 存储。如果应用无法容忍冷启动延迟，通常更好的答案是：</p>
+<ol>
+<li>在另一个可用区设置副本，在主节点完全故障时进行提升。</li>
+<li>通过源端保护使冷启动可接受，而非不可见。</li>
+<li>关闭时生成快照，启动时恢复（尽力而为的热缓存）。</li>
+</ol>
+<p>不要承诺缓存层能提供零数据丢失的持久性，那是数据库的职责。</p>
+<h3 id="memory-management">内存管理</h3>
+<p>区分认真回答与普通回答的实现细节：</p>
+<ul>
+<li><strong>内存分配器</strong>：jemalloc 是 Redis 的默认分配器；与 glibc malloc 相比，它显著降低了内存碎片。要提到它。</li>
+<li><strong>碎片率</strong>: <code>used_memory_rss / used_memory</code>。高于 1.5 意味着内存浪费；考虑 <code>ACTIVEDEFRAG</code> 或重启。</li>
+<li><strong>对象共享</strong>：Redis 中小整数在键之间共享。对高基数计数器缓存很有用。</li>
+<li><strong>编码优化</strong>：短哈希、列表、有序集合使用紧凑编码（<code>ziplist</code>, <code>listpack</code>）；在可配置的阈值处切换为完整哈希表。调优这些参数可节省内存，但大值操作延迟会增加。</li>
+<li><strong>淘汰粒度</strong>：按键淘汰，而非按桶淘汰。大值每次淘汰回收的内存较少。</li>
+<li><strong>maxmemory 和 maxmemory-policy</strong>：这两个配置决定达到内存上限时的淘汰行为。配置错误会导致缓存开始返回错误而非淘汰数据。</li>
+</ul>
+<h3 id="threading-model">线程模型</h3>
+<p>Redis 以命令执行单线程著称。其含义如下：</p>
+<ul>
+<li><strong>引擎内部无需加锁</strong> ——操作因串行执行而具有原子性。</li>
+<li><strong>一条慢命令会阻塞所有请求</strong>. <code>KEYS *</code> ，超过百万键时可能造成数秒的阻塞。</li>
+<li><strong>使用事件循环处理 I/O，单线程处理命令逻辑</strong>。Redis 6 新增了用于解析请求和写入响应的 I/O 线程，同时保持命令执行单线程。</li>
+<li><strong>Pipelines</strong> 以批量方式发送命令，从而分摊往返延迟。批量操作始终应使用 pipeline。</li>
+<li><strong>Lua 和 Function</strong> 脚本在单线程上原子执行；同样适用"不要执行慢操作"的规则。</li>
+</ul>
+<p>面试中常被问到的问题："Redis 为何是单线程却依然很快？"答：瓶颈在于网络和内存带宽，而非 CPU；串行执行避免了锁开销；事件循环可同时处理大量连接。该线程模型是针对工作负载的最优选择，而非妥协方案。</p>
+<h3 id="multi-region-strategy">多区域策略</h3>
+<p>三种选项，按运维复杂度从低到高排列：</p>
+<ol>
+<li><strong>独立区域集群</strong>。每个区域拥有自己的缓存，从各自的源端副本懒加载填充。无跨区域缓存协调。不同区域的缓存可能暂时不一致；源端复制的最终一致性会使其趋于一致。</li>
+<li><strong>主动-被动全局集群</strong>。一个区域负责写入，其他区域只读。被动区域的读取仅在缓存未命中时承担跨区域延迟。故障转移时提升另一个区域。</li>
+<li><strong>支持无冲突复制数据类型（CRDTs）的主动-主动模式</strong>。Redis Enterprise 支持此模式。任意区域的写入最终收敛。运维成本较高；仅在产品有此需求时使用。</li>
+</ol>
+<p>默认选择方案一。将一致性问题下推至源端数据库，那才是它该解决的地方。</p>
+<h3 id="operational-metrics">运维指标</h3>
+<p>需要告警的指标：</p>
+<ul>
+<li><strong>命中率</strong> （按路由、分片、全局统计）。命中率下降表明源端压力即将到来。</li>
+<li><strong>p99 GET / SET 延迟</strong>.</li>
+<li><strong>每分片连接数</strong>。连接池耗尽是一种常见的故障模式。</li>
+<li><strong>内存使用量和碎片率</strong> ，按分片统计。</li>
+<li><strong>每秒淘汰次数</strong>。出现峰值说明工作集刚刚超过内存上限。</li>
+<li><strong>复制延迟</strong> ，按副本统计。</li>
+<li><strong>每分片每秒命令数</strong>。用于检测热分片。</li>
+<li><strong>Slowlog 条目</strong>。超过 10ms 的记录需要人工排查。</li>
+</ul>
+<p>需要采样（不告警，但记录日志）：</p>
+<ul>
+<li>每个分片的前 N 个热键。</li>
+<li>前 N 个最大值。</li>
+<li>来自缓存未命中路径的源端调用速率。</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">需要指出的权衡</h3>
+<ul>
+<li><strong>缓存新鲜度与源端负载</strong>：TTL 越短，数据越新鲜，源端流量也越多。按数据类型设置 TTL，而非全局统一设置。</li>
+<li><strong>一致性与可用性</strong>：更强的一致性意味着跨分片协调，这会严重影响延迟。缓存选择可用性，代价是数据的一定程度陈旧。</li>
+<li><strong>内存与计算</strong>：缓存越大，命中率越高，源端成本越低——直到缓存本身的成本无法承受。通过命中率/每 GB 成本分析找到最优点，而非凭直觉。</li>
+<li><strong>智能客户端与代理</strong>：智能客户端少一跳，更快；代理更易于运维，且允许在不重新部署客户端的情况下更改拓扑。</li>
+<li><strong>持久化开启或关闭</strong>：开启会增加延迟和磁盘开销；关闭则需承担冷启动代价。默认关闭，通过副本和源端保护来缓解冷启动问题。</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">常见陷阱与更优做法</h3>
+<ul>
+<li><strong>直接说"用 Redis"，但不选择分区、复制或故障转移方案</strong>。面试官希望看到组件层面的设计，而非产品名称。</li>
+<li><strong>完全忘记缓存雪崩问题</strong>。这是回答此题最大的"失分点"。</li>
+<li><strong>承诺异步复制缓存能提供强一致性</strong>。合同是最终一致性；要坦然接受。</li>
+<li><strong>使用取模-N 哈希进行分区</strong>。重新分片需要全量数据迁移。</li>
+<li><strong>忽视热键和热分片问题</strong>。资深面试官会刻意引导到这里。</li>
+<li><strong>将源端视为无限可扩展</strong>。缓存的存在是为了保护源端；如果设计中忽略了源端，就没有真正解决实际问题。</li>
+<li><strong>承诺跨区域缓存读取延迟低于毫秒级</strong>。光速决定了这不可能。</li>
+</ul>
+<h3 id="deep-dives-interviewer-may-choose">面试官可能深入探讨的方向</h3>
+<ul>
+<li><strong>Redis 分布式锁</strong>：Redlock 算法、Martin Kleppmann 的批评、redlock 适用的场景（尽力而为的协调）与需要真正共识系统的场景（正确性要求）。</li>
+<li><strong>Pub/Sub 与 Streams</strong>：Redis Pub/Sub 是即发即忘，无投递保证。Redis Streams 是带有消费者组、持久化和至少一次语义的追加日志。选择合适的方案。</li>
+<li><strong>Geo、HyperLogLog、sorted sets</strong>：这些数据结构发挥作用的场景。sorted sets 用于排行榜，HyperLogLog 用于内存紧张时的唯一计数估算。</li>
+<li><strong>分片计数器</strong> vs Redis <code>INCR</code>：何时需要分片计数器来避免热键固定？</li>
+<li><strong>集群重新分片机制</strong>：一个 slot 在继续提供服务的同时如何迁移（ <code>MIGRATING</code> 。 <code>IMPORTING</code> 状态，MOVED 与 ASK 重定向的区别）。</li>
+<li><strong>Memcached vs Redis</strong>：Memcached 是多线程的，数据模型更简单，无持久化；Redis 提供数据结构、持久化和复制。对于最简单的工作负载，Memcached 仍然是正确的选择。</li>
+</ul>
+<h3 id="staff-level-answer-checklist">Staff 级别回答检查清单</h3>
+<ul>
+<li>阐明了不变式：缓存返回足够新鲜的数据或干净的未命中，源端受到雪崩保护。</li>
+<li>选择了分区方案（hash slots）并给出了理由。</li>
+<li>选择了淘汰策略（近似 LRU）并给出了理由。</li>
+<li>演示了 cache-aside 读写路径。</li>
+<li>解决了缓存雪崩问题（TTL 抖动、请求合并、概率性提前刷新）。</li>
+<li>解决了热键和热分片问题（键拆分、客户端侧缓存、副本）。</li>
+<li>讨论了故障模式，并明确指出缓存故障不能演变为源端故障。</li>
+<li>选择了复制模型（异步主副本加多数派故障转移）并说明了一致性合同。</li>
+<li>多区域策略（默认采用独立区域集群）。</li>
+<li>运维指标及告警项。</li>
+</ul>
+<h3 id="interview-phrase">面试用语</h3>
+<blockquote>
+<p>"缓存的存在是为了保护源端并提供快速读取。每一个设计决策——分区、淘汰、复制、雪崩保护——都源于这两个目标。我默认选择 hash slot 分区、近似 LRU、带多数派故障转移的异步复制，以及带 TTL 抖动和请求合并的 cache-aside。我首要防范的故障场景是相关缓存未命中，而非单节点崩溃。"</p>
+</blockquote>
+<hr/>
+<h2 id="2-simulated-interview">2. 模拟面试</h2>
+<p><strong>面试官：</strong> 设计一个类似 Redis 的分布式缓存。</p>
+<p><strong>候选人：</strong> 我将在应用服务器与源端数据库之间的读路径上设计一个分片内存 KV 集群。两个目标是：在高命中率下实现亚毫秒级读取，以及保护源端免受相关缓存未命中的冲击。我将澄清需求、选择分区方案、演示数据路径，并深入讲解淘汰策略和雪崩保护。</p>
+<p><strong>面试官：</strong> 如何对键进行分区？</p>
+<p><strong>候选人：</strong> 使用 hash slots，类似 Redis Cluster。固定数量的逻辑槽——例如 16,384 个——每个槽映射到一个分片。客户端对键进行哈希，在小型映射表中查找槽，然后直接路由。重新分片时在分片间迁移槽，过程明确且可观测。使用类似 <code>user:{42}:profile</code> 的 hash tags 可将相关键放在同一分片上，以支持多键操作。我避免使用取模-N 哈希，因为扩容时会重新映射所有数据；也避免使用纯一致性哈希，因为 hash slots 的运维体验更清晰。</p>
+<p><strong>面试官：</strong> 如何处理复制和故障转移？</p>
+<p><strong>候选人：</strong> 每个分片由一个主节点加一个或多个异步副本构成。写入发往主节点，区域内复制延迟在亚毫秒级。拓扑服务——Redis Cluster gossip、Sentinel 或 etcd 支撑的控制器——监控健康状态，在主节点故障时提升副本。提升需要多数派确认，以防止分区时的脑裂。一致性合同是最终一致；从副本读取可能有轻微延迟。</p>
+<p><strong>面试官：</strong> 你使用什么淘汰策略？</p>
+<p><strong>候选人：</strong> 默认使用近似最近最少使用（LRU）。Redis 每次淘汰时随机采样若干键，移除其中最旧的；采样数量约为 10 时，与真正的 LRU 误差在 1% 以内，但成本低得多。对于 LRU 会淘汰热集合的扫描密集型工作负载，我切换到最不常用（LFU）策略。更深层的选择是内存压力下的行为：默认情况下 SET 返回错误；我还会在内存达到 80% 时告警，以便运维人员在影响服务前扩容。</p>
+<p><strong>面试官：</strong> 缓存雪崩怎么办？</p>
+<p><strong>候选人：</strong> 这是本题最重要的话题。分三层应对。第一层，TTL 抖动——添加 10% 的随机噪声，使键不会同时过期。成本为零。第二层，按键请求合并——第一次未命中时获取进程内锁或短暂的 Redis 锁，调用源端，填充缓存；并发未命中等待。第三层，最热键的概率性提前刷新——读取方以随机概率在过期前略早刷新，从而避免悬崖式雪崩。此外，我还针对整个缓存为空的冷启动雪崩制定预案：关闭时快照加启动时恢复，以及源端限流来吸收不可避免的流量峰值。</p>
+<p><strong>面试官：</strong> 如果某个键过热导致一个分片成为瓶颈怎么办？</p>
+<p><strong>候选人：</strong> 这就是热键问题。有几种应对措施：启用服务端辅助的客户端侧缓存，使每个客户端保留一份短 TTL 的本地副本；将读取分散到副本；拆分键—— <code>leaderboard:global</code> 变成 <code>leaderboard:global:{0..15}</code> 客户端对各分片结果取并集。对于写入热键，键拆分是唯一真正有效的方案；客户端缓存无济于事。</p>
+<p><strong>面试官：</strong> Cache-aside 还是 write-through？</p>
+<p><strong>候选人：</strong> 默认使用带 write-around 的 cache-aside。应用读取时先查缓存，未命中则穿透到源端，并填充缓存。应用写入时直接写源端，然后使缓存键失效。Write-through 看起来很诱人，因为它能保持缓存与源端一致，但它将写路径延迟翻倍，且当缓存写成功而源端写失败时，故障模式会变得很麻烦。除非你已在缓存层构建了真正的持久性（此时它实际上已是数据库），否则 write-back 几乎永远不是正确选择。</p>
+<p><strong>面试官：</strong> 缓存集群不可用时会发生什么？</p>
+<p><strong>候选人：</strong> 缓存故障不能演变为源端故障。应用将缓存错误视为缓存未命中，穿透到源端。没有保护的话，这是源端最坏的情况——每次读取都穿透。因此应用还需要一个熔断器，在持续缓存错误时打开，后面配合源端限流和请求降级。宁可让一部分用户看到干净的错误，也不能让源端对所有人崩溃。</p>
+<p><strong>面试官：</strong> 缓存如何在不拖垮源端的情况下重启？</p>
+<p><strong>候选人：</strong> 两种策略。第一，副本位于独立的可用区，单区故障不会使整个集群冷启动。第二，关闭时快照到磁盘，启动时加载；集群以接近热态的状态恢复。第三，如果两种方式都失败，进行真正的冷启动时，应用的熔断器和源端限流可以吸收流量峰值。缓存预热缓慢是可以接受的；数据库宕机是不可接受的。</p>
+<p><strong>面试官：</strong> 多区域？</p>
+<p><strong>候选人：</strong> 默认采用独立区域集群，每个集群从其区域源端副本填充。无跨区域缓存协调，复杂度低，通过数据库复制实现最终一致性。如果产品确实需要单一全局缓存，Redis Enterprise 的主动-主动 CRDTs 模式是可选方案，但运维成本是真实的，大多数产品并不需要。我会深入追问需求是否真的是全局缓存，还是仅需与全局数据库保持区域内一致性。</p>
+<p><strong>面试官：</strong> 谈谈持久化。</p>
+<p><strong>候选人：</strong> 纯缓存不需要持久化。一旦开启持久化，缓存就会变慢，故障模式也更复杂；你在为缓存收益支付 KV 存储的成本。Redis 提供 RDB 快照和 AOF 追加日志。我使用关闭时 RDB 快照作为尽力而为的热态恢复，而非持久化保障。如果产品无法容忍冷启动时间，正确的答案通常是多可用区副本加源端保护，而非完整持久化。</p>
+<p><strong>面试官：</strong> 你会对哪些指标告警？</p>
+<p><strong>候选人：</strong> 按路由统计的命中率——下降意味着源端负载上升。GET 和 SET 的 P99 延迟。每分片的内存压力和碎片率——工作集超过内存上限时淘汰速率会出现峰值。复制延迟——过旧的副本不应提供读取服务。Slowlog 条目——单线程引擎中超过 10ms 的操作是真实问题。每分片连接数——连接池耗尽是一种静默故障模式，在所有请求超时之前看起来不像缓存中断。</p>
+<p><strong>面试官：</strong> 总结设计。</p>
+<p><strong>候选人：</strong> 使用智能客户端的 hash slot 分区，每分片异步主副本复制，基于多数派的故障转移。近似 LRU 淘汰。带 TTL 抖动、请求合并和概率性提前刷新的 cache-aside 雪崩保护。热键通过客户端侧缓存、副本读取和键拆分处理。多区域采用独立区域集群。故障设计确保缓存宕机不会拖垮源端——熔断器、源端限流以及应用将缓存错误视为缓存未命中。整个设计优化目标是快速读取和保护源端，而非精确一致性。</p>
+<h2 id="3-practice-notes">3. 练习备注</h2>
+<h3 id="five-minute-version">五分钟版本</h3>
+<ol>
+<li>澄清：数据类型、TTL 行为、一致性合同、是否需要持久化。</li>
+<li>阐明不变式：缓存返回足够新鲜的数据或干净的未命中，源端受到雪崩保护。</li>
+<li>选择 hash slot 分区；解释为何优于取模哈希和一致性哈希。</li>
+<li>选择带多数派故障转移的异步主副本；说明一致性合同。</li>
+<li>选择近似 LRU；覆盖内存压力下的淘汰行为。</li>
+<li>演示 cache-aside 读写路径。</li>
+<li>雪崩保护：TTL 抖动、请求合并、概率性提前刷新。</li>
+<li>热键：客户端侧缓存、副本读取、键拆分。</li>
+<li>故障处理：缓存错误变为缓存未命中，而非源端故障。</li>
+<li>以指标和独立区域集群的多区域方案收尾。</li>
+</ol>
+<h3 id="one-minute-closeout">一分钟结尾陈述</h3>
+<blockquote>
+<p>缓存是一个近似系统，首要任务是保护源端，其次才是提供快速访问。分区用 hash slots，可用性用异步复制，淘汰用近似 LRU，上层用带雪崩保护的 cache-aside。有趣的问题不在于数据结构；而在于键过热、缓存冷启动和分片故障时会发生什么。我优先设计这些路径，稳态设计自然而然地随之得出。</p>
+</blockquote>
+<h3 id="best-interview-phrases">最佳面试用语</h3>
+<ul>
+<li>"缓存的存在是为了保护源端，而不仅仅是为了快速。"</li>
+<li>"缓存故障不能演变为源端故障。"</li>
+<li>"雪崩是我首要防范的故障模式；节点宕机反而容易处理。"</li>
+<li>"异步复制、最终一致性、主节点读以实现读己之写——这就是合同。"</li>
+<li>"近似 LRU 已经足够好；不要为精确性付出代价。"</li>
+<li>"热键会让朴素设计失效；客户端侧缓存、副本读取和键拆分是三种应对手段。"</li>
+<li>"开启了持久化的缓存是一个更慢的 KV 存储。要明确你在构建哪一种。"</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

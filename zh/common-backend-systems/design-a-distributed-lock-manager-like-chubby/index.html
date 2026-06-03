@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>设计类 Chubby 的分布式锁管理器 — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">设计类 Chubby 的分布式锁管理器</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p><strong>对这些术语不熟悉？</strong> 请参阅 <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> ，了解常见系统设计术语的中英文解释。</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. 基础知识与解题思路</h2>
+<h3 id="what-this-question-is-testing">本题考察点</h3>
+<p>分布式锁管理器看起来很简单——"给我键 X 的锁"——但支撑它的系统是少数既需要高可用又需要严格一致性的基础设施之一。难点在于：当持有锁的客户端崩溃，以及当网络将锁管理器与客户端隔离时，如何保证正确性。</p>
+<p>其不变量如下：</p>
+<blockquote>
+<p>在任意时刻，对于任意锁标识符，最多只有一个客户端认为自己处于允许操作的状态下持有该锁，且锁管理器与下游服务通过围栏令牌（而非单纯依赖挂钟超时）就该信念达成共识。</p>
+</blockquote>
+<p>在 ICT5 / L6+ 级别，面试官考查的是：你能否在复制状态机之上构建互斥机制，能否防御"客户端暂停 30 秒"这一破坏朴素锁管理器的故障场景，并能解释为何 Chubby 选择了粗粒度锁加会话租约，而非细粒度互斥锁。</p>
+<h3 id="60-second-interview-framing">60 秒面试框架</h3>
+<p>口述版本：</p>
+<blockquote>
+<p>我会将类 Chubby 服务构建为一个运行 Paxos 或 Raft 的小型副本集群。客户端通过 TTL 租约开启会话；锁被具象化为小型层级命名空间中的文件；每次锁获取都返回一个单调递增的围栏令牌。下游服务必须校验该令牌。有趣的设计决策包括：会话到期处理、围栏令牌与纯 TTL 的对比，以及为何该系统是为不频繁的粗粒度锁而非微秒级互斥锁而设计的。</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">首先明确需求</h3>
+<p>功能性需求：</p>
+<ul>
+<li>客户端可以以独占或共享模式获取和释放命名锁。</li>
+<li>客户端通过心跳与锁服务维持会话。</li>
+<li>一个小型文件系统支持小型配置文件（Chubby 的原始用例）。</li>
+<li>客户端接收文件或锁状态变更的通知。</li>
+<li>该服务将 leader 选举作为主要用例支持。</li>
+</ul>
+<p>非功能性需求：</p>
+<ul>
+<li>强一致性：已授予的锁不会同时授予其他人。</li>
+<li>高可用性：容忍少数副本故障。</li>
+<li>客户端崩溃后不泄漏锁。</li>
+<li>网络分区时不发生危险的双重授予。</li>
+<li>锁获取延迟在数十毫秒级别；心跳开销低。</li>
+<li>每次授予、释放和会话到期均可审计。</li>
+</ul>
+<p>除非面试官要求，否则超出范围：</p>
+<ul>
+<li>高吞吐量的细粒度按行锁（请改用数据库事务）。</li>
+<li>超出简单计数器风格支持的可重入等应用层锁语义。</li>
+<li>跨集群锁联邦。</li>
+</ul>
+<h3 id="scale-assumptions">规模假设</h3>
+<table>
+<thead>
+<tr>
+<th>领域</th>
+<th>假设</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>客户端</td>
+<td>每个 Chubby 单元 10,000–100,000 个。</td>
+</tr>
+<tr>
+<td>活跃锁</td>
+<td>稳定状态下数万个，主要用于 leader 选举和所有权声明。</td>
+</tr>
+<tr>
+<td>获取速率</td>
+<td>每秒数十至数百次；这是有意设计为低的。</td>
+</tr>
+<tr>
+<td>会话心跳频率</td>
+<td>每个客户端每隔几秒一次。</td>
+</tr>
+<tr>
+<td>Latency（延迟）</td>
+<td>获取延迟 10–100 ms；心跳延迟低于 10 ms。</td>
+</tr>
+<tr>
+<td>可用性</td>
+<td>五个副本；容忍两个故障。</td>
+</tr>
+<tr>
+<td>吞吐量</td>
+<td>非高 QPS 系统；粗粒度是设计选择。</td>
+</tr>
+</tbody>
+</table>
+<p>瓶颈不在吞吐量，而在 Raft/Paxos 提交延迟以及大量客户端的心跳扇入。</p>
+<h3 id="core-product-model">核心产品模型</h3>
+<table>
+<thead>
+<tr>
+<th>界面</th>
+<th>使用场景</th>
+<th>需求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>主节点选举</td>
+<td>副本池选举出单一 primary；落选者保持热备。</td>
+<td>最多一个 leader；故障转移在数秒内完成。</td>
+</tr>
+<tr>
+<td>服务发现 / 所有权</td>
+<td>"哪个节点拥有分片 42？"</td>
+<td>每个分片单一写入者；读者看到一致的所有权信息。</td>
+</tr>
+<tr>
+<td>配置存储</td>
+<td>用于集群配置的小型文件。</td>
+<td>强一致性，基于 watch 的变更通知。</td>
+</tr>
+<tr>
+<td>分布式协调</td>
+<td>屏障、队列、围栏。</td>
+<td>基于文件原语加序列号构建。</td>
+</tr>
+</tbody>
+</table>
+<p>这是有意设计为粗粒度的。Chubby 的设计理念：应用程序针对整个角色获取锁（例如，成为某分片的 master），而非针对每个操作。</p>
+<h3 id="high-level-architecture">高层架构</h3>
+<pre><code class="language-text">+---------------------+        +---------------------+
+| Client Library      |&lt;------&gt;| Lock Cell           |
+| - session mgr       |        | - 5 replicas        |
+| - cache + watches   |        | - Paxos/Raft consensus|
+| - fence token       |        | - one leader serves writes|
++---------+-----------+        +---+-----------------+
+          |                        |
+          | session heartbeat      | replicate log
+          |                        v
+          |              +--------------------+
+          |              | Replicated Log     |
+          |              | + KV state machine |
+          |              +--------------------+
+          v
++---------------------+
+| Application logic   |
+| - uses fence token  |
++---------+-----------+
+          |
+          v
++---------------------+
+| Downstream Storage  | &lt;-- checks fence token before serving writes
++---------------------+
+</code></pre>
+<h3 id="core-components">核心组件</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>职责</th>
+<th>关键细节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>副本节点</td>
+<td>参与 Paxos/Raft；一个 leader 处理写入。</td>
+<td>通常五个副本；需要多数仲裁。</td>
+</tr>
+<tr>
+<td>共识层</td>
+<td>状态机操作的复制日志。</td>
+<td>操作为文件/锁的 CRUD 及会话事件。</td>
+</tr>
+<tr>
+<td>状态机</td>
+<td>层级命名空间、锁状态、会话状态。</td>
+<td>确定性；所有副本收敛到相同状态。</td>
+</tr>
+<tr>
+<td>会话管理器</td>
+<td>跟踪客户端会话、租约和心跳。</td>
+<td>会话到期触发自动锁释放。</td>
+</tr>
+<tr>
+<td>Watch 分发器</td>
+<td>向订阅者发送变更通知。</td>
+<td>在变更提交后触发。</td>
+</tr>
+<tr>
+<td>客户端库</td>
+<td>维护会话、缓存读取、校验围栏令牌。</td>
+<td>大多数生产 bug 在此处被捕获。</td>
+</tr>
+<tr>
+<td>围栏基础设施</td>
+<td>每把锁的单调计数器；下游进行校验。</td>
+<td>若无此机制，暂停的客户端可能损坏状态。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">数据模型</h3>
+<h4 id="file-lock-node">文件 / 锁节点</h4>
+<pre><code class="language-text">Node(
+  path,                  // /ls/cell/service/lock
+  type,                  // file or directory
+  data,                  // small content, KB-range
+  metadata,
+  lock_state,            // exclusive_owner_session, shared_owners[], free
+  lock_generation,       // monotonic counter, used as fence token
+  acl,
+  version,               // for compare-and-swap operations
+  created_at,
+  modified_at
+)
+</code></pre>
+<h4 id="session">Session（会话模式）</h4>
+<pre><code class="language-text">Session(
+  session_id,
+  client_address,
+  lease_expires_at,
+  jeopardy_state,        // healthy, jeopardy, expired
+  held_locks,
+  watches
+)
+</code></pre>
+<h4 id="replicated-log-entry">复制日志条目</h4>
+<pre><code class="language-text">LogEntry(
+  index,
+  term,
+  operation,             // create, delete, acquire, release, session_keepalive, session_expire
+  args,
+  client_session_id,
+  commit_token
+)
+</code></pre>
+<h3 id="apis">API</h3>
+<pre><code class="language-text">Open(path, mode, flags) -&gt; handle           // create or open a file
+Acquire(handle, mode) -&gt; fence_token        // exclusive or shared
+Release(handle)
+GetContents(handle) -&gt; data, version
+SetContents(handle, data, expected_version) // CAS
+ReadDir(path)
+Delete(path, expected_version)
+SetWatch(handle, event_mask)                // change/delete notification
+KeepAlive(session_id) -&gt; session_status     // heartbeat
+</code></pre>
+<p>获取响应中包含围栏令牌（有时称为 sequencer）：一个单调递增的整数，下游服务在接受归属于该锁持有者的写入之前必须校验它。</p>
+<h3 id="session-lease-and-the-jeopardy-state">会话租约与 Jeopardy 状态</h3>
+<p>会话是带 TTL 的租约（例如，Chubby 默认通常为 12 秒）。</p>
+<p>生命周期：</p>
+<ol>
+<li>客户端开启会话；服务器授予有效期至 <code>T</code>.</li>
+<li>客户端定期发送 <code>KeepAlive</code>. 服务器延长租约。</li>
+<li>如果 <code>KeepAlive</code> 在 <code>T</code>之前未到达，服务器将会话标记为 <strong>过期</strong>.</li>
+<li>到期时，该会话持有的所有锁被释放，所有 watch 被移除，所有临时节点被删除。</li>
+<li>客户端可能无法访问服务器，但自身仍在运行。它进入 <strong>危险</strong> 状态，暂停应用活动，直到确认自己仍持有会话。</li>
+</ol>
+<p>关键细节：客户端强制执行一个本地保守截止时间，该时间 <em>早于</em> 服务器的截止时间。如果客户端在其保守截止时间前无法访问服务器，它会停止使用锁（而非等到服务器端可能已到期）。这种非对称性防止了"客户端认为自己持有锁，而服务器已将其授予他人"的时间窗口。</p>
+<p>面试用语：</p>
+<blockquote>
+<p>单纯的租约超时无法保证跨网络的互斥安全性。客户端必须应用比服务器更早的保守截止时间，且下游服务必须校验围栏令牌，而非信任客户端的声明。</p>
+</blockquote>
+<h3 id="fencing-tokens-the-crucial-mechanism">围栏令牌——关键机制</h3>
+<p>若无围栏机制，以下场景将破坏互斥：</p>
+<ol>
+<li>客户端 A 获取锁；服务器授权至 T=10。</li>
+<li>客户端 A 暂停（GC、网络）至 T=12。</li>
+<li>服务器在 T=10 时令 A 的会话到期；在 T=11 时将锁授予客户端 B。</li>
+<li>A 在 T=12 时恢复，毫不知情地向存储发送写入请求。</li>
+<li>B 也发送写入请求。</li>
+<li>存储同时处理两者——数据损坏。</li>
+</ol>
+<p>围栏修复方案：</p>
+<ul>
+<li>每次授权时递增每把锁的单调计数器并返回该值。</li>
+<li>A 获得令牌 7；B 获得令牌 8。</li>
+<li>存储跟踪该资源已见到的最高令牌；拒绝令牌值更低的写入请求。</li>
+<li>A 的过期写入在下游失败。</li>
+</ul>
+<p>这需要下游的配合。不进行围栏的锁服务，或不校验令牌的服务，无法跨网络安全地使用锁保护的临界区。</p>
+<h3 id="consensus-layer">共识层</h3>
+<p>所有写操作都经过 Paxos 或 Raft：</p>
+<ul>
+<li>五个副本；一个选举出的 leader 处理客户端写入。</li>
+<li>leader 追加到本地日志，复制到多数副本，应用到状态机，然后回复客户端。</li>
+<li>读取默认路由到 leader（线性一致性）；可选在副本上进行过期读取。</li>
+<li>leader 故障时，选举新 leader；根据协议，前任期未提交的条目要么被提交，要么被覆盖。</li>
+</ul>
+<p>心跳和会话 keepalive 也经过 leader，以便状态机反映当前的会话活跃状态。</p>
+<h3 id="read-caching-in-the-client-library">客户端库中的读缓存</h3>
+<p>大多数操作是读取。为降低负载：</p>
+<ul>
+<li>客户端库按路径缓存文件内容，并附带服务器提供的版本号。</li>
+<li>服务器跟踪哪些客户端持有哪些缓存条目。</li>
+<li>数据变更时，服务器在完成写入之前使相关客户端的缓存失效。</li>
+<li>从应用程序的视角来看，这有效地实现了强一致性读取，同时将工作卸载给客户端。</li>
+</ul>
+<p>这就是 Chubby 的缓存设计。这也是 Chubby 能用五个副本服务数千客户端的主要原因之一。</p>
+<h3 id="watches-and-notifications">Watch 与通知</h3>
+<ul>
+<li>客户端在文件路径上注册 watch。</li>
+<li>变更提交后，分发器推送一次性通知。</li>
+<li>客户端重新读取以获取新状态。</li>
+<li>通知不携带有效载荷；读取才是事实来源，避免了 watch 和读取结果不一致的竞争条件。</li>
+</ul>
+<p>Watch 是 leader 选举客户端得知前任 leader 锁已释放的方式。</p>
+<h3 id="leader-election-pattern">Leader 选举模式</h3>
+<p>典型用例：</p>
+<pre><code class="language-text">1. Each candidate opens session.
+2. Each tries to acquire lock at /service/election.
+3. The winner sets the file contents to their address; remaining candidates set watches.
+4. Winner periodically heartbeats its session.
+5. If winner's session expires, the lock is released; watches fire.
+6. A new election begins.
+7. Every successful acquire returns a higher fence token than the previous leader's.
+</code></pre>
+<p>下游服务对收到的每次写入校验围栏令牌；来自前任 leader 的延迟写入将失败。</p>
+<h3 id="scaling-strategy">扩展策略</h3>
+<p>Chubby 有意设计为非高吞吐量。为跨多租户扩展：</p>
+<ul>
+<li>在每个数据中心运行多个独立的 Chubby cell，按应用进行分片。</li>
+<li>每个 cell 处理数千个客户端。</li>
+<li>对延迟敏感的应用使用其所在区域的 cell；避免跨 cell 协调。</li>
+<li>当同一进程中存在大量 session 时，客户端侧会对心跳进行聚合和批处理。</li>
+</ul>
+<p>如果吞吐量成为问题，通常的答案是"你用错了"——Chubby 适用于粗粒度协调，而非序列化写入。</p>
+<h3 id="consistency-model">一致性模型</h3>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>一致性</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Acquire/Release</td>
+<td>通过共识实现线性一致性</td>
+<td>互斥需要全序保证。</td>
+</tr>
+<tr>
+<td>Get/Set with version</td>
+<td>线性一致性</td>
+<td>通过主节点读取并结合缓存失效机制。</td>
+</tr>
+<tr>
+<td>过期读取</td>
+<td>最终一致</td>
+<td>仅在明确指定时使用。</td>
+</tr>
+<tr>
+<td>Watch 通知</td>
+<td>提交后投递</td>
+<td>应用重新读取以获取最新数据。</td>
+</tr>
+<tr>
+<td>Session 事件</td>
+<td>线性一致性</td>
+<td>持有锁时释放锁必须是一个已提交的日志事件。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">故障模式与缓解措施</h3>
+<table>
+<thead>
+<tr>
+<th>故障模式</th>
+<th>缓解措施</th>
+<th>监控指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>客户端在持有锁的情况下暂停；租约到期。</td>
+<td>下游服务检查 fencing token；客户端使用保守截止时间。</td>
+<td>存储层的过期 fencing token 被拒绝；jeopardy session 数量。</td>
+</tr>
+<tr>
+<td>主副本发生故障。</td>
+<td>Raft 选举选出新主节点；中断持续数秒。</td>
+<td>主节点切换频率，选举持续时间。</td>
+</tr>
+<tr>
+<td>网络分区隔离了少数副本。</td>
+<td>少数派无法提交；连接到少数派的客户端失去获取锁的能力。</td>
+<td>Quorum 大小，分区检测。</td>
+</tr>
+<tr>
+<td>网络分区将客户端与 cell 隔离。</td>
+<td>客户端进入 jeopardy 状态，随后停止使用锁；服务端使 session 过期。</td>
+<td>Jeopardy 持续时间分布。</td>
+</tr>
+<tr>
+<td>心跳风暴。</td>
+<td>客户端批处理；保守的 TTL；服务端限流。</td>
+<td>心跳 QPS，响应延迟。</td>
+</tr>
+<tr>
+<td>热门文件上的 watch 风暴。</td>
+<td>Fan-out 限流；客户端侧防抖。</td>
+<td>Watch 触发频率，分发队列深度。</td>
+</tr>
+<tr>
+<td>副本时钟偏差。</td>
+<td>使用仅服务端时钟进行租约决策；不依赖客户端时间。</td>
+<td>跨副本时钟漂移。</td>
+</tr>
+<tr>
+<td>复制日志的存储空间耗尽。</td>
+<td>快照 + 日志压缩。</td>
+<td>日志大小，快照年龄。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">运维指标</h3>
+<p>正确性：</p>
+<ul>
+<li>下游的 fencing token 违规（必须为零或可审计）。</li>
+<li>持有锁时 session 过期——持续时间和次数。</li>
+<li>双重授权告警。</li>
+</ul>
+<p>容量：</p>
+<ul>
+<li>共识提交延迟 p99。</li>
+<li>活跃 session 数量及心跳频率。</li>
+<li>活跃 watch 数量。</li>
+<li>客户端缓存命中率。</li>
+</ul>
+<p>服务健康：</p>
+<ul>
+<li>主节点稳定性；选举频率。</li>
+<li>Quorum 可用性。</li>
+<li>日志大小和快照年龄。</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">需要指出的权衡</h3>
+<ul>
+<li>强一致性需要共识，将每个 cell 的写入吞吐量上限限制在每秒数百次。</li>
+<li>粗粒度锁降低了加锁频率，但要求应用围绕更长的临界区进行设计。</li>
+<li>TTL 租约是保守的；设置过短会导致误判性故障转移，设置过长则会延迟恢复。</li>
+<li>Fencing token 需要下游配合；忽略它们的应用无法保证安全。</li>
+<li>客户端侧缓存可减轻负载，但需要服务端跟踪失效操作。</li>
+<li>五个副本可容忍两个故障；更多副本会增加提交延迟，而额外的安全性有限。</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">常见陷阱与更优做法</h3>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>将其用作高吞吐量的互斥服务。</td>
+<td>将其定位为粗粒度协调；按角色加锁，而非按操作加锁。</td>
+</tr>
+<tr>
+<td>仅依赖租约 TTL。</td>
+<td>在下游检查 fencing token。</td>
+</tr>
+<tr>
+<td>客户端/服务端对称的过期截止时间。</td>
+<td>客户端使用更保守的本地截止时间。</td>
+</tr>
+<tr>
+<td>在设计中遗忘缓存失效。</td>
+<td>服务端跟踪缓存持有者，并在提交前进行失效。</td>
+</tr>
+<tr>
+<td>将 Chubby 用作大规模的配置数据库。</td>
+<td>仅存储小文件；对于更大的配置，指向外部存储。</td>
+</tr>
+<tr>
+<td>跨 cell 的全局锁。</td>
+<td>避免使用；按应用/区域对锁空间进行分区。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">面试官可能深入探讨的方向</h3>
+<table>
+<thead>
+<tr>
+<th>深入方向</th>
+<th>优秀回答要点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fencing token</td>
+<td>展示 GC 暂停场景；解释单调递增计数器和下游检查机制。</td>
+</tr>
+<tr>
+<td>Session jeopardy</td>
+<td>客户端保守截止时间；通过 session 重连窗口进行恢复。</td>
+</tr>
+<tr>
+<td>共识机制</td>
+<td>Paxos 或 Raft；主节点选举；日志复制；快照。</td>
+</tr>
+<tr>
+<td>Watch 语义</td>
+<td>一次性触发，无载荷，提交后投递；应用重新读取。</td>
+</tr>
+<tr>
+<td>粗粒度 vs 细粒度</td>
+<td>为何 Chubby 适用于角色级锁，而非请求级互斥锁。</td>
+</tr>
+<tr>
+<td>多 cell 策略</td>
+<td>每个应用独立 cell；无全局协调。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff 级别回答检查清单</h3>
+<ul>
+<li>声明不变性：最多一个持有者，加上 fencing token 正确性。</li>
+<li>基于共识复制状态机构建。</li>
+<li>解释 session、租约、心跳和 jeopardy。</li>
+<li>务必提及 fencing token。</li>
+<li>解释带服务端失效的客户端侧缓存。</li>
+<li>将系统定位为粗粒度，而非细粒度。</li>
+<li>讨论 watch 语义。</li>
+<li>将多 cell 确定为扩展策略。</li>
+</ul>
+<h3 id="interview-phrase">面试用语</h3>
+<blockquote>
+<p>分布式锁管理器是正确性优先的基础设施。锁本身不是安全原语；锁加上 fencing token 才是。Session、租约和 jeopardy 协议防止锁泄漏，但安全网是由每个遵守锁的服务强制执行的单调 token。</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. 模拟面试</h2>
+<p><strong>面试官：</strong> 设计一个分布式锁管理器。</p>
+<p><strong>候选人：</strong> 我会构建一个由五个副本运行 Raft 的 Chubby 风格 cell，暴露一个微型层级命名空间，其中文件兼作锁。每个客户端通过租约打开一个 session；获取锁会返回一个单调递增的 fencing token。不变性是最多一个持有者，下游服务在处理写入前必须检查 fencing token。</p>
+<p><strong>面试官：</strong> 为什么需要 fencing token？租约 TTL 还不够吗？</p>
+<p><strong>候选人：</strong> 不够。假设客户端 A 持有锁，然后暂停了 20 秒（GC、网络抖动）。其租约到期；服务端将锁授予客户端 B。然后 A 恢复，仍认为自己持有锁，并写入存储。没有 fencing，存储无法区分 A 的写入和 B 的写入。有了 fencing，A 的 token 是 7，B 的是 8；存储跟踪已接受的最大 token，并拒绝 A 的过期写入。仅靠租约 TTL 存在不安全窗口；fencing 消除了它。</p>
+<p><strong>面试官：</strong> 租约 TTL 应该设置多大？</p>
+<p><strong>候选人：</strong> 需要权衡。太短则轻微暂停会导致误判性故障转移和重新选举。太长则真实故障的恢复会很慢。Chubby 的默认值约为 12 秒。客户端使用更保守的本地截止时间——比如 8 秒——以便在服务端可能撤销锁之前就停止使用。这种不对称性至关重要。</p>
+<p><strong>面试官：</strong> 请带我走一遍主节点选举的流程。</p>
+<p><strong>候选人：</strong> 每个候选者打开一个 session 并尝试 <code>Acquire</code> 对选举文件执行操作。胜者获得 fencing token，将其地址写入文件。失败者注册 watch。胜者定期发送心跳。如果胜者的 session 过期，锁被释放；watch 触发通知失败者；下一次获取返回更高的 token。被废黜的主节点在过期后发送的任何下游写入都会因 token 比较而被拒绝。</p>
+<p><strong>面试官：</strong> 共识层是如何工作的？</p>
+<p><strong>候选人：</strong> Raft。五个副本，一个主节点，提交需要多数 quorum。每次写入——获取锁、释放锁、文件编辑、session 保活——都会追加到日志中，复制到多数副本，然后应用到确定性状态机。读取可以通过主节点实现线性一致性，或通过副本并显式接受过期读取。</p>
+<p><strong>面试官：</strong> 通过主节点读取听起来很昂贵。</p>
+<p><strong>候选人：</strong> 这就是为什么客户端库会进行缓存。服务端跟踪哪些客户端持有哪些缓存条目。当写入提交时，服务端在写入完成前向所有缓存持有者发送失效通知。持有者的下一次读取被强制重新获取。这使应用获得线性一致性的读取，同时将大部分工作卸载到客户端。</p>
+<p><strong>面试官：</strong> 为什么这不是高 QPS 服务？</p>
+<p><strong>候选人：</strong> 每次写入都要经过共识，在最佳情况下需要数十毫秒。这将每个 cell 的写入上限限制在每秒数百次。Chubby 设计用于粗粒度协调——服务在整个主节点任期内持有锁，而非按请求持有。如果需要细粒度锁，应使用数据库事务或 Redis 风格的乐观系统。</p>
+<p><strong>面试官：</strong> 客户端网络中断但进程仍在运行，会发生什么？</p>
+<p><strong>候选人：</strong> 客户端进入 jeopardy 状态：它未能刷新租约。它暂停使用锁的应用活动，期望在租约到期前恢复。它持续尝试连接任意副本。如果在租约窗口内重新连接，它确认 session 仍然存活并恢复。如果保守的客户端本地截止时间在未得到确认的情况下到达，它会在本地放弃锁，即便技术上服务端尚未使 session 过期。这样一来，即使网络恢复且服务端仍认为客户端持有锁，客户端也会拒绝使用它。</p>
+<p><strong>面试官：</strong> 如果共识中的少数派被分区会怎样？</p>
+<p><strong>候选人：</strong> 少数派无法提交写入。连接到少数派副本的客户端会看到获取失败。多数派继续通过其主节点处理写入。当分区恢复时，少数派副本重放日志条目并重新加入。重要的是，少数派副本在分区期间不会授予冲突的锁，因为它们没有 quorum。</p>
+<p><strong>面试官：</strong> 如何处理 watch 风暴？</p>
+<p><strong>候选人：</strong> Watch 是一次性触发且无载荷的；触发后，如果客户端需要进一步通知，必须重新注册。Fan-out 受分发器速率限制的约束。对于热门文件，我们要么降低通知频率，要么让 watcher 改为轮询。应用在收到通知后读取以获取最新数据，从而避免 watch 触发但缓存值已过期的竞态条件。</p>
+<p><strong>面试官：</strong> 多区域还是单 cell？</p>
+<p><strong>候选人：</strong> 多个 cell，按应用和区域分区。每个数据中心的每个应用一个 cell 是典型做法。全局协调不是目标；如果两个服务需要跨区域协调，它们在这一层之上进行（并接受延迟）。试图使一个 cell 全局化会将提交延迟从毫秒级放大到数百毫秒。</p>
+<p><strong>面试官：</strong> 总结。</p>
+<p><strong>候选人：</strong> 一个小型复制状态机——五个副本，Raft——暴露一个微型文件系统，其中文件充当锁。带有租约的 session 加上 jeopardy 协议防止锁泄漏；fencing token 消除了 GC 暂停的漏洞。带服务端驱动失效的客户端缓存使读取开销低廉。系统有意设计为粗粒度；我们通过增加 cell 来扩展，而非提高单个 cell 的吞吐量。</p>
+<h2 id="3-practice-notes">3. 练习备注</h2>
+<h3 id="five-minute-version">五分钟版本</h3>
+<ol>
+<li>明确定位：粗粒度、主节点选举的主要用途、互斥。</li>
+<li>声明不变性：最多一个持有者 + fencing token 正确性。</li>
+<li>基于共识（Raft 或 Paxos）构建；五个副本。</li>
+<li>展示 session、租约、jeopardy。</li>
+<li>展示 fencing token 和 GC 暂停场景。</li>
+<li>解释带失效机制的客户端侧缓存。</li>
+<li>解释 watch；一次性触发，无载荷。</li>
+<li>以多 cell 扩展策略收尾。</li>
+</ol>
+<h3 id="one-minute-closeout">一分钟结尾陈述</h3>
+<blockquote>
+<p>分布式锁管理器是正确性优先的基础设施。锁存在于复制状态机中；带 TTL 租约的 session 防止永久泄漏；fencing token 防止过期客户端破坏下游状态。带服务端驱动失效的客户端缓存承担读取负载。系统有意设计为粗粒度；扩展来自运行多个 cell，而非提高单个 cell 的吞吐量。</p>
+</blockquote>
+<h3 id="best-interview-phrases">最佳面试用语</h3>
+<ul>
+<li>"锁本身不是安全原语；锁加上 fencing token 才是。"</li>
+<li>"仅靠租约 TTL 存在不安全窗口；客户端必须使用保守的本地截止时间。"</li>
+<li>"Watch 是一次性触发且无载荷的；读取才是获取真相的方式。"</li>
+<li>"这有意设计为粗粒度——按角色加锁，而非按操作加锁。"</li>
+<li>"通过增加 cell 来扩展；永远不要试图提高单个 cell 的吞吐量。"</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

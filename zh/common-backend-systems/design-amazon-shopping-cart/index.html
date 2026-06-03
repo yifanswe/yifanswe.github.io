@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>设计 Amazon 购物车 — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">设计 Amazon 购物车</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p><strong>对这些术语不熟悉？</strong> 请参阅 <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> ，了解常见系统设计术语的中英文解释。</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. 基础知识与解题思路</h2>
+<h3 id="what-this-question-is-testing">本题考察点</h3>
+<p>Amazon 的购物车是一个看似简单实则复杂的功能：它是原始 Dynamo 论文中用于论证动机的典型示例。难点在于保持购物车的高可用性——即便在网络分区期间，每次"加入购物车"操作也必须成功——同时需要协调来自多个设备的并发冲突更新。</p>
+<p>其不变量如下：</p>
+<blockquote>
+<p>每次"加入购物车"操作最终都会出现在用户所有设备的购物车中；删除的商品不会重新出现，除非重新添加；来自多个设备的并发更新合并时不会丢失任何商品；即使部分副本不可达，购物车依然可用。</p>
+</blockquote>
+<p>在 ICT5 / L6+ 级别，面试官考察的是你能否清晰表述 Dynamo 风格的"始终可写"权衡，通过向量时钟或 CRDT 设计冲突解决方案，处理多设备购物车合并，以及分析购物车放弃、库存检查和转换为订单等场景。</p>
+<h3 id="60-second-interview-framing">60 秒面试框架</h3>
+<p>口述版本：</p>
+<blockquote>
+<p>我将围绕一个以 user_id 为键、始终可写的 Dynamo 风格 KV 存储来设计购物车。添加和删除操作通过向量时钟或 CRDT 语义进行合并，使得来自多个设备的并发更新永远不会静默丢失商品。关键决策在于冲突解决语义（偏向保留）、库存检查时机，以及结账时购物车转为订单的转换流程。</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">首先明确需求</h3>
+<p>功能性需求：</p>
+<ul>
+<li>将商品加入购物车并指定数量。</li>
+<li>更新数量。</li>
+<li>移除商品。</li>
+<li>在任意设备查看购物车。</li>
+<li>持久化购物车（在会话结束后保留）。</li>
+<li>应用优惠券/促销。</li>
+<li>保存以备后用（独立列表）。</li>
+<li>结账：将购物车转换为订单。</li>
+</ul>
+<p>非功能性需求：</p>
+<ul>
+<li>高可用性：即使在部分故障期间，购物车写入也必须成功。</li>
+<li>跨设备最终一致。</li>
+<li>亚秒级响应。</li>
+<li>扩展至数亿用户。</li>
+<li>冲突解决：永不静默丢失商品。</li>
+</ul>
+<p>以下内容超出范围，除非被特别询问：</p>
+<ul>
+<li>在加入购物车时执行库存检查（仅在结账时锁定库存）。</li>
+<li>税费计算（独立服务）。</li>
+<li>推荐商品插入（独立服务）。</li>
+</ul>
+<h3 id="scale-assumptions">规模假设</h3>
+<table>
+<thead>
+<tr>
+<th>领域</th>
+<th>假设</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>用户</td>
+<td>3 亿以上 Prime 用户；10 亿以上账户。</td>
+</tr>
+<tr>
+<td>活跃购物车</td>
+<td>数千万并发。</td>
+</tr>
+<tr>
+<td>每秒添加数</td>
+<td>峰值 10 万以上。</td>
+</tr>
+<tr>
+<td>购物车大小</td>
+<td>平均 3 件商品；长尾可达数百件。</td>
+</tr>
+<tr>
+<td>每用户设备数</td>
+<td>2-5.</td>
+</tr>
+<tr>
+<td>Latency（延迟）</td>
+<td>添加操作 &lt; 200 ms。</td>
+</tr>
+</tbody>
+</table>
+<p>瓶颈在于多设备合并的正确性；吞吐量适中。</p>
+<h3 id="core-product-model">核心产品模型</h3>
+<table>
+<thead>
+<tr>
+<th>界面</th>
+<th>体验</th>
+<th>需求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>购物车</td>
+<td>商品列表 + 数量。</td>
+<td>始终可写。</td>
+</tr>
+<tr>
+<td>保存以备后用</td>
+<td>类似愿望清单。</td>
+<td>相同。</td>
+</tr>
+<tr>
+<td>结算</td>
+<td>购物车 → 订单。</td>
+<td>强一致性；库存检查。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">高层架构</h3>
+<pre><code class="language-text">Multiple devices --add/update/remove--&gt; Cart API
+                                            |
+                                            v
+                                  +------------------+
+                                  | Cart Service     |
+                                  | always writable  |
+                                  +--------+---------+
+                                            |
+                                            v
+                                  +------------------+
+                                  | Dynamo-style KV  |
+                                  | per-user cart    |
+                                  | vector clocks    |
+                                  +--------+---------+
+                                            |
+                              Conflict resolution: client merge
+                                            |
+                                            v
+                                  +------------------+
+                                  | Checkout Service |
+                                  +--------+---------+
+                                            |
+                                            v
+                                  +------------------+
+                                  | Order Service    |
+                                  +------------------+
+</code></pre>
+<h3 id="core-components">核心组件</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>职责</th>
+<th>关键细节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cart API</td>
+<td>无状态；路由请求。</td>
+<td>标准。</td>
+</tr>
+<tr>
+<td>购物车存储</td>
+<td>每用户始终可写的 KV。</td>
+<td>Dynamo 风格复制。</td>
+</tr>
+<tr>
+<td>冲突解决器</td>
+<td>合并并发版本。</td>
+<td>向量时钟或 CRDT。</td>
+</tr>
+<tr>
+<td>稍后购买存储</td>
+<td>每用户独立列表。</td>
+<td>相似模式。</td>
+</tr>
+<tr>
+<td>库存服务</td>
+<td>结账时检查库存。</td>
+<td>强一致性。</td>
+</tr>
+<tr>
+<td>定价</td>
+<td>计算含促销的总价。</td>
+<td>无状态。</td>
+</tr>
+<tr>
+<td>结算</td>
+<td>将购物车转化为订单。</td>
+<td>状态机。</td>
+</tr>
+<tr>
+<td>订单服务</td>
+<td>参见支付/订单设计。</td>
+<td>强一致性。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">数据模型</h3>
+<h4 id="cart">购物车</h4>
+<pre><code class="language-text">Cart(
+  user_id,
+  items: { sku_id: {quantity, added_at, ...} },
+  version_vector,         // for conflict resolution
+  last_updated,
+  status                  // active, abandoned, converted
+)
+</code></pre>
+<p>存储在以以下键索引的 Dynamo 风格 KV 中 <code>user_id</code>。跨多节点副本复制。</p>
+<h4 id="cart-item">Cart Item</h4>
+<pre><code class="language-text">CartItem(
+  sku_id,
+  quantity,
+  added_at,
+  source,                 // browse, recommendation, list, ...
+  promo_code?,
+  notes?
+)
+</code></pre>
+<h3 id="apis">API</h3>
+<pre><code class="language-text">POST   /cart/add               { sku_id, quantity }
+PATCH  /cart/{sku_id}          { quantity }
+DELETE /cart/{sku_id}
+GET    /cart                   -&gt; { items, total }
+POST   /save-for-later         { sku_id }
+POST   /checkout/start         -&gt; { order_id }
+</code></pre>
+<h3 id="conflict-resolution-the-dynamo-story">冲突解决：Dynamo 的故事</h3>
+<p>场景：用户在手机上添加书 A，在笔记本上添加书 B，同时操作（或某设备离线）。</p>
+<p><strong>向量时钟方案：</strong></p>
+<p>每次写入携带一个向量时钟。购物车存储接受两次写入；读取时，若存在多个版本（兄弟节点），客户端将其合并。</p>
+<p>对于购物车，自然的合并策略是 <strong>并集</strong>：取两个版本中的所有商品。若两个版本修改了同一商品的数量，取最大值（保留更多，避免丢失）。</p>
+<p>结果：购物车包含 A 和 B 两本书。用户不会"丢失"任何添加操作。</p>
+<p>对于删除操作，这更复杂。若 A 在购物车中，然后在设备 1 上被删除，而设备 2（持有过期状态）向 A 添加了数量，朴素的并集会让 A 复活。</p>
+<p><strong>修复方法：</strong> 使用墓碑。删除时记录带版本号的墓碑；后续使用旧版本的添加操作会被合并，但墓碑优先。</p>
+<p><strong>CRDT 方案：</strong></p>
+<p>将购物车建模为 CRDT（如 OR-Set 或 2P-Set）：</p>
+<ul>
+<li>OR-Set：每次添加有唯一标签；删除只移除其已知的标签。</li>
+<li>结果：未看到删除操作的添加仍会出现在合并集中。</li>
+</ul>
+<p>面试用语：</p>
+<blockquote>
+<p>Dynamo 的设计以可用性优先于一致性。购物车始终可写；并发更新产生兄弟节点，由客户端合并。购物车的自然合并策略是带墓碑的集合并集——优先保留而非删除。</p>
+</blockquote>
+<h3 id="write-path">写入路径</h3>
+<ol>
+<li>用户在某设备上添加商品。</li>
+<li>Cart API 以写入法定数量 W 个副本写入购物车存储。</li>
+<li>一旦 W 个副本确认，即返回成功。</li>
+<li>副本异步传播到其他节点。</li>
+<li>在另一设备上读取可能看到最终一致的状态；若存在多个版本，进行合并。</li>
+</ol>
+<p>为实现高可用性： <code>W + R &gt; N</code> 用于强一致性，或 <code>W &lt; N</code> 。 <code>R &lt; N</code> 用于最终一致性下的高可用性。</p>
+<h3 id="read-path">读取路径</h3>
+<ol>
+<li>用户在某设备上打开购物车。</li>
+<li>Cart API 从 R 个副本读取。</li>
+<li>若版本出现分歧，客户端（或合并服务）通过向量时钟进行协调。</li>
+<li>返回合并后的购物车。</li>
+</ol>
+<p>可选地，将合并后的版本写回以修复分歧（读修复）。</p>
+<h3 id="multi-device-sync">多设备同步</h3>
+<p>当用户在另一设备上打开购物车时：</p>
+<ol>
+<li>从购物车存储读取。</li>
+<li>展示合并后的状态。</li>
+<li>用户的操作（添加、删除、更新）写回。</li>
+</ol>
+<p>推送更新：当写入提交时，通知已订阅的设备刷新。可选；打开时拉取即已足够。</p>
+<h3 id="inventory-at-cart-time">结账时的库存处理</h3>
+<p>Amazon 历史上在加入购物车时不锁定库存。原因如下：</p>
+<ul>
+<li>购物车放弃率高；锁定库存会阻碍其他用户购买。</li>
+<li>库存会变成抢购式的预购争夺。</li>
+<li>昂贵的协调操作被推迟到结账时进行。</li>
+</ul>
+<p>因此，加入购物车时不检查库存。结账时验证并锁定库存。若届时缺货，用户会看到"已无法购买"的提示。</p>
+<p>对于极度稀缺的商品（如限时抢购），这会改变——参见限时抢购设计。但普通购物车：懒惰式库存检查。</p>
+<h3 id="checkout">结算</h3>
+<ol>
+<li>用户发起结账。</li>
+<li>本次结账会话中购物车被冻结。</li>
+<li>逐商品进行库存检查和锁定。</li>
+<li>计算价格（含当前促销）。</li>
+<li>创建订单（状态机）。</li>
+<li>完成支付。</li>
+<li>购物车标记为已转化；商品移除。</li>
+</ol>
+<p>若任何商品缺货，向用户展示错误并允许调整。购物车保持活跃。</p>
+<h3 id="save-for-later">稍后购买</h3>
+<p>与购物车类似但为独立列表。相同的 KV 模式；相同的冲突解决方式。</p>
+<p>购物车与稍后购买之间的移动是原子操作。</p>
+<h3 id="scaling-and-partitioning">扩展与分区</h3>
+<table>
+<thead>
+<tr>
+<th>数据</th>
+<th>分区键</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>购物车</td>
+<td><code>user_id</code> 哈希值</td>
+<td>每用户数据。</td>
+</tr>
+<tr>
+<td>保存以备后用</td>
+<td><code>user_id</code> 哈希值</td>
+<td>按用户存储。</td>
+</tr>
+<tr>
+<td>库存</td>
+<td><code>sku_id</code> 哈希值</td>
+<td>每商品。</td>
+</tr>
+<tr>
+<td>订单</td>
+<td><code>order_id</code> 哈希值</td>
+<td>每订单。</td>
+</tr>
+<tr>
+<td>购物车事件</td>
+<td><code>user_id</code> 哈希值</td>
+<td>历史记录。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consistency-model">一致性模型</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>一致性</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>购物车写入</td>
+<td>高可用性，最终一致性</td>
+<td>永不丢失添加操作。</td>
+</tr>
+<tr>
+<td>购物车读取</td>
+<td>法定数量 + 兄弟节点解决</td>
+<td>融合趋势。</td>
+</tr>
+<tr>
+<td>结账时的库存</td>
+<td>强一致性</td>
+<td>真实金额。</td>
+</tr>
+<tr>
+<td>订单创建</td>
+<td>强一致性</td>
+<td>权威性。</td>
+</tr>
+<tr>
+<td>定价</td>
+<td>结账时强一致性</td>
+<td>最终总价。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-region-strategy">多区域策略</h3>
+<ul>
+<li>用户主区域用于购物车写入。</li>
+<li>跨区域异步复制。</li>
+<li>对于旅行用户，跨区域读取具有最终一致性；若存在分歧则合并。</li>
+<li>故障转移区域保持热备。</li>
+</ul>
+<h3 id="failure-modes-and-mitigations">故障模式与缓解措施</h3>
+<table>
+<thead>
+<tr>
+<th>故障模式</th>
+<th>缓解措施</th>
+<th>监控指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>多设备并发添加。</td>
+<td>合并为并集；取最大数量。</td>
+<td>Sibling 速率。</td>
+</tr>
+<tr>
+<td>删除后再添加的竞争。</td>
+<td>墓碑；OR-Set 语义。</td>
+<td>复活缺陷数量。</td>
+</tr>
+<tr>
+<td>购物车存储分区。</td>
+<td>Sloppy quorum + hinted handoff。</td>
+<td>分区事件。</td>
+</tr>
+<tr>
+<td>副本宕机。</td>
+<td>继续处理剩余部分。</td>
+<td>副本健康状态。</td>
+</tr>
+<tr>
+<td>结账竞争（两个设备）。</td>
+<td>最后写入者优先或显式冲突处理。</td>
+<td>并发结账次数。</td>
+</tr>
+<tr>
+<td>结账时库存不匹配。</td>
+<td>优雅地呈现给用户。</td>
+<td>缺货率。</td>
+</tr>
+<tr>
+<td>促销在购物车中途过期。</td>
+<td>结账时重新计算。</td>
+<td>促销过期竞争。</td>
+</tr>
+<tr>
+<td>用户放弃购物车数月。</td>
+<td>保留策略；软过期。</td>
+<td>购物车年龄。</td>
+</tr>
+<tr>
+<td>购物车合并产生不需要的商品。</td>
+<td>墓碑；合并 UI 清晰度。</td>
+<td>用户投诉数量。</td>
+</tr>
+<tr>
+<td>机器人批量添加商品。</td>
+<td>频率限制；CAPTCHA。</td>
+<td>每用户添加频率。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">运维指标</h3>
+<p>正确性：</p>
+<ul>
+<li>丢失添加率（必须约为零）。</li>
+<li>复活率（已删除商品重新出现）。</li>
+<li>读取时的兄弟节点率。</li>
+</ul>
+<p>容量：</p>
+<ul>
+<li>每秒购物车写入次数。</li>
+<li>读取 QPS。</li>
+<li>每秒合并操作数。</li>
+</ul>
+<p>业务层面：</p>
+<ul>
+<li>购物车到结账的转化率。</li>
+<li>购物车放弃率。</li>
+<li>平均购物车大小。</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">需要指出的权衡</h3>
+<ul>
+<li>高可用性牺牲了严格一致性；这对购物车来说是可接受的权衡。</li>
+<li>集合并集合并保留商品，但可能复活删除的商品；墓碑以元数据为代价解决了这个问题。</li>
+<li>结账时不锁定库存节省了协调开销，但可能在结账时令用户失望。</li>
+<li>墓碑垃圾回收需要决定何时可以安全遗忘。</li>
+<li>每用户状态简化了分区。</li>
+<li>CRDT 设计比向量时钟更复杂，但具有可组合性。</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">常见陷阱与更优做法</h3>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>购物车写入的强一致性。</td>
+<td>始终可写，最终合并。</td>
+</tr>
+<tr>
+<td>最后写入者优先。</td>
+<td>向量时钟兄弟节点 + 并集合并。</td>
+</tr>
+<tr>
+<td>在加入购物车时锁定库存。</td>
+<td>结账时懒惰检查。</td>
+</tr>
+<tr>
+<td>无墓碑（删除操作会被过期添加覆盖）。</td>
+<td>带版本号的墓碑。</td>
+</tr>
+<tr>
+<td>单副本。</td>
+<td>N 个副本，配置 W/R 法定数量。</td>
+</tr>
+<tr>
+<td>严格排序。</td>
+<td>并发操作可行；合并解决冲突。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">面试官可能深入探讨的方向</h3>
+<table>
+<thead>
+<tr>
+<th>深入方向</th>
+<th>优秀回答要点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>冲突解决</td>
+<td>向量时钟 + 并集；墓碑；OR-Set CRDT。</td>
+</tr>
+<tr>
+<td>多设备同步</td>
+<td>打开时拉取 + 推送通知。</td>
+</tr>
+<tr>
+<td>库存时机</td>
+<td>结账时懒惰检查。</td>
+</tr>
+<tr>
+<td>购物车到订单的流程</td>
+<td>状态机；幂等。</td>
+</tr>
+<tr>
+<td>Dynamo 原则</td>
+<td>宽松法定数量；暗示移交；向量时钟。</td>
+</tr>
+<tr>
+<td>放弃</td>
+<td>保留；软过期。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff 级别回答检查清单</h3>
+<ul>
+<li>Dynamo 风格始终可写的购物车存储。</li>
+<li>向量时钟或 CRDT 冲突解决。</li>
+<li>带墓碑的并集合并用于删除处理。</li>
+<li>加入购物车时不检查库存；结账时检查。</li>
+<li>购物车到订单的流程作为状态机。</li>
+<li>多设备拉取 + 推送。</li>
+<li>多区域部署，用户归属主区域。</li>
+</ul>
+<h3 id="interview-phrase">面试用语</h3>
+<blockquote>
+<p>Amazon 的购物车是 Dynamo 经典用例。可用性至上——每次"加入购物车"操作必须成功，即使在分区期间也不例外。来自多个设备的并发更新产生兄弟节点，客户端将其合并为带墓碑的并集。有趣的权衡在于：优先保留商品（永不静默丢失添加操作）而非严格一致性。库存是懒惰式的：在结账时检查，而非加入时检查。</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. 模拟面试</h2>
+<p><strong>面试官：</strong> 设计 Amazon 的购物车。</p>
+<p><strong>候选人：</strong> 以 user_id 为键的 Dynamo 风格始终可写 KV 存储。即使在部分故障期间，购物车写入也能成功；读取通过向量时钟解决兄弟节点。购物车商品的自然合并策略是集合并集，每件商品取最大数量；删除使用墓碑防止复活。加入购物车时不锁定库存；库存在结账时检查并锁定。不变量是：即使在网络分区和并发设备更新下，每次添加操作都能被保留。</p>
+<p><strong>面试官：</strong> 带我走一遍多设备竞争场景。</p>
+<p><strong>候选人：</strong> 用户手机和笔记本电脑同时在线。手机添加书 A；笔记本同时添加书 B，两者均基于之前的购物车状态。购物车存储用各自的向量时钟记录两次写入。两次写入均不知道对方的存在。当用户在任一设备上打开购物车时，读取看到两个兄弟节点（并发版本）。合并：对商品集合取并集，每件商品取最大数量。结果：购物车包含 A 和 B 两本书。用户不会丢失任何添加操作。</p>
+<p><strong>面试官：</strong> 如果用户在手机上删除 A，然后笔记本以过期状态向 A 添加数量怎么办？</p>
+<p><strong>候选人：</strong> 使用墓碑。删除操作以版本 V 写入一个墓碑。笔记本的添加操作有版本 V'，但不知道墓碑的存在。合并时，按照 CRDT 语义（或追踪删除的合并规则），墓碑优先。A 保持删除状态。用户刷新笔记本后购物车中不包含 A。另一种方案——朴素并集——会让 A 复活，即"静默删除"缺陷。</p>
+<p><strong>面试官：</strong> 为什么加入购物车时不锁定库存？</p>
+<p><strong>候选人：</strong> 购物车放弃是常态——大多数购物车从不结账。在加入购物车时锁定库存会使真实买家无法购买；在高流量下，锁定的库存会超过实际买家数量。跨数亿购物车的协调成本极高。Amazon 的选择：结账时懒惰检查库存。若届时商品缺货，优雅地告知用户。例外是限时抢购，稀缺性是核心，系统在加入时锁定库存。</p>
+<p><strong>面试官：</strong> 结账流程。</p>
+<p><strong>候选人：</strong> 状态机。用户发起 → 本次结账冻结购物车（乐观锁）→ 逐商品进行库存检查和锁定 → 用当前促销计算价格 → 使用幂等键创建订单 → 完成支付 → 购物车标记为已转化；商品移除。若任何库存检查失败，向用户展示错误并允许调整；购物车保持活跃。</p>
+<p><strong>面试官：</strong> 如果用户从两个设备同时结账怎么办？</p>
+<p><strong>候选人：</strong> 幂等性。结账以一个 <code>checkout_session_id</code>开始。两次同时发起产生两个会话；先提交的那个创建订单。第二个会话因"购物车已结账"而失败。第二个设备上的 UI 刷新。或者，使用购物车状态上的单个 CAS 来 <code>checkout_in_progress</code>.</p>
+<p><strong>面试官：</strong> 用户快速添加 100 件商品。</p>
+<p><strong>候选人：</strong> 对添加操作实施每用户频率限制。设置合理阈值。若模式看起来是自动化的，进行机器人检测。购物车对正常重度用户（如批量购物者）仍然有效，但极端频率时会被标记审查。</p>
+<p><strong>面试官：</strong> 多区域？</p>
+<p><strong>候选人：</strong> 用户主区域用于购物车写入。跨区域异步复制。旅行场景：用户从另一区域访问购物车——副本可能有轻微延迟；读取返回可能过期的状态；写入时，合并解决冲突。故障转移区域保持热备。</p>
+<p><strong>面试官：</strong> 购物车放弃处理？</p>
+<p><strong>候选人：</strong> 购物车默认无限期保留（或按策略——许多电商网站保留 90 天）。营销系统可能会就放弃的购物车发送提醒邮件。软过期（N 天后标记为已放弃）用于指标；硬过期较为罕见。</p>
+<p><strong>面试官：</strong> 购物车中的促销？</p>
+<p><strong>候选人：</strong> 促销码记录在购物车商品或购物车层面。结账时验证并应用（资格、有效期、使用次数）。购物车总价在结账时计算；购物车展示显示估算总价。加入购物车和结账之间促销过期：告知用户；允许调整。</p>
+<p><strong>面试官：</strong> 稍后购买？</p>
+<p><strong>候选人：</strong> 独立列表，相同模式。在购物车和稍后购买之间移动是在一个中添加墓碑 + 在另一个中添加。相同的冲突解决方式适用。</p>
+<p><strong>面试官：</strong> 总结。</p>
+<p><strong>候选人：</strong> Dynamo 风格始终可写的购物车存储，以 user_id 为键，复制 N 份。向量时钟解决并发写入；合并是带墓碑的集合并集用于删除，碰撞时取最大数量。加入购物车时不检查库存；结账时检查。购物车到订单是具有幂等性的状态机。多区域，配置用户主区域。最难的正确性问题是保留每次添加操作同时不让删除操作复活；墓碑解决了这个问题。</p>
+<h2 id="3-practice-notes">3. 练习备注</h2>
+<h3 id="five-minute-version">五分钟版本</h3>
+<ol>
+<li>明确：规模、多设备、库存时机、冲突处理。</li>
+<li>不变量：永不丢失添加操作；删除保持删除状态。</li>
+<li>Dynamo 风格始终可写存储。</li>
+<li>向量时钟或 CRDT 用于冲突解决。</li>
+<li>带墓碑的并集合并。</li>
+<li>加入时不检查库存；结账时懒惰检查。</li>
+<li>带幂等性的购物车到订单状态机。</li>
+<li>多区域部署，用户归属主区域。</li>
+</ol>
+<h3 id="one-minute-closeout">一分钟结尾陈述</h3>
+<blockquote>
+<p>Amazon 的购物车是 Dynamo 论文的经典用例。可用性至上；来自多个设备的并发更新通过向量时钟以集合并集语义和墓碑进行合并。加入购物车时不锁定库存；结账时懒惰检查。最难的正确性问题是保留每次添加操作而不复活删除操作——墓碑解决了这个问题。多区域，配置用户主区域。</p>
+</blockquote>
+<h3 id="best-interview-phrases">最佳面试用语</h3>
+<ul>
+<li>"购物车始终可写；并发更新合并为带墓碑的并集。"</li>
+<li>"集合并集保留所有添加操作；墓碑防止删除操作被复活。"</li>
+<li>"加入购物车时不检查库存；结账时懒惰检查。"</li>
+<li>"向量时钟告诉我们版本何时是并发的；合并告诉我们如何组合。"</li>
+<li>"这是 Dynamo 论文的经典示例。"</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

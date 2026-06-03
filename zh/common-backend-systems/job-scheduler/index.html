@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Distributed Job Scheduler — Cron at Scale (walkthrough) — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">Distributed Job Scheduler — Cron at Scale (walkthrough)</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<p><strong>难度：</strong> Hard · <strong>总耗时：</strong> ~45 min · <strong>框架：</strong> Hello Interview Delivery</p>
+<p><strong>一句话场景：</strong> 构建分布式 Cron / 任务调度器。用户注册带有调度计划（Cron 表达式或一次性时间戳）和负载（待 POST 的 URL 或待调用的函数）的任务。系统在计划时间精确触发每个任务一次，失败时重试。已注册任务 1000 万个，顶峰时每分钟整点约 10 万个任务同时触发，平均任务运行时长 5 秒。</p>
+<hr/>
+<h2 id="1-requirements-5-min">1. 需求（约 5 分钟）</h2>
+<p><strong>功能需求</strong>
+- 注册带有 Cron 表达式和处理器的周期性或一次性任务。\n- 在计划时间的约 1 秒内触发每个任务。\n- 至多一次或至少一次语义（可配置）；绝不静默漏触发。\n- 失败时按退避策略重试。\n- 可见性：查看任务历史及成功/失败状态。</p>
+<p>我会推迟多租户深度和处理器运行时沙箱的设计（假设目标为 HTTP Webhook）。</p>
+<p><strong>非功能需求</strong>
+- 触发时间精度：p99 在计划时间 1 秒以内。\n- 调度器节点故障不丢失触发记录。\n- <strong>不得静默漏触发。</strong> 宁可双重触发（要求处理器幂等）也不能漏触发。\n- 线性扩展：1000 万个任务，峰值 10 万次触发/秒。</p>
+<p><strong>容量估算</strong>
+- 1000 万个已注册任务 × 约 200 字节元数据 = 2 GB。\n- 10 万次触发/秒 × 约 5 秒处理器运行时长 = 50 万个并发执行中实例。\n- 调度元数据经复制后体量极小（约 2 GB × RF=3 = 6 GB）。主要成本来自运行历史及重试/审计事件：如果峰值 10 万次触发/秒持续一小时，以约 300 字节/事件 × RF=3 计，仅该小时就会产生约 324 GB 数据（不含索引）。</p>
+<hr/>
+<h2 id="2-core-entities-2-min">2. 核心实体（约 2 分钟）</h2>
+<ul>
+<li><strong>Job</strong> — <code>job_id</code>，调度计划（Cron / 一次性），目标（URL + 负载），重试策略，所有者。</li>
+<li><strong>JobInstance</strong> ——具体的一次触发： <code>instance_id</code>，job_id，scheduled_at，status（queued/running/done/failed）。</li>
+<li><strong>Lease</strong> ——防止两个 Worker 运行同一实例的租约。</li>
+</ul>
+<hr/>
+<h2 id="3-api-5-min">3. API（约 5 分钟）</h2>
+<pre><code>POST  /v1/jobs              { schedule, target, retry_policy }  → { job_id }
+GET   /v1/jobs/{id}/runs?cursor=...
+DELETE /v1/jobs/{id}
+POST  /v1/jobs/{id}/pause / resume
+</code></pre>
+<p>从 Token 获取用户身份。任务创建对可选字段幂等。 <code>client_id</code>.</p>
+<p>运行历史游标编码 <code>{job_id, last_scheduled_at, last_instance_id}</code>。处理器调用包含 <code>fire_id</code> ，供客户在自身侧对重试进行去重。</p>
+<hr/>
+<h2 id="4-data-flow-5-min">4. 数据流（约 5 分钟）</h2>
+<p>任务注册 → 计算 next_fire_at → 在时间桶中建立索引。时间轮逐秒遍历时间桶 → Worker 通过租约认领到期任务 → 调用处理器 → 记录结果 → 重新计算 next_fire_at。</p>
+<hr/>
+<h2 id="5-high-level-design-1015-min">5. 高层设计（约 10–15 分钟）</h2>
+<ol>
+<li><strong>任务目录。</strong> 以 <code>job_id</code>为键的分片 MySQL。行存储调度计划、目标和 <code>next_fire_at</code>.</li>
+<li><strong>调度索引。</strong> 用于"未来 N 秒内到期"的时间桶索引。有两种适合该问题的方案：\n   - <strong>时间轮：</strong> 内存中的时间桶数组，每秒（或更细粒度）一个槽位，每个槽位持有 <code>job_id</code>在该槽位到期的任务。每个槽位 tick 成本为 O(1)。状态持久化在后备存储中，以防崩溃丢失状态。\n   - <strong>有序集合 / 堆，按 <code>next_fire_at</code>:</strong> Redis ZSET 以 <code>next_fire_at</code>为键。Worker 执行 <code>ZRANGEBYSCORE 0 now</code> 并消费。</li>
+<li><strong>调度器（Dispatcher）。</strong> 每次 tick（1 Hz）遍历时间轮/ZSET。对每个到期任务，写入一行 <code>JobInstance</code> （status=queued）并向任务队列（Kafka 或 SQS）推送触发事件。</li>
+<li><strong>Worker 池。</strong> 拉取触发事件。每个 Worker：\n   - 获取租约（Redis <code>SET instance:I worker:W NX EX 60</code>）。\n   - 调用处理器（向目标 HTTP POST，携带负载 + 签名重试 Token）。\n   - 记录结果；释放租约。</li>
+<li><strong>重试策略。</strong> 失败时，计算下次重试时间 = <code>now + backoff(attempt)</code>。用该触发时间调度一个新的 <code>JobInstance</code> 。限制重试次数。</li>
+<li><strong>下次触发时间重算。</strong> 成功触发后，根据 Cron 表达式重新计算 <code>next_fire_at</code> ，并同时更新目录行和调度索引。</li>
+<li><strong>协调。</strong> 多个 Dispatcher 实例。每个实例负责一部分 <code>job_id</code>的分片（一致性哈希）。分片内通过主节点选举确定活跃 Dispatcher；备节点在故障时接管。</li>
+</ol>
+<p>端到端叙述：09:59:55，Dispatcher 遍历 <code>10:00:00</code> 槽位的时间轮，发现 10 万个到期任务 → 批量写入 10 万行 JobInstance → 推送到 Kafka。10:00:00，Worker 从 Kafka 拉取，对每个实例加租约，向目标发起 HTTP POST。处理器在 200 ms 内响应 200 → 记录结果 → Dispatcher 重新计算下次触发时间（例如， <code>10:01:00</code> 对于每分钟任务）并重新插入时间轮。</p>
+<p>具体存储方案：</p>
+<table>
+<thead>
+<tr>
+<th>存储</th>
+<th>我会明确说出的具体存储方案：</th>
+<th style="text-align: right;">条目大小</th>
+<th>TTL / 保留期</th>
+<th>分片键</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>作业 catalog</td>
+<td><code>job:{job_id}</code> 行，含调度计划、目标、next_fire_at</td>
+<td style="text-align: right;">~200-500 B</td>
+<td>直至删除</td>
+<td><code>job_id</code></td>
+</tr>
+<tr>
+<td>调度索引</td>
+<td><code>due:{epoch_second}:{shard}</code> 列表或 ZSET 成员=<code>job_id</code></td>
+<td style="text-align: right;">约 24 字节/成员</td>
+<td>直至触发/重建</td>
+<td><code>job_id % N</code></td>
+</tr>
+<tr>
+<td>实例数据库</td>
+<td><code>instance:{job_id}:{scheduled_at}</code> 状态行</td>
+<td style="text-align: right;">~300 B</td>
+<td>30-90 天</td>
+<td><code>job_id</code></td>
+</tr>
+<tr>
+<td>Lease</td>
+<td><code>lease:{instance_id}</code> -&gt; Worker + 防护令牌</td>
+<td style="text-align: right;">~100 B</td>
+<td>60 秒 TTL，按需续期</td>
+<td><code>instance_id</code></td>
+</tr>
+<tr>
+<td>触发队列</td>
+<td>主题 <code>fires.{shard}</code> 事件=<code>instance_id</code></td>
+<td style="text-align: right;">约 200 B</td>
+<td>24 小时重放</td>
+<td><code>job_id % N</code></td>
+</tr>
+</tbody>
+</table>
+<p>按存储容量估算：</p>
+<table>
+<thead>
+<tr>
+<th>存储</th>
+<th>Math</th>
+<th>主要调节项</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>作业 catalog</td>
+<td>1000 万任务 * 500 字节 * RF=3 ≈ 15 GB</td>
+<td>字节数不是关键，分片数量更重要</td>
+</tr>
+<tr>
+<td>调度索引</td>
+<td>1000 万条到期记录 * 24 字节 * RF=2 ≈ 480 MB</td>
+<td>时间桶宽度和重建来源</td>
+</tr>
+<tr>
+<td>实例数据库</td>
+<td>5000 万次触发/天 * 300 字节 * RF=3 ≈ 45 GB/天；10 万次/秒持续 1 小时 ≈ 324 GB</td>
+<td>历史保留与汇总策略</td>
+</tr>
+<tr>
+<td>租约</td>
+<td>50 万并发执行 * 100 字节 * RF=2 ≈ 100 MB</td>
+<td>TTL/心跳间隔</td>
+</tr>
+<tr>
+<td>触发队列</td>
+<td>5000 万/天 * 200 字节 * RF=3 ≈ 30 GB/天；持续峰值会远高于此</td>
+<td>保留时长与批处理策略</td>
+</tr>
+</tbody>
+</table>
+<h3 id="system-components-diagram">系统组件图</h3>
+<pre><code class="language-text">             +---------------------------+
+             |   Scheduler UI / Client   |
+             +------+---------------+----+
+                |               |
+              POST /jobs        GET /runs
+                |               |
+                v               v
+           +-------------+   +-------------+
+           | Job API     |   | History API |
+           | idempotent  |   | cursor read |
+           +------+------+   +------+------+
+              |                 ^
+              | job + due entry | run rows
+              v                 |
+   +----------------------------------------------------------------+
+   | Stores / Caches                                                |
+   | job:{job_id} schedule,target,next_fire_at                      |
+   | due:{epoch_second}:{shard} list/ZSET job_ids                   |
+   | instance:{job_id}:{scheduled_at} status row                    |
+   | lease:{instance_id} worker + fencing token                     |
+   | fires.{shard} compact event, 24h replay                        |
+   +----------+----------------------+------------------------------+
+      | due tick             | schedule index miss/corrupt
+      v                      v
+    +-------------+        +-------------------+
+    | Dispatcher  |        | Repair scan from  |
+    | shard owner |        | job:{job_id} rows |
+    +------+------+        +-------------------+
+       | instance + fire event
+       v
+    +-------------+       retry/backoff      +----------------+
+    | Fire queue  |&lt;-------------------------| Retry scheduler|
+    | fires.*     |                          +----------------+
+    +------+------+
+       |
+       v
+    +-------------+      POST target + fire_id      +-------------+
+    | Worker pool |-------------------------------&gt; | HTTP target |
+    | lease/call  |                                +-------------+
+    +------+------+
+       | result
+       v
+         Instance DB status update
+
+    +----------------+
+    | etcd/ZooKeeper |
+    | shard leases   |---- leader lease ----&gt; Dispatcher
+    +----------------+
+</code></pre>
+<hr/>
+<h2 id="6-deep-dives-10-min">6. 深度探讨（约 10 分钟）</h2>
+<p><strong>为什么选择时间轮。</strong> 在 1000 万个任务、峰值 10 万次/秒触发的场景下，每秒扫描堆中到期任务的代价很高。时间轮每次 tick 的成本为 O(当前槽位内的活跃任务数)。对于 1 Hz 的 1 小时时间轮，共有 3600 个槽位；超出轮盘范围的任务由分层第二时间轮处理（例如，日轮向小时轮投递）。分层时间轮是经典答案。</p>
+<p>为什么不只用 Redis ZSET：以 <code>next_fire_at</code> 为键的 ZSET 是一个良好的持久化索引，v1 也更简单，但在每分钟整点时会产生热点范围扫描和锁竞争。时间轮提供可预期的每槽位工作量；ZSET/Kafka 日志是恢复数据来源。</p>
+<p>技术选型依据：MySQL/Postgres 非常适合任务目录，因为更新是按任务进行的，需要支持创建/暂停/删除的事务语义；如果面试偏向云原生，DynamoDB 同样可用，但按所有者/历史进行二级访问更为繁琐。Kafka 优于直接 Worker RPC，因为调度突发需要缓冲和重放；SQS 运维上更简单，但对分区归属和按 <code>job_id % N</code>有序重放的控制力较弱。Redis 租约在秒级协调上足够快，而 etcd/ZooKeeper 只应管理 Dispatcher 分片的主节点选举，而非每个任务实例。</p>
+<p><strong>持久化与恢复。</strong> 时间轮位于内存中；若进程崩溃，正在处理的槽位会丢失。两种防御措施：\n- 以 Redis 有序集合作为后备存储（重启时即可重建时间轮）。\n- 定期快照到持久化存储 + 从 Kafka Topic 重放近期事件。</p>
+<p>注册路径跟踪：API 校验 Cron 并检查所有者配额 -&gt; 写入 <code>job:{job_id}</code> 与 <code>next_fire_at</code> -&gt; 写入 <code>due:{epoch_second}:{shard}</code> -&gt; 发出 <code>job.registered</code> 审计事件。目录行与调度索引的更新必须原子完成，或通过修复任务进行对账（扫描目录中未出现在索引里的行）。</p>
+<p>触发路径跟踪：Dispatcher 拥有分片 -&gt; 读取时间轮槽位 -&gt; 以幂等插入方式创建 <code>instance:{job_id}:{scheduled_at}</code> -&gt; 发布 <code>fires.{shard}</code> -&gt; Worker 获取 <code>lease:{instance_id}</code> -&gt; 调用目标 -&gt; 写入终态状态 -&gt; 重新计算下次触发时间并重新插入任务。</p>
+<p>热触发路径，逐步说明：\n1. Dispatcher 通过协调器租约拥有哈希范围 <code>job_id % N = shard</code> 。\n2. 在 tick <code>T</code>时，它从内存中排空 <code>due:{T}:{shard}</code> ；若时间轮槽位缺失，则回退到 Redis/ZSET 恢复索引以处理 <code>[T - grace, T]</code>。\n3. 以幂等方式批量插入 <code>instance:{job_id}:{scheduled_at}</code> ，幂等键为 <code>(job_id, scheduled_at, attempt)</code>。\n4. 将紧凑的触发消息发布到 <code>fires.{shard}</code> ，并提交槽位水位线。\n5. Worker 按分片拉取，读取实例行，以防护令牌获取 <code>lease:{instance_id}</code> ，调用目标，仅在防护令牌有效时写入终态状态。</p>
+<p>冷启动/恢复路径：Dispatcher 故障后，备节点认领分片，读取最后提交的水位线，扫描调度索引以处理 <code>[watermark, now]</code>，并重建缺失的实例行。重复触发事件是允许的，因为实例插入和客户可见的 <code>fire_id</code> 均为幂等；漏触发则不被允许。</p>
+<p>运行历史分页使用 <code>{job_id, last_scheduled_at, last_instance_id}</code> ，使 UI 能按时间顺序遍历 <code>job_id</code> 分片，无需偏移量扫描。</p>
+<p><strong>精确一次 vs 至少一次。</strong> 在分布式调度器中实现真正的精确一次是不切实际的目标。承诺至少一次 + 要求处理器幂等（通过处理器可用于去重的 <code>fire_id</code> ）。在 SDK 中清晰说明这一点。</p>
+<p><strong>基于租约的双重触发防护。</strong> Worker 获取 <code>SET instance:I worker:W NX EX 60</code>。若 Worker 宕机，租约到期，其他 Worker 可重新认领。Worker 定期续期租约（心跳），用于长时间运行的任务。</p>
+<p><strong>热秒问题。</strong> 每分钟整点是惊群现象——所有人的 <code>*/1 * * * *</code> 任务都落在 <code>:00</code>。两种缓解措施：\n- <strong>注册时添加抖动：</strong> 自动对调度计划添加 ±5 秒的抖动（为严格调度的用户提供可选关闭）。\n- <strong>槽位内平滑：</strong> 在调度时，使用一个小抖动缓冲区，在整秒内均匀分散触发。</p>
+<p><strong>扩展调度分发。</strong> 在 N 个 Dispatcher 实例间对 <code>job_id</code> 进行分片。每个实例拥有一个哈希范围；任务只从一个所有者触发。协调器（etcd / ZooKeeper）追踪所有权；故障时，范围进行故障转移。</p>
+<p><strong>Worker 池的背压。</strong> 若目标处理较慢，队列增长。根据队列深度自动扩缩 Worker。对于突发目标，允许设置每目标并发限制（不要向单个端点同时发起 1 万次并发调用）。</p>
+<p><strong>双视图模型。</strong> 调度器以两种视图保存同一个未来触发：目录行（<code>job:{job_id}.next_fire_at</code>）是修复的真相来源，而调度索引（<code>due:{second}:{shard}</code> 或 ZSET）是下次 tick 的服务索引。修复循环持续对二者进行对账，确保丢失的时间桶不会变成静默漏触发。</p>
+<p>任务实例状态机：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>模式</th>
+<th>数据源</th>
+<th>状态转换</th>
+<th>延迟/行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>已调度</td>
+<td>未来触发</td>
+<td>调度索引 + 目录</td>
+<td>tick 到达 <code>scheduled_at</code></td>
+<td>p99 在 1 秒目标以内</td>
+</tr>
+<tr>
+<td>已入队</td>
+<td>触发事件已发出</td>
+<td>触发队列 + 实例行</td>
+<td>Worker 拉取</td>
+<td>正常负载下为秒级</td>
+</tr>
+<tr>
+<td>运行中</td>
+<td>持有租约</td>
+<td>租约 + worker 心跳</td>
+<td>目标返回或超时</td>
+<td>每 15-30 秒续约</td>
+</tr>
+<tr>
+<td>重试中</td>
+<td>失败的尝试</td>
+<td>实例 DB + 重试策略</td>
+<td>退避到期</td>
+<td>带抖动的重试</td>
+</tr>
+<tr>
+<td>终态</td>
+<td>完成/失败/死信</td>
+<td>实例 DB</td>
+<td>成功或尝试次数耗尽</td>
+<td>保留 30-90 天</td>
+</tr>
+</tbody>
+</table>
+<p><strong>边缘压力测试。</strong> 分钟级突发流量由抖动、槽位分散和批量实例写入来处理。时间轮条目已过期的休眠任务可从 <code>job:{job_id}.next_fire_at</code> 中由修复扫描恢复。若用户翻阅非常久远的运行历史，API 会读取归档实例分区而非热数据行，并返回较慢的游标。多区域主动-主动调度风险较高，因为两个区域可能同时触发同一任务；我会为每个任务保持单一写入/分发区域，并将历史数据全局复制。冷启动新的调度器时只需重建其分片窗口，而非全部 1000 万个任务。</p>
+<p><strong>Webhook 可靠性。</strong> 目标可能不稳定。使用指数退避 + 抖动进行重试，最多重试 N 次。重试耗尽后，路由到死信队列并在 UI 中展示。</p>
+<p><strong>Cron 漂移 / 时区。</strong> 调度计划以用户指定的时区存储。服务器在解析时将时间转换为 UTC 以计算 next_fire_at。夏令时切换需要特别处理（跳过的小时、重复的小时）——需明确约定规范。</p>
+<p><strong>可审计性。</strong> 每次触发都会发出一条结构化事件。JobInstance 历史保留 30 天以上，便于调试和 SLA 报告。</p>
+<p><strong>优雅降级。</strong></p>
+<table>
+<thead>
+<tr>
+<th>情形</th>
+<th>模式</th>
+<th>数据源</th>
+<th>延迟/行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>调度器宕机</td>
+<td>备用节点接管分片并重放到期区间</td>
+<td>调度索引 + Kafka</td>
+<td>可能产生重复，但不会丢失</td>
+</tr>
+<tr>
+<td>分钟级热点槽位</td>
+<td>分散并批量写入实例</td>
+<td>时间轮槽位</td>
+<td>根据 SLA 在 1-5 秒内触发</td>
+</tr>
+<tr>
+<td>Worker 池饱和</td>
+<td>队列增长，自动扩容，按目标设置上限</td>
+<td>触发队列</td>
+<td>延迟，积压可见</td>
+</tr>
+<tr>
+<td>租约在运行中途到期</td>
+<td>新 worker 可能以相同 ID 重试 <code>fire_id</code></td>
+<td>租约 + 实例 DB</td>
+<td>至少一次语义</td>
+</tr>
+<tr>
+<td>调度索引损坏</td>
+<td>从目录重建 <code>next_fire_at</code></td>
+<td>任务目录</td>
+<td>重建期间精度下降</td>
+</tr>
+</tbody>
+</table>
+<p>面试要点："我宁愿以稳定的 <code>fire_id</code> 也不假装实现精确一次；产品承诺是不出现静默丢失。"</p>
+<p><strong>我会推迟的内容。</strong> 内联处理器的沙盒代码执行（相对于 Webhook 目标）、任务工作流/DAG（跨任务依赖）、计费/配额、租户隔离深度。</p>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

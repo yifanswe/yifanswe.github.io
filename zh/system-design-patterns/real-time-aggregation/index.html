@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>实时聚合 — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/system-design-patterns/">← 返回系统设计模式</a>
+<h1 class="article-title">实时聚合</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/05/31  ·  系统设计模式
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p>对无界事件流进行持续、增量计算，以产出秒级的计数、汇总、Top-K 列表或异常信号——其核心围绕窗口、水位线、带检查点的键控状态、诚实的投递契约（至少一次 + 幂等写入、effectively-once 或真正的 Kafka-to-Kafka Exactly-Once Semantics（EOS））以及近似草图算法展开。参见 Staff System Design Glossary。核心问题文档： <a href="/zh/common-backend-systems/design-an-ad-click-aggregator/">广告点击聚合器</a>, <a href="/zh/common-backend-systems/design-a-youtube-likes-counter/">YouTube 点赞计数器</a>, <a href="/zh/common-backend-systems/design-a-metrics-and-monitoring-system-like-datadog/">Datadog 风格的指标与监控</a>, <a href="/zh/common-backend-systems/design-google-news-as-a-global-aggregator/">Google News 聚合器</a>, <a href="/zh/common-backend-systems/design-google-ads/">Google Ads</a>, <a href="/zh/common-backend-systems/design-typeahead-suggestion/">输入联想建议</a>, <a href="/zh/common-backend-systems/apache-kafka/">Apache Kafka</a>.</p>
+</blockquote>
+<hr/>
+<h2 id="1-the-fundamental-hardness">1. 核心难点</h2>
+<p>批处理系统回答"活动 42 昨天获得了多少次点击？"的方式是 <code>SELECT COUNT(*) FROM clicks WHERE campaign_id = 42 AND day = ...</code>。数据是有限的，已全部到达并建立了索引。查询只执行一次，扫描后返回结果。同一个问题的实时版本——"每秒百万事件下，所有活跃活动在过去五分钟内的点击量（每秒刷新一次）"——无法用这种方式回答。数据集是无界的，没有终点。你无法对其进行扫描，也无法等待数据停止到达。你必须以增量方式进行计算，只保留状态，而不保留历史。</p>
+<p>这一根本转变——从有限扫描到无限增量计算——带来了三个批处理从未面临的问题。第一个是 <strong>事件时间与处理时间</strong>。一次点击在 12:00:01 发生于一部网络不稳定的手机上，直到 12:00:47 才到达你的摄取管道。该用户属于 12:00 这一分钟窗口，但处理时间显示该窗口已在 47 秒前关闭。若按处理时间分桶，计数就会出错；若按事件时间分桶，则需要在可能仍有旧事件到达的情况下，判断窗口何时"结束"。这一判断就是 <strong>水印</strong>：一个启发式时间戳，表示"我认为不会再有早于该时间的事件到达。"水位线有时是错的——它是对分布尾部的猜测——系统必须在新鲜度（提前关闭窗口，丢失迟到事件）与完整性（推迟关闭窗口，损害新鲜度）之间做出选择。没有免费的答案。</p>
+<p>第二个问题是 <strong>状态</strong>。计数器没有问题，每个 key 只需一个整数。但"过去一小时内以一分钟为步长的 100 个热门话题标签"需要维护过去 60 个窗口的各标签计数，并为快速 Top-K 建立索引、为容错进行副本，以及设置检查点，以确保 worker 崩溃不会丢失最近 10 分钟的计算结果。状态可能增长至 TB 级，其热度甚至可能超过事件流本身。状态管理——分片、嵌入式（RocksDB）与远程、检查点、可恢复——才是流处理真正的工程挑战，其余的不过是过滤和映射。</p>
+<p>第三个问题是 <strong>至少一次投递及其副作用</strong>。朴素的管道是"Kafka 消费者读取点击，对数据库行进行递增。"现在，消费者在递增后、提交 Kafka 偏移量之前崩溃了。重启后它读取了相同的点击并再次递增。或者数据库提交失败，你进行重试，导致双重递增。框架营销中对该修复方案的称呼是 <strong>端到端精确一次</strong>，但值得精确了解它实际上能保证什么。Flink 和 Kafka Streams 在内部 <em>在 Kafka 内部</em>提供精确一次：源偏移量、算子状态和事务性 Kafka sink 提交作为一个原子单元。一旦 sink 是其他存储——Cassandra、Redis、MySQL——引擎就无法与该存储建立真正的分布式事务，你只能退而采用两种实际策略之一：（a）确定性重放加上以 <code>(aggregation_key, window)</code>为键的幂等 upsert，只要聚合是确定性的，就能产生 <em>effectively-once</em> 的输出；或（b）至少一次加下游去重。选择从来不是"魔法般地处处精确一次"，而是针对每条管道的设计决策。对于许多生产聚合——仪表盘、热门列表、指标——至少一次加幂等 sink 才是诚实的答案，Flink 的事务提交实属大材小用。</p>
+<p>这三个约束——事件时间语义、大型托管状态，以及至少一次加幂等 sink（或 effectively-once）的投递——定义了该模式。其他所有工具（Flink、Kafka Streams、Spark Structured Streaming、Beam）都是对如何处理这些约束的不同见解。</p>
+<p>有一个先要指出的认知陷阱："实时"本身并不能证明引入 Flink 的合理性。5 分钟的新鲜度预算，用 1 分钟的 Spark Structured Streaming 微批次甚至定期批处理作业就能轻松满足，且运维面要小得多。只有当（a）新鲜度预算是秒级乃至亚秒级，（b）状态足够大以致从头重算不可行，或（c）需要针对迟到事件的事件时间正确性时，流处理才值得其复杂性。若以上都不适用，Staff 级的做法是说清楚并选择更简单的工具。</p>
+<hr/>
+<h2 id="2-how-to-recognize-it-in-the-interview">2. 如何在面试中识别背压问题</h2>
+<h3 id="prompt-phrases-that-signal-this-pattern">触发该模式的提示语</h3>
+<ul>
+<li>"实时"或"近实时"，新鲜度预算在秒到分钟级别</li>
+<li>持续更新的"热门趋势"/"Top N"/"排行榜"</li>
+<li>大规模"点击计数"/"曝光计数"/"浏览量"</li>
+<li>"指标汇总"/"过去 5 分钟各服务的 p99 延迟"</li>
+<li>"异常检测"/"事件到达时的欺诈信号"</li>
+<li>"实时聚合"/"实时仪表盘"</li>
+<li>从事件流中进行"会话重建"</li>
+<li>"窗口化"计算，或"滚动 X 分钟平均值"</li>
+</ul>
+<h3 id="architectural-smells">架构异味</h3>
+<ul>
+<li>"计数"的读 QPS 远超底层事件的写 QPS（"我们每秒有 100 万次点击，但仪表盘只展示汇总结果"）</li>
+<li>对每个读者而言，同一数字必须以相同方式出现错误（不能按需为每个读者单独计算；必须预先计算且保持一致）</li>
+<li>聚合结果必须易于且快速地提供服务，但其背后的事件量过大、速度过快，无法实时扫描</li>
+<li>产品可以容忍小的新鲜度延迟（秒到几分钟），但无法接受以小时计的陈旧，排除了每日批处理</li>
+<li>产品可以容忍在小误差范围内的近似答案（允许使用 HyperLogLog（HLL）和 Count-Min Sketch（CMS）等草图算法）</li>
+</ul>
+<h3 id="example-interview-prompts-where-this-is-core">该类型为核心的面试题示例</h3>
+<ol>
+<li>设计一个广告点击聚合器，以每秒 100 万事件的速度，在 5 分钟新鲜度下，按活动和分钟统计曝光和点击次数。（<a href="/zh/common-backend-systems/design-an-ad-click-aggregator/">doc</a>)</li>
+<li>设计一个类 Datadog 的指标与监控系统，摄取每主机的计数器和仪表盘数据，并支持以 10 秒分辨率按标签汇总。（<a href="/zh/common-backend-systems/design-a-metrics-and-monitoring-system-like-datadog/">doc</a>)</li>
+<li>设计一个 YouTube 点赞计数器，使点赞者感觉即时响应，但全局一致性在数秒内达成。（<a href="/zh/common-backend-systems/design-a-youtube-likes-counter/">doc</a>)</li>
+<li>将 Google News 设计为一个全球聚合器，近实时地跨地区呈现热门话题。（<a href="/zh/common-backend-systems/design-google-news-as-a-global-aggregator/">doc</a>)</li>
+<li>设计一个输入联想建议服务，其排名融合最近一小时的查询频率。（<a href="/zh/common-backend-systems/design-typeahead-suggestion/">doc</a>)</li>
+<li>设计一个欺诈检测管道，在事件到达后数秒内标记可疑的支付序列。（相关： <a href="/zh/common-backend-systems/design-a-delayed-payment-system/">延迟支付系统</a>, <a href="/zh/common-backend-systems/design-a-payment-system/">支付系统</a>.)</li>
+</ol>
+<hr/>
+<h2 id="3-60-second-spoken-framing">3. 60秒口头框架</h2>
+<blockquote>
+<p>我会将其视为流处理问题而非数据库问题。事件落入类似 Apache Kafka 的分区日志中，按聚合键分区，以便同一活动或同一主机的所有事件落在同一消费者上。流处理器——生产环境用 Apache Flink，轻量级工作负载用 Kafka Streams——消费这些分区，在本地 RocksDB 支持的状态后端中维护每键窗口状态，并在水位线超过窗口边界时发出汇总结果。状态和源偏移量一起做检查点，以便在故障时可以从已知良好点进行重放。对于独立用户计数等唯一计数指标，我使用 HyperLogLog 以保持内存有界；对于 Top-K，我使用 Count-Min Sketch 加堆。我的设计不变量是：即使在 worker 崩溃、重平衡和迟到事件的情况下，没有任何已提交的事件被重复计数，也没有任何事件被静默丢弃。</p>
+</blockquote>
+<hr/>
+<h2 id="4-canonical-toolkit">4. 标准工具集</h2>
+<h3 id="41-the-processing-engines">4.1 处理引擎</h3>
+<table>
+<thead>
+<tr>
+<th>引擎</th>
+<th>最佳场景</th>
+<th>状态模型</th>
+<th>水位线</th>
+<th>精确一次</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Apache Flink</td>
+<td>低延迟、大状态、复杂窗口。</td>
+<td>托管式 RocksDB 后端，增量检查点至远程存储。</td>
+<td>一等支持，每算子级别。</td>
+<td>通过事务性 sink 实现端到端。</td>
+</tr>
+<tr>
+<td>Kafka Streams</td>
+<td>轻量级，嵌入应用，仅限 Kafka 生态。</td>
+<td>本地 RocksDB，通过 changelog topic 恢复。</td>
+<td>支持，API 更简单。</td>
+<td>支持，Kafka-to-Kafka。</td>
+</tr>
+<tr>
+<td>Spark Structured Streaming</td>
+<td>微批次，适合批流混合工作负载。</td>
+<td>Spark state store，检查点至分布式文件系统。</td>
+<td>支持，但粒度较粗。</td>
+<td>支持，使用幂等或事务性 sink。</td>
+</tr>
+<tr>
+<td>Apache Beam (Dataflow)</td>
+<td>跨 runner 可移植，高级窗口模型。</td>
+<td>依赖于 runner。</td>
+<td>一等支持，定义了该模型。</td>
+<td>依赖于 runner。</td>
+</tr>
+</tbody>
+</table>
+<p>Staff 级答案的默认选择是：Flink 用于"具有非平凡状态的实时处理"，Kafka Streams 用于"保持在 Kafka 内部且状态较小的场景"。当面试官提到现有的 Spark 批处理管道时，Spark Structured Streaming 是可接受的选项；不要仅为流处理而引入新引擎。</p>
+<h3 id="42-windows">4.2 窗口</h3>
+<p>三种窗口类型几乎涵盖了所有面试题。</p>
+<pre><code>Tumbling (non-overlapping, fixed size):
+   [---- W1 ----][---- W2 ----][---- W3 ----]
+   t=0          5             10            15
+
+Sliding (overlapping, fixed size, step &lt; size):
+   [---- W1 ----]
+        [---- W2 ----]
+             [---- W3 ----]
+   t=0   2    4    6   8    10
+
+Session (gap-based, dynamic boundaries):
+   user A:   ev ev ev    [gap &gt;30s closes window]   ev ev
+            [-- S1 --]                              [- S2 -]
+</code></pre>
+<ul>
+<li><strong>滚动窗口（Tumbling）</strong>：每分钟点击计数。开销低；每个事件属于一个窗口。默认选择。</li>
+<li><strong>滑动窗口（Sliding）</strong>："每 30 秒更新一次的 5 分钟移动平均值。"每个事件属于多个窗口；成本成倍增加。在需要平滑度时使用。</li>
+<li><strong>Session（会话模式）</strong>："以 30 分钟无活动为边界的用户活动会话。"窗口边界取决于数据而非时钟。状态开销大，因为必须为每个 key 跟踪一个开放会话。</li>
+</ul>
+<h3 id="43-watermarks">4.3 水位线</h3>
+<p>水位线是一个单调递增的时间戳，断言"未来不会有事件时间早于 W 的事件到达。"引擎基于观测到的时间戳减去配置的 <strong>允许迟到时间</strong>来发出水位线。当水位线超过窗口的结束时间时，窗口触发。</p>
+<pre><code>event-time line ─────────────────────────────────────►
+                  e1   e2  e3        e4       e5
+                  10s  12s 11s       14s      18s
+                                            watermark = max_seen - 5s = 13s
+                                            window [0s, 10s] closes when watermark &gt; 10s
+                                            window [10s, 20s] still open
+</code></pre>
+<p>迟到事件在水位线之后到达时，有以下处理方式：（1）丢弃，（2）使用更新后的状态重新触发窗口（Flink 的"allowed lateness"加 side output），或（3）发送至 dead-letter 侧输出，供离线对账批处理使用。这一选择是产品决策，需要在面试中明确提出。</p>
+<h3 id="44-exactly-once-via-checkpointed-barriers-and-what-it-actually-guarantees">4.4 通过检查点屏障实现精确一次——以及它实际保证了什么</h3>
+<p>Flink 风格的机制，简化描述：源周期性地向流中注入 <strong>屏障（barriers）</strong> 。每个算子在所有输入都看到该屏障后，将自身状态快照至持久化存储，并将屏障向下游转发。当 sink 确认该屏障并提交其事务时，检查点完成。发生故障时，所有算子回滚至最后一个完成的检查点，源则将偏移量回退至记录的位置。</p>
+<p>这个故事的诚实版本有三个不对称性，文档编写者往往想将其平滑掉：</p>
+<ol>
+<li><strong>在 Flink 内部，这是精确一次。</strong> 状态与检查点保持一致，且重放是确定性的。</li>
+<li><strong>Kafka-to-Kafka EOS 是精确一次。</strong> 当 sink 也是事务性 Kafka topic 时，源偏移量提交和 sink 输出提交被捆绑在一个 Kafka 事务中。这是框架本身能为你提供端到端精确一次的唯一情况。</li>
+<li><strong>Kafka 到外部存储不是精确一次。</strong> Cassandra、Redis、MySQL、S3、ClickHouse——这些都不参与 Flink/Kafka 事务。只有当 sink 写入是 <em>幂等且确定性的</em>时，你才能获得端到端正确性：相同的输入窗口产生相同的输出行，且 upsert 以 <code>(aggregation_key, window)</code>为键。这是"effectively-once"，而非教科书意义上的精确一次；如果任何算子做了不确定性操作（随机采样、读取挂钟时间、运行时读取外部特征存储），该属性就会被破坏，崩溃后同一窗口可能重新发出不同的值。</li>
+</ol>
+<p>参见 <a href="/zh/system-design-patterns/idempotency-exactly-once/">idempotency-exactly-once.md</a> 用于双重处理的参考资料。</p>
+<h3 id="45-state-backends">4.5 状态后端</h3>
+<table>
+<thead>
+<tr>
+<th>后端</th>
+<th>适用场景</th>
+<th>成本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>内存（堆）。</td>
+<td>状态适合放入 RAM；key 基数极小。</td>
+<td>GC 压力；崩溃时丢失数据（除非设有检查点）。</td>
+</tr>
+<tr>
+<td>嵌入式 RocksDB。</td>
+<td>每任务大状态，本地磁盘速度。</td>
+<td>磁盘 I/O；序列化开销；标准选择。</td>
+</tr>
+<tr>
+<td>远程（S3 / HDFS）检查点。</td>
+<td>持久化快照，非实时读取。</td>
+<td>快照开销；恢复延迟。</td>
+</tr>
+<tr>
+<td>远程状态存储（例如 FoundationDB、Tair）。</td>
+<td>计算与状态解耦；较为少见。</td>
+<td>每次状态访问均有网络开销。</td>
+</tr>
+</tbody>
+</table>
+<p>默认方案：本地 RocksDB 加增量远程检查点。仅在面试官深入探讨恢复时间或计算与状态解耦时，才提及替代方案。</p>
+<h3 id="46-approximate-algorithms">4.6 近似算法</h3>
+<p>当精确计数代价过高时，草图算法能在有界内存中给出概率性答案。</p>
+<h4 id="hyperloglog-hll-for-unique-counts">HyperLogLog（HLL）用于唯一计数</h4>
+<p>使用约 <code>1.04/sqrt(m)</code> 的相对误差统计不同元素，所用寄存器数为 <code>m</code> 。当 <code>p=14</code> （m=16384 个寄存器）时，约 16KB 内存对应约 0.8% 的相对误差。关键在于，HLL 是 <strong>可合并的</strong>：两个 HLL 的并集即为其输入并集的 HLL（对寄存器数组取逐元素最大值）。这意味着按分片并行处理的成本很低——合并成本为 O(m)，与基数无关——但并非完全免费：合并时寄存器仍需通过网络传输，且在基数非常小时 <code>p</code> 相对误差会急剧增大。</p>
+<p>误差范围至关重要。约 0.8% 听起来很小，但要记住这是 <em>相对</em> 。 <em>概率性的</em>：在真实基数为 1 亿独立用户时，典型误差区间为 ±80 万。对于仪表盘上"今天看到此活动的独立用户数"来说这完全可以接受；但对于"我们需要退款的独立付款人"则不可接受，后者需要对源头事实日志进行精确 <code>COUNT DISTINCT</code> 计数。规则是：当数字的消费者是看图表或做排名的人时使用 HLL；当消费者是财务系统、监管机构或不得遗漏的去重路径时，使用精确计数。</p>
+<pre><code class="language-python">import math
+import hashlib
+
+class HyperLogLog:
+    def __init__(self, p=14):
+        # p = log2(m). p=14 -&gt; m=16384 registers, ~0.8% error, ~16KB.
+        self.p = p
+        self.m = 1 &lt;&lt; p
+        self.registers = [0] * self.m
+
+    def _hash(self, item):
+        h = hashlib.sha1(str(item).encode()).digest()
+        return int.from_bytes(h[:8], "big")
+
+    def add(self, item):
+        x = self._hash(item)
+        idx = x &gt;&gt; (64 - self.p)            # top p bits select register
+        w = (x &lt;&lt; self.p) &amp; ((1 &lt;&lt; 64) - 1) # remaining bits
+        # rank = position of leftmost 1-bit + 1, in the remaining 64-p bits
+        rank = 1
+        mask = 1 &lt;&lt; 63
+        while rank &lt;= 64 - self.p and (w &amp; mask) == 0:
+            rank += 1
+            mask &gt;&gt;= 1
+        if rank &gt; self.registers[idx]:
+            self.registers[idx] = rank
+
+    def estimate(self):
+        alpha = 0.7213 / (1 + 1.079 / self.m)
+        z = sum(2.0 ** -r for r in self.registers)
+        return alpha * self.m * self.m / z
+
+    def merge(self, other):
+        assert self.p == other.p
+        self.registers = [max(a, b) for a, b in zip(self.registers, other.registers)]
+</code></pre>
+<p>使用场景：每活动独立用户数、每分钟独立 IP、独立查询字符串。</p>
+<h4 id="count-min-sketch-cms-for-heavy-hitters-and-frequency-estimation">Count-Min Sketch（CMS）用于重热点和频率估计</h4>
+<p>CMS 是一个 <code>d</code> 行× <code>w</code> 列的二维数组。每个元素被哈希 <code>d</code> 次；每次哈希对每行中的一个单元格递增。查询返回各行对应单元格的 <strong>最小值</strong> 行（来自全部 <code>d</code> ，这是一个上界估计，以概率 <code>epsilon = e/w</code> 有界于 <code>1 - 1/e^d</code>.</p>
+<pre><code class="language-python">import hashlib
+
+class CountMinSketch:
+    def __init__(self, w=2048, d=5):
+        # w controls error, d controls confidence.
+        self.w = w
+        self.d = d
+        self.table = [[0] * w for _ in range(d)]
+
+    def _hashes(self, item):
+        b = str(item).encode()
+        for i in range(self.d):
+            h = hashlib.blake2b(b, digest_size=8, person=str(i).encode()).digest()
+            yield int.from_bytes(h, "big") % self.w
+
+    def add(self, item, count=1):
+        for i, j in enumerate(self._hashes(item)):
+            self.table[i][j] += count
+
+    def estimate(self, item):
+        return min(self.table[i][j] for i, j in enumerate(self._hashes(item)))
+
+    def merge(self, other):
+        assert self.w == other.w and self.d == other.d
+        for i in range(self.d):
+            for j in range(self.w):
+                self.table[i][j] += other.table[i][j]
+</code></pre>
+<p>将 CMS 与大小为 K 的小型最小堆配合使用，可实现流式 Top-K：当某元素的估计频率超过堆的最小值时，将其驱逐并插入。</p>
+<p>使用场景：热门话题标签、缓存预热的热键、欺诈重热点。</p>
+<h4 id="bloom-filter-for-streaming-membership">Bloom filter 用于流式成员检测</h4>
+<p>用于"我在此窗口内见过这个事件 ID 吗？"，在至少一次管道的边缘进行去重。误报意味着事件可能被错误丢弃；相应地调整 <code>m</code> 。 <code>k</code> 。</p>
+<h4 id="reservoir-sampling-for-streaming-uniform-sample">蓄水池采样用于流式均匀抽样</h4>
+<p>要在不知道总大小的情况下，从无界流中保留 <code>k</code> 个元素的均匀随机样本：</p>
+<pre><code class="language-python">import random
+
+class Reservoir:
+    def __init__(self, k):
+        self.k = k
+        self.buf = []
+        self.seen = 0
+
+    def add(self, x):
+        self.seen += 1
+        if len(self.buf) &lt; self.k:
+            self.buf.append(x)
+        else:
+            j = random.randrange(self.seen)
+            if j &lt; self.k:
+                self.buf[j] = x
+</code></pre>
+<p>使用场景：日志采样、异常调查、从生产流量中采样训练数据。</p>
+<h3 id="47-tumbling-window-aggregation-with-watermark-sketch">4.7 带水位线的滚动窗口聚合（草图）</h3>
+<p>一段自包含的 Python 伪代码，展示引擎如何处理带事件时间水位线的每键滚动窗口。真实引擎在状态和检查点方面处理得更为精细。</p>
+<pre><code class="language-python">from collections import defaultdict
+
+WINDOW_SIZE_MS = 60_000
+ALLOWED_LATENESS_MS = 30_000
+
+class TumblingAggregator:
+    def __init__(self):
+        # key -&gt; window_start_ms -&gt; count
+        self.state = defaultdict(lambda: defaultdict(int))
+        self.watermark = 0
+        self.max_event_time = 0
+
+    def window_start(self, ts):
+        return (ts // WINDOW_SIZE_MS) * WINDOW_SIZE_MS
+
+    def on_event(self, key, event_time_ms):
+        if event_time_ms + ALLOWED_LATENESS_MS &lt; self.watermark:
+            # Too late: route to side output for offline reconciliation.
+            return ("late", key, event_time_ms)
+        ws = self.window_start(event_time_ms)
+        self.state[key][ws] += 1
+        self.max_event_time = max(self.max_event_time, event_time_ms)
+        # Watermark = max observed event time minus configured lateness.
+        self.watermark = max(self.watermark,
+                             self.max_event_time - ALLOWED_LATENESS_MS)
+        return self._fire_closed_windows()
+
+    def _fire_closed_windows(self):
+        emissions = []
+        for key, windows in list(self.state.items()):
+            for ws in list(windows.keys()):
+                if ws + WINDOW_SIZE_MS &lt;= self.watermark:
+                    emissions.append((key, ws, windows[ws]))
+                    del windows[ws]
+            if not windows:
+                del self.state[key]
+        return emissions
+</code></pre>
+<p>此草图在面试中的价值在于展示你理解：每键状态、基于事件时间的窗口分配、由最大观测事件时间减去允许迟到时间得出的水位线，以及基于水位线推进触发窗口。在真实的 Flink 作业中，这一切都隐藏在 <code>keyBy(...).window(...).aggregate(...)</code> 之后，但你必须能够解释底层机制。</p>
+<hr/>
+<h2 id="5-worked-example-naive-broken-fixed">5. 实际案例：朴素设计 → 崩溃 → 修复</h2>
+<h3 id="scenario">场景</h3>
+<p>广告点击聚合器。输入条件：</p>
+<ul>
+<li>峰值每秒 100 万点击事件，跨地区分区。</li>
+<li>每秒 500 万曝光事件。</li>
+<li>10 万个活跃活动。长尾效应：1% 的活动获得 80% 的流量。</li>
+<li>新鲜度目标：计数在事件发生后 5 分钟内对计费仪表盘可见。</li>
+<li>正确性目标：每分钟活动计数的精度必须在 0.1% 以内（计费级别；重复计数意味着退款和欺诈风险）。</li>
+</ul>
+<h3 id="naive-design-the-trap">朴素设计（陷阱）</h3>
+<pre><code>Click producer ──► Kafka topic "clicks"
+                       │
+                       ▼
+                  Consumer group
+                       │
+                       ▼
+   For each event: UPDATE counters SET c = c + 1
+                   WHERE campaign_id = X AND minute = Y
+                       │
+                       ▼
+                   MySQL
+</code></pre>
+<p>初级答案。它在每个维度上都会失败。</p>
+<h3 id="why-it-breaks">为什么行不通</h3>
+<ol>
+<li><strong>热行上的锁竞争。</strong> 排名最高的活动每秒获得约 5 万次点击。每次 <code>UPDATE counters SET c = c + 1 WHERE campaign_id = X AND minute = Y</code> 操作都需要获取独占行锁并在提交时 fsync；在单个 InnoDB 行上，即使使用组提交，每秒每行也只能支持几千次更新，远低于实际负载。结果不仅是更新缓慢——还会导致无限增长的锁等待队列、消费者在 Kafka 上落后，以及事务被杀死时的 <code>Lock wait timeout exceeded</code> 错误。修复方法是永不按事件写入；而是在内存中预聚合，按窗口写入。</li>
+<li><strong>重试时的重复递增。</strong> 消费者读取一批数据，对行进行递增，然后在提交 Kafka 偏移量之前崩溃。重启时重新读取该批数据并再次递增。数据库侧没有幂等键。每活动计数一天内会偏高几个百分点。计费出错。参见 <a href="/zh/system-design-patterns/idempotency-exactly-once/">idempotency-exactly-once.md</a> 。 <a href="/zh/system-design-patterns/coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a>.</li>
+<li><strong>无事件时间语义。</strong> 一次发生在 12:00:30 但在 12:05:01 到达的点击被记入 12:05 分钟，而非 12:00。分钟级报告在边界处出错。</li>
+<li><strong>无背压处理。</strong> 当 MySQL 变慢时，消费者只能丢弃事件、OOM 或阻塞——而 Kafka 不会对生产者施加背压。参见 <a href="/zh/system-design-patterns/backpressure-flow-control/">backpressure-flow-control.md</a>.</li>
+<li><strong>热键压垮一个 MySQL 分片。</strong> 即使按活动 ID 分片也无济于事：排名最高的活动哈希总是落在同一个分片上并主导它。参见 <a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a>.</li>
+<li><strong>基于扫描的仪表盘。</strong> 每次仪表盘查询都按分钟和活动联合并聚合。对最新分钟数据的读取与写入方热度相当且是同步的。</li>
+</ol>
+<h3 id="fixed-design">优化后的设计</h3>
+<pre><code>                   (events partitioned by campaign_id mod N)
+Click producer ──► Kafka "clicks" (200 partitions)
+                       │
+                       ▼
+       ┌───────────────┴───────────────┐
+       ▼                               ▼
+  Flink job (taskmanager 1)       Flink job (taskmanager N)
+   - keyBy(campaign_id)            (each owns a partition subset)
+   - tumbling(1 minute, event time)
+   - allowed lateness 2 minutes
+   - state: RocksDB local
+   - checkpoint every 30s to S3
+       │
+       ▼
+   Per-minute (campaign_id, minute, count) records
+       │
+       ├──► Kafka "rollups" topic (transactional sink, exactly-once)
+       │       │
+       │       ▼
+       │   Sink consumer with idempotent upsert (PK = campaign_id, minute)
+       │       │
+       │       ▼
+       │   Apache Cassandra: counts_per_minute(campaign_id, minute) ── PK ──
+       │       │
+       │       ▼
+       │   Dashboard / billing reads
+       │
+       └──► (optional) HyperLogLog merged across partitions for unique-user counts
+</code></pre>
+<p>关键设计选择及其合理性：</p>
+<ol>
+<li><strong>按 campaign_id 分区。</strong> 同一活动的所有点击落在同一个 Flink 键控流槽上。状态是本地的；每个事件无需跨任务协调。</li>
+<li><strong>必要时对热键进行加盐处理。</strong> 前 10 个活动被预先识别并重新键入 <code>(campaign_id, salt)</code> 其中 <code>salt = hash(event_id) mod 16</code>。十六个子计数器随后在第二个 Flink 阶段合并。以延迟（多一跳）换取热键上的并行度。参见 <a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a>.</li>
+<li><strong>1 分钟的事件时间滚动窗口</strong> ，允许 2 分钟的迟到时间。水位线由每分区最大事件时间减去允许迟到时间得出。超过 2 分钟的迟到事件发送至侧输出 topic，由批处理作业每晚对账。</li>
+<li><strong>effectively-once 写入 Cassandra。</strong> Flink 屏障将算子状态与 Kafka 源偏移量一起做检查点；这在 <em>Flink 内部</em> 以及到中间 Kafka rollups topic 之间实现了精确一次。从 Kafka 到 Cassandra，sink 消费者以 <code>(campaign_id, minute)</code> 为主键进行 upsert。由于上游窗口聚合在从检查点重放时是确定性的，因此 upsert 从构造上即为幂等——重试写入的是相同的行和相同的值。对此诚实的标签是"effectively-once"：端到端正确性在聚合保持确定性的前提下成立。Flink 与 Cassandra 之间没有两阶段提交；我们通过重放确定性加幂等键实现，而非魔法。</li>
+<li><strong>用 Cassandra 提供服务。</strong> 宽行布局：分区键 <code>campaign_id</code>，聚簇键 <code>minute</code>。查询某活动过去 60 分钟的仪表盘数据是单分区范围扫描。热门活动的读取通过薄层读透缓存或每活动副本来解决。参见 <a href="/zh/common-backend-systems/apache-cassandra/">apache-cassandra.md</a>.</li>
+<li><strong>在写入 sink 前进行预聚合。</strong> 在每个 1 分钟窗口内，Flink 任务在窗口关闭时发出一条（活动, 分钟, 计数）记录，而非每个事件一条。这正是整个设计得以工作的原因：每秒 100 万事件折叠为每分钟约 10 万条汇总记录，Cassandra 可以轻松处理。</li>
+<li><strong>通过 HLL 近似统计独立用户数。</strong> 每窗口 HLL，参数为 <code>p=14</code> （约 16KB，0.8% 误差）。各分区的 HLL 在第二阶段合并为全局 HLL。基数从合并后的寄存器中读取。</li>
+<li><strong>回填与对账。</strong> 一个每晚运行的 Spark 作业从冷存储（Kafka 的 S3 导出）读取原始点击 topic，并重新计算精确计数；流式计数与批处理结果进行容差校对。漂移超过 0.1% 时触发待命告警。这是 <strong>lambda 架构</strong> 用于计费级别精确性的措施；纯 kappa 架构对仪表盘来说可以接受，但对于涉及金额的场景则很少适用。</li>
+</ol>
+<h3 id="capacity-sanity-check">容量健全性检查</h3>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>交易量</th>
+<th>瓶颈候选项</th>
+<th>缓解措施</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Kafka 摄入</td>
+<td>600万事件/秒</td>
+<td>生产者 ack 延迟。</td>
+<td>acks=1 配合幂等生产者，200 个分区。</td>
+</tr>
+<tr>
+<td>Flink 状态</td>
+<td>10万个广告活动 x 60 个窗口 x ~50 字节 ≈ 300 MB 热数据，x 副本数。</td>
+<td>RocksDB 压缩。</td>
+<td>增量检查点；调优块缓存。</td>
+</tr>
+<tr>
+<td>Cassandra 写入</td>
+<td>每分钟 10万次汇总 ≈ 1.7K/s。</td>
+<td>微不足道。</td>
+<td>默认副本因子为 3。</td>
+</tr>
+<tr>
+<td>Cassandra 读取</td>
+<td>仪表盘 QPS，约 10K/s。</td>
+<td>热门广告活动行。</td>
+<td>缓存热分区；按分钟降序预先聚集。</td>
+</tr>
+<tr>
+<td>延迟事件侧输出</td>
+<td>&lt;0.01% 的流量。</td>
+<td>存储。</td>
+<td>侧输出 topic 保留 30 天。</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h2 id="6-variants-and-how-to-choose">6. 变体及如何选择</h2>
+<h3 id="61-exact-versus-approximate">6.1 精确计数与近似计数</h3>
+<table>
+<thead>
+<tr>
+<th>需求</th>
+<th>使用精确计数</th>
+<th>使用近似计数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>计费、监管、结算场景。</td>
+<td>是的——必须精确。与批处理进行核对。</td>
+<td>绝不使用。</td>
+</tr>
+<tr>
+<td>面向用户的计数器（点赞、浏览量）。</td>
+<td>可以接受精确计数。</td>
+<td>可以接受；对唯一值使用 HLL，对总量使用精确计数。</td>
+</tr>
+<tr>
+<td>趋势/Top-K 仪表盘。</td>
+<td>往往过于复杂。</td>
+<td>Count-Min Sketch 加小堆是正确答案。</td>
+</tr>
+<tr>
+<td>高基数下的独立用户指标。</td>
+<td>成本过高。</td>
+<td>HLL，可跨分片合并。</td>
+</tr>
+<tr>
+<td>逐事件审计与回放。</td>
+<td>是的——保留原始事件。</td>
+<td>Sketch 会丢失底层事件。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="62-tumbling-versus-sliding-versus-session">6.2 滚动窗口、滑动窗口与会话窗口的对比</h3>
+<table>
+<thead>
+<tr>
+<th>窗口</th>
+<th>选择时机</th>
+<th>成本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>滚动窗口。</td>
+<td>按分钟/按小时报告；默认选择。</td>
+<td>每个（键，窗口）一条状态记录。</td>
+</tr>
+<tr>
+<td>滑动窗口。</td>
+<td>平滑仪表盘；"移动平均"。</td>
+<td>N x 滚动窗口成本，其中 N = 大小/滑动步长。</td>
+</tr>
+<tr>
+<td>会话窗口。</td>
+<td>按用户会话化；活动分组。</td>
+<td>每个开放会话一条状态；每个键一个间隔计时器。</td>
+</tr>
+<tr>
+<td>全球。</td>
+<td>对所有数据产生一个结果。</td>
+<td>单一共享状态；通常不建议使用。</td>
+</tr>
+</tbody>
+</table>
+<p>一个陷阱：候选人往往默认选择滑动窗口，因为听起来更精妙。但其代价是实实在在的。如果产品只需要每分钟的数字，滚动窗口才是正确答案。</p>
+<h3 id="63-lambda-versus-kappa">6.3 Lambda 架构与 Kappa 架构的对比</h3>
+<pre><code>Lambda:                              Kappa:
+  raw events ──► Kafka                  raw events ──► Kafka
+                  ├─► stream layer ──► serving         └─► stream layer ──► serving
+                  └─► batch layer  ──► serving
+                       (HDFS, Spark, daily/hourly)
+
+  Two pipelines, two codebases,         One pipeline.
+  reconciled to one answer.             Replay from Kafka for backfill.
+</code></pre>
+<ul>
+<li><strong>Lambda 架构</strong> ——以批处理作为真实来源，流处理作为快速近似。当流处理无法用于计费或合规场景，或当历史重处理需要流式引擎难以表达的逻辑时使用。</li>
+<li><strong>Kappa 架构</strong> ——流处理是唯一路径。重处理意味着使用新作业从头重新读取 Kafka，并切换消费者。当流处理的正确性已足够，且不希望维护两套代码库时使用。需要较长的 Kafka 保留期或分层存储。</li>
+</ul>
+<p>在面试中，优先提出 Kappa 架构作为 <em>概念上的</em> 默认方案——单一流水线、单一代码库、单一心智模型——但要坦诚其运维成本。Kappa 的"只需重放 Kafka"对于回放几小时的数据没问题；而通过 Flink 作业重放 90 天点击数据以回填 schema 变更，可能需要数天的集群时间，期间需要并行运行两个 Flink 作业（一个处理实时数据，一个负责回放），且 Kafka 或分层存储必须保留整个时间窗口的数据。生产团队往往最终还是会采用 Lambda 架构，因为批处理路径同样支持对相同原始事件执行即席分析 SQL——他们从现有数据湖中"免费"获得了批处理层，因此将其作为核对真实来源的边际成本很低。当使用场景真正是仅追加且历史有限时，选择 Kappa；当 (a) 需要计费级别的核对、(b) 无论如何都需要对原始事件执行分析 SQL、或 (c) 流回放的保留窗口短于需要重处理的历史窗口时，选择 Lambda。</p>
+<h3 id="64-engine-selection-table">6.4 引擎选型表</h3>
+<table>
+<thead>
+<tr>
+<th>约束条件</th>
+<th>推荐选择</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>已有 Kafka、中小规模状态、无其他引擎。</td>
+<td>Kafka Streams。</td>
+</tr>
+<tr>
+<td>大型状态、复杂窗口、需要低延迟。</td>
+<td>Apache Flink。</td>
+</tr>
+<tr>
+<td>已有 Spark 批处理流水线、可接受微批延迟。</td>
+<td>Spark Structured Streaming。</td>
+</tr>
+<tr>
+<td>跨云运行的可移植性需求。</td>
+<td>Apache Beam 运行在 Dataflow / Flink runner 上。</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h2 id="7-failure-modes-and-operations">7. 故障模式与运维</h2>
+<table>
+<thead>
+<tr>
+<th>失败</th>
+<th>需监控的指标</th>
+<th>缓解措施</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>水位线之后到达的延迟事件。</td>
+<td>延迟事件比例（侧输出）。</td>
+<td>增大允许延迟时间；路由到核对作业；作为已知的正确性滞后对外展示。</td>
+</tr>
+<tr>
+<td>状态大小爆炸（每用户会话永不关闭）。</td>
+<td>每个任务的 RocksDB 磁盘字节数；检查点大小。</td>
+<td>对状态设置 TTL；显式的会话关闭事件；使用淘汰策略为每个键的状态设置上限。</td>
+</tr>
+<tr>
+<td>键控流中的热点键。</td>
+<td>每个任务的事件速率；每个任务的 CPU。</td>
+<td>对热点键加盐，分两阶段聚合；参见 <a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a>.</td>
+</tr>
+<tr>
+<td>检查点失败/超时。</td>
+<td>检查点持续时间 p99；检查点失败次数。</td>
+<td>切换为增量检查点；减少每个任务的状态；增大检查点超时时间。</td>
+</tr>
+<tr>
+<td>水位线停滞（某个分区空闲）。</td>
+<td>每个分区的水位线年龄。</td>
+<td>空闲源检测；发出合成水位线；对水位线年龄 &gt; N 的情况设置告警。</td>
+</tr>
+<tr>
+<td>分区倾斜（某个 Kafka 分区过热）。</td>
+<td>每个分区的消费滞后。</td>
+<td>在上游重新分区；在生产前加盐；参见 <a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a>.</td>
+</tr>
+<tr>
+<td>Sink 处的精确一次性缺口。</td>
+<td>输出重复率（幂等键冲突与预期值之比）。</td>
+<td>事务性 sink；幂等 upsert；在边界处使用 Bloom 过滤器进行去重。</td>
+</tr>
+<tr>
+<td>消费者积压持续增长。</td>
+<td>每个分区的 Kafka 消费滞后。</td>
+<td>增加 Flink 并行度；检查下游 sink 吞吐量；背压可见。参见 <a href="/zh/system-design-patterns/backpressure-flow-control/">backpressure-flow-control.md</a>.</td>
+</tr>
+<tr>
+<td>与批处理之间的回填正确性漂移。</td>
+<td>每个（键，天）的流处理与批处理差异。</td>
+<td>核对作业；在阈值时告警；排查窗口分配错误、被丢弃的延迟事件或 sketch 误差。</td>
+</tr>
+<tr>
+<td>事件 payload 中的 schema 变更。</td>
+<td>反序列化失败率。</td>
+<td>Schema Registry；向前/向后兼容的 Avro/Protobuf；为有问题的事件设置死信队列。</td>
+</tr>
+<tr>
+<td>崩溃后恢复时间过长。</td>
+<td>重启后恢复所需时间。</td>
+<td>增量检查点；预热备用任务；减少每个任务的状态。</td>
+</tr>
+<tr>
+<td>集群重启导致最近 N 秒数据丢失。</td>
+<td>恢复滞后（崩溃到重启之间的时间差）。</td>
+<td>若精确一次性语义保证了正确性，则可以接受；滞后成为新鲜度事故，而非正确性事故。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics-to-call-out-by-name">需要点名的运维指标</h3>
+<ul>
+<li><strong>每个分区的水位线年龄</strong>：所有分区中 max(当前时间 - 水位线)。这是最重要的新鲜度指标。</li>
+<li><strong>检查点持续时间与大小</strong>：状态管理问题的领先指标。</li>
+<li><strong>水位线之后的延迟记录数</strong>：正确性预算的消耗量。</li>
+<li><strong>Sink 提交延迟</strong>：精确一次性语义隐藏其成本的地方。</li>
+<li><strong>重启次数与恢复时间</strong>：集群的运维健康度。</li>
+</ul>
+<hr/>
+<h2 id="8-combinations-with-other-patterns">8. 与其他模式的组合</h2>
+<p>实时聚合很少单独存在。常见的组合模式：</p>
+<ul>
+<li><strong><a href="/zh/system-design-patterns/idempotency-exactly-once/">幂等性/精确一次语义</a></strong> ——sink 提交是端到端精确一次性实现的地方。对 <code>(key, window)</code> 的 upsert 是最简洁的机制。</li>
+<li><strong><a href="/zh/system-design-patterns/hot-key-skew/">热键倾斜</a></strong> ——流量最高的广告活动或用户会主导任何键控流。在规模化场景下，加盐和两阶段聚合是必须的。</li>
+<li><strong><a href="/zh/system-design-patterns/backpressure-flow-control/">背压/流量控制</a></strong> ——当 sink 速度变慢时，流处理必须传播背压而非无限制地缓冲。Flink 原生支持此功能；Kafka 不会向生产者施加背压。</li>
+<li><strong><a href="/zh/system-design-patterns/fan-out-write-amplification/">扇出写放大</a></strong> ——如果汇总数据要推送给多个下游订阅者（按区域划分的仪表盘、ML 特征存储、告警系统），扇出本身就会成为瓶颈。</li>
+<li><strong><a href="/zh/system-design-patterns/ordering-causal-consistency/">顺序与因果一致性</a></strong> ——事件时间语义需要仔细分配时间戳；同一键内的乱序事件需要重排序缓冲区或满足交换律的聚合操作。</li>
+<li><strong><a href="/zh/system-design-patterns/durability-at-scale/">大规模持久性</a></strong> ——Kafka 保留加上检查点存储共同定义了恢复的 RPO/RTO。</li>
+<li><strong><a href="/zh/system-design-patterns/coordination-exactly-one-execution/">协调精确一次性执行</a></strong> ——在至少一次语义的流之上实现至多一次的副作用（例如发送告警），需要在边界处进行去重。</li>
+<li><strong><a href="/zh/system-design-patterns/search-and-ranking/">搜索与排序</a></strong> ——趋势话题流水线为排序提供输入；聚合模式产出特征，排序模式消费特征。</li>
+<li><strong><a href="/zh/system-design-patterns/cache-stampede-read-amplification/">缓存击穿/读放大</a></strong> ——预聚合的汇总本身就是一种缓存；如果缓存层设计不当，对最新窗口读取的缓存击穿是典型故障模式。</li>
+<li><strong><a href="/zh/system-design-patterns/strong-consistency-under-contention/">强一致性下的竞争</a></strong> ——当聚合结果必须与底层写入事务一致时（例如广告活动的可用预算），基于流式聚合的派生映射模型会失效；此时需要带有预留语义的同步递减操作。</li>
+</ul>
+<hr/>
+<h2 id="9-likely-interviewer-probes">9. 面试官可能追问的问题</h2>
+<ol>
+<li>
+<p><strong>"请介绍一下当 Flink 任务在窗口处理中途崩溃时会发生什么。重启后状态从哪里恢复？我们会丢失部分计数吗？"</strong>
+   - 状态从远程存储中最后一次完成的检查点恢复。Kafka 偏移量回退到该检查点中记录的偏移量。部分窗口从这些偏移量开始确定性地重放。不会有部分丢失；代价是恢复时间，上限为检查点间隔加上恢复延迟。</p>
+</li>
+<li>
+<p><strong>"如何处理因用户在飞机上而延迟 10 分钟到达的点击事件？"</strong>
+   - 将允许延迟时间配置为主窗口的 2 分钟。超过此时间的事件进入侧输出 topic。每晚的核对作业读取侧输出，在 Cassandra 中查找原始的（广告活动，分钟）记录，并应用修正。仪表盘对最近一小时显示"初步值"与"最终值"。权衡：新鲜度预算与正确性预算需与产品方共同协商确定。</p>
+</li>
+<li>
+<p><strong>"为什么对唯一计数使用 HyperLogLog 而非 HashSet？什么情况下不应该使用 HLL？"</strong>
+   - HashSet 是精确的，但内存随基数增长；每天 1 亿独立用户，每个用户 50 字节，每个键每天需要 5 GB。HLL 每个键约 16 KB，误差约 0.8%，且可跨分区合并。不要在要求精确性的计费场景中使用 HLL，也不要在基数足够低以至于 HashSet 比 HLL 固定开销更便宜的情况下使用。</p>
+</li>
+<li>
+<p><strong>"你的顶级广告活动每秒收到 5 万次点击。请介绍一下你的 Flink 作业实际上是如何处理的。"</strong>
+   - 若不采取缓解措施，一个键控流槽位每秒处理 5 万次操作，而其他槽位空闲——该槽位成为瓶颈。缓解方案：将 campaign_id 加盐为 <code>(campaign_id, salt)</code> 其中 <code>salt = event_hash mod 16</code>，在 16 个槽位间并行化。第二阶段按 <code>campaign_id</code> 重新分区，对 16 个子计数求和，并输出最终的每分钟记录。延迟代价：额外增加一个阶段和一次网络 shuffle。</p>
+</li>
+<li>
+<p><strong>"处理时间和事件时间有什么区别，为什么这很重要？"</strong>
+   - 处理时间是流处理算子看到事件的时刻；事件时间是事件在真实世界中发生的时刻。按处理时间分桶意味着延迟到达的事件会被计入错误的桶；报告在分钟边界处出现错误，而重放流会产生与原始运行不同的结果。锚定于水位线的事件时间在重放时是确定性的，在网络延迟下也是正确的。代价是水位线机制以及处理延迟事件的必要性。</p>
+</li>
+<li>
+<p><strong>"当 sink 是 Cassandra 而非 Kafka 时，如何保证精确一次性？"</strong>
+   - Cassandra 不支持跨 Flink 提交边界的多行事务。你需要让 sink 提交是幂等的：每条输出记录都有一个确定性的主键 <code>(campaign_id, minute)</code> ，操作是 <code>UPSERT</code>。重试会写入具有相同值的同一行（因为上游窗口聚合在从检查点回放时是确定性的）。端到端精确一次性通过确定性回放加上幂等 upsert 来实现。代价是所有聚合必须是确定性的——不能有随机采样，不能有依赖系统时钟的逻辑。</p>
+</li>
+<li>
+<p><strong>"什么指标能告诉你流水线运行健康？"</strong>
+   - 三个：每个分区的水位线年龄（新鲜度）、检查点持续时间与成功率（状态健康）、以及与批处理相比的核对漂移（正确性）。其中任何一个发生变化都属于事故级别。每水位线后延迟记录数和每分区 Kafka 消费滞后是次要指标。</p>
+</li>
+<li>
+<p><strong>"如果我告诉你仪表盘必须在 1 秒内反映点击，而不是 5 分钟，怎么办？"</strong>
+   - 这会改变设计。1 分钟的滚动窗口无法满足 1 秒的新鲜度要求；你需要连续增量输出（每个事件触发输出，而不是等窗口关闭——Flink 通过 <code>aggregate</code> 加早期触发器支持此功能），或者放弃窗口语义，改用带有周期性刷新的按键运行计数器。代价是窗口期间"计数"会不断变化——读取方必须接受可能在延迟事件到达或 worker 崩溃后重新输出时向下修正的最终值。</p>
+</li>
+</ol>
+<hr/>
+<h2 id="10-common-traps-stronger-moves">10. 常见陷阱 → 更优方案</h2>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"我们只需在每个事件上递增一个 Redis 计数器就行了。"</td>
+<td>在流处理器中进行预聚合；每个窗口写入一次汇总，而不是每个事件都写入。</td>
+</tr>
+<tr>
+<td>按处理时间分桶。</td>
+<td>使用带有水位线和显式允许延迟时间的事件时间窗口。</td>
+</tr>
+<tr>
+<td>因为题目说"实时"就选 Flink。</td>
+<td>先明确新鲜度预算。若 SLO 为 5 分钟且状态规模适中，定期批处理或 Spark 微批更简单、更便宜。Flink 在秒级到亚秒级新鲜度或大型键控状态场景下才能物尽其用。</td>
+</tr>
+<tr>
+<td>将精确一次性视为框架免费提供的复选框。</td>
+<td>明确 sink 契约——事务性 Kafka（真正的 EOS）、确定性回放加幂等 upsert（有效一次性），或至少一次语义加下游去重——并说明你选择的是哪种。</td>
+</tr>
+<tr>
+<td>默认使用滑动窗口。</td>
+<td>默认使用滚动窗口；仅在需要平滑性时才使用滑动窗口，并为乘法状态成本做好预算。</td>
+</tr>
+<tr>
+<td>每个指标使用一个全局计数器。</td>
+<td>按键分区；每个分区聚合；如需在第二阶段合并。</td>
+</tr>
+<tr>
+<td>为"趋势 Top 100"在状态中存储每个事件。</td>
+<td>使用 Count-Min Sketch 加小堆；内存有界，误差有界。</td>
+</tr>
+<tr>
+<td>大规模场景下对唯一计数使用 HashSet。</td>
+<td>使用带有 <code>p=14</code> 的 HyperLogLog（约 16KB，约 0.8% 误差），并具备跨分片可合并性。</td>
+</tr>
+<tr>
+<td>热点键上的单阶段聚合。</td>
+<td>第一阶段对热点键加盐，第二阶段重新分区的两阶段聚合。</td>
+</tr>
+<tr>
+<td>忽略延迟事件。</td>
+<td>允许延迟窗口加侧输出 topic 加核对作业。</td>
+</tr>
+<tr>
+<td>反射性地到处使用 Lambda 架构。</td>
+<td>优先选择 Kappa；仅当批处理是计费或合规真实来源时才使用 Lambda。</td>
+</tr>
+<tr>
+<td>"我们只需添加更多 Kafka 分区来扩容。"</td>
+<td>分区是消费者并行度的上限，而非万能旋钮；再平衡成本不可忽视；应为未来 1-2 年而非当下选择分区数。</td>
+</tr>
+<tr>
+<td>对恢复时间一笔带过。</td>
+<td>以具体数字说明检查点间隔、恢复时间和 Kafka 回退窗口作为具体的恢复预算。</td>
+</tr>
+<tr>
+<td>将流处理层视为真实来源。</td>
+<td>Kafka 日志是真实来源；流处理是派生映射；你可以通过重处理来重建该映射。</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h2 id="11-staff-level-answer-checklist">11. Staff 级别回答清单</h2>
+<p>当你完成一道实时聚合题目的作答后，面试官应该已经听到你：</p>
+<ul>
+<li>明确说出新鲜度预算（秒、分钟）和正确性预算（精确还是近似、误差范围），用具体数字而非形容词来表达。</li>
+<li>确定分区键，并解释为何它能实现并行性而无需跨任务协调。</li>
+<li>选择窗口类型（滚动/滑动/会话）并给出理由。</li>
+<li>选择事件时间而非处理时间，定义水位线启发式算法，并给出带有理由的允许延迟值。</li>
+<li>选择状态后端并根据状态大小估算来证明其合理性。</li>
+<li>端到端明确传输契约，并使用正确的标签：精确一次性 <em>在 Kafka 内部</em> （Flink 事务性 sink 写入 Kafka topic）， <em>effectively-once</em> 写入外部存储（确定性回放加幂等 upsert），或至少一次语义加下游去重。仅说"精确一次性"而不指明 sink 是高级职级的红色警报。</li>
+<li>估算状态大小和检查点成本，而不仅仅是吞吐量。</li>
+<li>识别热点键，并提出加盐/两阶段聚合方案。</li>
+<li>仅在产品允许时选择近似算法（HLL、CMS、Bloom 过滤器、蓄水池采样），并说明内存/误差的权衡。</li>
+<li>明确提出 Lambda 与 Kappa 架构的选择，并根据使用场景是计费级别还是仪表盘级别来做决策。</li>
+<li>点出三个运维指标：水位线年龄、检查点持续时间、核对漂移。</li>
+<li>说明重处理方案：如何针对三个月的历史数据重新运行流水线？</li>
+<li>承认 schema 演进：事件负载中新增字段不应破坏管道。</li>
+<li>将设计归结为单一不变量："在新鲜度预算内，没有任何事件被重复计数，也没有任何事件被静默丢弃。"</li>
+</ul>
+<hr/>
+<h2 id="12-cross-references">12. 交叉引用</h2>
+<h3 id="pattern-siblings">模式兄弟</h3>
+<ul>
+<li><a href="/zh/system-design-patterns/idempotency-exactly-once/">idempotency-exactly-once.md</a> — 当副作用重要时，此模式的对偶场景。</li>
+<li><a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a> — 每个大规模实时聚合器都会遇到这个问题。</li>
+<li><a href="/zh/system-design-patterns/backpressure-flow-control/">backpressure-flow-control.md</a> — 当 sink 变慢时会发生什么。</li>
+<li><a href="/zh/system-design-patterns/fan-out-write-amplification/">fan-out-write-amplification.md</a> — 当汇总结果需要服务于多个下游消费者时。</li>
+<li><a href="/zh/system-design-patterns/ordering-causal-consistency/">ordering-causal-consistency.md</a> — key 内的乱序事件处理。</li>
+<li><a href="/zh/system-design-patterns/coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a> — 在至少一次流之上实现至多一次副作用。</li>
+<li><a href="/zh/system-design-patterns/strong-consistency-under-contention/">strong-consistency-under-contention.md</a> — 仅靠流式聚合不够用的情况。</li>
+<li><a href="/zh/system-design-patterns/durability-at-scale/">durability-at-scale.md</a> — 以 Kafka 保留加检查点存储作为恢复基础。</li>
+<li><a href="/zh/system-design-patterns/search-and-ranking/">search-and-ranking.md</a> — 趋势特征的下游消费者。</li>
+<li><a href="/zh/system-design-patterns/cache-stampede-read-amplification/">cache-stampede-read-amplification.md</a> — 汇总结果本质上是缓存；缓存击穿同样适用。</li>
+<li><a href="/zh/system-design-patterns/geo-spatial-queries/">geo-spatial-queries.md</a> — 基于地理分桶的流式聚合（网约车热力图、附近趋势）。</li>
+</ul>
+<h3 id="question-docs-where-this-pattern-is-core">此模式为核心的题目文档</h3>
+<ul>
+<li><a href="/zh/common-backend-systems/design-an-ad-click-aggregator/">design-an-ad-click-aggregator.md</a> — 经典练习题。</li>
+<li><a href="/zh/common-backend-systems/design-a-youtube-likes-counter/">design-a-youtube-likes-counter.md</a> — 病毒式传播规模下低新鲜度预算的计数器。</li>
+<li><a href="/zh/common-backend-systems/design-a-metrics-and-monitoring-system-like-datadog/">design-a-metrics-and-monitoring-system-like-datadog.md</a> — 跨主机的按标签汇总。</li>
+<li><a href="/zh/common-backend-systems/design-google-news-as-a-global-aggregator/">design-google-news-as-a-global-aggregator.md</a> — 全球范围内的热门话题。</li>
+<li><a href="/zh/common-backend-systems/design-google-ads/">design-google-ads.md</a> — 广告指标与预算节奏控制。</li>
+<li><a href="/zh/common-backend-systems/design-typeahead-suggestion/">design-typeahead-suggestion.md</a> — 查询频率作为流式特征。</li>
+<li><a href="/zh/common-backend-systems/design-twitter-search/">design-twitter-search.md</a> — 热门话题标签。</li>
+<li><a href="/zh/common-backend-systems/design-twitter-timeline/">design-twitter-timeline.md</a> — 用于互动特征汇总。</li>
+<li><a href="/zh/common-backend-systems/apache-kafka/">apache-kafka.md</a> — 基础设施层。</li>
+<li><a href="/zh/common-backend-systems/apache-cassandra/">apache-cassandra.md</a> — 汇总结果的典型服务存储。</li>
+</ul>
+<h3 id="glossary-anchors">词汇表锚点</h3>
+<ul>
+<li>Staff 级系统设计词汇表 — 术语。</li>
+<li>Staff 级系统设计面试手册 — 面试流程。</li>
+<li>Staff 级存储方案对比 — 用于服务层的选型。</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

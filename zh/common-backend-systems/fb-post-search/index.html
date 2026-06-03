@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Facebook Post Search — Full-Text Search Across the Firehose (walkthrough) — Yifan Li — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">Facebook Post Search — Full-Text Search Across the Firehose (walkthrough) — Yifan Li</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<p><strong>难度：</strong> Medium · <strong>总耗时：</strong> ~45 min · <strong>框架：</strong> Hello Interview Delivery</p>
+<p><strong>一句话场景：</strong> Facebook Post Search — Full-Text Search Across the Firehose (walkthrough)</p>
+<hr/>
+<h2 id="1-requirements-5-min">1. 需求（约 5 分钟）</h2>
+<p><strong>功能需求</strong>
+设计 Facebook (FB) 帖子搜索——类似 Twitter 的搜索栏。用户输入查询词，获得按关键词匹配的排名近期帖子，并按其网络/可见性过滤。每天索引 10 亿条新帖子；提供 1 万次/秒的搜索服务；帖子创建后几秒内即可出现在结果中。</p>
+<p>- 按关键词搜索近期帖子，可选按日期/作者/类型过滤。\n- 结果遵循帖子可见性（公开/好友/私密）。\n- 近实时索引新帖子（目标：帖子在约 30 秒内在搜索中可见）。</p>
+<p><strong>非功能需求</strong>
+我会暂不涉及排序深度（可以提及 ML 重排序）以及图片/视频搜索内容。</p>
+<p><strong>容量估算</strong>
+- 搜索 p99 延迟 &lt; 500 毫秒。\n- 索引吞吐量能跟上 10 亿帖子/天（平均约 1.2 万帖子/秒）。\n- 可见性强一致性——永不泄露私密帖子。\n- 文档可用性最终一致性——帖子到搜索可见性之间 30 秒的延迟是可接受的。</p>
+<hr/>
+<h2 id="2-core-entities-2-min">2. 核心实体（约 2 分钟）</h2>
+<ul>
+<li><strong>帖子</strong> — <code>post_id</code>- 10 亿帖子/天 × 1 KB = 每天 1 TB 帖子文本，约 30 TB/月。\n- 倒排索引约为文档大小的 0.5 倍，含词条 Posting 列表。\n- 多年保留 → PB 级存储。\n- 查询扇出通过时间路由加以限制：大多数搜索首先命中近期分片，只有在返回的可见结果少于 K 个时才扩展到更老的分片。</li>
+<li><strong>, author_id, text, created_at, visibility (public/friends/private), entities (mentions, hashtags)。</strong> IndexShard <code>(post_id, score, ts)</code>.</li>
+<li><strong>User</strong> ——倒排索引，以词条为键，映射至</li>
+</ul>
+<hr/>
+<h2 id="3-api-5-min">3. API（约 5 分钟）</h2>
+<pre><code>GET /v1/search?q=...&amp;filters=...&amp;cursor=...    → { posts[], next_cursor }
+</code></pre>
+<p>——用于可见性检查（好友图）。</p>
+<p>从 Token 获取用户。游标是不透明的服务器端状态（词条、上次看到的分数+ID），用于稳定翻页。 <code>{query_hash, time_bucket, shard_offsets, last_score, last_post_id, visibility_epoch}</code> 游标编码</p>
+<hr/>
+<h2 id="4-data-flow-5-min">4. 数据流（约 5 分钟）</h2>
+<p>，使得第 2 页使用相同的可见性快照，不会因新帖子到达而重排。 <code>posts.created</code> 帖子创建 → 发布至 Kafka</p>
+<hr/>
+<h2 id="5-high-level-design-1015-min">5. 高层设计（约 10–15 分钟）</h2>
+<ol>
+<li><strong>帖子服务</strong> → 索引器消费、分词、应用分析器、写入倒排索引分片 → 搜索服务在读取时查询已索引的分片。 <code>post.created</code> 发布</li>
+<li><strong>事件至 Kafka。超出设计范围；我们是消费者。</strong> 索引器服务。</li>
+<li><strong>流处理器（Flink/Kafka 消费者池）：\n   - 对文本分词（Unicode 感知，小写，可选词干提取）。\n   - 去除噪声；提取实体。\n   - 计算初始静态分数（作者权威度、帖子类型）。\n   - 将文档写入索引。</strong> 索引存储。 <code>time bucket</code> Elasticsearch（或基于 RocksDB 等键值存储构建的自定义倒排索引）。按 <code>term hash</code> （近期月份与旧月份）分片，在桶内按</li>
+<li><strong>分散。\n   - 近期月份分片用于写入密集的近实时索引。\n   - 旧月份以读为主，可合并为更少、更大的分片。</strong> 可见性过滤。 <strong>两种方案：\n   -</strong> 查询时过滤： <strong>将结果与用户的好友列表关联。适用于好友列表规模合理（几千人）的情况。\n   -</strong> 索引可见性 Token：</li>
+<li><strong>为每个允许查看的组（公开、好友列表 ID）索引一个合成词条。查询时将用户 Token 与搜索词条做 AND 运算。\n   - 我默认对好友采用查询时过滤，对公开/私密布尔值采用索引 Token。</strong> 搜索服务。</li>
+<li><strong>解析查询 → 扇出到相关分片（最近的优先）→ 归并排序 → 用排序模型对 Top N 重排 → 返回。</strong> 排序流水线。</li>
+<li><strong>轻量级学习排序模型（LightGBM）：特征包括文本相关性（BM25）、近期度、作者亲密度、互动量。将前 200 名重排至前 20 名。</strong> 缓存。</li>
+</ol>
+<h3 id="system-components-diagram">系统组件图</h3>
+<pre><code>+-------------------------+
+|        FB CLIENT        |
++------------+------------+
+        |
+    +-- POST/PATCH/DELETE /post
+    |       |
+    |       v
+    |   +-----------+
+    |   | Post Svc  |
+    |   +-----+-----+
+    |         | post events
+    |         v
+    |   +--------------+
+    |   | Kafka post.* |
+    |   | key=post_id  |
+    |   +------+-------+
+    |          |
+    |          v
+    |   +--------------+
+    |   | Indexer Fleet|
+    |   | tokenize+ACL |
+    |   +------+-------+
+    |          | postings + docs
+    |          v
+    |
+    +-- GET /search?q&amp;cursor
+        |
+        v
+        +--------------+
+        | Search API   |
+        +------+-------+
+           | query cache miss
+           v
+        +--------------+
+        | Search Shards|
+        | time buckets |
+        +------+-------+
+           |
+    +----------+-----------+
+    |                      |
+    v                      v
+ +-------------+        +-------------+
+ | Graph / ACL |        | Ranker +    |
+ | friend/block|        | Feature Svc |
+ +------+------+        +------+------+
+    |                      |
++--------------------------------------------+---------------+-------+
+| Stores / Indexes                                                    |
+| QueryCache: query:{hash}:public-&gt;top post_ids, TTL 30s              |
+| Postings: (bucket,term_hash)-&gt;compressed post_id postings           |
+| DocStore: doc:{post_id}-&gt;snippet + visibility metadata              |
+| Watermark: index_watermark:{bucket}-&gt;offset/lag                     |
+| Visibility: visibility:{user_id}:{epoch}-&gt;ACL set                   |
+| Post SoT: post:{post_id}-&gt;body/media refs                           |
++----------------------+---------------------------------------------+
+             | doc/post or ACL miss
+             v
+         +----------------+
+         | TAO / MySQL    |
+         | source of truth|
+         +----------------+
+</code></pre>
+<p>常见查询缓存 30 秒（热门趋势搜索主导流量）。</p>
+<p>端到端叙述：Alice 发帖"Niners just won the Super Bowl!"→ 索引器在 5 秒内将帖子加入今日分片。Bob 在 30 秒后搜索"Super Bowl"→ 搜索服务扇出至上周分片 → 每个分片返回其前 50 条 → 合并为前 200 个候选 → 重排模型选出最新鲜、最具互动性、最与网络相关的 → 返回前 20 条，包括 Alice 的帖子。</p>
+<ol>
+<li>具体查询路径：</li>
+<li>搜索服务解析词条、过滤器和用户可见性上下文。 <code>(time_bucket, term_hash)</code>.</li>
+<li>按近期时间桶优先路由，分片键为</li>
+<li>分片获取每个词条的 Posting 列表，在本地进行交集/评分，并返回前 50 个 post_id 及 BM25 分数。</li>
+<li>同时，服务获取用户好友/屏蔽过滤器以及候选作者/帖子的排序特征。</li>
+</ol>
+<p>应用细粒度可见性检查，通过批量 post_id 查找补全帖子摘要，对前 200 条重排，返回前 20 条及游标。</p>
+<ol>
+<li><code>post.created</code> 写入/索引路径： <code>(created_at_bucket, post_id)</code>被追加至 Kafka，键为 <code>post_id</code> ；更新/删除使用相同的</li>
+<li>，确保索引器按帖子顺序看到各版本。 <code>doc:{post_id}</code>.</li>
+<li>索引器对文本分词，为每个唯一词条生成一条 Posting，并将文档摘要写入</li>
+<li>公开可见性以粗粒度 Token 写入；好友/私密帖子保留足够的元数据用于查询时 ACL 检查，且不单独信任索引中的数据。 <code>(bucket, term_hash)</code> 索引器将 Posting 写入按 <code>index_watermark:{bucket}</code>.</li>
+<li>为键的热时间桶分片，并推进</li>
+</ol>
+<p>搜索仅路由到水位健康的分片；滞后的分片被标记为降级，并异步重试，而不会阻塞所有查询。 <code>query:{hash}:public</code> 热查询路径与冷查询路径：热门公开查询首先检查 <code>visibility:{user_id}:{epoch}</code> ，可能在 &lt;100 毫秒内返回。个性化查询缓存未命中时，扇出到近期分片，过度获取前 500 条，同时并行获取排序特征，然后过滤并重排。若存活的可见结果少于 K 条，游标以相同的 <code>query_hash</code> 和分片偏移量扩展至下一个较旧的时间桶。</p>
+<hr/>
+<h2 id="6-deep-dives-10-min">6. 深度探讨（约 10 分钟）</h2>
+<p><strong>近实时索引。</strong> Elasticsearch 默认每约 1 秒刷新新的 Segment；在我们的流量规模下，经调优后完全可行。新帖子在几秒内即可被搜索到。</p>
+<p>具体索引存储：</p>
+<table>
+<thead>
+<tr>
+<th>存储</th>
+<th>键模式</th>
+<th>值 / 数据结构</th>
+<th style="text-align: right;">条目大小</th>
+<th>TTL / 保留期</th>
+<th>分片键</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>倒排 Posting</td>
+<td><code>(bucket, term_hash)</code></td>
+<td>压缩后的列表，包含 <code>(post_id, ts, term_freq, static_score)</code></td>
+<td style="text-align: right;">~12–20 字节/Posting</td>
+<td>热的 30 天使用 SSD；旧数据分层存储</td>
+<td><code>term_hash</code> 在时间桶内</td>
+</tr>
+<tr>
+<td>文档存储</td>
+<td><code>post_id</code></td>
+<td>文本摘要、作者、可见性、实体 ID</td>
+<td style="text-align: right;">~1 KB</td>
+<td>与帖子保留期相同</td>
+<td><code>post_id</code></td>
+</tr>
+<tr>
+<td>删除墓碑</td>
+<td><code>deleted:{post_id}</code></td>
+<td>版本号/墓碑标记</td>
+<td style="text-align: right;">~32 B</td>
+<td>直至 Segment 合并</td>
+<td><code>post_id</code></td>
+</tr>
+<tr>
+<td>热查询缓存</td>
+<td><code>query:{hash}:visibility:{tier}</code></td>
+<td>Top-N 帖子 ID + 分数</td>
+<td style="text-align: right;">~10 KB</td>
+<td>30 秒</td>
+<td>查询哈希</td>
+</tr>
+<tr>
+<td>好友/屏蔽过滤器</td>
+<td><code>visibility:{user_id}:{epoch}</code></td>
+<td>紧凑的好友 ID /屏蔽布隆过滤器</td>
+<td style="text-align: right;">KB 级，因用户而异</td>
+<td>分钟级</td>
+<td><code>user_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>容量估算：10 亿帖子/天 × 1 KB = 每天 1 TB 原始文档文本。若每帖平均有 20 个唯一词条，每条 Posting 压缩后约 16 字节，则 Posting 在副本前约为 320 GB/天；文档摘要新增约 1 TB/天。3 副本、30 天热存储，热搜索存储约为 120 TB（压缩前）。多年保留属于对象存储/冷索引范畴。主要成本在于热近期分片的 Posting/文档存储以及热词条带来的查询 CPU 开销。</p>
+<p>索引队列估算：平均 1.2 万帖子/秒，每事件约 1.5 KB，通过 Kafka 的原始流量约为 18 MB/秒，RF=3 时约为 54 MB/秒。30 秒的新鲜度目标意味着正常滞后应保持在约 36 万事件以内；若索引器停机 10 分钟，积压约为 720 万帖子，即约 10 GB 原始事件数据，Kafka 可轻松容纳，但分片刷新/合并的 CPU 成为瓶颈。热查询缓存体量适中：100 万个缓存查询变体 × 10 KB 约为 10 GB 原始数据，TTL 为 30 秒，但缓存失效故意基于时间而非按帖子进行。</p>
+<p><strong>时间分片索引。</strong> 大多数搜索集中于近期帖子。按时间桶分片，近期分片体量小且以热索引方式运行；旧分片较大且以读为主。查询路由首先命中最新分片，仅在结果不足时才回退到旧分片。</p>
+<p><strong>两个索引，一个答案。</strong> 倒排索引回答"哪些帖子包含这些词条？"，图/可见性索引回答"这些帖子中，该查看者可以看到哪些？"我不会构建按用户的搜索索引，因为存储会急剧膨胀；取而代之，从词条索引过度获取，然后在补全前于读取时应用可见性视图。</p>
+<p><strong>为什么选择 Elasticsearch/OpenSearch。</strong> 它开箱即用地提供倒排索引、刷新/Segment 合并、查询路由和评分。Solr 是接近的替代方案。在 FB 规模下，自定义 RocksDB 倒排索引可以更便宜，但这意味着需要自行维护分析器、合并、排序和运维。Bigtable/Cassandra 本身并不够用，因为核心操作是词条 Posting 列表交集，而不是单次宽行读取。</p>
+<p><strong>词条倾斜。</strong> 像 <code>#superbowl</code> 这样的话题标签会产生巨大的 Posting 列表。缓解措施：对热门 Posting 进行分片级缓存；预计算得分最高的 Top-K 热词条及其文档（"热词组"缓存）。</p>
+<p>倾斜降级：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>模式</th>
+<th>数据源</th>
+<th>延迟目标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>正常</td>
+<td>实时分片扇出</td>
+<td>近期 Posting</td>
+<td>&lt;500 毫秒</td>
+</tr>
+<tr>
+<td>热词条</td>
+<td>缓存 Top-K</td>
+<td><code>query:{hash}</code> / 热词组缓存</td>
+<td>首页 &lt;100 毫秒</td>
+</tr>
+<tr>
+<td>翻页耗尽</td>
+<td>继续游标</td>
+<td>分片偏移量 + 旧时间桶</td>
+<td>&lt;700 毫秒可接受</td>
+</tr>
+<tr>
+<td>可见性密集</td>
+<td>过度获取</td>
+<td>获取前 500–1000 条后过滤</td>
+<td>CPU 增加，无泄露</td>
+</tr>
+<tr>
+<td>分片失败</td>
+<td>部分结果</td>
+<td>忽略失败分片，标记降级，异步重试</td>
+<td>仍返回部分结果</td>
+</tr>
+</tbody>
+</table>
+<p><strong>排序——文本与行为。</strong> BM25 用于原始相关性。按帖子互动量（点赞/评论每分钟）加权。按作者亲密度个性化（搜索者是否与该作者有互动？）。在高级面试中，可以提及来自点击和"该结果是否满足查询"信号的训练数据。</p>
+<p><strong>可见性正确性。</strong> 这是最难的部分。搜索绝不能返回搜索者无权查看的帖子。分两阶段：\n1. <strong>索引时粗过滤。</strong> 公开帖子索引到公开分片；仅好友可见的帖子以合成词条 <code>_friend_of_author_X</code>索引。搜索者查询时附加其作者 Token。\n2. <strong>结果时细过滤。</strong> 检索后，针对少数边界情况（近期取消好友、屏蔽）逐一对照好友图重新检查每条结果。</p>
+<p>细过滤是不可或缺的。若好友图服务不可用，对好友/私密帖子保守拒绝，仅返回公开结果，而不冒隐私泄露的风险。</p>
+<p>可见性游标携带 <code>visibility_epoch</code>；第 2 页应使用相同的 ACL 快照或更新的保守快照。若 Bob 在第 1 页和第 2 页之间取消了 Alice 好友，第 2 页可能会省略 Alice 的旧结果，但绝不能从缓存查询页面中将其重新召回。</p>
+<p><strong>隐私/屏蔽。</strong> 若 A 屏蔽了 B，双方均无法看到对方的帖子。为每个用户维护屏蔽列表；在结果时进行交叉检查。实现为每用户的小布隆过滤器以实现 O(1) 检查。</p>
+<p><strong>更新与删除传播。</strong> 帖子可被编辑或删除。索引器订阅 <code>post.updated</code> / <code>post.deleted</code> 主题；更新倒排索引（墓碑 + 后续合并）。结果可能在几秒内过时——可接受。</p>
+<p><strong>存储成本。</strong> 1 PB 原始文本的倒排索引 → 约 500 TB。按年龄分层：近 30 天用热存储（SSD 支持的 ES 节点），较旧数据用暖存储（HDD），超过一年的全部快照至对象存储。</p>
+<p><strong>热查询缓存。</strong> 趋势查询（如"Super Bowl"）主导流量。按查询缓存 Top-N 结果 30 秒。缓存键包含搜索者的粗粒度可见性层级（大多数用户共享"仅公开"视图）。</p>
+<p><strong>多区域与冷启动行为。</strong> 索引可在帖子所在主区域完成，然后将 Segment 复制到搜索区域；远端区域可能落后 5–30 秒，对于新鲜度而言是可接受的。可见性数据要求更严格：屏蔽和隐私变更通过优先级流复制，若本地 ACL 纪元过期，搜索仅返回公开结果或向主区域请求细检查。新的时间桶初始为空，因此路由器持续查询上一个桶，直到 <code>index_watermark:{bucket}</code> 验证新分片正在提供服务；分片重启后，它从桶偏移量处重放 Kafka，搜索模块将该分片标记为部分就绪，直到重放追上进度。</p>
+<p><strong>面试中故障场景的核心论点：</strong> 我可以返回更少或更旧的结果，但我绝不能返回一条私有结果。降级路径是返回部分结果或仅返回公开结果，而不是使用过期的 ACL。</p>
+<p><strong>我会推迟的内容。</strong> 语义/向量搜索、图片/视频搜索、自动补全与查询建议、多语言分析、查询理解（实体识别、意图分类）。</p>
+<p><strong>面试核心要点：</strong> 搜索在数据新鲜度上可以是最终一致的，但在隐私保护上绝不能是最终一致的。我宁可过量拉取并在读取时过滤，也不愿冒险返回一条私有帖子。</p>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

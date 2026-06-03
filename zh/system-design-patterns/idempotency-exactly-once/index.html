@@ -1,0 +1,1008 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>幂等性 / 重试去重 — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/system-design-patterns/">← 返回系统设计模式</a>
+<h1 class="article-title">幂等性 / 重试去重</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/05/31  ·  系统设计模式
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p>一种使操作可安全重试的设计原则：无论请求被投递一次还是一百次，系统在精心选择的接缝处进行去重，从而产生相同的可观测效果，而非追求网络层"严格一次"这个不可能实现的承诺。相关术语请参见词汇表（quorum、向量时钟、write-ahead log）。相关问题文档： <a href="/zh/common-backend-systems/design-a-payment-system/">design-a-payment-system</a>, <a href="/zh/common-backend-systems/design-the-stripe-payment-gateway/">design-the-stripe-payment-gateway</a>, <a href="/zh/common-backend-systems/design-a-delayed-payment-system/">design-a-delayed-payment-system</a>, <a href="/zh/common-backend-systems/design-a-notification-system/">design-a-notification-system</a>, <a href="/zh/common-backend-systems/apache-kafka/">apache-kafka</a>, <a href="/zh/common-backend-systems/design-a-flash-sale-for-an-e-commerce-site/">design-a-flash-sale-for-an-e-commerce-site</a>, <a href="/zh/common-backend-systems/design-a-reminder-alert-system/">design-a-reminder-alert-system</a>.</p>
+</blockquote>
+<hr/>
+<h2 id="1-the-fundamental-hardness">1. 核心难点</h2>
+<p>"我的请求成功了吗？"是分布式系统中唯一重要的问题，也是网络拒绝回答的那个问题。客户端发送一个 <code>POST /charge</code>。服务器提交到数据库，数据库将 write-ahead log（WAL）刷盘，响应被序列化后放上网络 — 然后一次短暂的网络抖动、一次负载均衡器重置、一次 Linux conntrack 超时，或一个半关闭的 Transmission Control Protocol（TCP）连接吞掉了确认包。从客户端的视角来看，请求处于不确定状态：它可能成功了，也可能失败了，还可能已经成功并且数据库已经扣了用户的钱。客户端唯一合理的行为是重试。服务端唯一合理的行为是假设重试会发生，即便是它看不到的重试（客户端可能已宕机并被替换；兄弟服务可能正在代为重试；队列可能在数小时后重新投递）。</p>
+<p>这就是所有支付、注册、消息发送、提现和下单系统所处的困境。网络层的"严格一次投递"并不存在：要么是至多一次（fire and forget；消息可能丢失），要么是至少一次（重试直到收到确认；消息可能重复）。而通过在应用层和存储层精心设计，你可以构建出 <strong>严格一次效果（exactly-once effect）</strong> — 即用户只被收费一次，邮件只发送一次，行只插入一次 — 即便网络层的请求可能到达零次、一次、两次或十一次。其机制在本质上始终相同：为操作的 <em>意图</em> 赋予一个稳定的标识符，将以该标识符为键的记录持久化，并让该持久化记录来仲裁是执行操作还是返回之前计算的结果。</p>
+<p>一个资深工程师级别的前置警示：这套机制不是免费的。去重表意味着每个请求额外一行数据、一个额外索引、一套 TTL 策略，以及一份可用性预算必须与业务写入相匹配的状态。对于意外重复代价低廉、易于检测和回滚的低风险操作（例如"收藏"开关切换、分析事件、缓存失效），朴素设计加上下游对账作业往往才是正确答案。只有当重复代价高昂时 — 资金转移、库存占用、短信或退款等对外可见的副作用 — 这个模式才值得其复杂度。在拿起工具箱之前，先量化一次重复的代价。</p>
+<p>两将军问题（Two Generals Problem）捕捉了为何这个问题不可消除的精简版本：两个参与方无法通过有限次的消息交换在有损信道上就消息是否送达达成共同知识，因为最后一个发送方永远不知道其最终的确认包是否被接收到。其实践意义比定理有时被引申的含义更为朴素 — 你仍然可以构建可靠的系统，只是不能依赖 <em>发送方对投递的视图（sender's view of delivery）</em> 来协调状态。解法在于使操作的 <em>可能无法实现；恰好一次</em> 在重复执行下具有交换律（commutative under repetition）。这就是整个游戏的本质：使第二次、第三次乃至第 N 次尝试在外部可见状态上成为算术意义上的空操作，同时仍向调用方返回一致的答案。</p>
+<p>规模化场景下有三股力量使这变得困难。第一，去重状态本身必须高可用且一致 — 如果你的去重表宕机或返回陈旧数据，幂等性保证就会消失。第二，去重状态会无限增长，除非在设计中加入 time-to-live（TTL）或压缩机制，而 TTL 设置错误会带来另一种故障模式（延迟重试 → 双重效果，因为去重记录已过期）。第三，操作通常跨越多个系统 — 借记账本 A、贷记账本 B、发送 Kafka 事件、调用 Stripe Application Programming Interface（API）— 幂等性必须在每个边界上独立组合，或者通过 outbox + 事务性模式将多系统提交转化为单系统提交。</p>
+<hr/>
+<h2 id="2-how-to-recognize-it-in-the-interview">2. 如何在面试中识别背压问题</h2>
+<h3 id="prompt-phrases-that-signal-this-pattern">触发该模式的提示语</h3>
+<ul>
+<li>"客户端可能会重试。"</li>
+<li>"网络不可靠" / "如果响应丢失怎么办"</li>
+<li>"如何防止重复收费 / 重复发送 / 重复下单？"</li>
+<li>"消费者在批处理中途崩溃会怎样？"</li>
+<li>"如何保证一个 webhook 只被处理一次？"</li>
+<li>"我们使用至少一次投递 — 如何处理重复？"</li>
+<li>"如果同一笔支付授权被提交了两次怎么办？"</li>
+<li>提示词中出现"严格一次（Exactly once）"就是一个巨大的闪烁警示灯。</li>
+</ul>
+<h3 id="architectural-smells-things-in-the-diagram-that-demand-this-pattern">架构异味（图中需要此模式的迹象）</h3>
+<ul>
+<li>向任何修改外部状态的消费者提供数据的队列（Kafka、Simple Queue Service（SQS）、RabbitMQ）。队列是至少一次的。</li>
+<li>任何修改状态且在上游有重试策略（客户端重试、负载均衡器重试、服务网格重试、移动网络重连）的公开 Hypertext Transfer Protocol（HTTP）端点。</li>
+<li>具有多个写侧副作用的工作流 — Saga、支付流程、"创建用户 + 发送欢迎邮件"组合。</li>
+<li>Webhook 接收方：每个主流提供商的合约都规定 webhook 是至少一次的。</li>
+<li>任何带重试的跨地域/跨系统复制。</li>
+<li>Cron 作业或调度器，在故障转移时可能触发两次。</li>
+<li>任何开发者说"我们在插入前检查一下"的地方 — 那是一个等待发生的 Time-Of-Check-To-Time-Of-Use（TOCTOU）竞态条件。</li>
+</ul>
+<h3 id="example-interview-prompts-where-this-is-core">该类型为核心的面试题示例</h3>
+<ol>
+<li>"设计 Stripe 的支付网关。"Stripe 所有公开的写 API 都接受一个 <code>Idempotency-Key</code> 请求头。这是该模式在面试中的经典时刻。参见 <a href="/zh/common-backend-systems/design-the-stripe-payment-gateway/">design-the-stripe-payment-gateway.md</a>.</li>
+<li>"设计支付系统" / "设计延迟支付系统。"账本的权威写入必须是幂等的。参见 <a href="/zh/common-backend-systems/design-a-payment-system/">design-a-payment-system.md</a> 。 <a href="/zh/common-backend-systems/design-a-delayed-payment-system/">design-a-delayed-payment-system.md</a>.</li>
+<li>"设计通知系统。"在 Kafka 重平衡时重复发送同一条推送通知就是那个 bug。参见 <a href="/zh/common-backend-systems/design-a-notification-system/">design-a-notification-system.md</a>.</li>
+<li>"设计 Kafka" 或 "设计消息队列。"你会被问到幂等生产者、事务性提交和消费者偏移量管理。参见 <a href="/zh/common-backend-systems/apache-kafka/">apache-kafka.md</a>.</li>
+<li>"设计 Uber" / "设计 Uber Eats。"司机接单和下单操作在客户端重试下必须是单次效果的。参见 <a href="/zh/common-backend-systems/design-the-uber-backend/">design-the-uber-backend.md</a> 。 <a href="/zh/common-backend-systems/design-uber-eats/">design-uber-eats.md</a>.</li>
+<li>"设计限时抢购。"在重试风暴下扣减库存不得超卖。参见 <a href="/zh/common-backend-systems/design-a-flash-sale-for-an-e-commerce-site/">design-a-flash-sale-for-an-e-commerce-site.md</a>.</li>
+<li>"设计 Ticketmaster。"座位预订 = 意向记录 + 提交；重试不得造成双重预订。参见 <a href="/zh/common-backend-systems/design-ticketmaster/">design-ticketmaster.md</a>.</li>
+<li>"设计作业调度器。"Cron 在主节点故障转移时触发两次。参见 <a href="/zh/common-backend-systems/design-a-distributed-job-scheduler-like-cron/">design-a-distributed-job-scheduler-like-cron.md</a>.</li>
+</ol>
+<hr/>
+<h2 id="3-60-second-spoken-framing">3. 60秒口头框架</h2>
+<blockquote>
+<p>不变量是严格一次 <em>可能无法实现；恰好一次</em>，而非严格一次 <em>投递（delivery）</em>。在网络层，客户端无法判断丢失的响应意味着服务器已处理还是未处理请求，因此必须重试。我通过为每个改变状态的请求赋予一个稳定的幂等键（通常是客户端提供的 Universally Unique Identifier（UUID））来使重试安全，并在与业务状态变更相同的事务中，将以该 UUID 为键的操作结果存入去重表。第一个请求获胜，计算答案并持久化；之后所有携带相同键的请求均短路并回放已存储的响应。对于多系统副作用，我使用事务性 outbox 模式：业务写入和 outbox 行在同一个数据库事务中原子提交，一个具有至少一次语义的独立发布者将 outbox 行推送到 Kafka 或下游服务，这些服务再根据 outbox 事件标识符自行去重。我关注的指标是重复抑制率，我在预算中考虑的故障模式是去重表的 TTL 短于最大重试时间窗口。</p>
+</blockquote>
+<hr/>
+<h2 id="4-canonical-toolkit">4. 标准工具集</h2>
+<p>七种技术。每一种都是拼图的一块；资深工程师级别的答案会组合其中三到四种。</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>技术</th>
+<th>所在位置</th>
+<th>解决的问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>客户端提供的幂等键 + 去重表</td>
+<td>API 边界</td>
+<td>来自客户端重试的重复 HTTP 请求</td>
+</tr>
+<tr>
+<td>2</td>
+<td>单调状态机（Monotonic State Machine）</td>
+<td>领域模型</td>
+<td>与已提交状态相矛盾的乱序或延迟重试</td>
+</tr>
+<tr>
+<td>3</td>
+<td>两阶段意向 → 提交（Two-Phase Intent → Commit）</td>
+<td>多步骤工作流</td>
+<td>在副作用发生前原子性地预分配资源</td>
+</tr>
+<tr>
+<td>4</td>
+<td>事务性 Outbox（Transactional Outbox）</td>
+<td>服务边界</td>
+<td>与业务写入同步原子发布事件</td>
+</tr>
+<tr>
+<td>5</td>
+<td>变更数据捕获（Change Data Capture，CDC）</td>
+<td>复制 / 扇出（Fan-out）</td>
+<td>无需轮询的 Outbox 发布</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Kafka 幂等生产者 + 事务（Kafka Idempotent Producer + Transactions）</td>
+<td>流式处理管道</td>
+<td>单个 Kafka 集群内的生产者重试</td>
+</tr>
+<tr>
+<td>7</td>
+<td>至少一次 + 幂等消费者（At-Least-Once + Idempotent Consumer）</td>
+<td>流式处理</td>
+<td>重平衡/重启时的消费者重处理</td>
+</tr>
+</tbody>
+</table>
+<h3 id="41-idempotency-key-handling">4.1 幂等键处理</h3>
+<p>客户端生成一个 Universally Unique Identifier（UUID）v4（如果控制重试也可以是请求体的确定性哈希），并在同一逻辑请求的每次重试中以请求头形式发送。服务器将 <code>(idempotency_key, request_fingerprint, response_body, status_code, created_at)</code> 存入去重表，以 <code>idempotency_key</code> 为键并建立唯一索引。执行业务操作的事务与插入去重行的事务是同一个事务。</p>
+<pre><code class="language-python"># Single-system idempotent write. Postgres-flavored pseudocode.
+
+import hashlib
+import json
+import uuid
+from dataclasses import dataclass
+
+@dataclass
+class IdempotentResult:
+    status_code: int
+    body: dict
+    replayed: bool  # True if served from dedup cache
+
+def charge(
+    db,
+    user_id: str,
+    amount_cents: int,
+    idempotency_key: str,
+    request_body: dict,
+) -&gt; IdempotentResult:
+    # Fingerprint guards against accidental key reuse on a *different* request.
+    fingerprint = hashlib.sha256(
+        json.dumps(request_body, sort_keys=True).encode()
+    ).hexdigest()
+
+    with db.transaction() as tx:
+        # Try to insert the dedup row first. The unique index on idempotency_key
+        # is what makes this safe against concurrent retries.
+        row = tx.execute(
+            """
+            INSERT INTO idempotency_keys
+                (key, fingerprint, status, created_at)
+            VALUES (%s, %s, 'IN_FLIGHT', NOW())
+            ON CONFLICT (key) DO NOTHING
+            RETURNING id
+            """,
+            (idempotency_key, fingerprint),
+        ).fetchone()
+
+        if row is None:
+            # A concurrent or prior request already owns this key.
+            existing = tx.execute(
+                "SELECT fingerprint, status, response_body, status_code "
+                "FROM idempotency_keys WHERE key = %s",
+                (idempotency_key,),
+            ).fetchone()
+
+            if existing.fingerprint != fingerprint:
+                # Same key, different request body = client bug; reject loudly.
+                raise IdempotencyKeyConflict(idempotency_key)
+
+            if existing.status == 'IN_FLIGHT':
+                # Concurrent retry while the first is still running.
+                # Either block (with timeout) or return 409 and let client back off.
+                raise IdempotencyInFlight(idempotency_key)
+
+            return IdempotentResult(
+                status_code=existing.status_code,
+                body=json.loads(existing.response_body),
+                replayed=True,
+            )
+
+        # We are the first writer. Do the business work in the same transaction.
+        charge_id = str(uuid.uuid4())
+        tx.execute(
+            "INSERT INTO charges (id, user_id, amount_cents, status) "
+            "VALUES (%s, %s, %s, 'AUTHORIZED')",
+            (charge_id, user_id, amount_cents),
+        )
+
+        response = {"charge_id": charge_id, "status": "AUTHORIZED"}
+
+        tx.execute(
+            """
+            UPDATE idempotency_keys
+            SET status = 'DONE',
+                response_body = %s,
+                status_code = 200,
+                completed_at = NOW()
+            WHERE key = %s
+            """,
+            (json.dumps(response), idempotency_key),
+        )
+
+        return IdempotentResult(status_code=200, body=response, replayed=False)
+</code></pre>
+<p>区分初级与资深答案的三个细节：</p>
+<ol>
+<li><strong>指纹校验（Fingerprint Check）。</strong> 如果相同的幂等键携带不同的请求体到达，说明是客户端 bug — 永远不要回放缓存的响应，因为客户端认为自己在发送一个新请求。应返回 <code>409 Conflict</code>。Stripe 就是这样做的；它能捕获大量此类 bug。</li>
+<li><strong>IN_FLIGHT 状态。</strong> 两个重试可能并发到达（移动网络抖动会产生突发流量）。第一个以状态 <code>IN_FLIGHT</code>插入；第二个看到该记录，不得发起第二次写入，必须等待或返回 <code>409</code> 告知客户端在退避后重试。注意：上面的代码展示了一个单事务流程，其中 IN_FLIGHT 状态对并发重试永远不可见，因为该行在提交前不可见。这对 <em>纯数据库（pure-database）</em> 场景（插入与提交之间没有外部调用）是适用的。对于在事务中途调用外部服务的流程 — 参见第 5 节 — IN_FLIGHT 行必须在外部调用 <em>之前</em> 之前提交，以便并发重试能够观察到它；业务写入随后在第二个事务中完成。请根据中间是否存在外部副作用来选择对应的模式。</li>
+<li><strong>原子性域一致（Same Atomicity Domain）。</strong> 如果去重记录提交了而业务行没有（或反之），保证就丢失了。对于纯数据库操作，两次写入属于同一个数据库事务（或合并为一行，例如 charge 行本身以 <code>idempotency_key</code>为键）。对于有外部副作用的操作，你拆分为两个事务，并接受 IN_FLIGHT → DONE 的转换是系统所能提供的原子性边界 — 其运营后果是：若在调用中途崩溃，会留下一个卡住的 IN_FLIGHT 行，需要清理进程（reaper）来处理。</li>
+</ol>
+<h3 id="42-dedup-table-schema-with-ttl">4.2 带 TTL 的去重表 Schema</h3>
+<pre><code class="language-python"># Postgres DDL for the dedup table. Annotated.
+
+"""
+CREATE TABLE idempotency_keys (
+    key            TEXT PRIMARY KEY,                  -- client-supplied UUID
+    fingerprint    TEXT NOT NULL,                     -- sha256 of request body
+    status         TEXT NOT NULL,                     -- 'IN_FLIGHT' | 'DONE' | 'FAILED'
+    status_code    INT,
+    response_body  JSONB,
+    user_id        TEXT,                              -- for sharding / partition pruning
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at   TIMESTAMPTZ,
+    expires_at     TIMESTAMPTZ NOT NULL                -- TTL horizon
+);
+
+-- Partial index to quickly find expired rows for cleanup.
+CREATE INDEX idempotency_keys_expires_at ON idempotency_keys (expires_at)
+  WHERE status IN ('DONE', 'FAILED');
+
+-- Range-partition by created_at so TRUNCATE PARTITION can drop old data fast.
+-- Daily partitions × 30-day retention = 30 partitions.
+"""
+
+# Recommended TTL: longer than the maximum retry horizon for the API.
+# - Mobile clients: 24-72h is typical because that bounds offline app-resume retry.
+#   The 24h floor comes from "user backgrounds the app overnight"; pick the upper
+#   end if your client SDK persists pending requests across reinstalls.
+# - Server-to-server with a queue: max queue retention + safety margin
+#   (e.g., 7-day Kafka retention -&gt; TTL &gt;= 8 days).
+# - Webhooks delivered by external providers: match the provider's documented
+#   retry budget. Stripe retries webhooks for up to 3 days, so 7 days is the
+#   common floor for receivers. GitHub, Twilio, SNS all publish their own budgets.
+#
+# Failure modes of getting it wrong:
+# - TTL too short -&gt; late retry arrives after the dedup row was evicted, the
+#   server treats it as a brand-new request, and the effect happens twice. This
+#   is the *worse* failure mode because it is silent.
+# - TTL too long -&gt; table grows large (manageable with partitioning) and the
+#   chance of a client reusing the same UUID for a logically different request
+#   over a long window goes up slightly (caught by fingerprint check).
+# Default to "too long" when in doubt; partitioning makes storage cheap, but
+# double-effect on a missed dedup is a customer-facing incident.
+</code></pre>
+<h3 id="43-outbox-pattern-table-schema">4.3 Outbox 模式的表 Schema</h3>
+<p>Outbox 模式是在不使用分布式事务的情况下，使"写入数据库同时发布到 Kafka"具备原子性的方法。你在与业务写入相同的数据库事务中向 <code>outbox</code> 表写入一行。一个独立的发布者读取 outbox 并以至少一次语义推送到 Kafka；下游消费者按事件 ID 去重。</p>
+<p>诚实地说明这解决了什么、没有解决什么。它 <em>确实</em> 解决了双写竞态问题：业务状态和发布意向原子提交，因此数据库提交与 Kafka 发送之间的崩溃不再导致事件被悄悄丢失。它 <em>非</em> 为你提供下游的严格一次投递 — 发布者在设计上是至少一次的（它可能在 <code>kafka.send</code> 成功但 <code>UPDATE outbox SET published_at</code>之前崩溃），所以下游消费者仍必须按 <code>event_id</code>去重。好处在于系统退化为"至少一次加幂等消费者"，这是实践中唯一真正有效的模式。</p>
+<pre><code class="language-python">"""
+CREATE TABLE outbox (
+    id              BIGSERIAL PRIMARY KEY,         -- monotonic publish order
+    event_id        UUID NOT NULL UNIQUE,          -- dedup key for consumers
+    aggregate_type  TEXT NOT NULL,                 -- e.g. 'charge', 'order'
+    aggregate_id    TEXT NOT NULL,                 -- e.g. charge_id
+    event_type      TEXT NOT NULL,                 -- e.g. 'charge.authorized'
+    payload         JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    published_at    TIMESTAMPTZ                    -- NULL until published
+);
+
+CREATE INDEX outbox_unpublished ON outbox (id) WHERE published_at IS NULL;
+"""
+
+def authorize_and_emit(db, user_id, amount_cents, idempotency_key, request_body):
+    with db.transaction() as tx:
+        charge_id = insert_charge(tx, user_id, amount_cents, idempotency_key)
+
+        # Same transaction! This is the entire point.
+        tx.execute(
+            """
+            INSERT INTO outbox
+                (event_id, aggregate_type, aggregate_id, event_type, payload)
+            VALUES (%s, 'charge', %s, 'charge.authorized', %s)
+            """,
+            (
+                str(uuid.uuid4()),
+                charge_id,
+                json.dumps({"charge_id": charge_id, "amount": amount_cents}),
+            ),
+        )
+        return charge_id
+
+# A separate worker process polls or tails the outbox:
+def publish_outbox_loop(db, kafka):
+    while True:
+        with db.transaction() as tx:
+            rows = tx.execute(
+                """
+                SELECT id, event_id, event_type, payload
+                FROM outbox
+                WHERE published_at IS NULL
+                ORDER BY id
+                LIMIT 100
+                FOR UPDATE SKIP LOCKED
+                """,
+            ).fetchall()
+
+            for row in rows:
+                # Kafka idempotent producer keys by event_id so a producer-side
+                # retry within the same producer session does not duplicate.
+                kafka.send(
+                    topic='charges',
+                    key=row.event_id,
+                    value=row.payload,
+                )
+
+            tx.execute(
+                "UPDATE outbox SET published_at = NOW() "
+                "WHERE id = ANY(%s)",
+                ([r.id for r in rows],),
+            )
+</code></pre>
+<p>Outbox 发布者是至少一次的：如果它发送到 Kafka 后在更新 <code>published_at</code>之前崩溃，下一次迭代会重新发布相同的 <code>event_id</code>。消费者必须按 <code>event_id</code>去重。这没问题 — 系统是至少一次加幂等消费者，这是标准答案。</p>
+<p>关于轮询与 CDC 选择的说明。上面的轮询循环在运营上很简单，但会增加等于轮询间隔的发布延迟（通常为 100ms-1s），以及与发布者数量成正比的持续数据库负载。变更数据捕获替代方案 — Debezium/Maxwell 追踪数据库复制日志 — 消除了轮询，将提交到发布的延迟降至几十毫秒，但代价是引入一套非简单的基础设施：一个持有数据库复制槽的有状态连接器、变更流的 schema 演进方案、连接器延迟的独立运营面，以及"连接器是发布事件的唯一途径"这一故障模式。大多数系统从轮询开始，只有在发布延迟或数据库负载测量结果迫使迁移时才转向 CDC。本文建议默认使用 100-500ms 的轮询，仅在已实测到瓶颈的场景下才采用 CDC。</p>
+<h3 id="44-monotonic-state-machine">4.4 单调状态机（Monotonic State Machine）</h3>
+<p>许多领域可以将业务状态本身作为去重机制，从而消除对外部去重表的需求。一笔 charge 经历 <code>INITIATED → AUTHORIZED → CAPTURED → SETTLED</code>，且状态转换表只允许向前推进。</p>
+<pre><code class="language-python"># State transition is the dedup mechanism.
+
+ALLOWED_TRANSITIONS = {
+    'INITIATED':  {'AUTHORIZED', 'FAILED'},
+    'AUTHORIZED': {'CAPTURED', 'VOIDED'},
+    'CAPTURED':   {'SETTLED', 'REFUNDED'},
+    'SETTLED':    {'REFUNDED'},
+    'FAILED':     set(),
+    'VOIDED':     set(),
+    'REFUNDED':   set(),
+}
+
+def transition(db, charge_id: str, target_status: str) -&gt; bool:
+    """
+    Returns True if the transition happened on this call, False if it was a no-op
+    because the row was already past this state.
+    """
+    with db.transaction() as tx:
+        # Conditional update: only transition if current status allows it.
+        row = tx.execute(
+            """
+            UPDATE charges
+            SET status = %s, updated_at = NOW()
+            WHERE id = %s
+              AND status IN %s
+            RETURNING status
+            """,
+            (
+                target_status,
+                charge_id,
+                tuple(s for s, allowed in ALLOWED_TRANSITIONS.items()
+                      if target_status in allowed),
+            ),
+        ).fetchone()
+
+        if row is None:
+            # Either the charge does not exist, or it is already in (or past)
+            # target_status, or it is in a state from which this target is illegal.
+            current = tx.execute(
+                "SELECT status FROM charges WHERE id = %s", (charge_id,)
+            ).fetchone()
+            if current is None:
+                raise ChargeNotFound(charge_id)
+            if current.status == target_status:
+                return False  # idempotent no-op
+            # Else this is a state-machine violation, not a retry. Raise.
+            raise IllegalTransition(current.status, target_status)
+
+        return True
+</code></pre>
+<p>这比去重表更简洁，适用于操作具有清晰生命周期的场景。重试是隐式安全的，因为第二次调用看到 <code>status = AUTHORIZED</code> 已存在，条件 <code>UPDATE ... WHERE status IN ('INITIATED',)</code> 匹配零行。不需要外部去重状态。</p>
+<p>当这是正确工具时：领域实体自然具有单调生命周期（支付、订单、预订、部署），操作是对该实体的状态转换，且实体 ID 是调用方在重试时会提供的稳定的客户端可见标识符。过度设计的场景：操作是无后续状态的一次性变更（"点赞"开关、个人资料字段更新、分析事件），或实体没有自然排序。将人为的四状态机强加于单次写入端点会增加代码审查面而不改变正确性 — 对这些情况， <code>(user_id, target_id)</code> 或幂等键去重行更为简单。</p>
+<h3 id="45-two-phase-intent-commit">4.5 两阶段意向 → 提交（Two-Phase Intent → Commit）</h3>
+<p>对于必须在执行对外可见副作用之前分配资源的工作流（例如预订座位、对卡片设置预授权、锁定库存），将 <em>意图</em> 与 <em>commit</em>。两个阶段各自独立幂等；提交阶段以意向记录的存在为前提。</p>
+<pre><code class="language-python">def reserve_seat(db, user_id: str, seat_id: str, idem_key: str) -&gt; str:
+    """Phase 1: create the intent. Idempotent on idem_key."""
+    with db.transaction() as tx:
+        row = tx.execute(
+            """
+            INSERT INTO seat_reservations (id, user_id, seat_id, status, expires_at)
+            VALUES (%s, %s, %s, 'HELD', NOW() + INTERVAL '10 minutes')
+            ON CONFLICT (id) DO NOTHING
+            RETURNING id
+            """,
+            (idem_key, user_id, seat_id),
+        ).fetchone()
+
+        if row is None:
+            existing = tx.execute(
+                "SELECT user_id, seat_id, status FROM seat_reservations WHERE id = %s",
+                (idem_key,),
+            ).fetchone()
+            assert existing.user_id == user_id and existing.seat_id == seat_id
+            return idem_key  # replay
+
+        # Also conditionally mark seat as held (or fail if already held).
+        seat = tx.execute(
+            "UPDATE seats SET held_by = %s WHERE id = %s AND held_by IS NULL "
+            "RETURNING id",
+            (idem_key, seat_id),
+        ).fetchone()
+        if seat is None:
+            raise SeatUnavailable(seat_id)
+
+        return idem_key
+
+def confirm_reservation(db, idem_key: str) -&gt; None:
+    """Phase 2: commit. Idempotent on the reservation_id state machine."""
+    with db.transaction() as tx:
+        result = tx.execute(
+            "UPDATE seat_reservations SET status = 'CONFIRMED' "
+            "WHERE id = %s AND status = 'HELD' RETURNING id",
+            (idem_key,),
+        ).fetchone()
+        if result is None:
+            current = tx.execute(
+                "SELECT status FROM seat_reservations WHERE id = %s", (idem_key,)
+            ).fetchone()
+            if current and current.status == 'CONFIRMED':
+                return  # idempotent replay
+            raise IllegalConfirmation(current)
+</code></pre>
+<p>如果意向已创建但用户始终未确认（或网络断开）， <code>expires_at</code> 清理进程会释放该座位。如果确认操作被重试，状态机守卫会短路第二次尝试。</p>
+<h3 id="46-kafka-idempotent-producer-transactional-commits">4.6 Kafka 幂等生产者 + 事务性提交</h3>
+<p>Kafka 将这些功能定位为"严格一次语义"（EOS）。更准确的表述是 <strong>严格一次（exactly-once） <em>仅在 Kafka 边界内（within Kafka's boundary）</em></strong> — 即作为已提交事务一部分生产的记录对 <code>read_committed</code> 消费者恰好可见一次，且消费-处理-生产循环在集群内不会双写。一旦副作用离开 Kafka（写入数据库行、发起 HTTP 调用、推送通知），EOS 不提供任何保证；你回到了至少一次加幂等接收者的模式。将 EOS 视为有用的内部管道工具，而非系统级保证。</p>
+<p>两个协同工作的特性：</p>
+<ul>
+<li><strong>幂等生产者</strong> (<code>enable.idempotence=true</code>）：每个生产者被分配一个生产者 ID（PID），每批消息携带一个单调序列号。broker 拒绝来自同一 PID 的重复序列号，因此生产者侧对已确认批次的重试不会重复该消息 <em>within a single producer session</em>.</li>
+<li><strong>事务性生产者</strong> (<code>transactional.id=...</code>）：将跨多个 topic/partition 的生产操作和消费者偏移量提交组合进单个原子事务。以 <code>isolation.level=read_committed</code> 隔离级别读取的消费者只能看到已提交事务的消息。</li>
+</ul>
+<p>该模式是将"消费 → 处理 → 生产 → 提交偏移量"作为一个事务：</p>
+<pre><code class="language-python"># Pseudocode for the Kafka exactly-once-semantics (EOS) consumer pattern.
+
+producer = KafkaProducer(
+    bootstrap_servers=...,
+    enable_idempotence=True,
+    transactional_id='payment-enricher-v1',
+)
+producer.init_transactions()
+
+consumer = KafkaConsumer(
+    'charges',
+    isolation_level='read_committed',
+    enable_auto_commit=False,  # we commit offsets inside the transaction
+    group_id='payment-enricher',
+)
+
+for batch in consumer:
+    producer.begin_transaction()
+    try:
+        for msg in batch:
+            enriched = enrich(msg.value)
+            producer.send('enriched-charges', key=msg.key, value=enriched)
+        # Commit consumer offsets as part of the producer transaction.
+        producer.send_offsets_to_transaction(
+            offsets={tp: offset_for(tp, batch) for tp in batch.partitions()},
+            consumer_group_id='payment-enricher',
+        )
+        producer.commit_transaction()
+    except Exception:
+        producer.abort_transaction()
+        raise
+</code></pre>
+<p>两个资深工程师级别需要注意的警告：</p>
+<ul>
+<li>这仅适用于 <em>在</em> Kafka 内部。一旦你有 Kafka 之外的副作用（写入数据库、调用外部 API），Kafka 事务不覆盖这部分。你回到了 outbox 模式或幂等接收者。</li>
+<li>性能开销不可忽视 — 事务性生产者会增加协调器开销并提高端到端延迟（提交每 <code>commit.interval</code>批一次，通常 100ms+）。仅在管道下游 <em>同样在 Kafka 内部（also inside Kafka）</em> 且下游去重确实不可行时才使用 EOS。对于大多数"Kafka 入、副作用出"的管道，至少一次加幂等消费者既更简单，又能提供相同的可观测保证。</li>
+</ul>
+<h3 id="47-at-least-once-plus-idempotent-consumer">4.7 至少一次 + 幂等消费者（At-Least-Once + Idempotent Consumer）</h3>
+<p>最常见的生产模式，在不特别要求 EOS 的情况下通常是面试的正确答案。</p>
+<pre><code class="language-python">def handle_event(db, event):
+    """Idempotent consumer. Safe to call N times for the same event_id."""
+    with db.transaction() as tx:
+        row = tx.execute(
+            "INSERT INTO processed_events (event_id, processed_at) "
+            "VALUES (%s, NOW()) ON CONFLICT (event_id) DO NOTHING "
+            "RETURNING event_id",
+            (event.id,),
+        ).fetchone()
+
+        if row is None:
+            return  # already processed
+
+        apply_effect(tx, event)  # business work in same transaction
+
+    # Commit Kafka offset *after* the DB transaction commits.
+    # If we crash between the two, the next read replays the message; the
+    # INSERT ... ON CONFLICT short-circuits and apply_effect is not re-run.
+</code></pre>
+<p>此处去重表是消费者的责任。可以是专用的 <code>processed_events</code> 表，也可以让业务写入本身带条件（例如，直接在目标表上 <code>INSERT ... ON CONFLICT (event_id) DO NOTHING</code> ）。</p>
+<hr/>
+<h2 id="5-worked-example-naive-broken-fixed">5. 实际案例：朴素设计 → 崩溃 → 修复</h2>
+<h3 id="scenario">场景</h3>
+<p>用户在移动应用中点击"支付 $50"。应用调用 <code>POST /charges</code> 支付服务。支付服务向其 <code>charges</code> 表写入一行，并调用 Stripe 授权卡片。移动网络不稳定。</p>
+<h3 id="naive-design">没有冲正接口；每次事故的对账成本高达五位数美元。</h3>
+<pre><code>Mobile app  ──POST /charges──►  PaymentService  ──auth──►  Stripe
+                                       │
+                                       ▼
+                                  charges table
+</code></pre>
+<pre><code class="language-python"># THE BROKEN VERSION. Do not ship this.
+def naive_charge(db, user_id, amount_cents):
+    stripe_charge_id = stripe.authorize(user_id, amount_cents)
+    db.execute(
+        "INSERT INTO charges (id, user_id, amount_cents, stripe_id, status) "
+        "VALUES (%s, %s, %s, %s, 'AUTHORIZED')",
+        (uuid.uuid4(), user_id, amount_cents, stripe_charge_id),
+    )
+    return {"status": "ok"}
+</code></pre>
+<h3 id="how-it-breaks">如何出错</h3>
+<pre><code>t=0  app POSTs /charges                 [request id R1]
+t=1  PaymentService calls stripe.authorize
+t=2  Stripe debits the card, returns ch_abc
+t=3  PaymentService inserts charges row
+t=4  PaymentService returns 200 to app
+t=5  Mobile radio drops; app never sees the 200
+t=6  App's HTTP client times out, retries [request id R2]
+t=7  PaymentService calls stripe.authorize AGAIN
+t=8  Stripe debits the card AGAIN, returns ch_def
+t=9  PaymentService inserts a second charges row
+t=10 App sees 200, shows "Payment successful"
+</code></pre>
+<p>用户被收费两次。两个 <code>charges</code> 行存在，ID 各不相同。三天后，当客户投诉时，对账团队发现了这个 bug。</p>
+<p>这不是假设情景。这是每个支付系统在学会此模式之前都会遭遇的事情。</p>
+<h3 id="fixed-design-idempotency-key-state-machine-outbox">修复后的设计：幂等键 + 状态机 + Outbox</h3>
+<pre><code>Mobile app  ──POST /charges──►  PaymentService  ──auth──►  Stripe
+   │  Idempotency-Key: &lt;uuid&gt;            │
+   │                                     │  same transaction:
+   │                                     ▼
+   │                          ┌──────────────────┐
+   │                          │ idempotency_keys │
+   │                          │ charges          │
+   │                          │ outbox           │
+   │                          └──────────────────┘
+   │                                     │
+   │                                     ▼
+   │                              Outbox publisher
+   │                                     │
+   │                                     ▼
+   │                                   Kafka  (event_id = outbox.event_id)
+</code></pre>
+<pre><code class="language-python">def charge(db, user_id, amount_cents, idem_key, request_body):
+    fingerprint = sha256_json(request_body)
+
+    with db.transaction() as tx:
+        row = tx.execute(
+            "INSERT INTO idempotency_keys (key, fingerprint, status) "
+            "VALUES (%s, %s, 'IN_FLIGHT') ON CONFLICT (key) DO NOTHING RETURNING id",
+            (idem_key, fingerprint),
+        ).fetchone()
+
+        if row is None:
+            existing = tx.execute(
+                "SELECT fingerprint, status, response_body FROM idempotency_keys "
+                "WHERE key = %s", (idem_key,),
+            ).fetchone()
+            if existing.fingerprint != fingerprint:
+                raise IdempotencyKeyConflict()
+            if existing.status == 'IN_FLIGHT':
+                raise IdempotencyInFlight()
+            return json.loads(existing.response_body)
+
+        # First-time path. We are inside the transaction; Stripe call is OUTSIDE.
+        # We must commit the IN_FLIGHT row first so a concurrent retry sees it.
+        tx.commit()
+
+    # Outside the DB transaction now. Stripe's API is itself idempotent on its
+    # own key; we use the same idem_key so Stripe dedups on its side too.
+    try:
+        stripe_id = stripe.authorize(
+            user_id, amount_cents, idempotency_key=idem_key,
+        )
+    except StripeError as e:
+        with db.transaction() as tx:
+            tx.execute(
+                "UPDATE idempotency_keys SET status='FAILED', "
+                "response_body=%s, status_code=502 WHERE key=%s",
+                (json.dumps({"error": str(e)}), idem_key),
+            )
+        raise
+
+    # Stripe succeeded. Persist business state and dedup result atomically.
+    with db.transaction() as tx:
+        charge_id = str(uuid.uuid4())
+        tx.execute(
+            "INSERT INTO charges (id, user_id, amount_cents, stripe_id, status) "
+            "VALUES (%s, %s, %s, %s, 'AUTHORIZED')",
+            (charge_id, user_id, amount_cents, stripe_id),
+        )
+        tx.execute(
+            "INSERT INTO outbox (event_id, aggregate_type, aggregate_id, "
+            "event_type, payload) VALUES (%s, 'charge', %s, 'charge.authorized', %s)",
+            (str(uuid.uuid4()), charge_id, json.dumps({"charge_id": charge_id})),
+        )
+        response = {"charge_id": charge_id, "status": "AUTHORIZED"}
+        tx.execute(
+            "UPDATE idempotency_keys SET status='DONE', "
+            "response_body=%s, status_code=200 WHERE key=%s",
+            (json.dumps(response), idem_key),
+        )
+
+    return response
+</code></pre>
+<p>现在重放故障时间线：</p>
+<pre><code>t=0  app POSTs /charges, Idempotency-Key=K1
+t=1  PaymentService INSERTs idempotency_keys(K1, IN_FLIGHT), commits
+t=2  PaymentService calls stripe.authorize(idempotency_key=K1)
+t=3  Stripe debits the card, returns ch_abc
+t=4  PaymentService INSERTs charges + outbox + updates K1 to DONE, commits
+t=5  PaymentService returns 200; mobile network drops
+t=6  App retries: POST /charges, Idempotency-Key=K1
+t=7  PaymentService tries INSERT idempotency_keys(K1, ...) → conflict
+t=8  PaymentService reads existing row, sees status=DONE, returns cached 200
+t=9  Card is charged exactly once. App is happy.
+</code></pre>
+<p>在白板上需要点出的三件事：</p>
+<ol>
+<li>Stripe 自身的幂等层使用相同的键被调用，因此即使我们的服务两次调用 Stripe（例如我们在 t=2 和 t=4 之间崩溃），Stripe 也会为我们去重。</li>
+<li>IN_FLIGHT 行在调用 Stripe 之前提交，以便并发重试能看到它并拒绝发起第二次授权。</li>
+<li>Outbox 行与 charge 行在同一事务中插入，因此单个 Kafka 事件代表这笔 charge — 以 <code>event_id</code> 去重的下游服务也不会从我们这里重复收到该事件。</li>
+</ol>
+<p>白板答案应明确指出的一个不对称之处。该流程有 <em>两个（two）</em> 提交边界（IN_FLIGHT 提交，然后是最终的 DONE 提交），两者之间的窗口是 Stripe 被扣款的时间段。如果服务在该窗口内崩溃，下一次重试会看到 IN_FLIGHT 行并返回 409 — 但卡片已经被扣款了。这是一个 <em>卡在 IN_FLIGHT</em> 状态，系统需要一个清理程序来解决这个问题：扫描处于 <code>IN_FLIGHT</code> 比某个阈值更老的行（超过最坏情况下 Stripe 调用时长），然后对每个卡住的行，用相同的幂等键查询 Stripe 以了解授权是否成功，并将行转换为 DONE（携带恢复的响应）或 FAILED。关键在于，跨越外部边界实现恰好一次的效果并非免费——你用"极少数丢失后重试的请求"换来"极少数卡住后需要对账的请求"，必须自己拥有对账路径。你的服务与 Stripe 之间的对称幂等性，正是使清理程序可以安全重试的原因。</p>
+<hr/>
+<h2 id="6-variants-and-how-to-choose">6. 变体及如何选择</h2>
+<table>
+<thead>
+<tr>
+<th>技术</th>
+<th>最适合场景</th>
+<th>代价与缺点</th>
+<th>跳过条件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>客户端提供的幂等键 + 去重表</td>
+<td>公开 API；客户端控制重试；任意请求体</td>
+<td>去重表增长、TTL 调优、存储响应的 schema 设计</td>
+<td>操作可由业务键自然寻址</td>
+</tr>
+<tr>
+<td>以自然业务键去重</td>
+<td>操作映射到唯一的业务实体（例如订单 ID、转账 ID）</td>
+<td>需要客户端在调用前先生成稳定的 ID</td>
+<td>操作是匿名的/非结构化的</td>
+</tr>
+<tr>
+<td>单调状态机（Monotonic State Machine）</td>
+<td>生命周期具有明确的只向前推进的状态转换</td>
+<td>设计状态机；难以后期改造</td>
+<td>操作是一次性的，无后续状态</td>
+</tr>
+<tr>
+<td>两阶段意向 → 提交（Two-Phase Intent → Commit）</td>
+<td>多步骤工作流；需要在提交前预留资源</td>
+<td>两次往返；意图泄漏清理程序</td>
+<td>单步骤操作</td>
+</tr>
+<tr>
+<td>事务性 Outbox（Transactional Outbox）</td>
+<td>需要在数据库写入的同时发布事件；无法使用分布式事务</td>
+<td>Outbox 表增长、发布延迟、消费者侧去重仍然必要</td>
+<td>单系统操作，无扇出</td>
+</tr>
+<tr>
+<td>Outbox + 变更数据捕获（CDC）</td>
+<td>Outbox 发布者不应轮询；希望从提交到发布的延迟尽量低</td>
+<td>CDC 流水线（Debezium、Maxwell）的运维负担</td>
+<td>100ms 轮询间隔可接受</td>
+</tr>
+<tr>
+<td>Kafka 幂等生产者 + 事务（Kafka Idempotent Producer + Transactions）</td>
+<td>所有副作用都在 Kafka 内部；需要流水线内部的 EOS</td>
+<td>生产者/事务协调器的开销与复杂性</td>
+<td>单一生产者 + 简单消费者；下游去重可接受</td>
+</tr>
+<tr>
+<td>至少一次 + 幂等消费者</td>
+<td>默认方案；适用于所有场景；可与一切组合</td>
+<td>消费者必须维护去重状态</td>
+<td>面试中绝对不要跳过此项；这是最基础的答案</td>
+</tr>
+</tbody>
+</table>
+<h3 id="decision-flow">决策流程</h3>
+<pre><code>What is the cost of a duplicate effect?
+    └── Negligible (analytics, "like" toggle) ─► Do nothing structural.
+                                                  Rely on best-effort retries +
+                                                  downstream reconciliation.
+    └── Material (money, inventory, SMS)  ─► Continue.
+
+Is there a natural stable business identifier
+the client materializes before calling
+(order_id, transfer_id)?
+    └── Yes ─► Use it as the dedup key directly. No header needed.
+    └── No  ─► Require a client-supplied Idempotency-Key header + dedup table.
+
+Does the operation also publish events?
+    └── Yes ─► Add an outbox row in the same DB transaction.
+
+Does the operation have a clear lifecycle state?
+    └── Yes ─► Make the state machine monotonic; use it as a second dedup
+              layer on the business write.
+
+Does the operation require pre-allocating a resource?
+    └── Yes ─► Two-phase intent → commit. Reaper for stuck intents.
+
+Are all side effects inside Kafka?
+    └── Yes ─► Idempotent producer + transactional commits + read_committed.
+
+Anywhere else there is at-least-once delivery (queue, webhook, retry mesh)?
+    └── Default ─► Dedup at the consumer by event_id.
+</code></pre>
+<hr/>
+<h2 id="7-failure-modes-and-operations">7. 故障模式与运维</h2>
+<table>
+<thead>
+<tr>
+<th>失败</th>
+<th>需要告警的指标</th>
+<th>缓解措施</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>去重表无限增长；存储与索引膨胀</td>
+<td><code>idempotency_keys</code> 行数增长速率、表大小</td>
+<td>按 <code>created_at</code> （按天/周分区）；对旧分区执行 TRUNCATE；对 <code>expires_at</code>设置激进的 TTL；将冷数据迁移至压缩归档</td>
+</tr>
+<tr>
+<td>TTL 过短：延迟重试在逐出后到达 → 重复效果</td>
+<td>重放请求率 vs 请求率；"去重未命中"计数器</td>
+<td>将 TTL 设置为大于最大重试窗口（移动端离线窗口、队列保留时长、Webhook 提供商文档中注明的重试预算）；TTL 宁长勿短</td>
+</tr>
+<tr>
+<td>TTL 过长：客户端跨逻辑上不同的请求复用 UUID</td>
+<td><code>IdempotencyKeyConflict</code> 速率（指纹不匹配）</td>
+<td>在文档中说明每请求 UUID 的约定；发现不匹配时明确拒绝；在客户端 SDK 中埋点，确保在正确的作用域生成键</td>
+</tr>
+<tr>
+<td>Outbox 发布者延迟：事件积压增长</td>
+<td><code>outbox</code> 行，其中 <code>published_at IS NULL</code>，最旧行的时间</td>
+<td>水平扩展发布者（按 <code>aggregate_id</code>分区）；从轮询切换至 CDC；对最大时间超过 SLO 的情况告警</td>
+</tr>
+<tr>
+<td>Outbox 发布者在发布后、标记为已发布前崩溃</td>
+<td>重复 <code>event_id</code> 发射率（在消费者去重指标上可见）</td>
+<td>这是预期行为——消费者必须按 <code>event_id</code>去重；仅在速率异常偏高时告警</td>
+</tr>
+<tr>
+<td>并发 IN_FLIGHT 重试发生死锁或阻塞</td>
+<td><code>IdempotencyInFlight</code> 409 速率</td>
+<td>立即返回 409 而不是阻塞；记录客户端退避策略；考虑使用带超时的短暂 FOR UPDATE NOWAIT 加重试</td>
+</tr>
+<tr>
+<td>服务在外部调用中途崩溃后 IN_FLIGHT 卡住（例如，扣款 Stripe 后、写入 charge 行前崩溃）</td>
+<td>IN_FLIGHT <code>status='IN_FLIGHT'</code> 行的时间直方图；对超过外部调用最坏情况 2-3 倍的行告警</td>
+<td>清理程序扫描卡住的行，用相同的幂等键查询下游提供商以了解真实结果，然后转换至 DONE（携带恢复的响应）或 FAILED。要求下游 API 支持通过幂等键查询（Stripe 及大多数现代支付 API 都支持）</td>
+</tr>
+<tr>
+<td>去重表成为热分片</td>
+<td>每分片 <code>idempotency_keys</code>的 QPS；锁竞争等待</td>
+<td>按 <code>idempotency_key</code> hash 分片；使用 UUID v4（均匀分布）或 v7（时间有序，对分区友好）；如果可能，与业务写入共置</td>
+</tr>
+<tr>
+<td>状态机在重试时发生非法转换</td>
+<td><code>IllegalTransition</code> 异常计数</td>
+<td>区分"客户端 bug"（返回 409，不重试）与"合法重放"（返回当前状态，200）</td>
+</tr>
+<tr>
+<td>Stripe/外部 API 本身仅对调用方提供的键幂等，而我们忘记提供该键</td>
+<td>外部 API 重复扣款率</td>
+<td>始终将客户端的幂等键转发给支持该功能的下游提供商</td>
+</tr>
+<tr>
+<td>两阶段意图从未得到确认；资源被永久占用</td>
+<td>未确认意图的时间直方图；被放弃意图的速率</td>
+<td>清理程序扫描 <code>WHERE status='HELD' AND expires_at &lt; NOW()</code>；释放资源；将意图标记为 EXPIRED</td>
+</tr>
+<tr>
+<td>Kafka 事务卡住（事务协调器响应慢）</td>
+<td>生产者事务提交 p99</td>
+<td>调优 <code>transaction.timeout.ms</code>；对卡住的事务告警；不要将 transaction.timeout 调高至超过下游读取者的延迟容忍度</td>
+</tr>
+<tr>
+<td>消费者偏移量已提交但数据库事务失败（乱序提交）</td>
+<td>消费者偏移量与 processed_events 行数之间的差异</td>
+<td>始终先提交数据库事务，再提交 Kafka 偏移量。若在两者之间崩溃，下次重新读取的消息会命中去重表，而不会产生重复效果</td>
+</tr>
+</tbody>
+</table>
+<h3 id="key-operational-metrics">关键运维指标</h3>
+<p>以下百分比范围是源自公开 API 模式的经验值，并非普适数字。你系统的正确基准线是该指标在稳定周内趋于平稳的值；应对 <em>变化</em>告警，而非对绝对阈值告警。</p>
+<ul>
+<li><strong>重复抑制率</strong>: <code>replayed_requests / total_requests</code>。对于移动客户端公开 API，低个位数百分比是典型基准线。真正重要的是峰值形态——突然出现数倍跳涨，意味着网络事件、上游客户端 bug 在大量重试，或某次变更导致首次请求开始返回非 2xx。</li>
+<li><strong>幂等冲突率</strong>: <code>409 conflict / total_requests</code>。应接近零；非零速率意味着客户端在不同请求上复用了键，这是一个 bug。</li>
+<li><strong>重试后去重表未命中率</strong>：需要单独的事件日志；如果能检测到 TTL 逐出后到来的请求（罕见但后果严重），则触发告警。</li>
+<li><strong>Outbox 延迟 p99</strong>：从 <code>outbox.created_at</code> 与 <code>outbox.published_at</code>到的时间。目标取决于轮询间隔——100ms 轮询器应达到亚秒级，1s 轮询器应达到个位数秒级。对 <em>未发布行积压单调增长</em>告警，该指标能够独立于延迟目标捕获发布者卡死的情况。</li>
+<li><strong>消费者侧已处理事件去重率</strong>: <code>events_short_circuited / events_received</code>。基准线等于上游重传率；告警的是偏离基准线，而非达到某个特定数字。</li>
+</ul>
+<hr/>
+<h2 id="8-combinations-with-other-patterns">8. 与其他模式的组合</h2>
+<p>幂等性是一个横切关注点，几乎出现在所有其他模式中。交叉参考：</p>
+<ul>
+<li><strong><a href="/zh/system-design-patterns/coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a></strong> — 幂等性使单个 <em>操作</em> 可以安全重试；协调/恰好一次执行使一个 <em>作业</em> 在某一时刻只在一个 Worker 上运行（主节点选举、锁、租约）。两者共同覆盖了"恰好一次"的两个维度。</li>
+<li><strong><a href="/zh/system-design-patterns/ordering-causal-consistency/">ordering-causal-consistency.md</a></strong> — 如果重试乱序到达，状态机模式（只向前推进的转换）可使排序风险变得安全。如果需要严格排序，通常需要同时具备排序器（排序模式）和幂等应用（本模式）。</li>
+<li><strong><a href="/zh/system-design-patterns/strong-consistency-under-contention/">strong-consistency-under-contention.md</a></strong> — 幂等键依赖强一致的去重存储。在最终一致性 KV 存储上搭建去重表是一颗定时炸弹。</li>
+<li><strong><a href="/zh/system-design-patterns/fan-out-write-amplification/">fan-out-write-amplification.md</a></strong> — 当单次写入扇出至 N 个下游消费者时，每个消费者必须对上游事件 ID 幂等，否则重复数量将乘以 N 倍。</li>
+<li><strong><a href="/zh/system-design-patterns/durability-at-scale/">durability-at-scale.md</a></strong> — Outbox 模式的正确性依赖于 outbox 与业务数据共处于持久存储中；否则一次崩溃将同时丢失两者。</li>
+<li><strong><a href="/zh/system-design-patterns/backpressure-flow-control/">backpressure-flow-control.md</a></strong> — 在高负载下，重试会成倍增加。幂等性维护正确性，而背压则防止系统崩溃。</li>
+<li><strong><a href="/zh/system-design-patterns/real-time-aggregation/">real-time-aggregation.md</a></strong> — 对重复事件进行重复计数的聚合器会破坏指标。在聚合前去重，或使用能容忍重复的 HyperLogLog/概率结构。</li>
+<li><strong><a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a></strong> — 热门幂等键（例如来自有缺陷客户端的全局"default"键）会成为去重表中的热点行。验证键的基数。</li>
+<li><strong><a href="/zh/system-design-patterns/cache-stampede-read-amplification/">cache-stampede-read-amplification.md</a></strong> — 单飞/防缓存击穿是幂等性在读取侧的近亲：大量并发调用折叠为一次执行并共享结果。形态相同，目标不同（延迟，而非正确性）。</li>
+</ul>
+<hr/>
+<h2 id="9-likely-interviewer-probes">9. 面试官可能追问的问题</h2>
+<ol>
+<li>
+<p><strong>"如果两个客户端同时用相同的幂等键发送相同的请求，会发生什么？"</strong> — 答：去重表上的唯一索引会将它们串行化。第二个请求会看到 <code>IN_FLIGHT</code> ，然后要么等待（带超时），要么返回 409。讨论两者的选择：阻塞对客户端更简单，返回 409 对服务器资源更友好。</p>
+</li>
+<li>
+<p><strong>"你们去重表的 TTL 是多少，为什么？"</strong> — 答：大于该接口最大重试窗口的时长。对于移动 API，24-72 小时可以覆盖离线缓冲。对于 Stripe / GitHub / Twilio 等 Webhook 的重传，查阅提供商文档中的重试策略（Stripe 最多重试 3 天）。永远不要因为"存储昂贵"就把 TTL 设为"1 小时"——那是在埋下重复扣款的 bug。如果存储是问题，按日期对表进行分区并删除旧分区。</p>
+</li>
+<li>
+<p><strong>"为什么不直接在业务表上使用主键约束？"</strong> — 答：当以下两个条件都满足时，这个方案完全可行：(a) 客户端在调用前已经提供或能够推导出稳定的业务 ID；(b) 数据库写入是对外可见效果的门控点。例如，一个 <code>INSERT INTO orders (order_id, ...) ON CONFLICT DO NOTHING</code> 是完全够用的去重机制，如果你的重试路径是"客户端用相同的 <code>order_id</code>重试"，而被插入的订单通过 outbox 触发下游工作。需要单独去重表的场景，是当存在发生在 <em>之前</em> 数据库写入之前的外部副作用时——例如，你先调用 Stripe，再写入行。此时，主键约束无法防止重复调用 Stripe，因为去重点是在 <em>之前</em> 行存在之前，这就是为什么你需要提前提交 IN_FLIGHT 行。所以：对"DB 写入即副作用"的场景用自然键去重；对"外部调用先于 DB 写入"的场景用单独的幂等键去重表。如果更轻量的机制真的能满足需求，就不要使用更重的方案。</p>
+</li>
+<li>
+<p><strong>"Outbox 模式与跨数据库和 Kafka 的两阶段提交（2PC）相比如何？"</strong> — 答：2PC 需要事务协调器，在运维上非常不友好（阻塞、prepare-and-hang 故障模式，极少数系统能干净地支持它）。Outbox 模式通过先将事件写入数据库，将多系统提交转化为单系统提交；然后发布者具备至少一次语义，配合下游消费者去重。这是规模化场景下的标准答案。</p>
+</li>
+<li>
+<p><strong>"你说 outbox 发布者是至少一次。下游消费者如何去重？"</strong> — 答：每个 outbox 行都有一个 UUID <code>event_id</code>。消费者维护一个以 <code>processed_events</code> 为键的 <code>event_id</code> 表，并用 <code>INSERT ... ON CONFLICT DO NOTHING</code> 作为去重门控。Kafka 偏移量在消费者数据库事务 <em>after</em> 后提交。这将幂等生产者（Kafka 内部）与幂等消费者（跨系统边界）组合在一起。</p>
+</li>
+<li>
+<p><strong>"如果去重表宕机了怎么办？"</strong> — 答：这是一个关键路径依赖。将它与业务数据共置（同一数据库、同一分片），使其可用性与业务写入保持一致。不要把它放在有独立故障模式的单独微服务里。如果必须单独分片，考虑按 <code>user_id</code> 共置，以确保单个用户的写入始终命中同一对分片。</p>
+</li>
+<li>
+<p><strong>"如果请求从服务端视角看超时了——客户端重试和服务端完成都对对方不可见，怎么处理？"</strong> — 答：IN_FLIGHT 行正是这个机制。服务端在 IN_FLIGHT 之后、DONE 之前崩溃 → 客户端重试 → 看到 IN_FLIGHT → 返回 409"处理中" → 客户端退避并重试 → 最终清理程序将过时的 IN_FLIGHT 行转换为 FAILED（或通过 Stripe 的幂等键窗口等旁路解决）。讨论清理程序的间隔以及激进清理 vs 保守清理的选择。</p>
+</li>
+</ol>
+<hr/>
+<h2 id="10-common-traps-stronger-moves">10. 常见陷阱 → 更优方案</h2>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"我们只需要在插入前检查行是否存在。"</td>
+<td>使用唯一索引和 <code>INSERT ... ON CONFLICT DO NOTHING</code>。先读后写是检查时间-使用时间（TOCTOU）竞争。</td>
+</tr>
+<tr>
+<td>去重表没有 TTL 或分区策略。</td>
+<td>按 <code>created_at</code>范围分区；通过 cron 定期删除旧分区；将保留窗口作为 API 约定的一部分记录在文档中。</td>
+</tr>
+<tr>
+<td>去重状态存储在持久性或原子性与业务写入不匹配的存储上（例如，用于支付去重表的 Redis 未开启仅追加文件（AOF）持久化且无副本；位于另一数据库中、无法与业务写入共享事务的去重 KV）。</td>
+<td>将去重存储的持久性和可用性与业务写入相匹配，并将其放置在能与业务状态原子提交的位置——通常是同一个关系型数据库。开启 AOF + 副本的 Redis 可以用于非金融场景的去重，但对于涉及资金流动的场景，优先使用与业务行相同的数据库。</td>
+</tr>
+<tr>
+<td>对"创建"和"更新"使用相同的幂等键（客户端将其视为会话级别）。</td>
+<td>在文档中将键的作用域定义为每个逻辑请求，而非每个会话。对相同键/不同指纹的情况明确返回 409 拒绝。</td>
+</tr>
+<tr>
+<td>"Stripe 在其侧是幂等的，所以我不需要处理。"</td>
+<td>分层幂等性。你的服务仍然需要去重，因为客户端重试的是 <em>你</em>，而不是 Stripe。同时也将键转发给 Stripe 以实现纵深防御。</td>
+</tr>
+<tr>
+<td>Outbox 发布者 <code>SELECT ... FOR UPDATE</code> 无需 <code>SKIP LOCKED</code>.</td>
+<td>模拟程序启动时会进行的重定基址操作。 <code>FOR UPDATE SKIP LOCKED</code> ，因此多个发布者 Worker 可以并行扫描而不相互阻塞。</td>
+</tr>
+<tr>
+<td>在消费者的 DB 事务 <em>之前</em> 之后提交 Kafka 偏移量。</td>
+<td>先提交 DB，再提交 Kafka 偏移量。两者之间的崩溃窗口会产生一次重传，由去重表吸收。反过来则会丢失消息。</td>
+</tr>
+<tr>
+<td>将"恰好一次"声称为系统属性，却没有说明去重发生在哪个接缝处。</td>
+<td>始终明确说明：在 API 键、业务键、事件 ID 还是状态机处去重——并说明去重状态存储在何处。</td>
+</tr>
+<tr>
+<td>忽略 IN_FLIGHT 状态；只建模 DONE 与不存在。</td>
+<td>同一键上的并发重试都会尝试执行操作。明确建模 IN_FLIGHT 并制定相应策略。</td>
+</tr>
+<tr>
+<td>将 Webhook 视为恰好一次，因为"提供商保证了这一点"。</td>
+<td>没有提供商会做到这一点。Stripe、GitHub、Twilio、Slack、AWS Simple Notification Service（SNS）——全都是至少一次。始终按提供商的事件 ID 去重。</td>
+</tr>
+<tr>
+<td>将去重表放在与业务写入不同的数据库上。</td>
+<td>"插入去重行且插入业务行"的原子性就消失了。共置它们。</td>
+</tr>
+<tr>
+<td>在 outbox 中使用自增 ID 作为事件 ID。</td>
+<td>使用 UUID。自增 ID 会泄漏排序信息，在分区场景下无法存活，且在跨分片时不能保证无冲突。</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h2 id="11-staff-level-answer-checklist">11. Staff 级别回答清单</h2>
+<ul>
+<li>在使用这套工具之前，先明确重复效果的代价。对于易于回滚的重复，可能不值得引入这套机制。</li>
+<li>明确声明不变式："恰好一次 <em>可能无法实现；恰好一次</em>，而非严格一次 <em>投递（delivery）</em>."</li>
+<li>识别重试来源：客户端、负载均衡器、服务网格、队列、Webhook 重传、调度器。</li>
+<li>选择去重接缝：HTTP 头、业务键、事件 ID、状态机。</li>
+<li>将去重状态与业务写入共置，以确保两者原子提交。</li>
+<li>为并发重试建模 <code>IN_FLIGHT</code> 状态；在阻塞与 409 之间做出选择。</li>
+<li>对跨系统扇出使用 outbox 模式；不要使用分布式事务。</li>
+<li>将幂等键转发给支持该功能的下游提供商（Stripe、支付网络、内部服务）。</li>
+<li>声明 TTL 并将其与你支持的最大重试窗口绑定。</li>
+<li>为你生产的任何至少一次流命名消费者侧去重机制。</li>
+<li>明确说明你会对哪个运维指标告警（重放请求率、outbox 延迟、冲突率）。</li>
+<li>区分"合法重试"（返回缓存结果）与"在不同请求上复用键"（返回 409——客户端 bug）。</li>
+<li>讨论去重存储失败时会发生什么：它是关键路径依赖，应如此对待。</li>
+<li>对于 Kafka 流水线：了解 EOS 何时值得付出代价，相对于至少一次加幂等消费者。</li>
+<li>至少引用一个生产故障模式（去重 TTL 逐出、outbox 延迟、IN_FLIGHT 卡住）及其缓解措施。</li>
+<li>对 Kafka 的"恰好一次"要有明确认知：它仅在 Kafka 边界内是恰好一次；外部副作用仍然需要幂等接收者。</li>
+</ul>
+<hr/>
+<h2 id="12-cross-references">12. 交叉引用</h2>
+<h3 id="sibling-patterns">兄弟模式</h3>
+<ul>
+<li><a href="/zh/system-design-patterns/coordination-exactly-one-execution/">coordination-exactly-one-execution.md</a> — 恰好一次 <em>作业</em>，本模式覆盖恰好一次 <em>可能无法实现；恰好一次</em></li>
+<li><a href="/zh/system-design-patterns/ordering-causal-consistency/">ordering-causal-consistency.md</a> — 重试下的排序风险</li>
+<li><a href="/zh/system-design-patterns/strong-consistency-under-contention/">strong-consistency-under-contention.md</a> — 去重存储的一致性要求</li>
+<li><a href="/zh/system-design-patterns/fan-out-write-amplification/">fan-out-write-amplification.md</a> — 去重在消费者间成倍增加</li>
+<li><a href="/zh/system-design-patterns/durability-at-scale/">durability-at-scale.md</a> — outbox 持久性</li>
+<li><a href="/zh/system-design-patterns/backpressure-flow-control/">backpressure-flow-control.md</a> — 高负载下的重试</li>
+<li><a href="/zh/system-design-patterns/real-time-aggregation/">real-time-aggregation.md</a> — 容忍重复的聚合</li>
+<li><a href="/zh/system-design-patterns/hot-key-skew/">hot-key-skew.md</a> — 幂等键热点</li>
+<li><a href="/zh/system-design-patterns/cache-stampede-read-amplification/">cache-stampede-read-amplification.md</a> — 读取路径上的单飞</li>
+<li><a href="/zh/system-design-patterns/search-and-ranking/">search-and-ranking.md</a> — 去重索引</li>
+<li><a href="/zh/system-design-patterns/geo-spatial-queries/">geo-spatial-queries.md</a> — 乘车接单幂等性</li>
+</ul>
+<h3 id="related-question-docs">相关问题文档</h3>
+<ul>
+<li><a href="/zh/common-backend-systems/design-the-stripe-payment-gateway/">design-the-stripe-payment-gateway.md</a> — 幂等键 API 设计的规范方案</li>
+<li><a href="/zh/common-backend-systems/design-a-payment-system/">design-a-payment-system.md</a> — 账本写入与复式记账幂等性</li>
+<li><a href="/zh/common-backend-systems/design-a-delayed-payment-system/">design-a-delayed-payment-system.md</a> — 定时执行幂等性</li>
+<li><a href="/zh/common-backend-systems/design-a-notification-system/">design-a-notification-system.md</a> — 推送/邮件的重复抑制</li>
+<li><a href="/zh/common-backend-systems/design-a-flash-sale-for-an-e-commerce-site/">design-a-flash-sale-for-an-e-commerce-site.md</a> — 重试风暴下的库存扣减</li>
+<li><a href="/zh/common-backend-systems/design-ticketmaster/">design-ticketmaster.md</a> — 座位预订两阶段提交</li>
+<li><a href="/zh/common-backend-systems/design-the-uber-backend/">design-the-uber-backend.md</a> — 司机接单幂等性</li>
+<li><a href="/zh/common-backend-systems/design-uber-eats/">design-uber-eats.md</a> — 下单幂等性</li>
+<li><a href="/zh/common-backend-systems/design-a-distributed-job-scheduler-like-cron/">design-a-distributed-job-scheduler-like-cron.md</a> — 调度器故障转移去重</li>
+<li><a href="/zh/common-backend-systems/apache-kafka/">apache-kafka.md</a> — 幂等生产者与 EOS 内部机制</li>
+<li><a href="/zh/common-backend-systems/design-amazon-shopping-cart/">design-amazon-shopping-cart.md</a> — 松散仲裁下购物车写入幂等性</li>
+</ul>
+<h3 id="reference-docs">参考文档</h3>
+<ul>
+<li>STAFF_SYSTEM_DESIGN_GLOSSARY.md — 仲裁、向量时钟、预写日志</li>
+<li>STAFF_SYSTEM_DESIGN_INTERVIEW_PLAYBOOK.md — 高级工程师层面的框架与主线</li>
+<li>STAFF_STORAGE_COMPARISON.md — 各存储引擎的去重存储方案对比</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

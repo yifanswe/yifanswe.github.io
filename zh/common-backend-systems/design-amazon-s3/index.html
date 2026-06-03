@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>设计 Amazon S3 — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">设计 Amazon S3</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p><strong>对这些术语不熟悉？</strong> 请参阅 <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> ，了解常见系统设计术语的中英文解释。</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. 基础知识与解题思路</h2>
+<h3 id="what-this-question-is-testing">本题考察点</h3>
+<p>S3 是典型的星球级对象存储。难点在于在支持跨 EB 量级存储的数万亿对象的同时，提供 11 个 9 的持久性和接近 100% 的可用性，而磁盘和节点故障则持续不断发生。</p>
+<p>其不变量如下：</p>
+<blockquote>
+<p>每个返回成功的 PUT 请求，其数据均已跨多个故障域持久存储；每个针对已存储 key 的 GET 请求均返回最新已提交版本（或对于启用版本控制的 bucket，返回所请求的版本）；列举、key 唯一性以及 ACL 强制执行均正确；数据在任意单 AZ 故障下不丢失。</p>
+</blockquote>
+<p>在 ICT5 / L6+ 级别，面试官在考察你能否设计具有高持久性的纠删码存储、将元数据与数据分离、处理高吞吐量的 key 列举、管理热点 key，以及推导一致性（自 2020 年更新后为强一致性，此前为最终一致性）。</p>
+<h3 id="60-second-interview-framing">60 秒面试框架</h3>
+<p>口述版本：</p>
+<blockquote>
+<p>我将把 S3 设计为两个服务：一个将对象 key 映射到数据位置的元数据服务，以及一个使用纠删码或跨可用区副本存储对象内容的数据平面。关键决策包括：通过纠删码实现持久性、key 命名空间分区、一致性（现已为强读后写一致性）、热前缀处理，以及针对大对象的分片上传。</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">首先明确需求</h3>
+<p>功能性需求：</p>
+<ul>
+<li>通过 key 在 bucket 中执行 PUT、GET、DELETE 对象操作。</li>
+<li>按前缀列举对象；按字典序排序。</li>
+<li>针对大对象的分片上传。</li>
+<li>Bucket 版本控制（每个 bucket 可选）。</li>
+<li>生命周期策略：N 天后分层或过期。</li>
+<li>通过 IAM 和 bucket 策略进行访问控制。</li>
+<li>预签名 URL。</li>
+<li>跨区域复制（可选）。</li>
+</ul>
+<p>非功能性需求：</p>
+<ul>
+<li>11 个 9 的持久性（99.999999999%）。</li>
+<li>每个区域高可用。</li>
+<li>强读后写一致性（现代 S3）。</li>
+<li>对象大小：1 字节至 5 TB。</li>
+<li>吞吐量：每前缀每秒数千请求。</li>
+<li>每客户 PB 至 EB 规模。</li>
+<li>异地复制与容灾。</li>
+</ul>
+<p>以下内容超出范围，除非被特别询问：</p>
+<ul>
+<li>与计算直接集成（例如 S3 Select）。</li>
+<li>查询对象内容（Athena、Glue）。</li>
+<li>对象转换（Lambda 触发器）。</li>
+</ul>
+<h3 id="scale-assumptions">规模假设</h3>
+<table>
+<thead>
+<tr>
+<th>领域</th>
+<th>假设</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>对象</td>
+<td>全球范围内数万亿个；大型客户每人数十亿个。</td>
+</tr>
+<tr>
+<td>Bucket</td>
+<td>数百万。</td>
+</tr>
+<tr>
+<td>对象大小</td>
+<td>双峰分布：大量小 bucket，大量超大 bucket。</td>
+</tr>
+<tr>
+<td>吞吐量</td>
+<td>每前缀最高数千 QPS；每 bucket 数百万 QPS。</td>
+</tr>
+<tr>
+<td>持久性</td>
+<td>11 个 9 = 每 10^11 个对象中丢失约 1 个。</td>
+</tr>
+<tr>
+<td>可用性</td>
+<td>每区域 99.99% 以上。</td>
+</tr>
+<tr>
+<td>Latency（延迟）</td>
+<td>GET 首字节延迟低于 100ms；小对象 PUT 延迟低于 200ms。</td>
+</tr>
+<tr>
+<td>存储</td>
+<td>每区域 EB 量级存储。</td>
+</tr>
+</tbody>
+</table>
+<p>瓶颈在于因前缀元数据分区导致的每前缀吞吐量，以及相关故障下的持久性保障。</p>
+<h3 id="core-product-model">核心产品模型</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>职责</th>
+<th>需求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>API 网关</td>
+<td>身份验证、解析请求、路由。</td>
+<td>无状态；可横向扩展。</td>
+</tr>
+<tr>
+<td>元数据服务</td>
+<td>将对象 key 映射到数据位置。</td>
+<td>强一致性；按 key 范围分片。</td>
+</tr>
+<tr>
+<td>数据平面（存储节点）</td>
+<td>使用纠删码或副本存储对象字节。</td>
+<td>跨 AZ 分布；优先保障持久性。</td>
+</tr>
+<tr>
+<td>生命周期 / GC</td>
+<td>按策略分层或删除。</td>
+<td>异步；最终一致。</td>
+</tr>
+<tr>
+<td>副本</td>
+<td>为弹性进行跨区域复制。</td>
+<td>每个 bucket 可选。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="high-level-architecture">高层架构</h3>
+<pre><code class="language-text">Client --&gt; Load Balancer --&gt; Frontend (auth, route)
+                                  |
+                  +---------------+---------------+
+                  |                               |
+                  v                               v
+        +-------------------+         +---------------------+
+        | Metadata Service  |         | Data Plane          |
+        | key -&gt; placement  |         | erasure-coded chunks |
+        | sharded by key    |         | across AZs           |
+        +---------+---------+         +----------+----------+
+                  |                              |
+                  v                              v
+        +-------------------+         +---------------------+
+        | Metadata Store    |         | Object Storage      |
+        | (KV per key range)|         | (disks, SSDs)       |
+        +-------------------+         +---------------------+
+                                                 |
+                                                 v
+                                      +---------------------+
+                                      | Lifecycle / GC      |
+                                      | Replication         |
+                                      +---------------------+
+</code></pre>
+<h3 id="core-components">核心组件</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>职责</th>
+<th>关键细节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>前端</td>
+<td>TLS、鉴权、签名验证、请求路由。</td>
+<td>无状态；水平扩展。</td>
+</tr>
+<tr>
+<td>元数据服务</td>
+<td>对象 key 到位置的映射。</td>
+<td>按 key 范围或哈希分片；强一致性。</td>
+</tr>
+<tr>
+<td>索引服务</td>
+<td>列举和前缀查询。</td>
+<td>每个 bucket 类 B-tree 的有序索引。</td>
+</tr>
+<tr>
+<td>存储节点</td>
+<td>保存纠删码 chunk 或副本。</td>
+<td>重磁盘；持久性优先。</td>
+</tr>
+<tr>
+<td>纠删编码器</td>
+<td>对对象进行编码（Reed-Solomon 风格）。</td>
+<td>k+m 个 chunk；可容忍 m 个丢失。</td>
+</tr>
+<tr>
+<td>放置服务</td>
+<td>决定使用哪些存储节点。</td>
+<td>跨 AZ、机架分散放置。</td>
+</tr>
+<tr>
+<td>生命周期服务</td>
+<td>分层和过期处理。</td>
+<td>每 bucket 策略；每晚运行。</td>
+</tr>
+<tr>
+<td>复制服务</td>
+<td>跨区域复制。</td>
+<td>每个对象在 PUT 后执行。</td>
+</tr>
+<tr>
+<td>修复 / 恢复</td>
+<td>磁盘故障时重建 chunk。</td>
+<td>持续后台工作。</td>
+</tr>
+<tr>
+<td>ACL 服务</td>
+<td>Bucket 策略和 IAM 检查。</td>
+<td>同步拦截门控。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-model">数据模型</h3>
+<h4 id="object-metadata">对象元数据</h4>
+<pre><code class="language-text">ObjectMeta(
+  bucket,
+  key,
+  version_id,
+  size,
+  etag,                  // hash of content
+  storage_class,         // standard, IA, glacier
+  placement_refs,        // list of (storage_node_id, chunk_id)
+  encryption,
+  acl,
+  created_at,
+  user_metadata
+)
+</code></pre>
+<h4 id="bucket">Bucket</h4>
+<pre><code class="language-text">Bucket(
+  bucket_id,
+  name,
+  region,
+  owner_account,
+  versioning_enabled,
+  lifecycle_policies,
+  replication_config,
+  default_acl,
+  created_at
+)
+</code></pre>
+<h4 id="storage-chunk">存储 Chunk</h4>
+<pre><code class="language-text">Chunk(
+  chunk_id,              // content-addressed or random
+  storage_node_id,
+  bucket,
+  key,                   // for repair
+  offset,                // within object
+  size,
+  checksum,
+  erasure_index?         // for EC chunks
+)
+</code></pre>
+<h3 id="apis-s3-compatible">API（S3 兼容）</h3>
+<pre><code class="language-text">PUT    /{bucket}/{key}
+GET    /{bucket}/{key}
+DELETE /{bucket}/{key}
+HEAD   /{bucket}/{key}
+GET    /{bucket}?prefix=&amp;delimiter=&amp;marker=&amp;max-keys=
+
+# Multipart
+POST   /{bucket}/{key}?uploads           # initiate
+PUT    /{bucket}/{key}?partNumber=&amp;uploadId=
+POST   /{bucket}/{key}?uploadId          # complete (list of parts + etags)
+</code></pre>
+<h3 id="durability-and-erasure-coding">持久性与纠删码</h3>
+<p>11 个 9 意味着每 10^11 个对象中丢失 1 个。实现这一目标需要：</p>
+<ul>
+<li>将 chunk 跨可用区分散（独立故障域）。</li>
+<li>纠删码（例如 10+4 Reed-Solomon）：将对象分成 10 个数据 chunk + 4 个奇偶校验 chunk；可容忍任意 4 个 chunk 丢失；存储开销为 1.4 倍，而三副本为 3 倍。</li>
+<li>对于小对象，副本方式可能比纠删码开销更低。</li>
+</ul>
+<p>放置策略：</p>
+<ul>
+<li>对于每个对象，在至少 3 个 AZ 中选取 N+M 个存储节点。</li>
+<li>确保同一对象的任意两个 chunk 不共享同一 AZ 内的机架。</li>
+<li>后台修复：当节点故障时，从存活 chunk 在健康节点上重新生成其 chunk。</li>
+</ul>
+<p>面试用语：</p>
+<blockquote>
+<p>持久性通过将 chunk 跨故障域分散以及纠删码共同实现。数学上：chunk 跨 3 个 AZ 分布并采用 Reed-Solomon 10+4，在修复完成前丢失超过 4 个 chunk 的概率极小。</p>
+</blockquote>
+<h3 id="write-path">写入路径</h3>
+<p>对于典型的 100 MB 以下 PUT：</p>
+<ol>
+<li>客户端带 key、内容和 header 向前端发起 PUT 请求。</li>
+<li>前端鉴权、检查 ACL，生成 request_id。</li>
+<li>在内容流式传入时计算内容哈希（etag）。</li>
+<li>纠删编码为 k+m 个 chunk。</li>
+<li>放置服务跨 AZ 选取 k+m 个存储节点。</li>
+<li>前端并行写入 chunk；等待 quorum（或全部完成）。</li>
+<li>所有 chunk 写入并确认后，前端提交至元数据服务： <code>(bucket, key, version) -&gt; chunk_refs</code>.</li>
+<li>元数据写入返回；向客户端发送 ACK。</li>
+</ol>
+<p>为实现强读后写一致性，元数据提交必须在客户端收到成功响应之前对所有读取方可见。这通常意味着元数据服务通过共识协议进行写入。</p>
+<h3 id="multipart-upload-for-large-objects">分片上传（针对大对象）</h3>
+<p>对于 100 MB 至 5 TB 的对象：</p>
+<ol>
+<li>客户端发起分片上传，获取 <code>uploadId</code>.</li>
+<li>并行上传各分片；每个分片独立存储。</li>
+<li>每个分片有自己的放置位置和 etag。</li>
+<li>所有分片上传完成后，客户端调用 complete 并传入（partNumber, etag）列表。</li>
+<li>元数据服务将该对象记录为多个分片的组合。</li>
+<li>客户端 GET 时检索组合信息并按顺序流式传输各分片。</li>
+</ol>
+<p>优点：</p>
+<ul>
+<li>可恢复：失败的分片可独立重试。</li>
+<li>并行：多个分片可同时上传。</li>
+<li>内存有界：服务端无需缓冲整个对象。</li>
+</ul>
+<h3 id="read-path">读取路径</h3>
+<ol>
+<li>客户端向前端发起 GET 请求。</li>
+<li>认证与 ACL 检查。</li>
+<li>前端向元数据服务查询对象的分块布局。</li>
+<li>前端并行从存储节点读取分块。</li>
+<li>若使用 EC：从 k+m 个分块中的任意 k 个重建；可容忍节点缓慢或故障。</li>
+<li>将字节流传输给客户端。</li>
+</ol>
+<p>对于热门对象，前端可短暂缓存分块内容；或在前方部署 CDN。</p>
+<h3 id="listing">房源</h3>
+<p>LIST 是最痛苦的操作：按键的字典序排列，分页返回。</p>
+<p>实现方式：</p>
+<ul>
+<li>每个存储桶维护一个以对象键为索引的类 B-tree 索引。</li>
+<li>范围扫描从 <code>marker</code> 处对 <code>max-keys</code> 条目。</li>
+<li>按键范围分片；范围扫描在必要时跨分片进行。</li>
+</ul>
+<p>性能：</p>
+<ul>
+<li>LIST 远慢于 GET/PUT。</li>
+<li>建议客户尽量减少 LIST 操作，并对结果进行缓存。</li>
+</ul>
+<p>热点存储桶（数百万个键）：将存储桶的键空间划分为多个范围，每个范围对应独立的元数据分片。</p>
+<h3 id="consistency-model">一致性模型</h3>
+<p>现代 S3（2020 年后）：</p>
+<ul>
+<li>新对象的强读后写一致性。</li>
+<li>覆盖写和删除的强一致性。</li>
+<li>不再出现"列表显示旧数据、GET 返回新数据"的问题。</li>
+</ul>
+<p>实现方式：</p>
+<ul>
+<li>元数据服务具备强一致性（每个范围通过共识协议维护）。</li>
+<li>LIST 查询强一致性索引。</li>
+<li>前端协调写入，仅在元数据提交后才向客户端返回 ACK。</li>
+</ul>
+<h3 id="hot-prefix-handling">热点前缀处理</h3>
+<p>元数据服务按键前缀进行分区。当存储桶中数百万次写入的键均以 <code>logs/2024/01/</code> 开头时，会将某一分片固定下来。</p>
+<p>缓解措施：</p>
+<ul>
+<li>客户指导：对高吞吐量场景使用哈希前缀。</li>
+<li>自适应分区：S3 自动拆分热点前缀。</li>
+<li>预热：针对已知高吞吐量的存储桶联系 AWS。</li>
+</ul>
+<h3 id="scaling-and-partitioning">扩展与分区</h3>
+<table>
+<thead>
+<tr>
+<th>数据</th>
+<th>分区键</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>对象元数据</td>
+<td>每个存储桶的键范围</td>
+<td>按前缀列举；范围扫描。</td>
+</tr>
+<tr>
+<td>对象分块</td>
+<td>存储节点哈希</td>
+<td>分散负载。</td>
+</tr>
+<tr>
+<td>存储桶级元数据</td>
+<td>存储桶 ID</td>
+<td>每存储桶配置。</td>
+</tr>
+<tr>
+<td>ACL</td>
+<td>账号 + 存储桶</td>
+<td>IAM 查询。</td>
+</tr>
+<tr>
+<td>复制队列</td>
+<td>时间 + 存储桶</td>
+<td>按存储桶处理。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="failure-modes-and-mitigations">故障模式与缓解措施</h3>
+<table>
+<thead>
+<tr>
+<th>故障模式</th>
+<th>缓解措施</th>
+<th>监控指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>磁盘故障。</td>
+<td>纠删码可容忍故障；后台修复。</td>
+<td>磁盘故障率；重建积压。</td>
+</tr>
+<tr>
+<td>可用区故障。</td>
+<td>分块跨可用区分布；服务从剩余节点继续提供。</td>
+<td>可用区可用性；仲裁大小。</td>
+</tr>
+<tr>
+<td>热点前缀。</td>
+<td>自适应分区；客户指导。</td>
+<td>每前缀 QPS。</td>
+</tr>
+<tr>
+<td>元数据分片热点。</td>
+<td>子分片；缓存热门读取。</td>
+<td>每分片 QPS。</td>
+</tr>
+<tr>
+<td>存储节点缓慢。</td>
+<td>从 EC 仲裁读取，跳过慢节点。</td>
+<td>每节点尾延迟。</td>
+</tr>
+<tr>
+<td>相关性故障（固件漏洞）。</td>
+<td>硬件多样化；分阶段滚动升级。</td>
+<td>跨可用区故障相关性。</td>
+</tr>
+<tr>
+<td>对象版本冲突。</td>
+<td>版本控制生成唯一的 version_id。</td>
+<td>版本冲突计数。</td>
+</tr>
+<tr>
+<td>分块上传未完成。</td>
+<td>垃圾回收过期的分片。</td>
+<td>过期上传时长。</td>
+</tr>
+<tr>
+<td>跨区域复制延迟。</td>
+<td>异步执行并进行监控；对延迟告警。</td>
+<td>复制延迟分布。</td>
+</tr>
+<tr>
+<td>ACL 漏洞导致数据泄露。</td>
+<td>纵深防御检查；审计日志。</td>
+<td>未授权访问尝试。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">运维指标</h3>
+<p>持久性：</p>
+<ul>
+<li>修复积压；磁盘故障后的修复时长。</li>
+<li>丢失对象事件（必须接近零）。</li>
+<li>跨可用区分块分布。</li>
+</ul>
+<p>容量：</p>
+<ul>
+<li>按地区的 PUT/GET QPS。</li>
+<li>按操作的延迟 p50/p99。</li>
+<li>存储增长。</li>
+<li>每前缀 QPS。</li>
+</ul>
+<p>业务层面：</p>
+<ul>
+<li>每客户存储量。</li>
+<li>每客户请求量。</li>
+<li>出口带宽。</li>
+</ul>
+<h3 id="multi-region-strategy">多区域策略</h3>
+<ul>
+<li>每个地区独立运行。</li>
+<li>跨地区复制按存储桶选择性开启；PUT 操作异步复制到对等地区。</li>
+<li>复制可以是单向或双向的。</li>
+<li>存储桶以地区为范围；每个地区每个存储桶独立维护键命名空间。</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">需要指出的权衡</h3>
+<ul>
+<li>纠删码相比复制具有更高的持久性且存储开销更低，但会增加 CPU 消耗和读取复杂度。</li>
+<li>强一致性会增加元数据写入延迟，但可消除一类用户错误。</li>
+<li>按前缀分区使列举操作更快，但会产生热点前缀瓶颈。</li>
+<li>版本控制以存储成本换取历史保留。</li>
+<li>跨地区复制代价高昂；通常按需选择性开启。</li>
+<li>小对象的元数据开销占比偏高；聚合小对象有助于改善。</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">常见陷阱与更优做法</h3>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>全量三副本复制。</td>
+<td>大对象使用纠删码；小对象使用复制。</td>
+</tr>
+<tr>
+<td>单一元数据服务。</td>
+<td>按键范围分片；每分片通过共识协议维护。</td>
+</tr>
+<tr>
+<td>最终一致性。</td>
+<td>通过元数据共识实现强读后写一致性。</td>
+</tr>
+<tr>
+<td>像对待 GET 一样对待 LIST。</td>
+<td>LIST 代价高昂；鼓励稀少使用。</td>
+</tr>
+<tr>
+<td>忽视相关性故障。</td>
+<td>硬件多样化；分阶段固件滚动升级。</td>
+</tr>
+<tr>
+<td>单可用区分块。</td>
+<td>至少跨 3 个可用区分散。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">面试官可能深入探讨的方向</h3>
+<table>
+<thead>
+<tr>
+<th>深入方向</th>
+<th>优秀回答要点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>持久性数学</td>
+<td>纠删码比率；故障概率；修复时间。</td>
+</tr>
+<tr>
+<td>分块上传</td>
+<td>发起、上传分片、完成；并行性；可恢复性。</td>
+</tr>
+<tr>
+<td>强一致性</td>
+<td>元数据共识；提交后再 ACK。</td>
+</tr>
+<tr>
+<td>热点前缀</td>
+<td>自适应分区；客户端哈希键。</td>
+</tr>
+<tr>
+<td>纠删码 vs 复制</td>
+<td>按对象大小权衡。</td>
+</tr>
+<tr>
+<td>跨地区复制</td>
+<td>异步 PUT；冲突处理。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff 级别回答检查清单</h3>
+<ul>
+<li>两个服务：元数据服务 + 数据平面。</li>
+<li>跨可用区纠删码保障持久性。</li>
+<li>通过共识协议实现强一致性元数据。</li>
+<li>针对大对象的分片上传。</li>
+<li>自适应分区处理热点前缀。</li>
+<li>生命周期与存储分层。</li>
+<li>异步跨地区复制。</li>
+<li>后台修复应对磁盘故障。</li>
+</ul>
+<h3 id="interview-phrase">面试用语</h3>
+<blockquote>
+<p>S3 由元数据服务和数据平面组成。数据平面通过跨可用区纠删码和持续后台修复实现 11 个九的持久性。元数据服务在每个键范围内强一致。最难的扩展问题是热点前缀和相关性故障下的持久性；解决方案是自适应分区和多样化故障域。</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. 模拟面试</h2>
+<p><strong>面试官：</strong> 设计 S3。</p>
+<p><strong>候选人：</strong> 我将设计两个服务：元数据服务（将对象键映射到数据布局）和数据平面（使用跨可用区纠删码存储对象字节）。核心不变量是持久性——每次成功的 PUT 都能在任意单可用区故障中存活，目标是 11 个九。自 2020 年更新以来支持读后写强一致性。我将逐一介绍 PUT、GET、分块上传和持久性计算。</p>
+<p><strong>面试官：</strong> 带我了解一次 PUT 操作。</p>
+<p><strong>候选人：</strong> 客户端发送携带键和字节的 PUT 请求。前端认证、检查 ACL、流式接收数据并计算 etag。字节被纠删编码为 k+m 个分块——例如 10 个数据分块加 4 个奇偶校验分块。布局服务选取 14 个存储节点，分散在至少 3 个可用区中。前端并行写入分块；全部确认后，向元数据服务提交： <code>(bucket, key, version_id) -&gt; chunk_refs</code>。元数据提交在每个键范围内通过共识协议完成。提交成功后，向客户端返回 ACK。</p>
+<p><strong>面试官：</strong> 为何选择纠删码而非三副本复制？</p>
+<p><strong>候选人：</strong> 存储开销。三副本复制是 3× 开销。Reed-Solomon 10+4 是 1.4× 开销，持久性相当。对于大对象，在 PB 级别差异巨大。对于小对象，EC 的元数据开销可能超过节省；有时复制更优。现代 S3 采用混合方案。</p>
+<p><strong>面试官：</strong> 11 个九——如何实现？</p>
+<p><strong>候选人：</strong> 将分块跨 3 个可用区分散。使用 Reed-Solomon 10+4，在数据丢失前可容忍 4 个分块损失。可用区是独立的故障域。在持续后台修复的情况下，修复完成前丢失 5 个分块的概率极低。具体计算：假设磁盘 MTBF 为 100 万小时，修复时间 1 小时，14 个分块跨 3 个可用区——一年内的综合概率远低于 10^-11。硬件和固件多样化可降低相关性故障风险。</p>
+<p><strong>面试官：</strong> 带我过一遍 GET 流程。</p>
+<p><strong>候选人：</strong> 客户端向前端发起 GET。认证 + ACL 校验。元数据查询返回 chunk_refs。前端并行从存储节点读取分块。由于使用了 EC，任意 k 个分块（14 个中的 10 个）即可重建。我们向全部 14 个节点发起读取，取最先完成的 10 个，这自然地缓解了尾延迟。将字节流传输给客户端。</p>
+<p><strong>面试官：</strong> 1 TB 的对象——如何处理？</p>
+<p><strong>候选人：</strong> 分块上传。客户端发起请求并获取 uploadId。并行上传分片（例如，每片 100 MB，共 10,000 片）。每个分片独立存储——拥有自己的纠删编码分块。客户端重试失败的分片。所有分片完成后，客户端发送包含 (partNumber, etag) 列表的完成请求。元数据服务将对象记录为多分片的组合。GET 通过顺序或并行读取各分片来重建。</p>
+<p><strong>面试官：</strong> 强一致性——如何实现？</p>
+<p><strong>候选人：</strong> 元数据服务在每个键范围内通过共识协议（键范围副本集内的 Paxos 或 Raft）实现强一致性。成功的 PUT 提交后，任何后续 GET 都能看到新版本。LIST 查询同一个强一致性索引。2020 年以前，S3 对新键删除后采用最终一致性；现代 S3 已修复此问题。</p>
+<p><strong>面试官：</strong> 某客户每秒写入 100,000 个对象，所有键均以 <code>logs/2024/01/</code>开头。会发生什么？</p>
+<p><strong>候选人：</strong> 所有这些写入都打到拥有该前缀范围的元数据分片。热点出现。缓解措施：自适应分区——S3 自动检测热点前缀并将范围拆分到更多分片。客户指导：使用哈希前缀分散负载。对于已知的高吞吐量存储桶，提前预分区。我们监控每前缀 QPS 并告警。</p>
+<p><strong>面试官：</strong> 磁盘发生故障。会发生什么？</p>
+<p><strong>候选人：</strong> 该磁盘上的分块丢失。后台修复检测到并从每个受影响对象的剩余 k 个分块中重建，写入健康节点。修复持续进行；积压受到监控。在修复完成之前，GET 仍然有效，因为我们还有剩余的 k+m-1 个分块（仍高于 k 的阈值）。</p>
+<p><strong>面试官：</strong> 版本控制？</p>
+<p><strong>候选人：</strong> 按存储桶开关控制。启用后，对已有键的每次 PUT 都会创建新的 version_id，而非覆盖。元数据服务按 <code>(bucket, key, version_id)</code>建立索引。DELETE 创建删除标记；对象可以被恢复。生命周期策略可以使旧版本过期。</p>
+<p><strong>面试官：</strong> 生命周期？</p>
+<p><strong>候选人：</strong> 按存储桶策略：例如，"30 天后迁移至低频访问，1 年后迁移至 Glacier，7 年后删除。"生命周期服务每日运行，扫描存储桶索引，执行迁移。迁移至 Glacier 可能涉及针对不同存储类别以不同的持久性/延迟权衡重新编码。</p>
+<p><strong>面试官：</strong> 跨地区复制？</p>
+<p><strong>候选人：</strong> 按存储桶配置：源地区 → 目标地区。每次 PUT 在元数据提交后，复制服务将一个副本加入队列。对等地区通过内部 API 接收对象。异步执行；延迟通常为秒级到分钟级。监控复制延迟。</p>
+<p><strong>面试官：</strong> 列举拥有数十亿对象的存储桶？</p>
+<p><strong>候选人：</strong> LIST 是最难的操作。元数据服务为每个存储桶维护一个有序的类 B-tree 索引。从标记位置进行最多 max-keys 条目的范围扫描。若键跨越多个分片，前端负责拼接结果。我们强烈建议客户使用特定前缀来限制扫描范围，并进行分页。</p>
+<p><strong>面试官：</strong> 总结。</p>
+<p><strong>候选人：</strong> S3 = 元数据 + 数据平面。跨可用区纠删码实现 11 个九。元数据通过共识协议在每个键范围内强一致。分块上传处理大对象。自适应分区处理热点前缀。后台修复应对持续的磁盘故障。生命周期和复制是异步流水线。强一致性于 2020 年通过在 ACK 前同步提交元数据引入。</p>
+<h2 id="3-practice-notes">3. 练习备注</h2>
+<h3 id="five-minute-version">五分钟版本</h3>
+<ol>
+<li>明确：持久性、吞吐量、分块上传、一致性。</li>
+<li>不变量：11 个九持久性；强读后写。</li>
+<li>两个服务：元数据服务 + 数据平面。</li>
+<li>跨 3 个可用区的纠删码；例如 RS 10+4。</li>
+<li>针对大对象的分片上传。</li>
+<li>通过元数据共识实现强一致性。</li>
+<li>自适应分区处理热点前缀。</li>
+<li>后台修复；生命周期；跨地区复制。</li>
+</ol>
+<h3 id="one-minute-closeout">一分钟结尾陈述</h3>
+<blockquote>
+<p>S3 由元数据服务和数据平面组成。数据平面通过跨可用区纠删码和持续后台修复实现 11 个九。元数据服务在每个键范围内强一致；PUT 仅在元数据提交后才返回 ACK。分块上传支持最大 5 TB 的对象。自适应分区处理热点前缀；客户端使用哈希键的指导有所帮助。生命周期和跨地区复制是异步流水线。持久性在相关性故障下是最难的正确性问题；解决方案是多样化故障域和持续修复。</p>
+</blockquote>
+<h3 id="best-interview-phrases">最佳面试用语</h3>
+<ul>
+<li>"跨可用区纠删码以低于复制的存储开销实现持久性。"</li>
+<li>"强一致性要求在 PUT ACK 前完成元数据提交。"</li>
+<li>"分块上传是大对象的必要方式；并行且可恢复。"</li>
+<li>"热点前缀通过自适应分区和客户端键哈希来缓解。"</li>
+<li>"持续后台修复使磁盘的持续故障对用户不可见。"</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

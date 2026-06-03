@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>ChatGPT — Conversational LLM Service (walkthrough) — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">ChatGPT — Conversational LLM Service (walkthrough)</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<p><strong>难度：</strong> Hard · <strong>总耗时：</strong> ~45 min · <strong>框架：</strong> Hello Interview Delivery</p>
+<p><strong>一句话场景：</strong> 构建 ChatGPT。用户输入提示词，我们将其路由至大语言模型（LLM），逐 token 流式返回响应，并持久化对话。每次请求消耗大量 GPU 算力。假设 1 亿用户、每天 1 亿次对话，峰值约 1 万路并发生成流。GPU 经济性与首 token 时间（TTFT）主导整体设计。</p>
+<hr/>
+<h2 id="1-requirements-5-min">1. 需求（约 5 分钟）</h2>
+<p><strong>功能需求</strong>
+- 用户在对话中发送提示词，接收流式响应。\n- 对话历史持久化，可恢复任意历史对话。\n- 应用对话级上下文（历史记录 + 系统提示词）。</p>
+<p>我会推迟实现按用户微调、函数调用/工具调用以及深度多模态输入。</p>
+<p><strong>非功能需求</strong>
+- <strong>Time-to-first-token (TTFT)</strong> p95 &lt; 1 秒——用户必须快速看到响应。\n- <strong>Tokens-per-second (TPS)</strong> ≥ 30（流式输出期间）——体感流畅。\n- 支撑 1 万路并发活跃流，峰值可达 3 万路。\n- 对话历史强一致性（轮次顺序保证）。\n- 多租户隔离——一个用户的请求不得访问另一用户的数据。</p>
+<p><strong>容量估算</strong>
+- 每天 1 亿次对话 × 约 5 轮 × 约 500 个生成 token = 每天 2500 亿 token。\n- GPU 成本主导一切其他因素。\n- 对话存储并非难点：每天 5 亿轮次 × 每轮约 2 KB 的文本/元数据 ≈ 每天 1 TB（未含副本）。主要成本在于活跃 token 生成所需的 GPU 内存与算力。</p>
+<hr/>
+<h2 id="2-core-entities-2-min">2. 核心实体（约 2 分钟）</h2>
+<ul>
+<li><strong>User</strong>.</li>
+<li><strong>Conversation</strong> — <code>conversation_id, user_id, system_prompt, created_at</code>.</li>
+<li><strong>Turn</strong> — <code>(conversation_id, idx, role, content, tokens)</code>。仅追加。</li>
+<li><strong>GenerationRequest</strong> — <code>request_id, prompt_tokens, response_tokens, model, status</code>.</li>
+<li><strong>模型</strong> — <code>model_id, params, deployment, version</code>.</li>
+</ul>
+<hr/>
+<h2 id="3-api-5-min">3. API（约 5 分钟）</h2>
+<pre><code>POST /v1/conversations                                                          → { conversation_id }
+POST /v1/conversations/{id}/messages   { content, model? }   (Server-Sent Events) → streamed tokens
+GET  /v1/conversations/{id}                                                     → { turns[] }
+</code></pre>
+<p>流式传输采用 SSE 或 chunked HTTP；WebSocket 作为备选。消息 POST 接口携带幂等键，防止重试导致重复计费或重复生成。</p>
+<p>消息 POST 在路由推理请求前先存储用户轮次，并返回带有单调递增 <code>token_seq</code>的流式事件。携带相同幂等键的重试要么重新挂接到进行中的流，要么返回已完成的 assistant 轮次。</p>
+<hr/>
+<h2 id="5-high-level-design-1015-min">5. 高层设计（约 10–15 分钟）</h2>
+<h3 id="system-components-diagram">系统组件图</h3>
+<pre><code>       +-----------------------------+
+       | CLIENT                      |
+       | browser / mobile app        |
+       +------+----------+-----------+
+        |          |
+    POST /v1/conversations|          | GET /v1/conversations/{id}
+    POST /v1/conversations/{id}/messages (SSE)
+        |          |
+        v          v
+       +----------------+  +----------------+  +--------------------+
+       | API Gateway    |-&gt;| Conversation   |-&gt;| Prompt Assembly    |
+       | auth, quota,   |  | Service        |  | history + summary  |
+       | SSE connection |  | append turns   |  | + system prompt    |
+       +-------+--------+  +--------+-------+  +---------+----------+
+         |                    |                    |
+         |                    |                    v
+         |                    |          +--------------------+
+         |                    |          | Inference Router   |
+         |                    |          | sticky conv +      |
+         |                    |          | prefix-aware pick  |
+         |                    |          +---------+----------+
+         |                    |                    |
+         |                    | assign / token stream
+         |                    v                    v
+       +------------------------------------------------------------+
+       | STORE / CACHE GROUP                                       |
+       | Cassandra/Dynamo (conversation_id, turn_idx) turn log      |
+       | summary:{conversation_id}:{version} compressed history     |
+       | idem:{user_id}:{key}, conv_sticky:{conversation_id}        |
+       | prefix:{model_id}:{hash}, stream:{request_id} replay buf   |
+       | worker-local KV block table, 16-token GPU blocks           |
+       +---------------------+----------------------+---------------+
+           ^                      |
+           | history/cache miss   | prefix miss -&gt; load-only route
+           | reads durable turns  v
+       +---------------------+--------+    +------------------------+
+       | GPU Worker Pool (vLLM)       |---&gt;| Streaming Safety       |
+       | continuous batching, paged KV|    | Filter -&gt; Gateway SSE  |
+       +--------------+---------------+    +------------------------+
+          |
+          v
+       +------------------------------------------------------------+
+       | ASYNC / CONTROL ROW                                       |
+       | usage_events[tenant_id] -&gt; billing, model registry -&gt;      |
+       | workers, autoscaler -&gt; warm pool, moderation side checks   |
+       +------------------------------------------------------------+
+</code></pre>
+<ol>
+<li><strong>API Gateway。</strong> 负责认证、按租户限流、执行输入侧内容审核，并维持对客户端的 SSE 连接。幂等键用于去重重试请求。</li>
+<li><strong>Conversation service。</strong> 将对话元数据和轮次持久化存储于分片 LSM 存储中——Cassandra 或 DynamoDB，以 <code>conversation_id</code> 与 <code>turn_idx</code> 作为聚簇/排序键。技术选型由访问模式驱动：写入以追加为主（LSM 优于 B+ tree），读取始终是"某对话最近 N 轮"（单分区范围扫描，在 TTFT 预算内可控制在 &lt;10 ms），无 join，无跨对话事务，且需要在数十亿对话间水平扩展。PostgreSQL/MySQL 需要手动分片；S3 无法满足读延迟要求；Redis 不具备持久性。Cassandra 与 DynamoDB 在此场景可互换——按基础设施现状选择即可。</li>
+<li><strong>Prompt assembly。</strong> 将系统提示词、相关对话历史和新用户消息组合成适配模型上下文窗口的提示词。截断最旧的轮次；可选通过后台离线任务进行摘要压缩。</li>
+<li><strong>Inference router。</strong> 选择模型部署实例，找到可用的 GPU Worker。决策综合考虑 Worker 负载、对话亲和性以及 prefix-cache 索引（哪些 Worker 已在 KV cache 中持有该提示词的前缀）。</li>
+<li><strong>GPU worker pool。</strong> 每个 Worker 托管一个已部署的模型。执行 prefill（将提示词编码进 KV cache），然后进入连续批处理的 decode 循环，每次前向传播为所有活跃请求生成一个 token，并逐 token 回传。</li>
+<li><strong>Streaming safety filter。</strong> 小型模型对输出进行分类，采用回溯窗口机制；结果为通过/遮掩/中止。</li>
+<li><strong>Streaming proxy。</strong> Token 流路径：GPU Worker → 安全过滤器 → Router → Gateway → 客户端 SSE。若客户端消费慢，Gateway 最多缓冲约 1 MB 数据。</li>
+<li><strong>Token 用量/计费。</strong> 在流完成时计算（输入 token 数 + 输出 token 数 × 单 token 费率），并发送至用量统计管道。</li>
+<li><strong>存储。</strong> 对话轮次在最终确定后写入。完成时，持久化摘要及 token 计数。</li>
+</ol>
+<p><strong>端到端流程叙述。</strong> Alice 打开聊天 → 携带幂等键 POST 第一条消息 → 对话服务写入用户轮次 → 组装 prompt（系统 prompt + 用户轮次）→ 路由器查询前缀缓存索引："系统 prompt 块位于 worker W3 和 W7 上" → 选择 W7（负载更低）→ W7 执行 prefill（大量命中共享系统 prompt 块的缓存）→ decode 加入 W7 的连续批次 → token 以约 50 TPS 的速率流经安全过滤器 → 通过 SSE 推送至 Alice 的浏览器。流结束时，assistant 轮次写入对话历史，并发出用量事件。</p>
+<p>具体 API 路径：</p>
+<ol>
+<li>网关完成认证、检查租户 token 预算，并预留 <code>request:{request_id}</code> 使用幂等键。</li>
+<li>对话服务将用户轮次追加到 <code>(conversation_id, turn_idx)</code> 通过条件写入确保轮次顺序严格有序。</li>
+<li>Prompt 组装并行读取最近 N 轮对话及可选摘要，同时进行特性/配额读取。</li>
+<li>路由器检查 <code>conv_sticky:{conversation_id}</code> 。 <code>prefix:{prefix_hash}</code>；选择兼具 KV 局部性且 token 预算充足的 worker。</li>
+<li>Worker 将 token 流经安全过滤器。网关持久化一个小型环形缓冲区 <code>{request_id -&gt; last K tokens}</code> 用于流中途的重放。</li>
+<li>在 EOS 时，assistant 轮次、用量计数器和账单事件一并提交；幂等记录指向最终响应。</li>
+</ol>
+<p>恢复 / 历史读取路径：</p>
+<ol>
+<li>网关完成认证 <code>user_id</code> 并路由 <code>GET /v1/conversations/{id}</code> 以 <code>conversation_id</code>.</li>
+<li>对话服务从同一分区键中读取对话元数据行以及最新一页的轮次 <code>conversation_id</code>.</li>
+<li>旧页使用不透明游标 <code>{conversation_id, last_turn_idx, page_size, snapshot_version}</code> 以确保编辑/删除操作不影响分页偏移。</li>
+<li>与此同时，UI 可根据轮次附件 ID 从对象存储获取生成的资产或附件；文本历史不应等待大型二进制对象。</li>
+<li>若热点对话分区暂时不可用，读取路径可提供缓存快照用于展示，但消息追加必须快速失败或在每个对话的轮次锁后面排队。</li>
+</ol>
+<hr/>
+<h2 id="6-deep-dives-10-min">6. 深度探讨（约 10 分钟）</h2>
+<p><strong>GPU 调度——连续批处理是核心。</strong> 每次 GPU 前向传播为 <em>每个</em> 批次中的请求生成一个 token。静态批处理浪费 GPU——最慢的请求会阻塞其余请求；已完成的请求留下空槽。 <strong>迭代级调度</strong> （vLLM 的术语）：在每次前向传播时，调度器可以 (a) 丢弃已发出 EOS 的请求，(b) 接入 prefill 就绪的新请求，(c) 降级 KV 缓存不再适配的请求。最终效果：GPU 利用率约 80%+，而静态批处理仅约 30%。</p>
+<p>具体服务状态：</p>
+<table>
+<thead>
+<tr>
+<th>存储 / 状态</th>
+<th>键模式</th>
+<th>值 / 数据结构</th>
+<th style="text-align: right;">：当索引达到 50 GB 时滚动更新（每个分片）。</th>
+<th>TTL / 保留期</th>
+<th>分片键</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>对话轮次</td>
+<td><code>(conversation_id, turn_idx)</code></td>
+<td>role、content、token 计数</td>
+<td style="text-align: right;">平均约 2 KB/轮</td>
+<td>永久保留 / 用户删除</td>
+<td><code>conversation_id</code></td>
+</tr>
+<tr>
+<td>幂等性</td>
+<td><code>idem:{user_id}:{key}</code></td>
+<td>request_id、状态、响应指针</td>
+<td style="text-align: right;">约 200 B</td>
+<td>24 小时</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td>粘性路由</td>
+<td><code>conv_sticky:{conversation_id}</code></td>
+<td>worker_id、model_id</td>
+<td style="text-align: right;">~64 B</td>
+<td>30-120 s</td>
+<td><code>conversation_id</code></td>
+</tr>
+<tr>
+<td>前缀索引</td>
+<td><code>prefix:{model_id}:{hash}</code></td>
+<td>小型 worker_id 集合</td>
+<td style="text-align: right;">~100 B</td>
+<td>秒级，通过心跳刷新</td>
+<td><code>prefix_hash</code></td>
+</tr>
+<tr>
+<td>对话摘要</td>
+<td><code>summary:{conversation_id}:{version}</code></td>
+<td>压缩后的旧轮次</td>
+<td style="text-align: right;">约 4-20 KB</td>
+<td>直至被覆盖/删除</td>
+<td><code>conversation_id</code></td>
+</tr>
+<tr>
+<td>流重放缓冲区</td>
+<td><code>stream:{request_id}</code></td>
+<td>最近 K 个 token 事件 + 序列号</td>
+<td style="text-align: right;">约 10-100 KB</td>
+<td>请求时长 + 10 分钟</td>
+<td><code>request_id</code></td>
+</tr>
+<tr>
+<td>KV 缓存</td>
+<td>worker 本地块表</td>
+<td>16 token 的 GPU 块</td>
+<td style="text-align: right;">约 4.8 MB/块（70B FP16）</td>
+<td>请求生命周期</td>
+<td>worker 本地</td>
+</tr>
+<tr>
+<td>用量流</td>
+<td><code>usage_events[{partition}]</code></td>
+<td>token 计数 + 租户信息</td>
+<td style="text-align: right;">约 200 B/事件</td>
+<td>30-90 天</td>
+<td><code>tenant_id</code></td>
+</tr>
+</tbody>
+</table>
+<p>容量计算：10k 活跃流 × 8k 上下文 × 约 300 KB/token = 24 TB KV 缓存（若每个流都使用完整的 8k 上下文），这正是准入控制、前缀共享和缩短有效 prompt 至关重要的原因。一个 4×H100 pod 约有 180 GB 可用 KV 缓存，可支持约 75 个满 8k 上下文的流；10k 流意味着在留有余量之前需要约 130 个此类 pod。这是主要成本；与 GPU 相比，Cassandra/Dynamo 存储的开销微不足道。</p>
+<p>GPU 之外的存储计算：500M 轮次/天 × 约 2 KB × 3 副本 ≈ 压缩前 3 TB/天，因此 90 天热历史窗口约为数百 TB，仍比 GPU 服务成本低。幂等性存储：100M 消息请求/天 × 200 B × 24 h ≈ 额外开销前 20 GB。重放缓冲区受并发数限制：30k 活跃流 × 100 KB ≈ 3 GB 加上副本。前缀索引状态很小；开销主要来自其所指向的 worker 本地 KV 块。</p>
+<p>同一对话数据存在两种视图。仅追加的轮次日志是审计、排序和用户可见历史的唯一事实来源。prompt 视图是由最新轮次 + 摘要 + 检索片段组成的物化服务视图；它允许有损且可再生，但必须始终引用一个 <code>snapshot_version</code> 以便重试时使用相同的上下文。</p>
+<p>微妙之处：prefill（一次性编码整个 prompt）和 decode（每次一个 token）的计算特征差异极大，简单混合会产生问题。 <strong>分块 prefill</strong> 将长 prompt 的 prefill 拆分到 N 次前向传播中，使每次迭代的计算量均衡——其他请求的 decode 不必等待一次巨大的 prefill。</p>
+<p><strong>KV 缓存管理（PagedAttention）。</strong> 在 decode 阶段，每个请求持有一个 key/value 缓存：大约 <code>2 × layers × kv_heads × head_dim × seq_len × dtype_bytes</code> ≈ <strong>约 300 KB/token</strong> 在使用 Grouped Query Attention 的 70B FP16 模型上。8k 上下文时每个请求约需 2.4 GB。朴素的连续分配（每个请求一个最大尺寸的块）会浪费 60–80% 的 GPU 显存。</p>
+<p><strong>PagedAttention (vLLM)</strong> 将 KV 缓存视为虚拟内存：\n- 固定大小的 <strong>16 token 的块</strong> 位于物理 GPU 显存中。\n- 每个请求持有一个 <strong>页表</strong> 将逻辑位置映射到物理块。\n- 块按需分配，随着生成推进动态申请。无外部碎片；同一 GPU 上可支持约 4× 更多并发请求。\n- <strong>通过写时复制实现前缀共享。</strong> 若两个请求共享 prompt 前缀（例如，10k 用户共享同一个 2k token 的系统 prompt），则前缀块在物理上共享。对前缀 token 取哈希以查找共享块。当请求需要分叉（写入自己的 token）时，复制该块。效果：前缀存储从 O(用户数) 降为 O(1)。</p>
+<p>驱逐（驱逐请求的块，稍后重新 prefill）代价高昂——准入控制应尽量避免其发生。</p>
+<p><strong>首 token 时间（TTFT）——预算拆解。</strong> 目标 p95 &lt; 1 s。各组件耗时：\n- 认证 + 限流 + 输入审核：约 20 ms\n- 对话历史读取：约 10 ms（副本读取）\n- Prompt 组装：约 5 ms\n- 路由器 → worker 切换：约 5 ms\n- <strong>Worker 上的队列等待：</strong> 可变；高负载下的主要耗时项\n- <strong>Prefill 计算：</strong> 70B 模型每 1k prompt token 约 50 ms（与长度线性相关）\n- 首 token decode：约 30 ms</p>
+<p>这为队列 + prefill 留下了约 900 ms 的预算。后续深入分析的重点就是如何将队列 + prefill 控制在这一范围内。</p>
+<p><strong>Worker 预热——具体方法，而非仅仅"避免冷启动"。</strong>
+- <strong>镜像内嵌权重。</strong> 容器镜像（或 sidecar 卷）携带模型权重，启动时一次性落盘到节点本地 NVMe。避免在每次扩容时从对象存储拉取 60+ GB（这是 30 秒与 10 分钟启动时间的差距所在）。\n- <strong>热池 / 保底数量。</strong> 自动扩缩器为每个模型始终保持最低 <em>N</em> 个 worker 处于已加载状态——绝不缩容至零。保底数量根据低峰期 QPS 确定。\n- <strong>合成预热 prompt。</strong> 模型加载后，worker 运行少量伪 prompt（数百 token）以 JIT 编译 CUDA kernel、填充 cuBLAS 启发式缓存并触发 TensorRT 自动调优。vLLM 默认在启动时执行此操作。跳过预热 → 第一个真实 prompt 的 prefill 成本是稳态的 2–5 倍。\n- <strong>健康门控。</strong> Worker 在预热完成且稳态基准测试通过之前不向路由器注册。新 worker 不会污染延迟分布。\n- <strong>抢先扩容。</strong> 当池子 token 预算压力达到约 70% 时，自动扩缩器触发新 worker。模型加载 + 预热约需 30–60 s——在达到饱和之前提前供给，意味着 worker 在 <em>之前</em> 现有池满载之前就已就绪。\n- <strong>候选池。</strong> 一组已加载模型但被排除在活跃 LB 轮询之外的节点。晋升仅需切换配置——亚秒级——远快于完整供给流程。</p>
+<p><strong>KV 缓存与前缀局部性的粘性路由。</strong>
+- <strong>对话粘性。</strong> 路由器将 <code>conv_id → worker_id</code> 保存在快速存储中（Redis，TTL 约几秒）。后续轮次路由到同一 worker，以便复用其对先前轮次的 KV 缓存——节省续写时的完整 prefill 开销。粘性窗口故意设置较短（worker 会轮换）；未命中时，新 worker 重新执行 prefill。\n- <strong>前缀缓存索引。</strong> 路由器维护一个小型全局索引 <code>prefix_hash → [workers holding it]</code>。对于新请求，以 16 token 为窗口对 prompt 前缀取哈希，查找已持有这些块的 worker，并优先选择其中之一。即使对于共享系统 prompt 的全新对话（大多数情况如此），也能节省 prefill 开销。\n- <strong>迁移。</strong> 若所属 worker 过载，执行 <em>感知前缀的迁移</em>：新目标 worker 很可能已持有部分前缀（系统 prompt 块是通用的）。比完整重启请求便宜得多。</p>
+<p><strong>投机解码（适合的负载下吞吐量提升 2–3×）。</strong> 一个小型 <strong>草稿模型</strong> （例如 1B 参数）提议接下来的 <em>k</em> 个 token（k ≈ 4–8）。 <strong>目标模型</strong> （例如 70B）在一次前向传播中验证全部 <em>k</em> ——与否则只生成一个 token 的传播相同。 <strong>拒绝采样</strong> 保留与目标模型分布相匹配的最长前缀。若平均接受长度为 <em>n</em>，吞吐量倍率约为 <code>n / (k+1) × cost(target) / cost(target + draft)</code>。在结构化输出（代码、事实性回答）上收益显著；创意写作上收益较小。 <strong>Medusa 变体：</strong> 在目标模型本身添加多个解码头——无需独立的草稿模型——以约 2× 的加速比降低基础设施复杂度。</p>
+<p><strong>基于 token 预算而非请求数的准入控制。</strong> GPU 工作的单位是 token，而非请求。每个 worker 暴露"剩余 token 预算" = <code>(free KV blocks) × (block size)</code>。路由器仅在满足以下条件时接入请求： <code>(input_tokens + max_output_tokens) ≤ remaining budget</code>。若没有 worker 有预算且预计队列等待将超过 TTFT，立即返回 503 + <code>Retry-After</code> ——好过占用客户端连接直至超时。 <strong>两条队列</strong>：短输出（&lt;200 token，快速通道）与长文本（慢速通道），防止一次聊天排在 4k token 文章后面。</p>
+<p>负载降级状态：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>模式</th>
+<th>来源 / 动作</th>
+<th>用户影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>正常</td>
+<td>缓存本地路由</td>
+<td>命中粘性 worker 或前缀</td>
+<td>TTFT &lt;1 s</td>
+</tr>
+<tr>
+<td>暖缺失</td>
+<td>重新 prefill</td>
+<td>路由至负载最低的 worker</td>
+<td>TTFT 随 prompt 长度上升</td>
+</tr>
+<tr>
+<td>过载</td>
+<td>按 token 预算排队</td>
+<td>短通道和付费层优先</td>
+<td>部分请求等待</td>
+</tr>
+<tr>
+<td>饱和</td>
+<td>提前拒绝</td>
+<td>503 + <code>Retry-After</code> 在 SSE 开始之前</td>
+<td>无隐性 GPU 消耗</td>
+</tr>
+<tr>
+<td>worker 丢失</td>
+<td>重放或重新生成</td>
+<td>prompt + 已发出 token 的环形缓冲区</td>
+<td>短暂停顿或重新生成 UI</td>
+</tr>
+</tbody>
+</table>
+<p>冷启动与边缘状态处理：</p>
+<table>
+<thead>
+<tr>
+<th>边缘</th>
+<th>设计方案</th>
+<th>预算</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>摘要过期后恢复的休眠对话</td>
+<td>读取轮次日志，异步重建摘要，先从最近 N 轮生成</td>
+<td>生成前额外增加 100-500 ms</td>
+</tr>
+<tr>
+<td>极长 prompt 耗尽上下文窗口</td>
+<td>确定性截断：系统 prompt、近期轮次、固定事实，再加摘要</td>
+<td>无静默溢出</td>
+</tr>
+<tr>
+<td>热点租户大量发起长文本生成</td>
+<td>token 预算配额及针对长输出的慢速通道</td>
+<td>保障付费用户/短对话的 TTFT</td>
+</tr>
+<tr>
+<td>多区域漂移</td>
+<td>将对话写入路由到归属 region；读副本携带版本水位线提供历史服务</td>
+<td>无乱序轮次</td>
+</tr>
+<tr>
+<td>模型冷启动</td>
+<td>worker 在权重加载完成且预热基准测试通过前不加入路由器</td>
+<td>无首用户延迟毛刺</td>
+</tr>
+</tbody>
+</table>
+<p><strong>面试核心要点：</strong> 同一轮次日志服务于两个产品：为用户提供精确历史，为模型提供紧凑的 prompt 视图；二者分离使我们能够优化延迟而不损害对话的真实性。</p>
+<p><strong>为何选择 SSE。</strong> Server-Sent Events 已足够，因为服务器发送的是单向 token 流，取消只需关闭连接。WebSocket 适用于更丰富的双向工具，但对于基础聊天，它增加了连接状态的复杂性，却无法改善 token 延迟。</p>
+<p><strong>流式协议——SSE 细节。</strong> HTTP 响应携带 <code>Content-Type: text/event-stream</code>。每个 token 以如下形式发出 <code>data: {...}\n\n</code>. <strong>Keepalive 注释</strong> (<code>:\n\n</code>）每 15 s 发送一次，防止中间代理（云 LB、企业代理——大多数空闲超时为 30–60 s）关闭连接。 <strong>取消：</strong> 当客户端关闭连接时，网关通知路由器，路由器向 worker 发信号，在 <em>next</em> 迭代时将请求从批次中移除——立即释放其 KV 缓存。这很重要：空闲的 GPU 槽是浪费；释放的槽可服务其他用户。 <strong>背压：</strong> 若客户端缓冲区已满，TCP 背压向上游传递，但你 <em>不能</em> 在不浪费批次槽的情况下暂停 GPU decode。网关最多缓冲约 1 MB；溢出时携带原因中止——好过为无法访问的客户端持续消耗 GPU 槽。</p>
+<p><strong>流式安全过滤器——带内工作原理。</strong> 输出在到达网关之前经过一个小型分类器（约 8B 级模型或蒸馏头）。它维护一个 <strong>滑动回溯窗口</strong> 包含最近约 50 个 token，每约 10 个 token 分类一次。过滤器延迟必须小于 token 间隔（约 30 ms），否则流会停滞。命中时：\n- <em>软（轻微策略违规）：</em> 遮盖违规片段（<code>[redacted]</code>），继续。\n- <em>硬（严重）：</em> 中止流，发出安全提示，记录以供审核。</p>
+<p>默认失败模式为关闭：若过滤器超时或不可达，遮盖该块。</p>
+<p><strong>对话上下文窗口。</strong> 上下文窗口是有限的（例如 128k tokens）。对于长对话：- 保留最后 N 轮的完整内容。- 将较早的轮次由后台任务使用更廉价的模型离线压缩为一条系统消息。- 对于非常长的对话，通过向量检索（检索增强）仅取回最相关的历史轮次。</p>
+<p><strong>共享 GPU 上的租户间公平调度。</strong> 对请求使用 token bucket 是错误的——资源是 GPU 秒（即 tokens），而不是请求次数。应使用 <strong>token-rate quota</strong> 按租户限制（每秒输出 tokens 数）。执行逻辑位于调度器中：当某个租户超出其份额时，调度器会降低其正在处理请求的优先级（在下一轮解码列表中跳过它们，每次跳过约损耗 1 个 token 的延迟），使其他租户得到服务。硬上限：租户在超过 10 秒内持续消耗超过配额 2 倍时，准入控制将拒绝请求直到冷却结束。付费层级享有优先通道（付费 &gt; 免费；会话内续写 &gt; 新会话，因为缓存是热的）。</p>
+<p><strong>自动扩缩容信号。</strong> 不是 QPS。正确的信号是 <strong>token-budget pressure</strong> = <code>sum(active KV bytes across workers) / total KV capacity</code>。在压力约 70% 时扩容；提前量 = 预热延迟（镜像内置权重约 30–60 秒）。保守地缩容：worker 排空（不接受新任务，完成正在处理的请求后再下线），在约 10 分钟空闲阈值后下线，因为启动代价较高。</p>
+<p><strong>故障模式——真实的流式传输中途恢复。</strong>
+- <strong>GPU worker 在流式传输中途崩溃。</strong> 已流出的 tokens 已丢失（客户端已接收）。Router 收到一个 <code>worker_disconnected</code> 事件。选择：  - <em>在新 worker 上重放：</em> gateway 在小型环形缓冲区中保存最后 <em>K</em> 个已发出的 tokens；故障时，将 <code>(original prompt + emitted tokens)</code> 拼接到新的 prompt 中；新 worker 重新预填充，从流中断处恢复解码。用户会看到短暂的卡顿。  - <em>前端重新生成：</em> 发出一个 <code>[stream interrupted]</code> sentinel，让客户端点击重新生成。  - 生产环境通常在 TTFT 预算内重放；否则重新生成。- <strong>Router 崩溃。</strong> Gateway 检测到超时；conversation_id 是持久的；客户端用相同的幂等键重试。不会重复计费。- <strong>对话存储不可用。</strong> 写路径跳过持久化；从正在处理的上下文生成；将轮次写入操作加入持久重试队列。读路径回退到缓存快照。- <strong>安全过滤器超时。</strong> 失败关闭——屏蔽该数据块，记录一个过滤器故障事件。</p>
+<p><strong>多模型。</strong> 不同请求路由到不同模型（免费与付费层、"快速"与"思考"模式）。命名 worker 池共享同一 router；路由根据用户层级和请求提示选择对应的池。前缀索引和 KV 缓存是按池隔离的。</p>
+<p><strong>成本优化——按 ROI 排序的杠杆。</strong> GPU 小时是主要成本。1. 连续批处理（无空闲槽位）——基本要求。2. PagedAttention + 前缀共享（共享系统提示 → 增量预填充接近零）。3. 投机解码（结构化输出解码吞吐量提升 2–3 倍）。4. 量化（INT8 / FP8）——内存约减半，速度约提升 1.5 倍，精度略有损失。5. 多层服务——小模型处理简单查询；大模型处理复杂查询（router 使用查询分类器）。</p>
+<p><strong>值得记住的关键数据。</strong>
+- 每 token 的 KV 缓存，70B FP16（GQA）：约 300 KB。在 8k 上下文下：每请求约 2.4 GB。- 70B FP16 权重：约 140 GB → 在 4× H100 80GB 上张量并行；该 pod 上约 180 GB 可用于 KV 缓存 → 约 75 个并发 8k 上下文请求。- 预填充速率：每 pod 约 10k 输入 tokens/s；解码速率：繁忙批次中每请求约 50 tokens/s。- 模型加载：从本地 NVMe 约 30 秒（镜像内置）；从对象存储约 5–15 分钟（冷启动）——这支持了镜像内置的做法。- SSE keepalive：15 秒（大多数负载均衡器的空闲超时为 30–60 秒）。</p>
+<p><strong>我会推迟的内容。</strong> 工具/函数调用协议、插件生态系统、多模态（图像输入/输出）、按客户微调、RLHF 训练流水线、跨区域故障转移语义。</p>
+<p><strong>面试核心要点：</strong> 产品看起来像聊天，但系统本质上是一个附带对话存储的 GPU 调度器。优化目标是 token 预算、KV 局部性以及优雅的早期拒绝；文本行只是其中最简单的部分。</p>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

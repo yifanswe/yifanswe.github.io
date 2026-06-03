@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Rate Limiter (walkthrough) — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">Rate Limiter (walkthrough)</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<p><strong>难度：</strong> Medium · <strong>总耗时：</strong> ~45 min · <strong>框架：</strong> Hello Interview Delivery</p>
+<p><strong>一句话场景：</strong> 构建一个分布式限流器，保护 API 免受滥用。每个入站请求首先经过限流器；限流器要么放行，要么以 429 拒绝。规则形如"每用户每分钟 100 次请求"、"每 API key 每秒 1000 次请求"、"每 IP 每小时 10 次登录"。预算为个位数毫秒级开销。整个集群 1M QPS，数百个限流器实例。</p>
+<hr/>
+<h2 id="1-requirements-5-min">1. 需求（约 5 分钟）</h2>
+<p><strong>功能需求</strong>
+- 根据一条或多条规则，对每个请求作出允许/拒绝决策。 - 支持常见策略：GCRA（通用信元速率算法）/ 令牌桶 / 滑动窗口计数器，按 (user, IP, key, route) 作为键。 - 在响应头中暴露剩余配额、重置时间和桶范围，使客户端能够智能退避。 - 支持热重载规则，无需重新部署网关。</p>
+<p>我会暂缓实现策略配置 UI 以及 OAuth 配额/计费集成计量功能。</p>
+<p><strong>非功能需求</strong>
+- 延迟开销 p99 &lt; 5 毫秒。 - 高可用——计数器存储故障不得导致被保护服务宕机。故障模式按规则粒度处理。 - 合理准确；对于软规则，少量超额允许是可接受的，但对于认证/滥用场景则不行。 - 扩展至整个集群 ≥ 1M 次决策/秒。</p>
+<p><strong>容量估算</strong>
+- 1 亿个唯一桶（身份 × 规则 × 窗口）。 - 每个桶的状态：约 50 字节（计数器 + 时间戳）。 - 原始计数器状态约 5 GB，但 Redis 对象开销和副本使实际热数据占用接近 30–60 GB。主要成本不是磁盘，而是内存加上同步路径上的一次网络往返。</p>
+<p><strong>生产标定：真正的限流器是一个分层体系，而不是一个旋钮。</strong></p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>问题</th>
+<th>窗口</th>
+<th>示例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>全局卸载器</td>
+<td>集群是否过载？</td>
+<td>秒</td>
+<td>繁忙时以 503 丢弃非关键请求</td>
+</tr>
+<tr>
+<td>按路由</td>
+<td>该端点是否过热？</td>
+<td>秒–分钟</td>
+<td>10k QPS 时 <code>/search</code></td>
+</tr>
+<tr>
+<td>按租户/身份</td>
+<td>某个客户是否存在噪声请求？</td>
+<td>分钟–小时</td>
+<td>每用户 100 req/min</td>
+</tr>
+<tr>
+<td>配额</td>
+<td>他们是否超出了套餐配额？</td>
+<td>小时–天</td>
+<td>Pro 套餐每天 1M API 调用</td>
+</tr>
+<tr>
+<td>滥用</td>
+<td>他们是否在探测系统？</td>
+<td>滚动窗口</td>
+<td>10 分钟内 10K 次无效请求 → 封禁</td>
+</tr>
+</tbody>
+</table>
+<p>每一层需要不同的状态（用于流量卸载的内存本地状态、用于按租户限流的 Redis 共享状态、用于配额管理的长期存储，以及用于滥用检测的 ML 流水线）。将这些视为单一组件是面试中最常见的失误。</p>
+<hr/>
+<h2 id="2-core-entities-2-min">2. 核心实体（约 2 分钟）</h2>
+<ul>
+<li><strong>Rule</strong> — <code>name</code>，匹配器（对身份属性的谓词）、算法、限制值、窗口、层级。由限流服务持有。</li>
+<li><strong>Identity</strong> ——描述一个请求的一组扁平维度： <code>user_id</code>, <code>ip</code>, <code>api_key</code>, <code>route</code>, <code>method</code>，以及规则可能匹配的任何其他字段。调用方将完整的属性包传递过来；规则从中选择自己关注的字段进行键控。</li>
+<li><strong>Bucket</strong> ——一个 <code>(rule, identity_subset)</code> 将某个键映射到一个计数器的键值对。对外通过以下方式暴露给客户端： <code>X-RateLimit-Bucket</code>.</li>
+<li><strong>决策</strong> — <code>allowed</code>，按规则 <code>remaining</code> / <code>reset_at</code> / <code>scope</code>，可选 <code>retry_after</code>.</li>
+</ul>
+<hr/>
+<h2 id="3-api-5-min">3. API（约 5 分钟）</h2>
+<pre><code>// Internal RPC the API gateway calls per request.
+// The caller describes the request; the limiter owns rule lookup.
+POST /v1/check {
+  identity: { user_id?, ip?, api_key?, route, method, ... },
+  cost: 1
+} → {
+  allowed,
+  decisions: [ { rule_name, bucket_id, allowed, remaining, reset_at, scope } ],
+  retry_after?
+}
+</code></pre>
+<p><code>identity</code> 是一个包含请求所有属性的扁平包——在这一层区分"谁"（user_id）和"什么"（路由）没有实际意义，因为类似"每 IP 每路由 5 次登录/小时"的规则同时需要两者，而且只有规则本身才知道它关注哪些字段。调用方完整描述请求，限流器将身份投影到每条匹配规则所键控的字段上。</p>
+<p><strong>为什么调用方不传递 <code>rule_id</code>.</strong> 规则是限流器持有的配置。允许调用方命名规则，会将每个网关与规则目录耦合在一起——新策略意味着网关需要重新部署，而过时的客户端会与真实配置产生偏差。通过传递原始请求上下文，限流器可以在不修改任何客户端的情况下新增、废弃或调整规则。</p>
+<p><strong>公共响应头</strong> （当网关返回 429 时）： <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>, <code>X-RateLimit-Reset</code>, <code>X-RateLimit-Bucket</code>, <code>X-RateLimit-Scope</code> (<code>user</code> / <code>shared</code> / <code>global</code>), <code>Retry-After</code>。Discord 的 <code>X-RateLimit-Bucket</code> 是不透明的，以便服务器可以在不破坏客户端的情况下重新分片分桶策略——详见深度解析。</p>
+<p><strong>Sidecar 替代方案。</strong> 一个直接与 Redis/Memcached 连接池通信的库——算法相同，无需额外的网络跳转。Sidecar 从配置服务拉取规则并在本地进行匹配；对应用代码的公开 API 接口保持不变（仍然传递身份包，而非规则 ID）。根据开销限制，我会同时提供两种方案。</p>
+<hr/>
+<h2 id="5-high-level-design-1015-min">5. 高层设计（约 10–15 分钟）</h2>
+<ol>
+<li><strong>限流服务/库。</strong> 接收身份包。从内存规则表中查找匹配规则，将身份投影到每条规则的键维度，查询计数器存储，并跨层聚合决策结果。调用方不需要指定规则名称。</li>
+<li><strong>计数器存储。</strong> Redis Cluster。每个桶对应一个字符串键（例如 <code>rl:user:42:postTweets:202605181847</code>）；Redis 将该键哈希到 16,384 个槽之一，并路由到拥有该槽的分片——因此桶均匀分布在各分片上，每个桶恰好存在于一个节点上。计数器以算法对应的数据结构存储在内存中（GCRA 使用一个 TAT 整数，滑动窗口使用两个计数器）。通过 TTL = 窗口长度进行淘汰。与限流器共置于同一可用区，以将 p99 延迟控制在预算范围内。</li>
+<li><strong>配置服务。</strong> 持有规则目录（单一真实来源）。将更新推送给限流器实例（长轮询或通过 etcd/Consul）。限流器以原子方式热重载匹配器表。新规则首先以 <strong>仅观察模式</strong> 启动（详见深度解析）。</li>
+<li><strong>本地预检/判决缓存。</strong> 进程内状态——详见深度解析（热键、自适应执行）——无需网络跳转即可处理简单情况。</li>
+<li><strong>决策流水线。</strong> 每次决策都会向指标和日志流水线发出 <code>(rule_name, allowed, layer, bucket_id, identity_hash)</code> 信号。运维人员可以按规则查看拒绝率；部分决策会写入结构化日志，用于离线调优和暗启动对比。</li>
+</ol>
+<p><strong>端到端流程叙述。</strong> 一个对 <code>POST /tweets</code> 的请求到达网关。网关调用限流器并传入 <code>identity={user_id:42, ip:1.2.3.4, route:/tweets, method:POST}</code>。限流器按顺序遍历各层——全局流量卸载（廉价，内存计算）、按路由（"写操作 10k QPS"）、按租户（"每用户 100 req/min"）、滥用检测（"最近无效请求率是否正常"）。每条匹配规则生成一个桶键（<code>rl:user:42:postTweets:202605181847</code>），通过 Lua 脚本以原子方式更新。若任一层拒绝，则返回 429 并携带 <code>Retry-After</code> 及桶头部信息。否则放行。</p>
+<h3 id="system-components-diagram">系统组件图</h3>
+<pre><code>+--------------------------------+
+| API Gateway / App Sidecar      |
++---------------+----------------+
+                |
+       POST /v1/check {identity,cost}
+                v
++------------------------------------------------+
+| Limiter Instance / Library                     |
+| local shed:{route}:{second}                    |
+| deny:{rule}:{identity_hash} verdict cache      |
++-------------+-------------------+--------------+
+              |                   |
+              | ruleset miss      | decision events
+              v                   v
++------------------------+   +--------------------------------+
+| Config Service         |   | Metrics / Logs / Dashboards     |
+| ruleset:{version}      |   | dark-launch comparisons         |
++------------------------+   +--------------------------------+
+              ^
+              |
+     hot-reload matcher table
+              |
+              v
++--------------------------------------------------------------+
+| Redis Cluster Counter Store                                  |
+| rl:{rule}:{identity_hash}       GCRA TAT string, TTL         |
+| rlsw:{rule}:{identity_hash}:win sliding counters, 2x window  |
+| rule buckets hash to one Redis shard for atomic Lua updates  |
++----------------------------+---------------------------------+
+                             |
+                             | miss / dormant bucket
+                             v
+                    +-----------------------+
+                    | Lua/GCRA creates key  |
+                    | with TTL + reset_at   |
+                    +-----------------------+
+
+Primary flow: gateway -&gt; limiter -&gt; Redis Lua update -&gt; allow or 429 headers.
+Rule flow: config service -&gt; ruleset:{version} -&gt; atomic in-memory swap.
+</code></pre>
+<hr/>
+<h2 id="6-deep-dives-10-min">6. 深度探讨（约 10 分钟）</h2>
+<p><strong>具体的键和内存占用。</strong></p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>键模式</th>
+<th>数据结构 / 条目</th>
+<th>TTL</th>
+<th>分片键</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>全局流量卸载</td>
+<td><code>shed:{route}:{second}</code></td>
+<td>进程内计数器，约 16 B</td>
+<td>2–5 s</td>
+<td>本地实例</td>
+</tr>
+<tr>
+<td>GCRA 桶</td>
+<td><code>rl:{rule}:{identity_hash}</code></td>
+<td>Redis 字符串 = 理论到达时间 + 元数据，逻辑约 50 B</td>
+<td>突发窗口 + 空闲宽限期</td>
+<td><code>{rule}:{identity_hash}</code></td>
+</tr>
+<tr>
+<td>滑动计数器</td>
+<td><code>rlsw:{rule}:{identity_hash}:{window}</code></td>
+<td>两个 Redis 计数器，逻辑约 32 B</td>
+<td>2 × 窗口</td>
+<td><code>{rule}:{identity_hash}</code></td>
+</tr>
+<tr>
+<td>本地拒绝缓存</td>
+<td><code>deny:{rule}:{identity_hash}</code></td>
+<td>进程内判决 + reset_at，约 64 B</td>
+<td>直到重置</td>
+<td>本地实例</td>
+</tr>
+<tr>
+<td>规则配置</td>
+<td><code>ruleset:{version}</code></td>
+<td>序列化的匹配器表，KB–MB</td>
+<td>直到被替换</td>
+<td>复制到所有</td>
+</tr>
+</tbody>
+</table>
+<p>命令使 LLDB 的行为类似于交互式命令工具。我们可以使用 <code>identity_hash</code> 由规则所选维度在服务端生成，因此更改规则的键结构会创建新的桶命名空间，无需修改客户端。</p>
+<p><strong>按存储/路径的容量估算。</strong></p>
+<table>
+<thead>
+<tr>
+<th>条目</th>
+<th>Math</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>活跃共享桶</td>
+<td>100M × 50 B 逻辑 ≈ 5 GB；Redis 开销 + 副本 ≈ 30–60 GB</td>
+<td>主要热内存开销</td>
+</tr>
+<tr>
+<td>严格 Redis 操作</td>
+<td>1M QPS × 每请求匹配 1–3 条严格规则 = 1–3M ops/sec</td>
+<td>对独立桶使用流水线</td>
+</tr>
+<tr>
+<td>本地拒绝缓存</td>
+<td>1M 热拒绝桶 × 64 B ≈ 每个大型网关层 64 MB</td>
+<td>攻击流量变得廉价</td>
+</tr>
+<tr>
+<td>规则配置</td>
+<td>数千条规则 × 匹配器数据 = 每实例 KB–MB</td>
+<td>复制到每个限流器</td>
+</tr>
+<tr>
+<td>决策流</td>
+<td>1M QPS × 约 100 B ≈ 全量记录时 100 MB/sec</td>
+<td>激进采样；指标已聚合</td>
+</tr>
+<tr>
+<td>配额导出</td>
+<td>按租户键控的天/小时聚合数据</td>
+<td>分析视图，非执行路径</td>
+</tr>
+</tbody>
+</table>
+<p><strong>触及各存储的检查路径。</strong>
+1. 网关调用 <code>/v1/check</code> 并传入扁平身份包和请求代价。\n2. 限流器在内存中匹配规则；全局流量卸载和本地拒绝缓存检查优先执行，无需 Redis 跳转。\n3. 对每条匹配的严格规则，限流器构建桶键并将 Lua/GCRA 命令流水线发送到 Redis。独立规则的桶可以并行执行，但每个桶在一个 Redis 分片上以原子方式更新。\n4. 按最严格结果聚合决策。若任何硬规则拒绝，则返回 429 并携带 <code>Retry-After</code>；仅观察的软规则只发出指标。\n5. 决策事件异步发送到指标/日志；日志记录失败不会阻塞请求。</p>
+<p>"我的核心观点：限流器是廉价本地决策与精确共享计数器的层级结构；让每条规则都承担最强一致性代价，才是可扩展性的根本缺陷。"</p>
+<p><strong>热/冷桶行为。</strong>
+1. 新建或休眠的身份：Redis 键不存在，Lua/GCRA 脚本创建 <code>rl:{rule}:{identity_hash}</code> ，TTL = 突发窗口 + 空闲宽限期。无需清理扫描。\n2. 健康的冷桶：乐观本地放行仅允许用于标记为软模式的规则；异步增量响应携带剩余配额信号。\n3. 接近限制的桶：限流器切换到严格同步模式，在允许请求前原子更新同一 Redis 键。\n4. 耗尽的桶：限流器将 <code>deny:{rule}:{identity_hash}</code> 写入本地，直到 <code>reset_at</code>，从而使重复的恶意请求不再持续命中 Redis。\n5. 规则形状变更： <code>identity_hash</code> 命名空间随 <code>ruleset:{version}</code>变化，旧桶自然过期，新桶以干净状态开始。</p>
+<p><strong>双视图框架。</strong> 计数器存储是以 <code>(rule, identity_subset)</code>为键的执行索引。决策流是以规则、租户、路由和时间为键的分析视图。仪表盘和配额导出可以有延迟或采样；Redis 桶决策不允许。</p>
+<p><strong>算法。</strong>
+- <strong>GCRA（通用信元速率算法）</strong> ——我的默认选择。每个桶一个"理论到达时间"整数。通过单条 Redis 命令实现原子操作（<code>CL.THROTTLE</code> 通过 redis-cell）。数学上等价于漏桶，但消除了滴漏进程故障模式和朴素令牌桶中的非原子读-修改-写竞争问题。\n- <strong>滑动窗口计数器</strong> ——两个固定窗口计数器按经过时间比例混合： <code>rate = prev * (1 − elapsed/window) + curr</code>。Cloudflare 在生产规模下测量到约 0.003% 的误分类率。廉价且可预测。\n- <strong>令牌桶</strong> ——天然适合突发容忍；需要精心编写 Lua 以保持原子性。当策略明确需要突发 + 稳定速率语义时使用。\n- <strong>固定窗口</strong> ——仅当边界处的突发（可能达到 2× 限制）不重要时使用。\n- <strong>滑动窗口日志</strong> ——精确但每桶内存为 O(窗口 × QPS)。不要在大规模场景下使用。</p>
+<p><strong>计数器同步——三种模型。</strong>
+- <strong>集中式计数器存储（Redis）。</strong> Stripe、Envoy、Kong。单个 Redis Cluster，每个桶键哈希到一个分片。简单且精确。代价：每次检查一次网络跳转。这是我对按租户和配额层的默认方案。\n- <strong>Anycast 固定本地计数器。</strong> Cloudflare。源 IP 路由将流量固定到一个 PoP，因此按 IP 的桶本地存储在 PoP 上，无需跨 PoP 同步。零跳转，但无法用于按用户限流（同一用户可能访问多个 PoP）。\n- <strong>协作式租约分发。</strong> Google 的 Doorman。限流器向主节点申请 <em>租约</em> （例如 5 秒内 1000 req/s），并定期刷新。以每请求精度换取在无每请求跳转的情况下执行大规模全局限制的能力。适用于限制值较大且客户端较多的场景。</p>
+<p>为什么默认计数器存储选 Redis 而非 DynamoDB/Cassandra：限流器需要个位数毫秒级的原子增量加 TTL，而不是持久查询历史。DynamoDB 支持条件写入，但其尾延迟和每请求成本在 1M QPS 下并不适合；Cassandra 擅长写日志，但在按请求原子计数器方面较弱。</p>
+<p><strong>热键。</strong> 知名用户或爬虫 IP 会产生热桶。应对措施叠加使用：\n- <strong>在本地缓存拒绝判决</strong> 一旦某个桶超出限制（Cloudflare、Envoy <code>freecache</code>）。来自该桶的后续请求完全跳过存储，直到 TTL 到期。反直觉的是：在最坏情况路径下，攻击期间后端负载 <em>下降</em> 。\n- <strong>廉价层先于昂贵层。</strong> 边缘按 IP（内存）；后端按用户（Redis）。\n- <strong>计数器分片</strong> 用于绝对热点桶——哈希到 N 个子键，读时求和。以一次读操作换取写热点的分散。\n- <strong>客户端微缓存</strong> 对放行决策（例如 50ms 窗口）缓存在网关端。</p>
+<p><strong>边缘压力测试。</strong></p>
+<table>
+<thead>
+<tr>
+<th>边缘</th>
+<th>故障模式</th>
+<th>降级 / 预算</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>休眠身份</td>
+<td>桶已过期</td>
+<td>在第一次请求时重建；一次 Redis 跳转</td>
+</tr>
+<tr>
+<td>耗尽的热桶</td>
+<td>攻击者持续命中 429 路径</td>
+<td>本地拒绝缓存直到重置</td>
+</tr>
+<tr>
+<td>突发写入</td>
+<td>大量身份同时变热</td>
+<td>流水线 Redis，在按用户检查之前先全局卸载</td>
+</tr>
+<tr>
+<td>Redis 分片故障</td>
+<td>严格计数器不可用</td>
+<td>按规则选择 fail-closed 或带下限的 fail-open</td>
+</tr>
+<tr>
+<td>多区域漂移</td>
+<td>同一用户访问多个 PoP</td>
+<td>对严格用户限制使用中心 Redis，或对大规模全局配额使用 Doorman 风格的租约</td>
+</tr>
+<tr>
+<td>冷配置上线</td>
+<td>新规则过于激进</td>
+<td>先以仅观察模式运行，再在仪表盘审核后执行</td>
+</tr>
+</tbody>
+</table>
+<p><strong>延迟预算。</strong> 5 ms p99 意味着最多一次 Redis 跳转。将 Redis 与网关共置于同一可用区。连接池、流水线和 Lua 脚本将网络往返次数控制在一次。</p>
+<p><strong>自适应执行（预测而非检查）。</strong> ≫99% 的 <code>(identity, rule)</code> 键值对从未接近其限制——对每个请求都付出 Redis 跳转的代价是浪费的。在限流器中维护每个桶的状态： <strong>冷启动</strong> （计数器远低于限制，拒绝率 ≈ 0）和 <strong>hot</strong> （接近限制或拒绝率上升）：\n- <strong>冷路径：</strong> 立即放行，异步触发增量（批量/流水线）。延迟 ≈ 0。\n- <strong>热路径：</strong> 通过 Lua 脚本进行同步先检查后放行。严格模式。</p>
+<p>状态转换：当计数器超过限制的约 80% 或出现异步拒绝时，由冷转热；经过一段安静窗口后，由热转冷。信号通过异步增量响应返回——Redis 告知"你已达到 95%"，我们切换到热模式。代价：在冷转热边界处存在短暂的过量放行。对软限制（分页配额）可接受；对硬限制（认证、滥用检测）绝不适用。按规则选择开启。</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>模式</th>
+<th>数据源</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>冷层</td>
+<td>乐观放行</td>
+<td>本地状态 + 异步 Redis 增量</td>
+<td>最低延迟，有界过量放行</td>
+</tr>
+<tr>
+<td>温层</td>
+<td>采样同步</td>
+<td>周期性 Redis 检查</td>
+<td>在达到限制前检测漂移</td>
+</tr>
+<tr>
+<td>热层</td>
+<td>严格同步</td>
+<td>Redis Lua/GCRA</td>
+<td>请求通过前的精确决策</td>
+</tr>
+<tr>
+<td>存储故障</td>
+<td>下限模式</td>
+<td>本地安全容量桶</td>
+<td>按规则选择带下限的 fail-open 或 fail-closed</td>
+</tr>
+</tbody>
+</table>
+<p><strong>带下限的 fail-open，而非二元选择。</strong> 如果计数器存储不可达，二元选择（fail-open = 滥用流量放行；fail-closed = 自我引发故障）对大多数规则来说都是错误的。每个网关对每个身份携带一个 <strong>安全容量下限</strong> （例如，"如果 Redis 不可用，每用户每秒最多允许 10 次请求，从本地内存执行"）。硬规则（认证、支付）仍然 fail-closed；软规则则采用带下限的 fail-open。Doorman 对此进行了明确建模；Stripe 通过 fail-open 加上一个并发请求限制器来近似实现，防止故障客户端独占工作线程。</p>
+<p><strong>通过响应头实现桶发现。</strong> 服务器返回 <code>X-RateLimit-Bucket: &lt;opaque&gt;</code> 以便行为良好的客户端可以对共享一个桶的端点进行分组并正确退避，而无需硬编码限制值。服务器控制分桶策略，可以重新分片，客户端自动适应。与 <code>X-RateLimit-Scope</code> 配合使用，让客户端知道哪一层触发了限流（用户/共享/全局），以及是应该退避当前令牌还是所有令牌。</p>
+<p><strong>代价模型。</strong> 并非所有请求代价相同：\n- <strong>积分制</strong> （GitHub：GET=1，mutation=5；每分钟 900 积分）。计数器按请求代价增量——通过在 Lua 脚本中传递 <code>cost</code> 来轻松支持。\n- <strong>GraphQL 查询复杂度</strong> ——在解析时累加字段代价，一次性计费。\n- <strong>并发在飞请求限制器</strong> — <em>与 RPS 限制不同的</em> 概念。一个用户发出 100 个慢速昂贵请求可能耗尽工作线程而不超过 RPS 限制。Stripe 将此作为独立层运行，用于捕获 RPS 限制遗漏的情况。</p>
+<p><strong>不暴露限制值（滥用层）。</strong> 对于对抗性规则，429 + <code>Retry-After</code> 会告诉攻击者确切的重试时机。Figma 的模式： <strong>影子封禁</strong> ——返回 200，悄悄丢弃或延迟请求。攻击者无法判断自己是否被限流，也无法切换到新凭证。仅在疑似机器人层使用影子封禁；对面向开发者的 API 配额绝不使用，因为透明反馈是服务契约的一部分。</p>
+<p><strong>暗启动/影子模式。</strong> 永远不要冷启动执行一条新规则。先以 <strong>仅观察</strong> 模式运行数天——统计 <em>本会</em> 被拦截的请求数量，在仪表盘上查看判决结果，调整阈值。Stripe 和 Envoy 都将此作为一等模式内置。成本低廉；能避免意外地对关键批处理任务返回 429。</p>
+<p><strong>多租户公平性。</strong> 嘈杂的租户不得拖慢其他租户。按租户（或按层级）对 Redis 进行分区，使一个租户的热桶不会驱逐另一个租户的数据。结合堆栈中的按租户层，确保滥用租户的拒绝工作不会消耗共享预算。</p>
+<p><strong>配置同步。</strong> 规则变更通过配置服务传播。限流器监听变化；收到变更时，以原子方式替换规则表。飞行中的请求按旧配置完成处理——这是可以接受的。</p>
+<p><strong>时钟偏差。</strong> 计数器在同一时刻只存在于一个地方——Redis 服务器的时钟（集中式）或 PoP 本地时钟（任播）。不要信任客户端时间戳。对于基于租约的系统，租约是秒级别的，NTP 偏差可以忽略不计。</p>
+<p><strong>我会推迟的内容。</strong> 基于 ML 的新型机器人检测、CAPTCHA 降级、OAuth 配额执行、计费集成的计量、深层次分层（组织 → 团队 → 用户）配额分配。</p>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>

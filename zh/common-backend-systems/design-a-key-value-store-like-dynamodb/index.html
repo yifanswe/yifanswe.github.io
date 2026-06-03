@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head><script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^\/zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^\/zh/,'')||'/');else location.reload();}
+</script>
+
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>设计类 DynamoDB 的键值存储 — Yifan Li</title>
+<link href="/css/style.css" rel="stylesheet"/>
+<link href="/images/favicon.ico" rel="shortcut icon" type="image/x-icon">
+<link href="/css/style/monokai-sublime.min.css" rel="stylesheet"/>
+<link crossorigin="anonymous" href="https://use.fontawesome.com/releases/v5.6.3/css/all.css" rel="stylesheet"/>
+<script src="/js/jquery.min.js"></script>
+<script src="/js/highlight.min.js"></script>
+<script src="/js/highlight-init.js"></script>
+</link></head>
+<body>
+<div class="container">
+<div class="topbar">
+<div class="topbar-brand"><a href="/zh/">Yifan Li</a></div>
+<nav class="topbar-nav">
+<a href="/zh/">首页</a>
+<a href="/zh/backend-fundamentals/">后端基础</a>
+<a href="/zh/common-backend-systems/">常见后端系统</a>
+<a href="/zh/system-design-patterns/">System Design Patterns</a>
+<a href="https://github.com/yifanswe" rel="noopener" target="_blank">GitHub</a>
+
+<a class="lang-toggle" href="javascript:void(0)" onclick="switchLang('en')">EN</a></nav>
+</div>
+<div class="article">
+<a class="article-back" href="/zh/common-backend-systems/">← Back to Common Backend Systems</a>
+<h1 class="article-title">设计类 DynamoDB 的键值存储</h1>
+<div class="article-meta">
+<i class="fas fa-edit"></i> 2026/06/01  ·  Common Backend Systems
+        </div>
+<details class="toc-inline toc" open="">
+<summary>目录</summary>
+<nav id="toc-nav-inline"></nav>
+</details>
+<aside class="toc-sticky toc">
+<div class="toc-title">目录</div>
+<nav id="toc-nav"></nav>
+</aside>
+<div class="article-content">
+<blockquote>
+<p><strong>对这些术语不熟悉？</strong> 请参阅 <a href="../STAFF_SYSTEM_DESIGN_GLOSSARY.md">Staff System Design Glossary</a> ，了解常见系统设计术语的中英文解释。</p>
+</blockquote>
+<h2 id="1-basic-knowledge-and-solution">1. 基础知识与解题思路</h2>
+<h3 id="what-this-question-is-testing">本题考察点</h3>
+<p>像 DynamoDB 这样的全球级 KV 存储是许多生产系统的基础。难点在于：在提供可预测的个位数毫秒级延迟和跨区域 99.999% 可用性的同时，允许运营者按请求选择所需的一致性模式。</p>
+<p>其不变量如下：</p>
+<blockquote>
+<p>对于任意键，一次成功的写入在至少法定数量的副本上是持久的，最终对所有一致性读取者可见，并且系统在单节点、单可用区甚至部分区域故障期间持续接受写入，冲突解决规则能够确定性地收敛。</p>
+</blockquote>
+<p>在 ICT5 / L6+ 级别，面试官考查的是：你能否在无主节点的基于法定数量的复制（Dynamo 论文风格）和单主节点分区复制（现代 DynamoDB 风格）之间做出选择，解释一致性哈希和分区拆分，处理向量时钟或最后写入者胜出，以及设计热点分区缓解方案。</p>
+<h3 id="60-second-interview-framing">60 秒面试框架</h3>
+<p>口述版本：</p>
+<blockquote>
+<p>我将设计一个托管 KV 存储，分为三个平面：请求路由器、拥有键空间范围的分区层，以及每个分区的复制存储层。关键决策包括：分区策略（一致性哈希 vs 带自动拆分的范围分区）、复制（无主节点法定数量 vs 基于主节点）、可调一致性（强一致 vs 最终一致），以及热点分区处理。我将先明确需求，选定分区 + 复制方案，讲解写入和读取路径，再深入探讨法定数量语义和热点键。</p>
+</blockquote>
+<h3 id="requirements-to-clarify-first">首先明确需求</h3>
+<p>功能性需求：</p>
+<ul>
+<li>通过主键进行 Put、Get、Delete（单键操作）。</li>
+<li>可选排序键，用于分区内的范围扫描。</li>
+<li>条件写入（CAS）：仅当 <code>version = X</code> 或条目不存在时才写入。</li>
+<li>批量 get/put、分页扫描。</li>
+<li>二级索引（全局和局部）。</li>
+<li>面向下游消费者的变更流。</li>
+<li>自动删除的每表 TTL。</li>
+</ul>
+<p>非功能性需求：</p>
+<ul>
+<li>p99 读写延迟个位数毫秒。</li>
+<li>每区域可用性 99.99% 至 99.999%。</li>
+<li>每请求可调一致性：强一致或最终一致。</li>
+<li>每表 PB 级规模；数千万 QPS。</li>
+<li>多区域，支持主动-主动模式。</li>
+<li>每租户隔离与配额。</li>
+</ul>
+<p>以下内容超出范围，除非被特别询问：</p>
+<ul>
+<li>完整 SQL 查询规划器。</li>
+<li>跨分区的多键 ACID 事务（作为独立功能提及）。</li>
+<li>备份与 PITR 机制。</li>
+</ul>
+<h3 id="scale-assumptions">规模假设</h3>
+<table>
+<thead>
+<tr>
+<th>领域</th>
+<th>假设</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>表</td>
+<td>跨租户数十万张。</td>
+</tr>
+<tr>
+<td>每表条目数</td>
+<td>数十亿至数万亿。</td>
+</tr>
+<tr>
+<td>条目大小</td>
+<td>典型为 KB 级；最大 400 KB。</td>
+</tr>
+<tr>
+<td>吞吐量</td>
+<td>每秒每表最多数千万读写单元。</td>
+</tr>
+<tr>
+<td>Latency（延迟）</td>
+<td>区域内 p50 &lt; 5 ms，p99 &lt; 10 ms。</td>
+</tr>
+<tr>
+<td>副本</td>
+<td>每分区默认 3 个副本；跨可用区分布于同一区域内。</td>
+</tr>
+<tr>
+<td>多区域</td>
+<td>可选主动-主动模式，采用最后写入者胜出或 CRDT。</td>
+</tr>
+<tr>
+<td>热点分区</td>
+<td>单分区限制约 3000 RCU / 1000 WCU；需要检测并拆分。</td>
+</tr>
+</tbody>
+</table>
+<p>瓶颈在于热点分区和副本故障下的尾部延迟。</p>
+<h3 id="core-product-model">核心产品模型</h3>
+<table>
+<thead>
+<tr>
+<th>界面</th>
+<th>操作</th>
+<th>需求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单键写入</td>
+<td>按主键进行 Put/Update/Delete。</td>
+<td>每键原子操作；可调持久性。</td>
+</tr>
+<tr>
+<td>单键读取</td>
+<td>按主键进行 Get。</td>
+<td>可调一致性；极低延迟。</td>
+</tr>
+<tr>
+<td>范围查询</td>
+<td>共享分区键的条目，排序键范围扫描。</td>
+<td>有界结果；通过游标分页。</td>
+</tr>
+<tr>
+<td>条件写入</td>
+<td>比较并交换（Compare-and-swap）。</td>
+<td>在分区内原子地检查并设置。</td>
+</tr>
+<tr>
+<td>变更流</td>
+<td>每分区变更日志。</td>
+<td>按分区有序；至少一次投递。</td>
+</tr>
+</tbody>
+</table>
+<p>系统有意限制为每键（或范围操作的每分区）操作。跨分区事务是例外，而非常规操作。</p>
+<h3 id="high-level-architecture">高层架构</h3>
+<pre><code class="language-text">                +-------------------+
+Client    ---&gt;  | Request Router    |
+                | metadata cache    |
+                +---------+---------+
+                          |
+              (locate partition by key)
+                          |
+                          v
+                +-------------------+
+                | Partition Layer   |
+                | leader of range   |
+                +----+---------+----+
+                     |         |
+              replicate writes |
+                     v         v
+              +----------------+----------------+
+              | Replica 1 | Replica 2 | Replica 3 |
+              | + WAL     | + WAL     | + WAL     |
+              | + LSM/Btree storage engine        |
+              +----------------+----------------+
+                                |
+                                v
+                  +---------------------------+
+                  | Stream / CDC consumer     |
+                  +---------------------------+
+</code></pre>
+<p>旁路组件：元数据服务（分区映射）、认证、自动扩缩容、GSI 维护器、备份、热点分区拆分器。</p>
+<h3 id="core-components">核心组件</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>职责</th>
+<th>关键细节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>请求路由器</td>
+<td>解析操作，按键找到归属分区，转发至该分区的主节点。</td>
+<td>无状态；缓存分区映射；变更时重新均衡。</td>
+</tr>
+<tr>
+<td>元数据服务</td>
+<td>将键范围 → 分区 → 副本集进行映射。</td>
+<td>强一致性；通过共识协议进行复制。</td>
+</tr>
+<tr>
+<td>分区（存储节点）</td>
+<td>拥有连续的键范围；在本地磁盘上运行 LSM/B-tree。</td>
+<td>每台主机数百个分区；可插拔存储引擎。</td>
+</tr>
+<tr>
+<td>复制组</td>
+<td>每个分区一个主节点 + 多个副本；类 Raft 日志复制。</td>
+<td>若选择 Dynamo 论文风格，则为无主节点法定数量。</td>
+</tr>
+<tr>
+<td>自动扩缩容器</td>
+<td>拆分热点分区；合并冷分区；跨主机重新均衡。</td>
+<td>在线操作；无需停机。</td>
+</tr>
+<tr>
+<td>GSI 维护器</td>
+<td>异步写入二级索引条目。</td>
+<td>最终一致性。</td>
+</tr>
+<tr>
+<td>变更流</td>
+<td>每分区变更日志，暴露给消费者。</td>
+<td>按分区有序；分片以支持并行消费。</td>
+</tr>
+<tr>
+<td>跨区域复制器</td>
+<td>在区域间复制写入，用于全局表。</td>
+<td>默认最后写入者胜出；计数器使用 CRDT。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="two-architectural-choices">两种架构选择</h3>
+<p><strong>选项 A：无主节点法定数量（原始 Dynamo 论文）</strong></p>
+<ul>
+<li>每键 N 个副本，无指定主节点。</li>
+<li>写入到 N 个副本中的 W 个，从 N 个副本中的 R 个读取。 <code>R + W &gt; N</code> 以实现强一致性。</li>
+<li>冲突通过向量时钟和读取时的兄弟节点协调来解决。</li>
+<li>Hinted handoff：若某副本宕机，临时代理节点存储该写入。</li>
+<li>通过 Merkle 树进行反熵，定期协调分歧副本。</li>
+</ul>
+<p>优点：即使副本故障仍可写入；无主节点瓶颈。缺点：兄弟节点解析复杂；客户端必须合并或系统必须应用最后写入者胜出。</p>
+<p><strong>选项 B：基于主节点的每分区复制（现代 DynamoDB）</strong></p>
+<ul>
+<li>每个分区有一个主节点；通过共识协议（Multi-Paxos / Raft 风格）进行复制。</li>
+<li>写入仅在多数节点完成日志复制后确认。</li>
+<li>从主节点读取为强一致性；从副本读取为最终一致性。</li>
+<li>故障转移为主节点重新选举；耗时数秒。</li>
+</ul>
+<p>优点：客户端模型更简单；天然支持强一致性；无兄弟节点问题。缺点：主节点是每分区的瓶颈；故障转移期间短暂写入不可用。</p>
+<p>现代 DynamoDB 更接近基于 Multi-Paxos 的每分区主节点复制。面试回答应选择其中一种并说明理由；若被追问，对比两者。</p>
+<p>面试用语：</p>
+<blockquote>
+<p>我默认选择基于主节点的分区复制，因为运营体验更简单——无需合并兄弟节点、按需强一致性，且每分区主节点提供天然的分片。无主节点法定数量在副本丢失时可用性更高，但将复杂性推给了客户端。</p>
+</blockquote>
+<h3 id="data-model">数据模型</h3>
+<h4 id="table-metadata">表元数据</h4>
+<pre><code class="language-text">TableMeta(
+  table_id,
+  primary_key_schema,         // partition key, sort key (optional)
+  attribute_schemas,
+  gsi_definitions,
+  ttl_attribute,
+  stream_enabled,
+  replication_mode,           // single_region, global_active_active
+  capacity_mode               // provisioned, on_demand
+)
+</code></pre>
+<h4 id="partition-map">分区映射</h4>
+<pre><code class="language-text">Partition(
+  partition_id,
+  table_id,
+  key_range_start,
+  key_range_end,
+  leader_node,
+  replica_nodes,
+  capacity_units,
+  version
+)
+</code></pre>
+<h4 id="item">条目</h4>
+<pre><code class="language-text">Item(
+  primary_key,
+  sort_key?,
+  attributes,                 // schemaless map
+  version,                    // for CAS
+  ttl?,
+  updated_at,
+  tombstone_until?            // for soft delete
+)
+</code></pre>
+<h4 id="replication-log">复制日志</h4>
+<pre><code class="language-text">LogEntry(
+  partition_id,
+  sequence_number,            // monotonic per partition
+  operation,                  // put, delete, ttl_expire
+  key,
+  payload,
+  timestamp,
+  origin_region
+)
+</code></pre>
+<h3 id="apis">API</h3>
+<pre><code class="language-text">PutItem(table, item, condition?, return_values?)
+GetItem(table, key, consistent_read?)
+DeleteItem(table, key, condition?)
+UpdateItem(table, key, update_expression, condition?)
+Query(table, key_condition, filter?, cursor?, limit?)
+Scan(table, segment, filter?, cursor?)
+BatchGet, BatchWrite
+TransactWrite(items[], condition?)        // multi-item ACID
+DescribeStream(stream_id), GetRecords(shard_iterator)
+</code></pre>
+<h3 id="partitioning">分区策略</h3>
+<p>DynamoDB 使用 <strong>哈希分区键</strong> 作为主要分区策略：</p>
+<ul>
+<li>对分区键应用哈希函数，对键空间取模。</li>
+<li>每个分区拥有哈希空间中的一段连续范围。</li>
+<li>带有 <code>(partition_key, sort_key)</code> 的条目被路由到范围包含该值的分区。 <code>hash(partition_key)</code>.</li>
+<li>在分区内，条目按 sort_key 排序（B-tree 或 LSM 组织）。</li>
+</ul>
+<p><strong>自动拆分：</strong> 当分区的存储或吞吐量超过阈值时，从中位键处拆分。拆分是在线进行的：拆分表选取中间点，复制在两个新分区上继续，一旦新分区追上进度，元数据服务切换路由。</p>
+<p><strong>热点键：</strong> 单个分区键（某一用户、某一租户）可能使单个分区饱和。缓解措施：自适应容量——临时允许该分区通过借用空闲兄弟分区的配额来提升吞吐量；写入分片——客户端在分区键后追加后缀（<code>user_42#0</code>, <code>user_42#1</code>，……）以跨分区分散，随后查询所有后缀；突发容量——短期超量供给。</p>
+<p>面试用语：</p>
+<blockquote>
+<p>自动拆分处理数据量不均的情况，但同一热点分区键仍会将所有请求路由到一个分区。解决方案必须针对访问模式——写入分片或在存储层之上进行缓存。</p>
+</blockquote>
+<h3 id="replication">副本</h3>
+<p>每分区复制（基于主节点）：</p>
+<ol>
+<li>客户端写入到达路由器 → 分区主节点。</li>
+<li>主节点追加到本地 WAL。</li>
+<li>主节点将日志条目发送给从节点；从节点持久化到 WAL。</li>
+<li>一旦多数节点（如 3 中 2 个）确认，主节点应用到本地状态并响应。</li>
+<li>从节点异步应用并确认。</li>
+</ol>
+<p>共识细节：</p>
+<ul>
+<li>类 Raft 风格，包含 term 和日志索引，或采用稳定主节点的 Multi-Paxos。</li>
+<li>故障时在数秒内完成主节点选举；元数据服务可参与，也可由共识组内部处理。</li>
+</ul>
+<p>无主节点（Dynamo 论文）：</p>
+<ol>
+<li>客户端写入协调者；协调者并行转发给 N 个副本。</li>
+<li>等待 W 个确认；响应。</li>
+<li>读取时，协调者查询 R 个副本；解决冲突。</li>
+<li>向量时钟追踪因果历史；冲突时将所有兄弟节点返回给客户端或通过最后写入者胜出合并。</li>
+</ol>
+<h3 id="consistency-model">一致性模型</h3>
+<table>
+<thead>
+<tr>
+<th>读取模式</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>最终一致</td>
+<td>从任意副本读取；可能落后数毫秒至数秒。</td>
+</tr>
+<tr>
+<td>强一致性读取（基于主节点）</td>
+<td>从主节点读取；反映所有已提交的写入。</td>
+</tr>
+<tr>
+<td>线性一致性读取（无主节点）</td>
+<td>R + W &gt; N 的法定数量读取。</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>写入模式</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>标准 put</td>
+<td>多数副本持久化后确认。</td>
+</tr>
+<tr>
+<td>条件 put</td>
+<td>同上，另加在分区主节点上原子评估条件。</td>
+</tr>
+<tr>
+<td>事务性写入</td>
+<td>涉及的分区间两阶段提交。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="write-path">写入路径</h3>
+<ol>
+<li>客户端 → 携带分区键的请求路由器。</li>
+<li>路由器通过缓存的映射解析分区；转发给主节点。</li>
+<li>主节点对当前状态检查条件表达式（如有）。</li>
+<li>追加到 WAL；复制到从节点。</li>
+<li>等待多数确认。</li>
+<li>应用到本地 LSM/B-tree。</li>
+<li>发送到每分区流；异步更新 GSI。</li>
+<li>响应。</li>
+</ol>
+<p>故障场景：</p>
+<ul>
+<li>条件检查失败：返回 ConditionalCheckFailed；不执行任何操作。</li>
+<li>副本不可达：若仍能达到 quorum，主节点使用剩余副本继续写入；否则返回可重试错误。</li>
+<li>主节点在写入中途宕机：客户端重试；新主节点的日志包含到上一条已提交条目为止的所有内容。</li>
+</ul>
+<h3 id="read-path">读取路径</h3>
+<ol>
+<li>客户端 → 路由器 → 主节点（强一致性）或任意副本（最终一致性）。</li>
+<li>副本从本地存储返回数据项。</li>
+<li>对于最终一致性读，无需进一步协调。</li>
+<li>对于强一致性读，主节点确认其已应用所有已提交的条目（按照主节点的定义，这一点始终成立）。</li>
+</ol>
+<p>对于范围查询，主节点扫描排序键范围，应用过滤条件，并返回不超过结果上限的数据及游标。</p>
+<h3 id="secondary-indexes">二级索引</h3>
+<p><strong>本地二级索引（LSI）：</strong> 在同一分区内使用备用排序键，与基础表同步更新，与基础表保持一致。</p>
+<p><strong>全局二级索引（GSI）：</strong> 使用完全不同的分区键，由消费分区变更日志的 GSI 写入器异步维护，最终一致。</p>
+<p>GSI 写入失败或延迟不会影响基础表写入，应用以最终一致性查询 GSI 来容忍这一点。</p>
+<h3 id="streams-change-data-capture">流（Change Data Capture）</h3>
+<p>每个分区的仅追加操作日志：</p>
+<ul>
+<li>与复制日志使用相同的序列号。</li>
+<li>以对应分区的分片形式暴露，消费者通过游标迭代。</li>
+<li>保留时间通常为 24 小时。</li>
+<li>同一分区内保证顺序；跨分区不保证。</li>
+</ul>
+<p>适用于触发器、物化视图、搜索索引以及向其他系统的复制。</p>
+<h3 id="multi-region-strategy">多区域策略</h3>
+<p>两种主要模式：</p>
+<p><strong>全局表（active-active）：</strong>
+- 每个区域在本地接受写入。 - 跨区域复制是异步的。 - 冲突解决：按时间戳 + 区域决胜的 last-writer-wins，或对计数器和集合使用 CRDT 语义。 - 跨区域读取最终一致。 - 所要求的 SLA：秒级收敛。</p>
+<p><strong>单区域加跨区域只读副本：</strong>
+- 一个区域接受写入。 - 其他区域持有只读副本。 - 更简单；故障转移需要显式晋升。</p>
+<p>对于大多数工作负载，单区域已足够。Active-active 适用于低延迟全球写入（代价是冲突模型的复杂性）。</p>
+<h3 id="failure-modes-and-mitigations">故障模式与缓解措施</h3>
+<table>
+<thead>
+<tr>
+<th>故障模式</th>
+<th>缓解措施</th>
+<th>监控指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>副本宕机</td>
+<td>以剩余 quorum 继续；恢复后重建。</td>
+<td>副本健康状况、quorum 规模。</td>
+</tr>
+<tr>
+<td>主节点宕机</td>
+<td>几秒内重新选举；写入短暂暂停。</td>
+<td>主节点选举频率、写入不可用时间。</td>
+</tr>
+<tr>
+<td>分区过热。</td>
+<td>自适应容量；拆分分区；对客户端限速。</td>
+<td>每分区吞吐量、被节流的请求数。</td>
+</tr>
+<tr>
+<td>存储卷已满。</td>
+<td>自动拆分 + 再均衡。</td>
+<td>每主机存储利用率。</td>
+</tr>
+<tr>
+<td>跨区域复制延迟。</td>
+<td>对写入方施加背压；对延迟发出告警。</td>
+<td>复制延迟 p99。</td>
+</tr>
+<tr>
+<td>并发写入冲突（active-active）。</td>
+<td>带区域决胜的 LWW；计数器使用 CRDT。</td>
+<td>每分区的冲突数量。</td>
+</tr>
+<tr>
+<td>GSI 延迟。</td>
+<td>异步回填；有界陈旧性告警。</td>
+<td>每索引的 GSI 延迟。</td>
+</tr>
+<tr>
+<td>网络分区隔离某个区域。</td>
+<td>在本地继续运行；恢复后收敛。</td>
+<td>分区检测时间、重新收敛时间。</td>
+</tr>
+<tr>
+<td>单个慢副本导致尾部延迟。</td>
+<td>向第二个副本发起带超时的对冲读取。</td>
+<td>读取 p99 与 p50 的差距。</td>
+</tr>
+<tr>
+<td>客户端重试放大负载。</td>
+<td>服务端准入控制；指数退避提示。</td>
+<td>重试后速率、被节流的 QPS。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="operational-metrics">运维指标</h3>
+<p>正确性：</p>
+<ul>
+<li>强一致性请求后出现陈旧读取（必须为零）。</li>
+<li>每区域的冲突解决事件数。</li>
+<li>GSI 同步延迟。</li>
+</ul>
+<p>容量：</p>
+<ul>
+<li>每分区的读写 QPS 和吞吐量消耗。</li>
+<li>存储增长。</li>
+<li>区域内及跨区域的复制延迟。</li>
+<li>每表的被节流请求率。</li>
+</ul>
+<p>业务层面：</p>
+<ul>
+<li>每表的 p50/p99 延迟。</li>
+<li>每次操作的成本。</li>
+<li>热点键检测事件。</li>
+</ul>
+<h3 id="tradeoffs-to-call-out">需要指出的权衡</h3>
+<ul>
+<li>基于主节点的复制在故障转移时可轻松实现强一致性，但会短暂失去可用性；无主节点方案提供可用性，但将冲突解决推给了客户端。</li>
+<li>哈希分区实现均匀分布，但破坏了跨分区键的范围扫描——这是有意为之的设计。</li>
+<li>自动拆分能重新均衡数据，但无法修复热点分区键的访问模式。</li>
+<li>强一致性读需要额外的一次往返（或跳转到主节点），最终一致性读开销更低，通常已足够。</li>
+<li>Active-active 多区域降低延迟，但约束了数据模型（LWW、CRDT）。</li>
+<li>LSM 提供高写入吞吐量，代价是 compaction 开销；B-tree 读取可预测，但写入较慢。</li>
+</ul>
+<h3 id="common-traps-and-stronger-moves">常见陷阱与更优做法</h3>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>更优做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>不假思索地对所有内容按 user id 哈希。</td>
+<td>识别热点用户，在存储层之上应用写入分片。</td>
+</tr>
+<tr>
+<td>承诺随处提供强一致性读。</td>
+<td>按请求区分最终一致性与强一致性；对强一致性收取费用。</td>
+</tr>
+<tr>
+<td>忽略二级索引的一致性。</td>
+<td>说明 GSI 是最终一致的，LSI 是强一致的。</td>
+</tr>
+<tr>
+<td>在所有地方使用多键事务。</td>
+<td>将事务限制在少量分区上；设计数据模型使相关数据共置。</td>
+</tr>
+<tr>
+<td>将全局表视为"免费的魔法"。</td>
+<td>解释 LWW / CRDT 及其后果。</td>
+</tr>
+<tr>
+<td>忽略尾部延迟。</td>
+<td>对冲读取、P99 告警、副本健康检查。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deep-dives-interviewer-may-choose">面试官可能深入探讨的方向</h3>
+<table>
+<thead>
+<tr>
+<th>深入方向</th>
+<th>优秀回答要点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>分区 + 自动拆分</td>
+<td>哈希分区键；每分区内按范围；在中间键处在线拆分。</td>
+</tr>
+<tr>
+<td>主节点 vs 无主节点</td>
+<td>权衡取舍；冲突解决；运维复杂度。</td>
+</tr>
+<tr>
+<td>热点分区</td>
+<td>自适应容量；写入分片；上游缓存。</td>
+</tr>
+<tr>
+<td>GSI 设计</td>
+<td>通过流异步维护；最终一致性；有界陈旧性。</td>
+</tr>
+<tr>
+<td>多区域 active-active</td>
+<td>LWW vs CRDT；收敛；分区修复。</td>
+</tr>
+<tr>
+<td>条件写入 / 事务</td>
+<td>每分区原子性；跨分区使用 2PC。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="staff-level-answer-checklist">Staff 级别回答检查清单</h3>
+<ul>
+<li>选择分区 + 复制方案并论证。</li>
+<li>阐明每键原子性不变量和复制 quorum。</li>
+<li>介绍一致性模式下的写入和读取路径。</li>
+<li>明确处理热点分区。</li>
+<li>将 GSI 阐述为异步派生状态。</li>
+<li>讨论多区域 active-active 的冲突语义。</li>
+<li>将流作为变更捕获的接口。</li>
+<li>运维指标与尾部延迟缓解措施。</li>
+</ul>
+<h3 id="interview-phrase">面试用语</h3>
+<blockquote>
+<p>星球级 KV 存储本质上是每分区一个已分区、已复制的日志，上层是一个键范围路由层。核心决策不在于数据结构，而在于分区（带自动拆分的哈希）、复制（主节点 vs 无主节点）以及多区域冲突语义。热点分区和尾部延迟是耗费最多工程精力的运维难题。</p>
+</blockquote>
+<h2 id="2-simulated-interview">2. 模拟面试</h2>
+<p><strong>面试官：</strong> 设计一个类似 DynamoDB 的键值存储。</p>
+<p><strong>候选人：</strong> 我将设计一个三层系统：请求路由器、拥有键范围的分区层，以及每分区的复制存储层。核心不变量是：成功的写入在大多数副本上持久化，读取可以在强一致性和最终一致性之间按请求调整。</p>
+<p><strong>面试官：</strong> 如何对数据进行分区？</p>
+<p><strong>候选人：</strong> 我对分区键进行哈希，并为每个分区分配哈希空间的连续范围。每个分区跨可用区三副本复制。当分区的存储或吞吐量超过阈值时，在中间键处自动拆分；拆分在线进行，方式是启动两个新的分区主节点，通过日志追上数据，然后切换元数据路由。</p>
+<p><strong>面试官：</strong> 主节点复制还是无主节点复制？</p>
+<p><strong>候选人：</strong> 每分区使用主节点复制。每个分区通过 Raft 风格的共识选出一个主节点，加上两个从节点。写入经由主节点，复制到多数 quorum（3 中 2），然后确认。强一致性读来自主节点；最终一致性读来自任意副本。相比 Dynamo 论文原始的无主节点 quorum 方案，我更倾向于这种方式，原因是客户端语义更简单——无需将兄弟节点解析推给应用程序。</p>
+<p><strong>面试官：</strong> 单个分区键变热——某位用户每秒产生 100,000 个请求，如何处理？</p>
+<p><strong>候选人：</strong> 三层防御。首先，自适应容量：该分区向空闲的兄弟分区借用吞吐量预算。其次，热点分区拆分无济于事，因为所有负载都集中在一个键上；自动拆分按存储拆分，而非按每键流量拆分。第三，应用程序必须对键进行分片：在写入时为分区键追加一个小的随机后缀（<code>user_42#0</code> through <code>user_42#9</code>），并跨所有后缀扇出查询。这以少量读放大换取了写入的分散。</p>
+<p><strong>面试官：</strong> 如果主节点宕机怎么办？</p>
+<p><strong>候选人：</strong> Raft 选举启动；拥有最新日志的从节点在几秒内成为新主节点。受影响分区的写入短暂暂停。从节点在整个过程中持续提供最终一致性读服务。元数据服务获知新主节点后更新路由缓存；持有旧路由的客户端会收到"非主节点"错误，并重新向元数据服务重试。</p>
+<p><strong>面试官：</strong> 条件写入如何工作？</p>
+<p><strong>候选人：</strong> 单键 CAS 很直接——主节点读取当前值，评估条件，若通过则将检查包含在复制日志条目中，从而原子性地写入新值。对于跨分区的多项事务，使用两阶段提交：协调者准备每个分区主节点（锁定数据项并写入 prepare 条目），所有 prepare 完成后再提交。速度较慢，仅在必要时使用。</p>
+<p><strong>面试官：</strong> 二级索引如何工作？</p>
+<p><strong>候选人：</strong> 两种类型。本地二级索引在同一分区内，与基础数据项同步更新，强一致。全局二级索引使用不同的分区键，因此更新必须跨分区。GSI 维护器消费基础分区的变更流，计算 GSI 条目，并写入目标分区。GSI 是最终一致的；延迟通常低于一秒，但重建索引时会出现峰值。</p>
+<p><strong>面试官：</strong> 流如何工作？</p>
+<p><strong>候选人：</strong> 每个分区都有一个带有单调序列号的仅追加变更日志。流消费者以游标按分区分片迭代。我们保留 24 小时。同一分区内保证顺序，跨分区不保证。消费者包括 GSI 维护器、跨区域复制器和应用触发器。</p>
+<p><strong>面试官：</strong> 全局表如何实现跨区域的 active-active？</p>
+<p><strong>候选人：</strong> 每个区域接受对同一张表的写入。跨区域复制通过流异步进行。冲突使用按时间戳的 last-writer-wins，以区域 id 作为决胜项。对于计数器属性，CRDT 计数器更为正确，但大多数产品接受 LWW。收敛目标是几秒钟。代价是两个区域同时写入可能丢失其中一方的数据；用户必须针对此进行设计（例如，对"归属"数据使用每区域分区键）。</p>
+<p><strong>面试官：</strong> 尾部延迟如何处理？</p>
+<p><strong>候选人：</strong> 多种技术结合。对冲读取：同时向主节点和一个副本发送请求，取先到的响应，慢的那个被取消或忽略。推测性重试。容量余量：目标利用率保持在 60-70%，以防慢节点引发级联。每副本健康检查将慢副本从读取路径中降级。Compaction 调度避免在高峰期产生 I/O 峰值。</p>
+<p><strong>面试官：</strong> 存储引擎的选择？</p>
+<p><strong>候选人：</strong> 底层使用 LSM 树。写入先追加到 memtable，然后刷写到磁盘上的有序 run；在后台合并。可预测的写入吞吐量，良好的压缩率，但由于 merge pass，读取尾部延迟略差于 B-tree。每个 SSTable 的 Bloom filter 加速了负面查找。</p>
+<p><strong>面试官：</strong> 跨分区的多键事务——发生频率如何？</p>
+<p><strong>候选人：</strong> 按设计，极少发生。数据模型鼓励单分区操作，因为这是 ACID 开销最低的地方。跨分区事务使用 2PC，并以更高成本收费。应用架构师被鼓励重新设计，而非诉诸事务。</p>
+<p><strong>面试官：</strong> 总结。</p>
+<p><strong>候选人：</strong> 哈希分区键加自动拆分；每分区三副本 Raft 风格主节点；每请求可调一致性；通过变更流实现异步 GSI；通过 LWW 或 CRDT 实现 active-active 多区域；热点分区通过自适应容量和客户端分片处理；对冲读取和容量余量缓解尾部延迟。该架构在操作层面（单键）有意保持简单，以便系统能在星球级规模下提供可预测的性能。</p>
+<h2 id="3-practice-notes">3. 练习备注</h2>
+<h3 id="five-minute-version">五分钟版本</h3>
+<ol>
+<li>明确：单键操作；可调一致性；分区内范围扫描；GSI。</li>
+<li>不变量：写入持久到 quorum；可调读取。</li>
+<li>架构：路由器 + 分区层 + 复制存储。</li>
+<li>哈希分区加自动拆分。</li>
+<li>每分区基于主节点；Raft 风格共识。</li>
+<li>写入路径：WAL → quorum → apply → 响应。</li>
+<li>热点键处理：自适应容量 + 客户端写入分片。</li>
+<li>多区域：LWW 或 CRDT；GSI 异步；流用于 CDC。</li>
+</ol>
+<h3 id="one-minute-closeout">一分钟结尾陈述</h3>
+<blockquote>
+<p>星球级 KV 存储是每分区一个已分区、已复制的日志，上层是路由层。我选择带在线自动拆分的哈希分区、每分区三副本 Raft 风格主节点，以及可调读取一致性。热点分区通过自适应容量和客户端分片处理；多区域使用带 last-writer-wins 的异步复制；二级索引通过每分区变更流实现最终一致性。最棘手的生产问题是热点键和尾部延迟，分别通过自适应容量和对冲读取加以解决。</p>
+</blockquote>
+<h3 id="best-interview-phrases">最佳面试用语</h3>
+<ul>
+<li>"我按哈希分区，按存储自动拆分；热点键仍需客户端分片。"</li>
+<li>"主节点复制比无主节点 quorum 更简单；运维人员永远不会看到兄弟节点冲突。"</li>
+<li>"GSI 是最终一致的，因为它跨分区；用户在设计时需考虑这一点。"</li>
+<li>"多区域 active-active 使用带区域决胜的 LWW，或对计数器使用 CRDT。"</li>
+<li>"对冲读取和容量余量是我控制 p99 不飙升的方式。"</li>
+</ul>
+</div>
+</div>
+<div class="footer">
+<a href="#">© 2018–2026 Yifan Li</a>
+</div>
+</div>
+<button class="totop" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑ 返回顶部</button>
+<script src="/js/totop.js"></script>
+<script src="/js/toc.js"></script>
+</body>
+</html>
