@@ -38,6 +38,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 SITE_AUTHOR = "Yifan Li"
 DEFAULT_DATE = "2026/05/31"
+NEXT_PLAY = Path.home() / "Documents" / "next_play"
 
 import markdown
 
@@ -55,8 +56,7 @@ SECTIONS = [
         "title": "System Design Patterns",
         "nav_label": "System Design Patterns",
         "src_dir": Path(
-            "/Users/liali/Documents/personal/next_play/interview/"
-            "general system design/system_design_pattern"
+            NEXT_PLAY / "interview/general system design/system_design_pattern"
         ),
         "intro": (
             "A taxonomy of the <strong>fundamental hardnesses</strong> that recur "
@@ -92,14 +92,38 @@ SECTIONS = [
              "A cache miss on a hot key wakes a thundering herd."),
         ],
     },
+    {
+        "slug": "programming-notes",
+        "title": "Programming Notes",
+        "nav_label": "Programming Notes",
+        "date": "2026/06/15",
+        "src_dir": NEXT_PLAY / "interview/Knowledge/Python",
+        "intro": (
+            "Practical language and data-structure references for coding "
+            "interviews and day-to-day engineering work."
+        ),
+        "docs": [
+            (
+                "pure_python_data_structure_apis.md",
+                "Python Data Structure API Cheatsheet",
+                "Fast lookup for Python built-ins, collections, heapq, bisect, itertools, and common LeetCode patterns.",
+            ),
+        ],
+    },
 ]
 
 
 # --- Templates ----------------------------------------------------------------
 
+LANG_HEAD_SCRIPT = """<script>
+(function(){var K='siteLang',p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0),s=null;try{s=sessionStorage.getItem(K);}catch(e){}if(s==='zh'&&!z){location.replace('/zh'+(p==='/'?'/':p)+location.hash);return;}if(s==='en'&&z){location.replace((p.replace(/^[/]zh/,'')||'/')+location.hash);return;}if(s===null&&z){try{sessionStorage.setItem(K,'zh');}catch(e){}}})();function switchLang(t){try{sessionStorage.setItem('siteLang',t);}catch(e){}var p=location.pathname,z=(p==='/zh/'||p.lastIndexOf('/zh/',0)===0);if(t==='zh'&&!z)location.href='/zh'+(p==='/'?'/':p);else if(t==='en'&&z)location.href=(p.replace(/^[/]zh/,'')||'/');else location.reload();}
+</script>"""
+
+
 ARTICLE_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
+    {lang_head_script}
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{title} — {author}</title>
@@ -121,6 +145,7 @@ ARTICLE_TEMPLATE = """<!DOCTYPE html>
             <a href="/common-backend-systems/">Common Backend Systems</a>
             <a href="/{section_slug}/">{nav_label}</a>
             <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+            <a href="javascript:void(0)" class="lang-toggle" onclick="switchLang('zh')">中文</a>
         </nav>
     </div>
     <div class="article">
@@ -155,6 +180,7 @@ ARTICLE_TEMPLATE = """<!DOCTYPE html>
 INDEX_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
+    {lang_head_script}
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{title} — {author}</title>
@@ -172,6 +198,7 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
             <a href="/common-backend-systems/">Common Backend Systems</a>
             <a href="/{section_slug}/">{nav_label}</a>
             <a target="_blank" rel="noopener" href="https://github.com/yifanswe">GitHub</a>
+            <a href="javascript:void(0)" class="lang-toggle" onclick="switchLang('zh')">中文</a>
         </nav>
     </div>
     <div class="article">
@@ -271,20 +298,22 @@ def build_section(section: dict) -> None:
     slug = section["slug"]
     out_root = REPO / slug
     src_dir = section["src_dir"]
+    date = section.get("date", DEFAULT_DATE)
 
     cards = []
     for filename, title, desc in section["docs"]:
-        doc_slug = Path(filename).stem
+        doc_slug = Path(filename).stem.replace("_", "-").lower()
         md_text = (src_dir / filename).read_text(encoding="utf-8")
         body = convert_doc(md_text, slug)
 
         page = ARTICLE_TEMPLATE.format(
             title=html.escape(title),
             author=SITE_AUTHOR,
+            lang_head_script=LANG_HEAD_SCRIPT,
             section_slug=slug,
             section_title=html.escape(section["title"]),
             nav_label=html.escape(section["nav_label"]),
-            date=DEFAULT_DATE,
+            date=date,
             body=body,
         )
         out_dir = out_root / doc_slug
@@ -298,16 +327,17 @@ def build_section(section: dict) -> None:
                 slug=doc_slug,
                 title=html.escape(title),
                 desc=html.escape(desc),
-                date=DEFAULT_DATE,
+                date=date,
             )
         )
 
     index_page = INDEX_TEMPLATE.format(
         title=html.escape(section["title"]),
         author=SITE_AUTHOR,
+        lang_head_script=LANG_HEAD_SCRIPT,
         section_slug=slug,
         nav_label=html.escape(section["nav_label"]),
-        date=DEFAULT_DATE,
+        date=date,
         intro=section["intro"],
         cards="\n".join(cards),
     )
