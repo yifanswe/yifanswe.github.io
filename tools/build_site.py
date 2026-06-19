@@ -66,6 +66,9 @@ SECTIONS = [
             "prompts are really 2–3 of these patterns stacked together."
         ),
         "docs": [
+            ("../HOW_TO_TACKLE_UNFAMILIAR_SYSTEM_DESIGN.md",
+             "How to Tackle an Unfamiliar System Design",
+             "A method, not an architecture: turn a blank-mind prompt into a finite traversal — verb or adjective?"),
             ("fan-out-write-amplification.md", "Fan-out / Write Amplification",
              "One write must reach N readers; celebrity creates write storm."),
             ("hot-key-skew.md", "Hot Key / Skew",
