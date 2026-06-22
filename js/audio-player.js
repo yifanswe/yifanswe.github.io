@@ -21,6 +21,34 @@
     "https://github.com/yifanswe/yifanswe.github.io/releases/download/audio-v1/";
   var MANIFEST_URL = "/audio-manifest.json";
 
+  // iOS WebKit (every iOS browser) refuses to play the GitHub Release assets:
+  // they're served cross-origin as application/octet-stream with
+  // Content-Disposition: attachment, which WebKit's media loader rejects.
+  // Desktop browsers sniff the bytes and play anyway, but mobile does not.
+  // As a fix, selected series are committed into the repo and served
+  // SAME-ORIGIN from GitHub Pages (correct audio/mpeg, no attachment header),
+  // which plays everywhere. A slug is same-origin iff it starts with one of
+  // these prefixes; everything else still streams from the release.
+  //   same-origin slug "foo__bar"  ->  "/audio/foo/bar/index.mp3"
+  var SAMEORIGIN_PREFIXES = ["backend-fundamentals__"];
+
+  function isSameOrigin(slug) {
+    for (var i = 0; i < SAMEORIGIN_PREFIXES.length; i++) {
+      if (slug.indexOf(SAMEORIGIN_PREFIXES[i]) === 0) return true;
+    }
+    return false;
+  }
+
+  // Build the playable URL for a slug. Same-origin slugs map back to their
+  // directory path under /audio/ (the "__" separators become "/"); the rest
+  // resolve to their flat release asset.
+  function audioUrlForSlug(slug) {
+    if (isSameOrigin(slug)) {
+      return "/audio/" + slug.replace(/__/g, "/") + "/index.mp3";
+    }
+    return RELEASE_BASE + encodeURIComponent(slug) + ".mp3";
+  }
+
   // Derive the flat slug for the current page. MUST match the slug the upload
   // tooling computed from the audio file path, or audio silently won't show.
   //   "/foo/bar/"            -> "foo__bar"
@@ -165,7 +193,7 @@
       })
       .then(function (slugs) {
         if (slugs && slugs.indexOf(slug) !== -1) {
-          build(RELEASE_BASE + encodeURIComponent(slug) + ".mp3");
+          build(audioUrlForSlug(slug));
         }
       })
       .catch(function () {
