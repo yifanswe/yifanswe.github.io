@@ -66,11 +66,63 @@
     return p.replace(/\//g, "__");
   }
 
+  function clamp(n, lo, hi) {
+    return Math.max(lo, Math.min(hi, n));
+  }
+
   function fmt(t) {
     if (!isFinite(t) || t < 0) t = 0;
     var m = Math.floor(t / 60);
     var s = Math.floor(t % 60);
     return m + ":" + (s < 10 ? "0" : "") + s;
+  }
+
+  function button(className, label, text) {
+    var b = document.createElement("button");
+    b.className = className;
+    b.type = "button";
+    b.setAttribute("aria-label", label);
+    b.title = label;
+    b.textContent = text;
+    return b;
+  }
+
+  // The MP3s do not carry chapter timestamps, so chapter seeking uses a
+  // deterministic approximation: map each article heading's text position to
+  // the same percentage of the audio duration. This keeps the controls useful
+  // across all generated narrations without requiring per-file metadata.
+  function chapterMarkers() {
+    var article = document.querySelector(".article-content");
+    if (!article) return [];
+
+    var total = (article.innerText || article.textContent || "").trim().length;
+    if (!total) return [];
+
+    var headings = Array.prototype.slice.call(article.querySelectorAll("h2, h3"));
+    var markers = [];
+    headings.forEach(function (heading) {
+      var r = document.createRange();
+      r.setStart(article, 0);
+      r.setEndBefore(heading);
+      var before = r.toString().trim().length;
+      r.detach && r.detach();
+      markers.push({
+        ratio: clamp(before / total, 0, 1),
+        label: (heading.textContent || "").trim(),
+      });
+    });
+
+    if (markers.length === 0 || markers[0].ratio > 0.001) {
+      markers.unshift({ ratio: 0, label: "Start" });
+    }
+
+    return markers
+      .filter(function (m, i, arr) {
+        return i === 0 || Math.abs(m.ratio - arr[i - 1].ratio) > 0.001;
+      })
+      .sort(function (a, b) {
+        return a.ratio - b.ratio;
+      });
   }
 
   var ICON_PLAY =
@@ -120,11 +172,29 @@
     rate.type = "button";
     rate.textContent = "1x";
 
+    var controls = document.createElement("div");
+    controls.className = "audio-player__controls";
+
+    var prevChapter = button(
+      "audio-player__control",
+      "Previous chapter",
+      "← Ch"
+    );
+    var rewind = button("audio-player__control", "Back 10 seconds", "−10s");
+    var forward = button("audio-player__control", "Forward 10 seconds", "+10s");
+    var nextChapter = button("audio-player__control", "Next chapter", "Ch →");
+
+    controls.appendChild(prevChapter);
+    controls.appendChild(rewind);
+    controls.appendChild(forward);
+    controls.appendChild(nextChapter);
+
     barRow.appendChild(seek);
     barRow.appendChild(time);
     barRow.appendChild(rate);
     main.appendChild(label);
     main.appendChild(barRow);
+    main.appendChild(controls);
     wrap.appendChild(btn);
     wrap.appendChild(main);
 
@@ -136,10 +206,65 @@
     anchor.parentNode.insertBefore(wrap, anchor.nextSibling);
 
     var seeking = false;
+    var chapters = chapterMarkers();
+
+    function setTime(t) {
+      if (!audio.duration) return;
+      audio.currentTime = clamp(t, 0, audio.duration);
+      seek.value = String((audio.currentTime / audio.duration) * 100);
+      time.textContent = fmt(audio.currentTime) + " / " + fmt(audio.duration);
+    }
+
+    function seekBy(delta) {
+      setTime((audio.currentTime || 0) + delta);
+    }
+
+    function chapterTime(marker) {
+      return audio.duration ? marker.ratio * audio.duration : 0;
+    }
+
+    function seekChapter(direction) {
+      if (!audio.duration || chapters.length === 0) return;
+      var now = audio.currentTime || 0;
+      var tolerance = 3;
+      var target = null;
+
+      if (direction > 0) {
+        for (var i = 0; i < chapters.length; i++) {
+          if (chapterTime(chapters[i]) > now + tolerance) {
+            target = chapters[i];
+            break;
+          }
+        }
+        if (!target) target = chapters[chapters.length - 1];
+      } else {
+        for (var j = chapters.length - 1; j >= 0; j--) {
+          if (chapterTime(chapters[j]) < now - tolerance) {
+            target = chapters[j];
+            break;
+          }
+        }
+        if (!target) target = chapters[0];
+      }
+
+      setTime(chapterTime(target));
+    }
 
     btn.addEventListener("click", function () {
       if (audio.paused) audio.play();
       else audio.pause();
+    });
+    rewind.addEventListener("click", function () {
+      seekBy(-10);
+    });
+    forward.addEventListener("click", function () {
+      seekBy(10);
+    });
+    prevChapter.addEventListener("click", function () {
+      seekChapter(-1);
+    });
+    nextChapter.addEventListener("click", function () {
+      seekChapter(1);
     });
     audio.addEventListener("play", function () {
       btn.innerHTML = ICON_PAUSE;
