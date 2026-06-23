@@ -10,10 +10,10 @@ of git keeps the Pages site small and ToS-clean. The site references them via:
 
 ## When you edit an article
 
-Run the sync tool with the article name(s). It detects whether the *speakable
-text* actually changed (so CSS/nav/script edits don't trigger pointless
-regeneration), regenerates only what changed, re-uploads to the release, and
-tells you whether the release audio was updated.
+Run the sync tool with the article name(s). It detects whether the hidden
+**verbal narration script** changed (so CSS/nav/script edits don't trigger
+pointless regeneration), regenerates only what changed, re-uploads to the
+release, and tells you whether the release audio was updated.
 
 ```bash
 PY=~/.hermes/hermes-agent/venv/bin/python   # venv with edge_tts, bs4, lxml
@@ -59,12 +59,13 @@ new manifest + content-hash baseline so the next run knows the current state.)
 
 ## How change-detection works
 
-`audio_state.json` stores a `sha256` of each article's speakable text (the exact
-string `extract_text.py` feeds to TTS). On each run the tool recomputes that hash
-from the current HTML and compares. Hash differs → regenerate. This is why a
-prerequisite is that `extract_text.py` here stays the **same** extractor used to
-generate the audio originally — if you change extraction rules, run `--all` once
-to rebaseline.
+`audio_state.json` stores a `sha256` of each article's verbal narration script
+(the exact string `extract_verbal.py` feeds to TTS, salted with the extractor
+version). On each run the tool recomputes that hash from the current HTML and
+compares. Hash differs → regenerate. The script is also written to the ignored
+`tools/audio/verbal_cache/` directory for inspection, but it is not linked from
+or displayed on the public blog. If you change extraction rules, run `--all`
+once to rebaseline.
 
 ## Requirements
 - `gh` authenticated to the repo (`gh auth status`)

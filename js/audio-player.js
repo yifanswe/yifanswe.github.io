@@ -298,7 +298,7 @@
       if (audio.duration) audio.currentTime = (seek.value / 100) * audio.duration;
       seeking = false;
     });
-    var rates = [1, 1.25, 1.5, 1.75, 2, 0.75];
+    var rates = [1, 0.9, 0.8, 0.75, 1.1, 1.25, 1.5, 1.75, 2];
     var ri = 0;
     rate.addEventListener("click", function () {
       ri = (ri + 1) % rates.length;

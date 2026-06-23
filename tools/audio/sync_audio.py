@@ -10,11 +10,13 @@ OUTPUT : for each requested article, whether its Release audio was UPDATED,
 
 How "changed" is decided
 ------------------------
-The audio is a function of the *speakable text* produced by extract_text.py
-(NOT the raw HTML — nav/CSS/script tweaks must not trigger regeneration).
-We sha256 that text and compare against tools/audio/audio_state.json, the
-baseline written after the last successful sync. Hash differs (or article is
-new) => regenerate + re-upload. Hash matches => skip.
+The audio is a function of the *verbal narration script* produced by
+extract_verbal.py (NOT the raw HTML — nav/CSS/script tweaks must not trigger
+regeneration). The verbal script rewrites reading-first structures such as code
+blocks, tables, and lists into spoken-friendly narration. We sha256 that script
+and compare against tools/audio/audio_state.json, the baseline written after the
+last successful sync. Hash differs (or article is new) => regenerate + re-upload.
+Hash matches => skip.
 
 On success the baseline + audio-manifest.json are updated so the next run
 sees the new state. Re-run is idempotent.
@@ -49,13 +51,15 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
-from extract_text import extract  # noqa: E402
+from extract_verbal import extract  # noqa: E402
 
 AUDIO_ROOT = os.path.join(REPO, "audio")
+VERBAL_ROOT = os.path.join(HERE, "verbal_cache")
 STATE_PATH = os.path.join(HERE, "audio_state.json")
 MANIFEST_PATH = os.path.join(REPO, "audio-manifest.json")
 
 VOICE = "en-US-AriaNeural"
+EXTRACTOR = "extract_verbal_v1"
 RELEASE_TAG = "audio-v1"
 MAX_CHUNK = 2200
 MIN_WORDS = 80
@@ -100,12 +104,27 @@ def asset_name_for_slug(slug: str) -> str:
     return slug + ".mp3"
 
 
+def verbal_path_for_slug(slug: str) -> str:
+    return os.path.join(VERBAL_ROOT, slug + ".txt")
+
+
+def write_verbal_cache(slug: str, text: str) -> None:
+    path = verbal_path_for_slug(slug)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text.rstrip() + "\n")
+
+
 # ── state ──────────────────────────────────────────────────────────────────
 def load_state() -> dict:
     if os.path.exists(STATE_PATH):
-        with open(STATE_PATH) as f:
-            return json.load(f)
-    return {"release_tag": RELEASE_TAG, "voice": VOICE, "articles": {}}
+        state = json.load(open(STATE_PATH))
+        state.setdefault("release_tag", RELEASE_TAG)
+        state.setdefault("voice", VOICE)
+        state.setdefault("extractor", EXTRACTOR)
+        state.setdefault("articles", {})
+        return state
+    return {"release_tag": RELEASE_TAG, "voice": VOICE, "extractor": EXTRACTOR, "articles": {}}
 
 
 def save_state(state: dict) -> None:
@@ -268,25 +287,27 @@ async def process_one(slug, state, dry_run) -> dict:
         res["detail"] = f"only {wc} words (<{MIN_WORDS})"
         return res
 
-    new_hash = text_hash(text)
+    new_hash = text_hash(EXTRACTOR + "\n" + text)
     prev = state["articles"].get(slug)
     is_new = prev is None
-    changed = is_new or prev.get("sha256") != new_hash
+    changed = is_new or prev.get("sha256") != new_hash or prev.get("extractor") != EXTRACTOR
 
     if not changed:
+        write_verbal_cache(slug, text)
         res["status"] = "UP_TO_DATE"
-        res["detail"] = f"{wc}w, hash {new_hash[:12]}"
+        res["detail"] = f"{wc}w, {EXTRACTOR}, hash {new_hash[:12]}"
         return res
 
     if dry_run:
         res["status"] = "WOULD_ADD" if is_new else "WOULD_UPDATE"
-        res["detail"] = (f"{wc}w; "
+        res["detail"] = (f"{wc}w; {EXTRACTOR}; "
                          + ("new article" if is_new
-                            else f"{prev['sha256'][:12]} -> {new_hash[:12]}"))
+                            else f"{prev.get('sha256', '')[:12]} -> {new_hash[:12]}"))
         return res
 
     # regenerate
     try:
+        write_verbal_cache(slug, text)
         out_path, nchunks = await synth_article(slug, text)
         size = os.path.getsize(out_path)
     except Exception as e:
@@ -312,6 +333,7 @@ async def process_one(slug, state, dry_run) -> dict:
         "html": os.path.relpath(hp, REPO),
         "sha256": new_hash,
         "words": wc,
+        "extractor": EXTRACTOR,
     }
     res["status"] = "ADDED" if is_new else "UPDATED"
     res["detail"] = f"{wc}w, {nchunks} chunks, {size//1024} KB -> {asset}"
@@ -325,6 +347,9 @@ async def main_async(args):
         return 2
 
     state = load_state()
+    state["release_tag"] = RELEASE_TAG
+    state["voice"] = VOICE
+    state["extractor"] = EXTRACTOR
     targets = resolve_targets(args, state)
     if not targets:
         print("No target articles given. Pass article names or --all.",
