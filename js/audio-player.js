@@ -20,6 +20,7 @@
   var RELEASE_BASE =
     "https://github.com/yifanswe/yifanswe.github.io/releases/download/audio-v1/";
   var MANIFEST_URL = "/audio-manifest.json";
+  var CHAPTERS_URL = "/audio-chapters.json";
 
   // iOS WebKit (every iOS browser) refuses to play the GitHub Release assets:
   // they're served cross-origin as application/octet-stream with
@@ -130,7 +131,7 @@
   var ICON_PAUSE =
     '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>';
 
-  function build(audioUrl) {
+  function build(audioUrl, exactChapters) {
     var titleEl = document.querySelector(".article-title");
     var metaEl = document.querySelector(".article-meta");
     var anchor = metaEl || titleEl;
@@ -206,7 +207,7 @@
     anchor.parentNode.insertBefore(wrap, anchor.nextSibling);
 
     var seeking = false;
-    var chapters = chapterMarkers();
+    var chapters = exactChapters && exactChapters.length ? exactChapters : chapterMarkers();
 
     function setTime(t) {
       if (!audio.duration) return;
@@ -220,6 +221,7 @@
     }
 
     function chapterTime(marker) {
+      if (typeof marker.start === "number") return marker.start;
       return audio.duration ? marker.ratio * audio.duration : 0;
     }
 
@@ -307,18 +309,37 @@
     });
   }
 
+  function loadChapterManifest() {
+    return fetch(CHAPTERS_URL)
+      .then(function (r) {
+        return r.ok ? r.json() : {};
+      })
+      .catch(function () {
+        return {};
+      });
+  }
+
   function init() {
     var slug = slugForPath();
     if (!slug) return;
     // Existence check against the same-origin manifest (no CORS issue).
     // The manifest is a JSON array of slugs that have a narration asset.
-    fetch(MANIFEST_URL)
-      .then(function (r) {
+    Promise.all([
+      fetch(MANIFEST_URL).then(function (r) {
         return r.ok ? r.json() : null;
-      })
-      .then(function (slugs) {
+      }),
+      loadChapterManifest(),
+    ])
+      .then(function (results) {
+        var slugs = results[0];
+        var chapterMap = results[1] || {};
         if (slugs && slugs.indexOf(slug) !== -1) {
-          build(audioUrlForSlug(slug));
+          var exactChapters = chapterMap[slug];
+          var audioUrl = audioUrlForSlug(slug);
+          if (exactChapters && exactChapters.length) {
+            audioUrl += (audioUrl.indexOf("?") === -1 ? "?" : "&") + "v=chaptered-v2";
+          }
+          build(audioUrl, exactChapters);
         }
       })
       .catch(function () {
