@@ -80,6 +80,13 @@ def _sentence(text: str) -> str:
     return text
 
 
+def _heading_text(text: str) -> str:
+    text = _clean(text)
+    # "§1. What Distributed Cache Is" sounds stiff. For audio, keep the idea.
+    text = re.sub(r"^§\s*\d+\.?\s*", "", text)
+    return text.strip(" .")
+
+
 def _inline_text(node: Tag) -> str:
     clone = BeautifulSoup(str(node), "lxml")
     for noisy in clone.find_all(["pre", "table", "script", "style"]):
@@ -148,10 +155,10 @@ def _render_list(tag: Tag) -> list[str]:
 
     # Long dense lists are easier to listen to if framed as a short tour rather
     # than as a literal page structure.
-    lines = [f"The important points are these."] if len(items) > 1 else []
+    lines = ["Here is the short version."] if len(items) > 1 else []
     for i, item in enumerate(items):
         prefix = _ORDINALS[i] if i < len(_ORDINALS) else "Next"
-        lines.append(_sentence(f"{prefix}, {item}"))
+        lines.append(_sentence(f"{prefix}: {item}"))
     return lines
 
 
@@ -171,7 +178,7 @@ def _render_table(table: Tag) -> list[str]:
 
     tbody = table.find("tbody")
     body_rows = tbody.find_all("tr") if tbody else rows
-    lines = ["The article includes a table here. I will summarize it in spoken form instead of reading the grid literally."]
+    lines = ["There is a table here. Instead of reading the whole grid, I will turn it into a quick walkthrough."]
 
     for tr in body_rows:
         cells = [_clean(c.get_text(" ", strip=True)) for c in tr.find_all(["td", "th"])]
@@ -207,15 +214,15 @@ def _render_children(parent: Tag) -> list[str]:
         if name in {"script", "style"}:
             continue
         if name == "pre":
-            lines.append("The original article includes a code or configuration block here. I am skipping the raw syntax in the audio version; please refer to the page for the exact code.")
+            lines.append("There is a code block here. I will skip the raw syntax in audio; check the page if you want the exact code.")
         elif name == "table":
             lines.extend(_render_table(child))
         elif name in {"ul", "ol"}:
             lines.extend(_render_list(child))
         elif name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-            txt = _inline_text(child)
+            txt = _heading_text(child.get_text(" ", strip=True))
             if txt:
-                lines.append(_sentence(f"Section: {txt}"))
+                lines.append(_sentence(f"Now, {txt}"))
         elif name in {"p", "blockquote"}:
             txt = _inline_text(child)
             if txt:
@@ -241,7 +248,7 @@ def extract(path: str) -> tuple[str, str]:
 
     lines = []
     if title:
-        lines.append(_sentence(f"This is an audio version of the article: {title}"))
+        lines.append(_sentence(f"Let's talk through {title}"))
     lines.extend(_render_children(content))
 
     out = []
