@@ -100,16 +100,55 @@ def _direct_text(tag: Tag) -> str:
     return _clean(" ".join(parts))
 
 
+def _looks_like_example_fragment(sentence: str) -> bool:
+    """Heuristic for vendor/example fragments that sound bad in audio.
+
+    Reading "Redis, Memcached, Aerospike, Hazelcast..." aloud is useful on the
+    page but choppy in narration. Prefer the conceptual sentence that follows.
+    """
+    words = sentence.split()
+    comma_count = sentence.count(",")
+    return comma_count >= 3 and len(words) <= 18
+
+
+def _first_strong_text(li: Tag) -> str:
+    first = li.find("strong", recursive=False)
+    if not first:
+        return ""
+    return _clean(first.get_text(" ", strip=True)).strip(" .,:;-")
+
+
+def _compact_list_item(li: Tag) -> str:
+    label = _first_strong_text(li)
+    full = _direct_text(li) or _inline_text(li)
+    if not full:
+        return ""
+
+    # If the item starts with a bold label, treat that as the spoken concept and
+    # summarize the body instead of reading every inline example/vendor name.
+    if label and full.startswith(label):
+        rest = full[len(label):].strip(" ,:;.-")
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", rest) if s.strip()]
+        sentences = [s for s in sentences if not _looks_like_example_fragment(s)]
+        if sentences:
+            return f"{label}: {sentences[0]}"
+        return label
+
+    return full
+
+
 def _render_list(tag: Tag) -> list[str]:
     items = []
     for li in tag.find_all("li", recursive=False):
-        txt = _direct_text(li) or _inline_text(li)
+        txt = _compact_list_item(li)
         if txt:
             items.append(txt)
     if not items:
         return []
 
-    lines = [f"There are {len(items)} key points here."] if len(items) > 1 else []
+    # Long dense lists are easier to listen to if framed as a short tour rather
+    # than as a literal page structure.
+    lines = [f"The important points are these."] if len(items) > 1 else []
     for i, item in enumerate(items):
         prefix = _ORDINALS[i] if i < len(_ORDINALS) else "Next"
         lines.append(_sentence(f"{prefix}, {item}"))
